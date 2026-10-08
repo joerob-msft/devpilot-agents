@@ -85,8 +85,9 @@ jobs:
             }
           }
           elseif ($env:RESOLUTION_MODE -eq 'exactVersion') {
-            if ($env:EXACT_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
-              throw 'An exactVersion canary requires one stable 0.4.x version.'
+            if ($env:EXACT_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+                [Version]$env:EXACT_VERSION -lt [Version]'0.4.0') {
+              throw 'An exactVersion canary requires one stable supported version.'
             }
           }
           else { throw 'Unsupported canary resolutionMode.' }
@@ -148,8 +149,9 @@ jobs:
           $consumer = Join-Path $env:RUNNER_TEMP 'consumer'
           $pinPath = Join-Path $consumer '.github\copilot\agents\devpilot-toolkit.lock.json'
           if ($env:RESOLUTION_MODE -eq 'exactVersion') {
-            if ($env:EXACT_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
-              throw 'exactVersion must be a stable 0.4.x version.'
+            if ($env:EXACT_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+                [Version]$env:EXACT_VERSION -lt [Version]'0.4.0') {
+              throw 'exactVersion must be a stable supported version.'
             }
             $pin = [ordered]@{
               schemaVersion = 2

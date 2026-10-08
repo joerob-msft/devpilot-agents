@@ -30,8 +30,8 @@ Describe 'Release publication boundary' {
         $release.LastIndexOf('Invoke-InstalledReleaseQualification.ps1') |
             Should -BeLessThan $release.IndexOf('gh release create $tagName')
         $release.IndexOf('gh release create $tagName') |
-            Should -BeLessThan $release.IndexOf('git tag -fa v0.4')
-        $release.IndexOf('git tag -fa v0.4') |
+            Should -BeLessThan $release.IndexOf('git tag -fa $channelTag')
+        $release.IndexOf('git tag -fa $channelTag') |
             Should -BeLessThan $release.IndexOf('push --force')
         $release | Should -Match 'exactly one compatible annotated immutable release tag'
         $release | Should -Match 'main moved after final smoke'
@@ -75,20 +75,66 @@ Describe 'Release publication boundary' {
         $release | Should -Match 'Verify mandatory live canary'
     }
 
-    It 'allows only qualified immutable 0.4 releases to receive rollback promotion' {
+    It 'allows only qualified immutable releases in the target line to receive rollback promotion' {
         $promotion | Should -Match "mode = 'exactVersion'"
         $promotion | Should -Match 'actions: read'
         $promotion | Should -Not -Match 'ssh-key:'
         $promotion | Should -Match '(?s)qualify:.*environment: release-qualification'
         $promotion | Should -Match '(?s)promote:.*environment: release-publish'
         $promotion | Should -Match 'Target must be an annotated immutable release tag'
-        $promotion | Should -Match 'exactly one compatible immutable 0\.4 patch tag'
+        $promotion | Should -Match 'exactly one compatible immutable \$versionLine patch tag'
         $promotion | Should -Match 'Re-resolve and smoke-test rollback target'
         $promotion | Should -Match 'main moved after rollback smoke'
         $promotion | Should -Match 'GH_TOKEN: \$\{\{ github\.token \}\}'
         $promotion | Should -Match 'Rollback stable GitHub Release changed during qualification'
         $promotion | Should -Match 'Remove temporary rollback cache'
-        $promotion | Should -Match '(?s)git -c "core\.sshCommand=\$ssh" push --force.*refs/tags/v0\.4'
+        $promotion | Should -Match '(?s)git -c "core\.sshCommand=\$ssh" push --force.*refs/tags/\$channelTag'
+    }
+
+    It 'derives publication and rollback channels without crossing a major/minor line' {
+        foreach ($workflow in @($release, $promotion)) {
+            $blocks = @(Get-WorkflowRunBlocks $workflow |
+                Where-Object { $_ -match 'git tag -fa \$channelTag' })
+            $blocks.Count | Should -Be 1
+            $tokens = $null
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput(
+                $blocks[0], [ref]$tokens, [ref]$errors)
+            $errors | Should -BeNullOrEmpty
+            $identity = @($ast.EndBlock.Statements | Where-Object {
+                    $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                    $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                    $_.Left.VariablePath.UserPath -in @(
+                        'releaseVersion', 'targetVersion', 'versionLine', 'channelTag', 'tagPattern')
+                } | ForEach-Object { $_.Extent.Text }) -join "`n"
+            $oldRelease = $env:RELEASE_VERSION
+            $oldTarget = $env:TARGET_VERSION
+            try {
+                foreach ($version in @('0.4.2', '0.5.0', '0.5.12')) {
+                    $env:RELEASE_VERSION = $version
+                    $env:TARGET_VERSION = $version
+                    . ([scriptblock]::Create($identity))
+                    $expectedLine = ($version -split '\.')[0..1] -join '.'
+                    $channelTag | Should -BeExactly "v$expectedLine"
+                    "v$version" | Should -Match $tagPattern
+                    $otherLine = if ($expectedLine -eq '0.4') { 'v0.5.0' } else { 'v0.4.0' }
+                    $otherLine | Should -Not -Match $tagPattern
+                    "v$version-beta" | Should -Not -Match $tagPattern
+                }
+            }
+            finally {
+                $env:RELEASE_VERSION = $oldRelease
+                $env:TARGET_VERSION = $oldTarget
+            }
+            $blocks[0] | Should -Not -Match 'git tag -fa v0\.4|refs/tags/v0\.4'
+        }
+    }
+
+    It 'uses the synchronized metadata line for new immutable release discovery' {
+        $release | Should -Match '\$versionInfo = \./tools/Test-DevPilotVersion.ps1 -ExpectedVersion \$env:RELEASE_VERSION'
+        $release | Should -Match '\$versionLine = \$versionInfo.VersionLine'
+        $release | Should -Match 'refs/tags/v\$versionLine\.\*'
+        $release | Should -Not -Match 'refs/tags/v0\.4\.\*'
     }
 
     It 'keeps write credentials out of every candidate execution block' {

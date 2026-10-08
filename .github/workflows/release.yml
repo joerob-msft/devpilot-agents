@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable 0.4.x version without the v prefix
+        description: Stable version matching VERSION, without the v prefix
         required: true
         type: string
       workflowCommit:
@@ -57,8 +57,8 @@ jobs:
               $env:CANDIDATE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
             throw 'workflowCommit and candidateCommit must be full lowercase SHA-1 values.'
           }
-          if ($env:RELEASE_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$') {
-            throw 'version must be a stable 0.4.x version.'
+          if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'version must be a stable semantic version matching VERSION.'
           }
           if ($env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
             throw 'Dispatch Release from the exact current main workflow commit.'
@@ -89,18 +89,21 @@ jobs:
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
         run: |
           $resume = $env:RESUME_PUBLISHED_TAG -ceq 'true'
+          $versionInfo = ./tools/Test-DevPilotVersion.ps1 -ExpectedVersion $env:RELEASE_VERSION
+          $versionLine = $versionInfo.VersionLine
+          $tagPattern = '^v' + [regex]::Escape($versionLine) + '\.(0|[1-9][0-9]*)$'
           $candidate = [Version]$env:RELEASE_VERSION
           $candidateTag = "v$($env:RELEASE_VERSION)"
-          $lines = @(git ls-remote --tags --refs origin 'refs/tags/v0.4.*')
+          $lines = @(git ls-remote --tags --refs origin "refs/tags/v$versionLine.*")
           if ($LASTEXITCODE -ne 0) { throw 'Could not read immutable release tags.' }
           $tagVersions = [ordered]@{}
           foreach ($line in $lines) {
-            if ($line -notmatch '^[0-9a-f]{40}\s+refs/tags/(v0\.4\..+)$') {
+            if ($line -notmatch "^[0-9a-f]{40}\s+refs/tags/(v$([regex]::Escape($versionLine))\..+)$") {
               throw "Malformed immutable tag response: '$line'."
             }
             $tag = $Matches[1]
-            if ($tag -cnotmatch '^v0\.4\.(0|[1-9][0-9]*)$') {
-              throw "Malformed or prerelease tag occupies the immutable 0.4 namespace: '$tag'."
+            if ($tag -cnotmatch $tagPattern) {
+              throw "Malformed or prerelease tag occupies the immutable $versionLine namespace: '$tag'."
             }
             if ((git cat-file -t "refs/tags/$tag").Trim() -cne 'tag') {
               throw "Immutable release tag is not annotated: '$tag'."
@@ -118,9 +121,9 @@ jobs:
             throw 'Resume requires the latest existing immutable patch tag.'
           }
           $tagsOnCandidate = @(git tag --points-at $env:CANDIDATE_COMMIT |
-            Where-Object { $_ -like 'v0.4.*' })
+            Where-Object { $_ -like "v$versionLine.*" })
           if (-not $resume -and $tagsOnCandidate.Count -gt 0) {
-            throw "Candidate commit already carries a 0.4 patch-like tag: $($tagsOnCandidate -join ', ')."
+            throw "Candidate commit already carries a $versionLine patch-like tag: $($tagsOnCandidate -join ', ')."
           }
           if ($resume) {
             $resolved = (git rev-parse "refs/tags/$candidateTag^{}").Trim()
@@ -376,19 +379,23 @@ jobs:
             ConvertFrom-Json
           $metadata = Get-Content -LiteralPath .\release\release-metadata.json -Raw |
             ConvertFrom-Json
+          $releaseVersion = [Version]$env:RELEASE_VERSION
+          $versionLine = "$($releaseVersion.Major).$($releaseVersion.Minor)"
           $manifestText = Get-Content -LiteralPath `
             .\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1 -Raw
           if ($version -cne $env:RELEASE_VERSION -or
               [string]$package.version -cne $env:RELEASE_VERSION -or
               [string]$metadata.toolkitVersion -cne $env:RELEASE_VERSION -or
               [string]$metadata.immutableTag -cne $tagName -or
+              [string]$metadata.versionLine -cne $versionLine -or
+              [string]$metadata.channelTag -cne "v$versionLine" -or
               $manifestText -cnotmatch "(?m)^\s*ModuleVersion\s*=\s*'$([regex]::Escape($env:RELEASE_VERSION))'\s*$") {
             throw 'Fixed publication metadata no longer matches the qualified version.'
           }
           $tagsOnCandidate = @(git tag --points-at $env:CANDIDATE_COMMIT |
-            Where-Object { $_ -like 'v0.4.*' })
+            Where-Object { $_ -like "v$versionLine.*" })
           if (-not $resume -and $tagsOnCandidate.Count -gt 0) {
-            throw "Candidate commit acquired a 0.4 patch-like tag: $($tagsOnCandidate -join ', ')."
+            throw "Candidate commit acquired a $versionLine patch-like tag: $($tagsOnCandidate -join ', ')."
           }
           if ($resume -and ($tagsOnCandidate.Count -ne 1 -or $tagsOnCandidate[0] -cne $tagName)) {
             throw 'Resume tag is not the sole patch-like tag on the qualified commit.'
@@ -520,7 +527,7 @@ jobs:
           ref: ${{ inputs.workflowCommit }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Publish stable Release and advance protected v0.4 channel
+      - name: Publish stable Release and advance its protected major/minor channel
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -529,6 +536,13 @@ jobs:
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Invalid stable release version at the channel boundary.'
+          }
+          $releaseVersion = [Version]$env:RELEASE_VERSION
+          $versionLine = "$($releaseVersion.Major).$($releaseVersion.Minor)"
+          $channelTag = "v$versionLine"
+          $tagPattern = '^v' + [regex]::Escape($versionLine) + '\.(0|[1-9][0-9]*)$'
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and tags after final smoke.' }
           $main = (git rev-parse origin/main).Trim()
@@ -537,7 +551,7 @@ jobs:
           }
           $tagName = "v$($env:RELEASE_VERSION)"
           $compatible = @(git tag --points-at $env:CANDIDATE_COMMIT |
-            Where-Object { $_ -cmatch '^v0\.4\.(0|[1-9][0-9]*)$' })
+            Where-Object { $_ -cmatch $tagPattern })
           if ($compatible.Count -ne 1 -or $compatible[0] -cne $tagName -or
               (git cat-file -t "refs/tags/$tagName").Trim() -cne 'tag') {
             throw 'Candidate commit must carry exactly one compatible annotated immutable release tag.'
@@ -565,12 +579,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
             git config user.name 'devpilot-release[bot]'
             git config user.email 'devpilot-release[bot]@users.noreply.github.com'
-            git tag -fa v0.4 $env:CANDIDATE_COMMIT -m 'DevPilot Agents 0.4 stable channel'
-            if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 channel tag.' }
+            git tag -fa $channelTag $env:CANDIDATE_COMMIT -m "DevPilot Agents $versionLine stable channel"
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the local $channelTag channel tag." }
             $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
             git -c "core.sshCommand=$ssh" push --force `
-              "git@github.com:$env:GITHUB_REPOSITORY.git" refs/tags/v0.4
-            if ($LASTEXITCODE -ne 0) { throw 'Could not advance the protected v0.4 channel.' }
+              "git@github.com:$env:GITHUB_REPOSITORY.git" "refs/tags/$channelTag"
+            if ($LASTEXITCODE -ne 0) { throw "Could not advance the protected $channelTag channel." }
           }
           finally {
             if (Test-Path -LiteralPath $keyPath) {

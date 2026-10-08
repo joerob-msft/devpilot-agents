@@ -1,5 +1,5 @@
 name: Release Channel Promotion
-run-name: Move v0.4 to v${{ inputs.targetVersion }}
+run-name: Promote channel for v${{ inputs.targetVersion }}
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       targetVersion:
-        description: Existing qualified stable 0.4.x version
+        description: Existing qualified stable version (its major/minor channel is selected)
         required: true
         type: string
       canaryRunId:
@@ -60,7 +60,7 @@ jobs:
         run: |
           $canaryRunId = 0L
           if ($env:WORKFLOW_COMMIT -cnotmatch '^[0-9a-f]{40}$' -or
-              $env:TARGET_VERSION -cnotmatch '^0\.4\.(0|[1-9][0-9]*)$' -or
+              $env:TARGET_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
               [Version]$env:TARGET_VERSION -lt [Version]'0.4.0' -or
               -not [long]::TryParse($env:CANARY_RUN_ID, [ref]$canaryRunId) -or $canaryRunId -lt 1) {
             throw 'Invalid workflow commit or target version.'
@@ -74,6 +74,9 @@ jobs:
             throw 'Channel promotion must use the exact current main workflow.'
           }
           $tagName = "v$($env:TARGET_VERSION)"
+          $targetVersion = [Version]$env:TARGET_VERSION
+          $versionLine = "$($targetVersion.Major).$($targetVersion.Minor)"
+          $tagPattern = '^v' + [regex]::Escape($versionLine) + '\.(0|[1-9][0-9]*)$'
           $tagObject = (git rev-parse "refs/tags/$tagName^{tag}").Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Target immutable tag is missing or not annotated.' }
           $targetCommit = (git rev-parse "refs/tags/$tagName^{}").Trim()
@@ -81,9 +84,9 @@ jobs:
             throw 'Target must be an annotated immutable release tag.'
           }
           $compatible = @(git tag --points-at $targetCommit |
-            Where-Object { $_ -cmatch '^v0\.4\.(0|[1-9][0-9]*)$' })
+            Where-Object { $_ -cmatch $tagPattern })
           if ($compatible.Count -ne 1 -or $compatible[0] -cne $tagName) {
-            throw 'Rollback target must carry exactly one compatible immutable 0.4 patch tag.'
+            throw "Rollback target must carry exactly one compatible immutable $versionLine patch tag."
           }
           $stable = gh release view $tagName --json isDraft,isPrerelease `
             --jq '(.isDraft == false) and (.isPrerelease == false)'
@@ -159,7 +162,7 @@ jobs:
           if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
 
   promote:
-    name: Move protected v0.4 channel
+    name: Move the target's protected major/minor channel
     needs: qualify
     runs-on: windows-latest
     timeout-minutes: 30
@@ -181,6 +184,14 @@ jobs:
           TARGET_VERSION: ${{ inputs.targetVersion }}
           TARGET_COMMIT: ${{ needs.qualify.outputs.target_commit }}
         run: |
+          if ($env:TARGET_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+              [Version]$env:TARGET_VERSION -lt [Version]'0.4.0') {
+            throw 'Invalid stable rollback version at the channel boundary.'
+          }
+          $targetVersion = [Version]$env:TARGET_VERSION
+          $versionLine = "$($targetVersion.Major).$($targetVersion.Minor)"
+          $channelTag = "v$versionLine"
+          $tagPattern = '^v' + [regex]::Escape($versionLine) + '\.(0|[1-9][0-9]*)$'
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main after rollback smoke.' }
           $main = (git rev-parse origin/main).Trim()
@@ -192,6 +203,11 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $targetCommit -cne $env:TARGET_COMMIT -or
               (git cat-file -t "refs/tags/$tagName").Trim() -cne 'tag') {
             throw 'Rollback immutable tag changed during qualification.'
+          }
+          $compatible = @(git tag --points-at $targetCommit |
+            Where-Object { $_ -cmatch $tagPattern })
+          if ($compatible.Count -ne 1 -or $compatible[0] -cne $tagName) {
+            throw 'Rollback target no longer has one compatible immutable patch tag.'
           }
           $stable = gh release view $tagName --json isDraft,isPrerelease `
             --jq '(.isDraft == false) and (.isPrerelease == false)'
@@ -208,12 +224,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not protect the temporary release key.' }
             git config user.name 'devpilot-release[bot]'
             git config user.email 'devpilot-release[bot]@users.noreply.github.com'
-            git tag -fa v0.4 $env:TARGET_COMMIT -m 'DevPilot Agents 0.4 stable channel'
-            if ($LASTEXITCODE -ne 0) { throw 'Could not create the local v0.4 rollback tag.' }
+            git tag -fa $channelTag $env:TARGET_COMMIT -m "DevPilot Agents $versionLine stable channel"
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the local $channelTag rollback tag." }
             $ssh = "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
             git -c "core.sshCommand=$ssh" push --force `
-              "git@github.com:$env:GITHUB_REPOSITORY.git" refs/tags/v0.4
-            if ($LASTEXITCODE -ne 0) { throw 'Could not move the protected v0.4 channel.' }
+              "git@github.com:$env:GITHUB_REPOSITORY.git" "refs/tags/$channelTag"
+            if ($LASTEXITCODE -ne 0) { throw "Could not move the protected $channelTag channel." }
           }
           finally {
             if (Test-Path -LiteralPath $keyPath) {
