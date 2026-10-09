@@ -79,12 +79,12 @@ test("history merges only newer metadata and retains independent role outcomes",
 
 test("history ignores incidental PR events and retains explicit skip activity", () => {
   const history = new PullRequestHistoryProjection();
-  for (const [index, type] of ["agent.heartbeat", "phase.changed", "notification.delivery"].entries()) {
+  for (const [index, type] of ["agent.heartbeat", "phase.changed", "panel.completed", "notification.delivery"].entries()) {
     assert.equal(history.apply(event("9007199254740993", 7, index + 1, { type })), false);
   }
   assert.equal(history.list().length, 0);
 
-  history.apply(event("9007199254740993", 7, 4, {
+  history.apply(event("9007199254740993", 7, 5, {
     role: "review-handler",
     type: "candidate.skipped",
     data: {

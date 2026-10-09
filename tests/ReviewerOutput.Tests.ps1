@@ -313,6 +313,55 @@ Describe 'Reviewer output modes' {
     }
 }
 
+Describe 'Reviewer panel completion output' {
+    BeforeAll {
+        $reviewerPath = Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1"
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            $reviewerPath, [ref]$tokens, [ref]$errors)
+        $errors | Should -BeNullOrEmpty
+        $senderAst = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Send-ReviewerEvent'
+            }, $true)
+        $senderAst | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($senderAst.Extent.Text))
+    }
+
+    It 'publishes <Outcome> panel diagnostics through the real publisher and continues the cycle' -ForEach @(
+        @{ Outcome = 'successful'; Reason = ''; Message = 'Skill-selected independent panel completed.' }
+        @{ Outcome = 'blocked'; Reason = 'invalid bound review'; Message = 'Panel blocked: invalid bound review' }
+    ) {
+        $script:ReviewerOutputContext = New-TestReviewerContext -Mode Json
+        Send-ReviewerEvent panel.completed -Cycle 7 -PrId 42 -SourceCommit ('a' * 40) -Data @{
+            provenance = @{ models = @('gpt-5.6-terra', 'claude-opus-5', 'grok-4.6') }
+            reason = $Reason
+        } -Message $Message
+        Send-ReviewerEvent phase.changed -Cycle 7 -PrId 42 -SourceCommit ('a' * 40) `
+            -Data @{ phase = 'validating the result' }
+
+        $events = @($script:reviewerLines | ForEach-Object { $_ | ConvertFrom-Json })
+        $events.Count | Should -Be 2
+        $events[0].eventType | Should -Be 'panel.completed'
+        $events[0].cycleNumber | Should -Be 7
+        $events[0].pullRequestId | Should -Be 42
+        $events[0].sourceCommit | Should -Be ('a' * 40)
+        $events[0].data.provenance.models | Should -Be @('gpt-5.6-terra', 'claude-opus-5', 'grok-4.6')
+        $events[0].data.reason | Should -Be $Reason
+        $events[0].message | Should -Be $Message
+        $events[1].eventType | Should -Be 'phase.changed'
+        $events[1].sequence | Should -Be ($events[0].sequence + 1)
+    }
+
+    It 'still rejects unregistered event types' {
+        $context = New-TestReviewerContext -Mode Json
+        { Publish-AgentEvent $context panel.unregistered } | Should -Throw '*EventType*'
+        $script:reviewerLines.Count | Should -Be 0
+    }
+}
+
 Describe 'Sealed reviewer artifact persistence' {
     BeforeAll {
         $reviewerPath = Resolve-Path "$PSScriptRoot\..\src\Agents\reviewer\Start-ReviewerAgent.ps1"
