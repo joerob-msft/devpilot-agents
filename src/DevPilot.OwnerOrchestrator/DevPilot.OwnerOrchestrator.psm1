@@ -1700,11 +1700,14 @@ function New-RelationV2RequestFromSnapshot {
         }
         $missingRequired = $true
     }
-    $applicability = if ($missingRequired -or $routingUnknown) {
+    $applicability = if ($routingUnknown) {
         'unknown'
     }
     elseif (-not $triggerMatched) {
         'not-applicable'
+    }
+    elseif ($missingRequired) {
+        'unknown'
     }
     else {
         'applicable'

@@ -494,6 +494,43 @@ Describe 'Scheduler-callable relation preview' {
         }
     }
 
+    It 'routes complete inventory without the trigger path to not-applicable' {
+        $context = New-TestRelationContext `
+            -Name no-trigger -MissingRole 'public-path'
+        $root = Join-Path $TestDrive 'no-trigger-state'
+        $run = & $script:Wrapper prepare-run `
+            -StateRoot $root `
+            -ManifestPath $context.ManifestPath `
+            -EnableLiveModel `
+            -LiveAcquisitionProvider $context.Provider `
+            -LiveModelProvider $context.Model
+        $observation =
+            Get-TestRelationObservation -StateRoot $root
+        $telemetry = Get-ChildItem -LiteralPath $root `
+            -Recurse -Filter '*.json' |
+            Where-Object FullName -Match `
+                '[\\/]telemetry[\\/]' |
+            Select-Object -First 1 |
+            ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 64
+            }
+
+        $run.records[0].state |
+            Should -Be 'completed'
+        $observation.lifecycle.status |
+            Should -BeExactly 'completed'
+        $observation.counts.notApplicable |
+            Should -Be 1
+        $observation.counts.unknown |
+            Should -Be 0
+        $observation.validationErrors |
+            Should -HaveCount 0
+        $telemetry.attempts | Should -Be 0
+        $telemetry.modelCalls | Should -Be 0
+        $context.Counts.writes | Should -Be 0
+    }
+
     It 'keeps Owner and relation scheduler runs independent under partial failure' {
         $relation = New-TestRelationContext -Name partial -MissingRole 'cache-lookup'
         $ownerFixturePath =
