@@ -850,6 +850,8 @@ function Invoke-ActivePrIntake {
         [Parameter(Mandatory)][string]$StateRoot,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
+        [ValidateRange(0, 720)]
+        [int]$MaximumSecondsThisRun = 0,
         [switch]$IncludeTransientSnapshots,
         [switch]$Run
     )
@@ -928,6 +930,25 @@ function Invoke-ActivePrIntake {
         else {
             [int]$Config.limits.maxHeadsPerRun
         }
+        $effectiveMaximumSeconds = if (
+            $MaximumSecondsThisRun -gt 0
+        ) {
+            $MaximumSecondsThisRun
+        }
+        else {
+            [int]$Config.limits.maxSeconds
+        }
+        $readConfig = [ordered]@{}
+        foreach ($key in $Config.Keys) {
+            $readConfig[$key] = $Config[$key]
+        }
+        $readLimits = [ordered]@{}
+        foreach ($key in $Config.limits.Keys) {
+            $readLimits[$key] = $Config.limits[$key]
+        }
+        $readLimits.maxSeconds =
+            $effectiveMaximumSeconds
+        $readConfig.limits = $readLimits
         $envelope = [ordered]@{
             schemaVersion = 1
             kind = 'active-pr-intake-cohort'
@@ -952,6 +973,8 @@ function Invoke-ActivePrIntake {
             mode = 'dry-run-read-only'
             execution = [ordered]@{
                 maximumHeadsThisRun = $effectiveMaximumHeads
+                maximumSecondsThisRun =
+                    $effectiveMaximumSeconds
             }
             writerEligible = $false
             autoPost = $false
@@ -994,16 +1017,19 @@ function Invoke-ActivePrIntake {
         $reads = 0
         $clock = [Diagnostics.Stopwatch]::StartNew()
         try {
-                $identity = Invoke-IntakeRead $Provider Identity @{} $Config ([ref]$reads) $clock
+                $identity = Invoke-IntakeRead $Provider Identity @{} `
+                    $readConfig ([ref]$reads) $clock
                 if ([string]$identity.id -ine
                         [string]$Config.expectedAccount.id -or
                     [string]$identity.descriptor -cne
                         [string]$Config.expectedAccount.descriptor) {
                     throw 'account-mismatch'
                 }
-                $first = Get-IntakePass $Provider $Config ([ref]$reads) $clock 1
+                $first = Get-IntakePass $Provider $readConfig `
+                    ([ref]$reads) $clock 1
                 $envelope.pages.first = $first.pages
-                $second = Get-IntakePass $Provider $Config ([ref]$reads) $clock 2
+                $second = Get-IntakePass $Provider $readConfig `
+                    ([ref]$reads) $clock 2
                 $envelope.pages.second = $second.pages
                 $envelope.gaps.duplicateEntries = $first.duplicates + $second.duplicates
                 if ($first.seen.Count -ne $second.seen.Count) { throw 'mutable-page' }
@@ -1115,7 +1141,9 @@ function Invoke-ActivePrIntake {
                         $envelope.counts.attempted++
                         try {
                             $before = Assert-IntakeHead (
-                                Invoke-IntakeRead $Provider Head @{ pullRequestId = $id } $Config ([ref]$reads) $clock
+                                Invoke-IntakeRead $Provider Head @{
+                                    pullRequestId = $id
+                                } $readConfig ([ref]$reads) $clock
                             ) $id $Config
                             $entry.targetRef = $before.targetRef
                             $entry.declaration = $before
@@ -1150,7 +1178,7 @@ function Invoke-ActivePrIntake {
                                     iterationId = $before.iterationId
                                     sourceCommit = $before.sourceCommit
                                     targetCommit = $before.targetCommit
-                                } $Config ([ref]$reads) $clock
+                                } $readConfig ([ref]$reads) $clock
                                 $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
                                 if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
                                 $lines = $null
@@ -1160,7 +1188,7 @@ function Invoke-ActivePrIntake {
                                 }
                                 $discussion = Invoke-IntakeRead $Provider Discussions @{
                                     pullRequestId = $id; iterationId = $before.iterationId
-                                } $Config ([ref]$reads) $clock
+                                } $readConfig ([ref]$reads) $clock
                                 $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
@@ -1196,7 +1224,9 @@ function Invoke-ActivePrIntake {
                                 }
                                 finally {
                                     $after = Assert-IntakeHead (
-                                        Invoke-IntakeRead $Provider Head @{ pullRequestId = $id } $Config ([ref]$reads) $clock
+                                        Invoke-IntakeRead $Provider Head @{
+                                            pullRequestId = $id
+                                        } $readConfig ([ref]$reads) $clock
                                     ) $id $Config
                                     if ((Get-IntakeDigest $before) -cne (Get-IntakeDigest $after)) {
                                         throw 'head-drift'

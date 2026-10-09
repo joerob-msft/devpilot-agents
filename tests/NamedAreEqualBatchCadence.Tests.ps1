@@ -247,15 +247,25 @@ Describe 'Named batch cadence' {
             -Config $config -Provider $provider `
             -StateRoot $state -RepositoryRoot $repo `
             -MaximumHeadsThisRun 1 -Run
+        {
+            Invoke-ActivePrIntake `
+                -Config $config -Provider $provider `
+                -StateRoot $state -RepositoryRoot $repo `
+                -MaximumHeadsThisRun 4 `
+                -MaximumSecondsThisRun 721 -Run
+        } | Should -Throw
         $second = Invoke-ActivePrIntake `
             -Config $config -Provider $provider `
             -StateRoot $state -RepositoryRoot $repo `
-            -MaximumHeadsThisRun 4 -Run
+            -MaximumHeadsThisRun 4 `
+            -MaximumSecondsThisRun 720 -Run
 
         $first.binding.configDigest |
             Should -BeExactly $second.binding.configDigest
         $first.execution.maximumHeadsThisRun | Should -Be 1
         $second.execution.maximumHeadsThisRun | Should -Be 4
+        $second.execution.maximumSecondsThisRun |
+            Should -Be 720
         @($first.heads | Where-Object {
                 [string]$_.reasonCode -ceq 'rules-incomplete'
             }).pullRequestId |

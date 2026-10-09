@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory)][string]$AcquisitionPath,
     [string]$AzureCliPath = 'az',
     [ValidateRange(1, 4)][int]$MaximumHeadsThisRun = 4,
+    [ValidateRange(1, 720)]
+    [int]$MaximumSecondsThisRun = 720,
     [switch]$Run,
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
 )
@@ -28,6 +30,7 @@ $intake = Invoke-ActivePrIntake `
     -Config $config -Provider $provider `
     -StateRoot $StateRoot -RepositoryRoot $RepoRoot `
     -MaximumHeadsThisRun $MaximumHeadsThisRun `
+    -MaximumSecondsThisRun $MaximumSecondsThisRun `
     -IncludeTransientSnapshots -Run:$Run
 
 $directory = Resolve-AgentTrustedRoot `
