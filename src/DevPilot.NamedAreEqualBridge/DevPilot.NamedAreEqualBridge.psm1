@@ -329,6 +329,136 @@ function New-NamedBridgeAcquisitionProvider {
         -ReviewerIdentity $reviewer -Handler $handler
 }
 
+function Get-NamedBridgeRelevantChangeSet {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$ChangeSet
+    )
+    if ($ChangeSet -isnot
+            [Collections.IDictionary] -or
+        -not $ChangeSet.Contains('changedFiles') -or
+        $ChangeSet.changedFiles -isnot [int] -and
+        $ChangeSet.changedFiles -isnot [long] -or
+        -not $ChangeSet.Contains('changedLines') -or
+        $ChangeSet.changedLines -isnot [int] -and
+        $ChangeSet.changedLines -isnot [long] -or
+        $ChangeSet.entries -isnot [array] -or
+        [int]$ChangeSet.changedFiles -ne
+            @($ChangeSet.entries).Count -or
+        [long]$ChangeSet.changedFiles -lt 0 -or
+        [long]$ChangeSet.changedLines -lt 0 -or
+        ([long]$ChangeSet.changedFiles -eq 0 -and
+            [long]$ChangeSet.changedLines -ne 0)) {
+        throw 'changed-line-evidence-unavailable'
+    }
+    foreach ($entry in @($ChangeSet.entries)) {
+        if ($entry -isnot
+                [Collections.IDictionary] -or
+            -not $entry.Contains('path') -or
+            $entry.path -isnot [string] -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$entry.path)) {
+            throw 'changed-path-evidence-unavailable'
+        }
+    }
+    $entries = @($ChangeSet.entries |
+        Where-Object {
+            [IO.Path]::GetExtension(
+                [string]$_.path) -ieq '.cs'
+        })
+    $changedLines = [long]0
+    foreach ($entry in $entries) {
+        foreach ($span in @($entry.spans)) {
+            [long]$start = 0
+            [long]$end = 0
+            $valid = $span -is
+                [Collections.IDictionary] -and
+                $span.Contains('startLine') -and
+                $span.Contains('endLine') -and
+                [long]::TryParse(
+                    [string]$span.startLine,
+                    [ref]$start) -and
+                [long]::TryParse(
+                    [string]$span.endLine,
+                    [ref]$end)
+            if ($valid -and $start -gt 0 -and
+                $start -le [int]::MaxValue -and
+                $end -ge $start -and
+                $end -le [int]::MaxValue) {
+                $changedLines +=
+                    ($end - $start + 1)
+            }
+        }
+    }
+    return [ordered]@{
+        changedFiles = $entries.Count
+        changedLines = $changedLines
+        entries = $entries
+    }
+}
+
+function Get-NamedBridgeFailureDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory)]
+        [ValidateSet(
+            'provider-preflight',
+            'package-preflight')]
+        [string]$Operation
+    )
+    $message = [string]$ErrorRecord.Exception.Message
+    $fileOrdinal = $null
+    if ($message -match
+        '(?i)file evidence for ordinal ([0-9]+)') {
+        [int]$parsedOrdinal = 0
+        if ([int]::TryParse(
+                [string]$Matches[1],
+                [ref]$parsedOrdinal)) {
+            $fileOrdinal = $parsedOrdinal
+        }
+    }
+    $category = switch -Regex ($message) {
+        '(?i)file evidence.*incomplete|file-evidence-unknown' {
+            'file-evidence-incomplete'
+            break
+        }
+        '(?i)discussion.*incomplete|discussion.*unknown' {
+            'discussion-evidence-incomplete'
+            break
+        }
+        '^provider-contract$' {
+            'provider-contract'
+            break
+        }
+        '(?i)binding.*mismatch|stale.*binding' {
+            'binding-mismatch'
+            break
+        }
+        '(?i)budget' {
+            'budget-refusal'
+            break
+        }
+        '(?i)invalid|digest|malformed' {
+            'invalid-evidence'
+            break
+        }
+        default { 'unclassified-preflight-failure' }
+    }
+    return [ordered]@{
+        category = $category
+        operation = $Operation
+        exceptionType =
+            $ErrorRecord.Exception.GetType().Name
+        messageSha256 =
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes(
+                        $message))).ToLowerInvariant()
+        fileOrdinal = $fileOrdinal
+    }
+}
+
 function Write-NamedBridgeManifest {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -445,13 +575,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
             $snapshot = $snapshots[$id]
             Assert-NamedBridgeHead -Expected $head `
                 -Actual $snapshot.head
-            $changeSet = $snapshot.changes
-            if ($changeSet.entries -isnot [array] -or
-                [int]$changeSet.changedFiles -ne
-                    @($changeSet.entries).Count -or
-                $null -eq $changeSet.changedLines) {
-                throw 'changed-line-evidence-unavailable'
-            }
+            $changeSet =
+                Get-NamedBridgeRelevantChangeSet `
+                    -ChangeSet $snapshot.changes
             $heads[$id] = $head
             $changes[$id] = $changeSet
             $entriesById[$id] =
@@ -529,6 +655,10 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     state = 'unknown'
                     reason = 'acquisition-incomplete'
                     stage = 'provider-preflight'
+                    diagnostic =
+                        Get-NamedBridgeFailureDiagnostic `
+                            -ErrorRecord $_ `
+                            -Operation provider-preflight
                 })
         }
     }
@@ -596,6 +726,10 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                     state = 'unknown'
                     reason = 'acquisition-incomplete'
                     stage = 'package-preflight'
+                    diagnostic =
+                        Get-NamedBridgeFailureDiagnostic `
+                            -ErrorRecord $_ `
+                            -Operation package-preflight
                 })
         }
     }

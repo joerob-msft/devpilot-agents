@@ -238,6 +238,239 @@ BeforeAll {
 }
 
 Describe 'Named batch cadence' {
+    It 'routes only current CSharp files to the Named evaluator' {
+        $changeSet = [ordered]@{
+            changedFiles = 3
+            changedLines = 5
+            entries = @(
+                [ordered]@{
+                    path = 'src/Checks.cs'
+                    state = 'complete'
+                    spans = @([ordered]@{
+                            startLine = 4
+                            endLine = 6
+                        })
+                },
+                [ordered]@{
+                    path = 'settings/app.yaml'
+                    state = 'unknown'
+                    spans = @()
+                },
+                [ordered]@{
+                    path = 'src/Unknown.cs'
+                    state = 'unknown'
+                    spans = @([ordered]@{
+                            startLine = 9
+                            endLine = 9
+                        })
+                })
+        }
+        $filtered = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet
+        } $changeSet
+
+        $filtered.changedFiles | Should -Be 2
+        $filtered.changedLines | Should -Be 4
+        @($filtered.entries.path) |
+            Should -Be @(
+                'src/Checks.cs',
+                'src/Unknown.cs')
+        @($filtered.entries | Where-Object {
+                [string]$_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
+
+        $irrelevant = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet
+        } ([ordered]@{
+                changedFiles = 1
+                changedLines = 1
+                entries = @([ordered]@{
+                        path = 'settings/app.yaml'
+                        state = 'unknown'
+                        spans = @()
+                    })
+            })
+        $irrelevant.changedFiles | Should -Be 0
+        @($irrelevant.entries) | Should -HaveCount 0
+
+        $invalidSpan = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet
+        } ([ordered]@{
+                changedFiles = 1
+                changedLines = 1
+                entries = @([ordered]@{
+                        path = 'tests/InvalidSpan.cs'
+                        state = 'unknown'
+                        spans = @([ordered]@{
+                                startLine = 0
+                                endLine = 0
+                            })
+                    })
+            })
+        $invalidSpan.changedFiles | Should -Be 1
+        $invalidSpan.changedLines | Should -Be 0
+        @($invalidSpan.entries) | Should -HaveCount 1
+
+        $nonnumericSpan = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet
+        } ([ordered]@{
+                changedFiles = 1
+                changedLines = 1
+                entries = @([ordered]@{
+                        path =
+                            'tests/NonnumericSpan.cs'
+                        state = 'unknown'
+                        spans = @([ordered]@{
+                                startLine = 'bad'
+                                endLine = 'worse'
+                            })
+                    })
+            })
+        $nonnumericSpan.changedFiles | Should -Be 1
+        $nonnumericSpan.changedLines | Should -Be 0
+        @($nonnumericSpan.entries) | Should -HaveCount 1
+
+        $oversizedSpans = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet
+        } ([ordered]@{
+                changedFiles = 1
+                changedLines = 2
+                entries = @([ordered]@{
+                        path =
+                            'tests/OversizedSpans.cs'
+                        state = 'unknown'
+                        spans = @(
+                            [ordered]@{
+                                startLine = 1
+                                endLine =
+                                    [long]::MaxValue
+                            },
+                            [ordered]@{
+                                startLine = 1
+                                endLine =
+                                    [long]::MaxValue
+                            })
+                    })
+            })
+        $oversizedSpans.changedFiles | Should -Be 1
+        $oversizedSpans.changedLines | Should -Be 0
+        @($oversizedSpans.entries) | Should -HaveCount 1
+
+        {
+            & (
+                Get-Module DevPilot.NamedAreEqualBridge) {
+                param($InputChangeSet)
+                Get-NamedBridgeRelevantChangeSet `
+                    -ChangeSet $InputChangeSet
+            } ([ordered]@{
+                    changedFiles = 2
+                    changedLines = 1
+                    entries = @([ordered]@{
+                            path = 'tests/OnlyOne.cs'
+                            state = 'complete'
+                            spans = @()
+                        })
+                })
+        } | Should -Throw
+
+        foreach ($invalidCount in @(
+                $null,
+                [decimal]0.4)) {
+            {
+                & (
+                    Get-Module DevPilot.NamedAreEqualBridge) {
+                    param($InputChangeSet)
+                    Get-NamedBridgeRelevantChangeSet `
+                        -ChangeSet $InputChangeSet
+                } ([ordered]@{
+                        changedFiles = $invalidCount
+                        changedLines = 0
+                        entries = [object[]]@()
+                    })
+            } | Should -Throw
+        }
+
+        foreach ($invalidChangeSet in @(
+                [ordered]@{
+                    changedFiles = -1
+                    changedLines = 0
+                    entries = [object[]]@()
+                },
+                [ordered]@{
+                    changedFiles = 0
+                    changedLines = -1
+                    entries = [object[]]@()
+                },
+                [ordered]@{
+                    changedFiles = 0
+                    changedLines = 1
+                    entries = [object[]]@()
+                },
+                [ordered]@{
+                    changedFiles = 1
+                    changedLines = 0
+                    entries = @([ordered]@{
+                            path = ''
+                            state = 'unknown'
+                            spans = @()
+                        })
+                },
+                [ordered]@{
+                    changedFiles = 1
+                    changedLines = 0
+                    entries = @([ordered]@{
+                            path = $null
+                            state = 'unknown'
+                            spans = @()
+                        })
+                })) {
+            {
+                & (
+                    Get-Module DevPilot.NamedAreEqualBridge) {
+                    param($InputChangeSet)
+                    Get-NamedBridgeRelevantChangeSet `
+                        -ChangeSet $InputChangeSet
+                } $invalidChangeSet
+            } | Should -Throw
+        }
+
+        $diagnostic = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            try {
+                throw (
+                    'File evidence for ordinal ' +
+                    ('9' * 64) +
+                    ' was incomplete or unknown.')
+            }
+            catch {
+                Get-NamedBridgeFailureDiagnostic `
+                    -ErrorRecord $_ `
+                    -Operation package-preflight
+            }
+        }
+        $diagnostic.category |
+            Should -BeExactly 'file-evidence-incomplete'
+        $diagnostic.fileOrdinal |
+            Should -BeNullOrEmpty
+        $diagnostic.messageSha256 |
+            Should -Match '^[0-9a-f]{64}$'
+    }
+
     It 'advances four picks from the existing cursor without changing config digest' {
         $config = New-BatchIntakeConfig
         $provider = New-BatchIntakeProvider -Config $config

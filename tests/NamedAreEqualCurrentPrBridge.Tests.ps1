@@ -131,6 +131,15 @@ BeforeAll {
             [ValidateRange(1, 8)][int]$MethodCount = 1,
             [string]$ChangeFailure = '',
             [bool]$IsDraft = $false,
+            [switch]$NonCSharpUnknown,
+            [switch]$CSharpUnknown,
+            [switch]$InvalidCSharpDigest,
+            [ValidateSet('', 'null', 'whitespace')]
+            [string]$InvalidPathMode = '',
+            [ValidateSet(
+                '', 'zero', 'nonnumeric',
+                'out-of-range')]
+            [string]$MalformedCSharpSpan = '',
             [AllowNull()][Collections.IDictionary]$IdentityOverride = $null
         )
         $calls = [Collections.Generic.List[string]]::new()
@@ -164,6 +173,13 @@ BeforeAll {
         }
         $spanDigest = Get-BridgeDigest 'span'
         $contentDigest = Get-BridgeTextDigest $content
+        $unknownContentDigest =
+            Get-BridgeTextDigest 'unknown-yaml'
+        $unknownCSharpDigest =
+            Get-BridgeTextDigest 'unknown-csharp'
+        $malformedSpanContent = 'class Span {}'
+        $malformedSpanDigest =
+            Get-BridgeTextDigest $malformedSpanContent
         $provider = {
             param($Operation, $Request)
             [void]$calls.Add([string]$Operation)
@@ -192,6 +208,131 @@ BeforeAll {
                 }
                 'Changes' {
                     if ($ChangeFailure) { throw $ChangeFailure }
+                    if ($InvalidPathMode) {
+                        return @{
+                            changedFiles = 1
+                            changedLines = 0
+                            entries = @([ordered]@{
+                                    changeTrackingId = 11
+                                    path = $(if (
+                                        $InvalidPathMode -ceq
+                                            'null'
+                                        ) { $null } else { '   ' })
+                                    changeType = 'edit'
+                                    state = 'unknown'
+                                    spans = @()
+                                    content = $null
+                                    byteLength = 0
+                                    sourceDigest =
+                                        $unknownContentDigest
+                                })
+                        }
+                    }
+                    if ($MalformedCSharpSpan) {
+                        $start = switch (
+                            $MalformedCSharpSpan) {
+                            zero { 0 }
+                            nonnumeric { 'bad' }
+                            'out-of-range' {
+                                [long]::MaxValue
+                            }
+                        }
+                        $end = switch (
+                            $MalformedCSharpSpan) {
+                            zero { 0 }
+                            nonnumeric { 'worse' }
+                            'out-of-range' {
+                                [long]::MaxValue
+                            }
+                        }
+                        return @{
+                            changedFiles = 1
+                            changedLines = 1
+                            entries = @([ordered]@{
+                                    changeTrackingId = 12
+                                    path =
+                                        'tests/MalformedSpan.cs'
+                                    changeType = 'edit'
+                                    state = 'complete'
+                                    spans = @([ordered]@{
+                                            startLine = $start
+                                            endLine = $end
+                                            state = 'complete'
+                                            sourceDigest =
+                                                $malformedSpanDigest
+                                        })
+                                    content =
+                                        $malformedSpanContent
+                                    byteLength =
+                                        [Text.Encoding]::UTF8.
+                                            GetByteCount(
+                                                $malformedSpanContent)
+                                    sourceDigest =
+                                        $malformedSpanDigest
+                                })
+                        }
+                    }
+                    if ($InvalidCSharpDigest) {
+                        return @{
+                            changedFiles = 1
+                            changedLines = 1
+                            entries = @([ordered]@{
+                                    changeTrackingId = 10
+                                    path = 'tests/Invalid.cs'
+                                    changeType = 'edit'
+                                    state = 'complete'
+                                    spans = @([ordered]@{
+                                            startLine = 1
+                                            endLine = 1
+                                            state = 'complete'
+                                            sourceDigest = 'invalid'
+                                        })
+                                    content = 'class Invalid {}'
+                                    byteLength = 16
+                                    sourceDigest = 'invalid'
+                                })
+                        }
+                    }
+                    if ($CSharpUnknown) {
+                        return @{
+                            changedFiles = 1
+                            changedLines = 1
+                            entries = @([ordered]@{
+                                    changeTrackingId = 9
+                                    path = 'tests/Unknown.cs'
+                                    changeType = 'edit'
+                                    state = 'unknown'
+                                    spans = @([ordered]@{
+                                            startLine = 1
+                                            endLine = 1
+                                            state = 'unknown'
+                                            sourceDigest =
+                                                $unknownCSharpDigest
+                                        })
+                                    content = $null
+                                    byteLength = 0
+                                    sourceDigest =
+                                        $unknownCSharpDigest
+                                })
+                        }
+                    }
+                    if ($NonCSharpUnknown) {
+                        return @{
+                            changedFiles = 1
+                            changedLines = 0
+                            entries = @([ordered]@{
+                                    changeTrackingId = 8
+                                    path = 'settings/app.yaml'
+                                    changeType = 'edit'
+                                    state = 'unknown'
+                                    spans = @()
+                                    content = $null
+                                    byteLength = 0
+                                    sourceDigest =
+                                        $unknownContentDigest
+                                })
+                        }
+                    }
                     return @{
                         changedFiles = 1
                         changedLines = $callLines.Count
@@ -402,6 +543,191 @@ Describe 'Named AreEqual current PR bridge' {
                 -ErrorAction SilentlyContinue |
             Where-Object { $_.Directory.Name -ceq 'observations' }) |
             Should -HaveCount 0
+    }
+
+    It 'completes when only an unknown non-CSharp file changed' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider `
+            -Config $config -NonCSharpUnknown
+        $state = Join-Path $TestDrive `
+            'non-csharp-state'
+        $manifest = Join-Path $TestDrive `
+            'non-csharp-manifest.json'
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'completed' `
+            -Because (
+                $result |
+                    ConvertTo-Json -Depth 16 -Compress)
+        @($result.records) | Should -HaveCount 1
+        $result.records[0].state |
+            Should -BeExactly 'completed'
+        $identity = [string]$result.records[0].identity
+        $observation = Get-ChildItem `
+            -LiteralPath $state -Recurse -File `
+            -Filter "$identity.json" |
+            Where-Object {
+                $_.Directory.Name -ceq
+                    'observations'
+            } | Select-Object -First 1 |
+            ForEach-Object {
+                Get-Content -LiteralPath $_.FullName `
+                    -Raw |
+                    ConvertFrom-Json -AsHashtable `
+                        -Depth 64
+            }
+        $observation.lifecycle.status |
+            Should -BeExactly 'completed'
+        $observation.findingsComplete |
+            Should -BeTrue
+        $observation.counts.unknown | Should -Be 0
+        @($observation.findings) | Should -HaveCount 0
+        $observation.effects.providerWrites |
+            Should -Be 0
+        $observation.execution.modelStarts |
+            Should -Be 0
+    }
+
+    It 'retains a bounded diagnostic for unknown CSharp evidence' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider `
+            -Config $config -CSharpUnknown
+        $state = Join-Path $TestDrive `
+            'unknown-csharp-state'
+        $manifest = Join-Path $TestDrive `
+            'unknown-csharp-manifest.json'
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'partial'
+        @($result.records) | Should -HaveCount 1
+        $result.records[0].state |
+            Should -BeExactly 'unknown'
+        $failure = @($result.outcomes |
+            Where-Object {
+                [string]$_.stage -ceq
+                    'evaluation'
+            })
+        $failure | Should -HaveCount 1
+        $failure[0].state | Should -BeExactly 'unknown'
+        $failure[0].validationErrors |
+            Should -Contain (
+                'file-evidence-unknown: File evidence for ordinal 0 was incomplete or unknown.')
+    }
+
+    It 'retains a bounded package-preflight diagnostic' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider `
+            -Config $config -InvalidCSharpDigest
+        $state = Join-Path $TestDrive `
+            'invalid-csharp-state'
+        $manifest = Join-Path $TestDrive `
+            'invalid-csharp-manifest.json'
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'partial'
+        @($result.records) | Should -HaveCount 0
+        $failure = @($result.outcomes |
+            Where-Object {
+                [string]$_.stage -ceq
+                    'package-preflight'
+            })
+        $failure | Should -HaveCount 1
+        $failure[0].state | Should -BeExactly 'unknown'
+        $failure[0].diagnostic.category |
+            Should -BeExactly 'invalid-evidence'
+        $failure[0].diagnostic.operation |
+            Should -BeExactly 'package-preflight'
+        $failure[0].diagnostic.fileOrdinal |
+            Should -BeNullOrEmpty
+        $failure[0].diagnostic.messageSha256 |
+            Should -Match '^[0-9a-f]{64}$'
+        $failure[0].diagnostic.Keys |
+            Should -Not -Contain 'message'
+        $failure[0].diagnostic.Keys |
+            Should -Not -Contain 'path'
+    }
+
+    It 'keeps malformed changed paths UNKNOWN for <Mode>' `
+        -TestCases @(
+            @{ Mode = 'null' },
+            @{ Mode = 'whitespace' }
+        ) {
+        param($Mode)
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider `
+            -Config $config -InvalidPathMode $Mode
+        $state = Join-Path $TestDrive `
+            "invalid-path-$Mode-state"
+        $manifest = Join-Path $TestDrive `
+            "invalid-path-$Mode-manifest.json"
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'partial'
+        @($result.records) | Should -HaveCount 0
+        $failure = @($result.outcomes |
+            Where-Object {
+                [string]$_.stage -ceq 'snapshot'
+            })
+        $failure | Should -HaveCount 1
+        $failure[0].state | Should -BeExactly 'unknown'
+        $failure[0].reason |
+            Should -BeExactly 'acquisition-incomplete'
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
+    It 'keeps malformed CSharp spans UNKNOWN for <Mode>' `
+        -TestCases @(
+            @{ Mode = 'zero' },
+            @{ Mode = 'nonnumeric' },
+            @{ Mode = 'out-of-range' }
+        ) {
+        param($Mode)
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider `
+            -Config $config `
+            -MalformedCSharpSpan $Mode
+        $state = Join-Path $TestDrive `
+            "malformed-span-$Mode-state"
+        $manifest = Join-Path $TestDrive `
+            "malformed-span-$Mode-manifest.json"
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot -Run
+
+        $result.state | Should -BeExactly 'partial'
+        @($result.records) | Should -HaveCount 0
+        $failure = @($result.outcomes |
+            Where-Object {
+                [string]$_.state -ceq 'unknown'
+            })
+        $failure | Should -HaveCount 1
+        $failure[0].stage |
+            Should -BeExactly 'package-preflight'
+        $failure[0].reason |
+            Should -BeExactly 'acquisition-incomplete'
+        $failure[0].diagnostic.messageSha256 |
+            Should -Match '^[0-9a-f]{64}$'
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
     }
 
     It 'uses known-empty only for a complete inventory with zero eligible heads' {
