@@ -684,6 +684,13 @@ function Get-IntakeDiscussionCounts {
     }
 }
 
+function Test-IntakeUsesFindingScopedDiscussionReconciliation {
+    param([Collections.IDictionary]$Rule)
+
+    return [string]$Rule.id -ceq 'bpm-named-areequal-arguments@1' -and
+        [string]$Rule.capability -ceq 'bpm-named-areequal-arguments@1'
+}
+
 function Get-IntakePriorObservation {
     param($Previous, [int]$Id, [string]$RuleId, [string]$Capability,
         [string]$CurrentDigest, [string]$ConfigDigest)
@@ -1215,7 +1222,11 @@ function Invoke-ActivePrIntake {
                                             'stale-observation'
                                         } else { 'no-new-observation' }
                                     }
-                                    if ($entry.discussion.ambiguous -gt 0) {
+                                    if ($entry.discussion.ambiguous -gt 0 -and
+                                        -not (
+                                            Test-IntakeUsesFindingScopedDiscussionReconciliation `
+                                                -Rule $rule
+                                        )) {
                                         $result.state = 'unknown'
                                         $result.reasonCode = 'ambiguous-discussion'
                                     }

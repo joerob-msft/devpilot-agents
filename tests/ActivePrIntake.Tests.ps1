@@ -355,6 +355,49 @@ Describe 'Active PR read-only intake' {
         $outdated.heads[0].discussion.human | Should -Be 0
         $outdated.heads[0].discussion.automation | Should -Be 0
     }
+    It 'delegates aggregate discussion ambiguity only for the exact Named rule' {
+        $c = New-IntakeCase -Count 1
+        $c.config.rules[0].id = 'bpm-named-areequal-arguments@1'
+        $c.config.rules[0].capability = 'bpm-named-areequal-arguments@1'
+        $c.state.iteration = 2
+        $c.state.comments = @([ordered]@{
+                id = 1
+                status = 'active'
+                isDeleted = $false
+                threadContext = [ordered]@{
+                    filePath = '/docs/legacy.md'
+                    rightFileStart = [ordered]@{ line = 1; offset = 1 }
+                    rightFileEnd = [ordered]@{ line = 1; offset = 1 }
+                }
+                pullRequestThreadContext = [ordered]@{
+                    changeTrackingId = 7
+                    iterationContext = [ordered]@{
+                        firstComparingIteration = 1
+                        secondComparingIteration = 1
+                    }
+                }
+                comments = @([ordered]@{
+                        id = 1
+                        parentCommentId = 0
+                        commentType = 1
+                        isDeleted = $false
+                        content = 'Unrelated historical review.'
+                        author = [ordered]@{
+                            id = '44444444-4444-4444-4444-444444444444'
+                            descriptor = 'aad.human'
+                            uniqueName = 'human@example.invalid'
+                        }
+                    })
+            })
+
+        $named = Invoke-IntakeCase $c
+
+        $named.heads[0].discussion.outdated | Should -Be 1
+        $named.heads[0].discussion.ambiguous | Should -Be 1
+        $named.heads[0].rules[0].state | Should -BeExactly 'pending'
+        $named.heads[0].rules[0].reasonCode | Should -BeExactly 'no-evaluator'
+        $named.gapCounts.unknownRules | Should -Be 0
+    }
     It 'registers generic capabilities without accepting evaluator callbacks or completion claims' {
         $c = New-IntakeCase -Count 1
         $pending = Invoke-IntakeCase $c

@@ -140,6 +140,7 @@ BeforeAll {
                 '', 'zero', 'nonnumeric',
                 'out-of-range')]
             [string]$MalformedCSharpSpan = '',
+            [object[]]$DiscussionThreads = @(),
             [AllowNull()][Collections.IDictionary]$IdentityOverride = $null
         )
         $calls = [Collections.Generic.List[string]]::new()
@@ -357,7 +358,10 @@ BeforeAll {
                     }
                 }
                 'Discussions' {
-                    return @{ threads = @(); count = 0 }
+                    return @{
+                        threads = @($DiscussionThreads)
+                        count = @($DiscussionThreads).Count
+                    }
                 }
                 default { throw "unexpected:$Operation" }
             }
@@ -516,6 +520,126 @@ Describe 'Named AreEqual current PR bridge' {
         $provider.Calls | Should -Contain 'ListPage'
         $provider.Calls | Should -Contain 'Changes'
         $provider.Calls | Should -Contain 'Discussions'
+    }
+
+    It 'ignores unrelated outdated discussion but retains relevant discussion ambiguity' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $human = [ordered]@{
+            id = '44444444-4444-4444-4444-444444444444'
+            descriptor = 'aad.human'
+            uniqueName = 'human@example.invalid'
+        }
+        $newThread = {
+            param(
+                [string]$Path,
+                [int]$Line,
+                [string]$Body,
+                [int]$Iteration,
+                [AllowNull()][Collections.IDictionary]$Author
+            )
+            [ordered]@{
+                id = 9
+                status = 'active'
+                isDeleted = $false
+                threadContext = [ordered]@{
+                    filePath = $Path
+                    rightFileStart = [ordered]@{
+                        line = $Line
+                        offset = 1
+                    }
+                    rightFileEnd = [ordered]@{
+                        line = $Line
+                        offset = 1
+                    }
+                }
+                pullRequestThreadContext = [ordered]@{
+                    changeTrackingId = 7
+                    iterationContext = [ordered]@{
+                        firstComparingIteration = 1
+                        secondComparingIteration = $Iteration
+                    }
+                }
+                comments = @([ordered]@{
+                        id = 10
+                        parentCommentId = 0
+                        commentType = 1
+                        isDeleted = $false
+                        content = $Body
+                        author = $Author
+                    })
+            }
+        }
+
+        $unrelatedProvider = New-BridgeProvider -Config $config `
+            -DiscussionThreads @(& $newThread `
+                '/docs/legacy.md' 1 'Unrelated historical review.' 2 $human)
+        $unrelatedState = Join-Path $TestDrive 'unrelated-outdated-state'
+        $unrelated = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $unrelatedProvider.Handler `
+            -StateRoot $unrelatedState `
+            -ManifestPath (Join-Path $TestDrive 'unrelated-outdated-manifest.json') `
+            -RepositoryRoot $repoRoot -Run
+        $unrelated.intake.heads[0].discussion.outdated | Should -Be 1
+        $unrelated.intake.heads[0].rules[0].state | Should -BeExactly 'pending'
+        $unrelated.intake.gapCounts.unknownRules | Should -Be 0
+        $unrelatedObservation = Get-ChildItem -LiteralPath $unrelatedState `
+            -Recurse -File -Filter "$($unrelated.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' } |
+            Select-Object -First 1 |
+            ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+            }
+        $unrelatedObservation.effects.dedupe.wouldCreate | Should -Be 1
+        $unrelatedObservation.effects.dedupe.unknown | Should -Be 0
+
+        $historicalProvider = New-BridgeProvider -Config $config `
+            -DiscussionThreads @(& $newThread `
+                '/tests/Checks.cs' 6 `
+                'Use named arguments for Assert.AreEqual.' 2 $human)
+        $historicalState = Join-Path $TestDrive 'relevant-outdated-state'
+        $historical = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $historicalProvider.Handler `
+            -StateRoot $historicalState `
+            -ManifestPath (Join-Path $TestDrive 'relevant-outdated-manifest.json') `
+            -RepositoryRoot $repoRoot -Run
+        $historical.intake.heads[0].rules[0].state | Should -BeExactly 'pending'
+        $historicalObservation = Get-ChildItem -LiteralPath $historicalState `
+            -Recurse -File -Filter "$($historical.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' } |
+            Select-Object -First 1 |
+            ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+            }
+        $historicalObservation.effects.dedupe.wouldCreate | Should -Be 0
+        $historicalObservation.effects.dedupe.unknown | Should -Be 1
+        $historicalObservation.findings[0].reconciliation.reason |
+            Should -BeExactly 'historical-human-review-needs-review'
+
+        $ambiguousIdentityProvider = New-BridgeProvider -Config $config `
+            -DiscussionThreads @(& $newThread `
+                '/tests/Checks.cs' 6 `
+                'Use named arguments for Assert.AreEqual.' 3 @{})
+        $ambiguousState = Join-Path $TestDrive 'ambiguous-identity-state'
+        $ambiguous = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $ambiguousIdentityProvider.Handler `
+            -StateRoot $ambiguousState `
+            -ManifestPath (Join-Path $TestDrive 'ambiguous-identity-manifest.json') `
+            -RepositoryRoot $repoRoot -Run
+        $ambiguousObservation = Get-ChildItem -LiteralPath $ambiguousState `
+            -Recurse -File -Filter "$($ambiguous.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' } |
+            Select-Object -First 1 |
+            ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+            }
+        $ambiguousObservation.effects.dedupe.wouldCreate | Should -Be 0
+        $ambiguousObservation.effects.dedupe.unknown | Should -Be 1
+        $ambiguousObservation.findings[0].reconciliation.reason |
+            Should -BeExactly 'human-reviewer-identity-ambiguous'
     }
 
     It 'does not qualify or create when required Item content is unavailable' {

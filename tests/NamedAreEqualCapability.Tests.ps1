@@ -342,4 +342,53 @@ class Checks {
         $observation.findings[0].reconciliation.classification | Should -BeExactly noOp
         $observation.effects.dedupe.wouldCreate | Should -Be 0
     }
+
+    It 'keeps duplicate, foreign, and badly anchored exact markers unknown' {
+        $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
+        $contract = New-NamedTestContract -Entry $result.Entry
+        $finding = $result.Observation.findings[0]
+        $marker = Get-NamedAreEqualMarkerKey -Contract $contract -Finding $finding
+        $body = Format-NamedAreEqualComment -Contract $contract `
+            -Finding $finding -MarkerKey $marker
+
+        $foreign = New-NamedTestThread -Contract $contract -Finding $finding `
+            -Body $body -ReviewerOwned $false
+        $foreignObservation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation ($result.Observation | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64) `
+            -Contract $contract `
+            -Snapshot (New-NamedTestDiscussion -Contract $contract -Threads @($foreign))
+        $foreignObservation.effects.dedupe.unknown | Should -Be 1
+        $foreignObservation.findings[0].reconciliation.reason |
+            Should -BeExactly 'duplicate-or-foreign-reviewer-marker'
+
+        $first = New-NamedTestThread -Contract $contract -Finding $finding `
+            -Body $body -ReviewerOwned $true
+        $second = New-NamedTestThread -Contract $contract -Finding $finding `
+            -Body $body -ReviewerOwned $true
+        $second.threadId = 202
+        $second.comments[0].commentId = 203
+        $duplicateObservation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation ($result.Observation | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64) `
+            -Contract $contract `
+            -Snapshot (New-NamedTestDiscussion -Contract $contract `
+                -Threads @($first, $second))
+        $duplicateObservation.effects.dedupe.unknown | Should -Be 1
+        $duplicateObservation.findings[0].reconciliation.reason |
+            Should -BeExactly 'duplicate-or-foreign-reviewer-marker'
+
+        $badAnchor = New-NamedTestThread -Contract $contract -Finding $finding `
+            -Body $body -ReviewerOwned $true
+        $badAnchor.anchor.line = [int]$finding.anchor.line + 1
+        $anchorObservation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation ($result.Observation | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64) `
+            -Contract $contract `
+            -Snapshot (New-NamedTestDiscussion -Contract $contract `
+                -Threads @($badAnchor))
+        $anchorObservation.effects.dedupe.unknown | Should -Be 1
+        $anchorObservation.findings[0].reconciliation.reason |
+            Should -BeExactly 'reviewer-marker-generation-unknown'
+    }
 }
