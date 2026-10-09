@@ -800,9 +800,15 @@ Describe 'Owner no-tools model provider' {
         $pidPath = Join-Path $TestDrive 'acp-descendant.pid'
         {
             Invoke-TestAcpInitialize -Mode descendant -StatePath $pidPath `
-                -DeadlineMilliseconds 1500
+                -DeadlineMilliseconds 5000
         } | Should -Throw '*timed out*'
-        $descendantPid = [int](Get-Content -LiteralPath $pidPath -Raw)
+        $pidText = Get-Content -LiteralPath $pidPath -Raw
+        [int]$descendantPid = 0
+        [int]::TryParse(
+            $pidText, [ref]$descendantPid) |
+            Should -BeTrue -Because (
+                'descendant fixture must persist only its numeric PID')
+        $descendantPid | Should -BeGreaterThan 0
         Start-Sleep -Milliseconds 200
         Get-Process -Id $descendantPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }

@@ -9,7 +9,7 @@ if ($StatePath -ceq '-') { $StatePath = $null }
 $line = [Console]::In.ReadLine()
 if ($null -eq $line) { exit 22 }
 
-if ($StatePath) {
+if ($StatePath -and $Mode -cne 'descendant') {
     $request = $line | ConvertFrom-Json -AsHashtable -Depth 16
     $summary = [ordered]@{
         method = $request.method
