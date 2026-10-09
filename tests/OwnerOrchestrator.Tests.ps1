@@ -893,6 +893,17 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
         $partialObservation.lifecycle.completed | Should -Be 'unknown'
         $partialObservation.lifecycle.incomplete | Should -Be 'unknown'
         $partialObservation.lifecycle.pending | Should -Be 'unknown'
+        $partialObservation.findingsComplete | Should -BeFalse
+        (& $script:OrchestratorModule {
+                param($Observation)
+                Test-Json -Json (
+                    $Observation |
+                        ConvertTo-Json -Depth 64 `
+                            -Compress) `
+                    -SchemaFile `
+                        $script:OwnerV2ObservationSchemaPath `
+                    -ErrorAction Stop
+            } $partialObservation) | Should -BeTrue
         $partialObservation.measurements.execution.modelStarts.status |
             Should -Be 'unavailable'
         $partialObservation.measurements.execution.modelStarts.reason |
@@ -934,6 +945,113 @@ Describe 'Owner v2 preview orchestrator run lifecycle' {
             } $partialObservationFile.FullName $partialState
             $candidate.runState | Should -Be 'read'
             $candidate.candidateCompleted | Should -Be 'unknown'
+        }
+    }
+
+    It 'bounds Named schema diagnostics without raw input' {
+        $bounded = & $script:OrchestratorModule {
+            try {
+                throw [Exception]::new(
+                    'Expected "unknown" at ''/findingsComplete'' secret-value')
+            }
+            catch {
+                New-NamedAreEqualBoundedPhaseException `
+                    -Exception $_.Exception `
+                    -Phase normalized-observation-schema `
+                    -FindingsCompleteJsonKind Boolean
+            }
+        }
+        $bounded.Message | Should -Match (
+            '^named-areequal-failure:type=Exception;' +
+            'phase=normalized-observation-schema;' +
+            'schemaPath=/findingsComplete;' +
+            'findingsCompleteJsonKind=Boolean;' +
+            'messageSha256=[0-9a-f]{64}$')
+        $bounded.Message |
+            Should -Not -Match 'Expected|secret-value'
+        $bounded.InnerException |
+            Should -BeNullOrEmpty
+    }
+
+    It 'redacts unapproved schema pointers' {
+        foreach ($pointer in @(
+                '/findings/customer-secret',
+                '/C/Users/customer-name')) {
+            $bounded = & $script:OrchestratorModule {
+                param($Pointer)
+                try {
+                    throw [Exception]::new(
+                        "Failure at '$Pointer'")
+                }
+                catch {
+                    New-NamedAreEqualBoundedPhaseException `
+                        -Exception $_.Exception `
+                        -Phase `
+                            normalized-observation-schema `
+                        -FindingsCompleteJsonKind `
+                            Unknown
+                }
+            } $pointer
+            $bounded.Message |
+                Should -Match 'schemaPath=unknown'
+            $bounded.Message |
+                Should -Not -Match (
+                    [regex]::Escape($pointer))
+        }
+    }
+
+    It 'uses the production Named schema validator for fixed field kinds' {
+        $stateRoot = New-TestStateRoot
+        $manifest = New-TestManifestFile `
+            -Name 'schema-validator.json'
+        [void](Invoke-OwnerV2PreviewPrepare `
+                -StateRoot $stateRoot `
+                -ManifestPath $manifest)
+        $entry = & $script:OrchestratorModule {
+            param($ManifestPath)
+            (Read-OwnerV2Manifest `
+                -ManifestPath $ManifestPath).
+                Entries[0]
+        } $manifest
+        $fallback = & $script:OrchestratorModule {
+            param($BoundEntry)
+            New-OwnerV2LiveUnavailableObservation `
+                -Entry $BoundEntry `
+                -Reason 'controlled-unavailable'
+        } $entry
+        $fallback.lifecycle.status = 'unknown'
+        $fallback.lifecycle.completed = 'unknown'
+        $fallback.lifecycle.incomplete = 'unknown'
+        $fallback.lifecycle.pending = 'unknown'
+
+        {
+            & $script:OrchestratorModule {
+                param($Observation)
+                Assert-NamedAreEqualObservationSchema `
+                    -Observation $Observation
+            } $fallback
+        } | Should -Not -Throw
+
+        foreach ($case in @(
+                @{ Value = $null; Kind = 'Null' },
+                @{ Value = @(); Kind = 'Array' }
+            )) {
+            $candidate = $fallback |
+                ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+            $candidate.findingsComplete =
+                $case.Value
+            {
+                & $script:OrchestratorModule {
+                    param($Observation)
+                    Assert-NamedAreEqualObservationSchema `
+                        -Observation $Observation
+                } $candidate
+            } | Should -Throw (
+                '*phase=normalized-observation-schema;' +
+                'schemaPath=/findingsComplete;' +
+                "findingsCompleteJsonKind=$($case.Kind);*")
         }
     }
 

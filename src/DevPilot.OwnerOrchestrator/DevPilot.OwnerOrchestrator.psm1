@@ -1927,12 +1927,8 @@ function Invoke-NamedAreEqualLive {
                 -FailureReason 'discussion-reconciliation-failed'
         }
     }
-    $observationJson = $observation | ConvertTo-Json -Depth 64 -Compress
-    if (-not (Test-Json -Json $observationJson `
-            -SchemaFile $script:OwnerV2ObservationSchemaPath `
-            -ErrorAction Stop)) {
-        throw 'Named AreEqual observation failed the normalized observation schema.'
-    }
+    Assert-NamedAreEqualObservationSchema `
+        -Observation $observation
     Assert-OwnerV2PipelineNoWrites `
         -PipelineResult $result -Observation $observation
     return [pscustomobject][ordered]@{
@@ -1942,6 +1938,125 @@ function Invoke-NamedAreEqualLive {
                 'completed'
             } else { 'unknown' })
         Reason = [string]$observation.execution.incompleteReason
+    }
+}
+
+function New-NamedAreEqualBoundedPhaseException {
+    param(
+        [Parameter(Mandatory)]
+        [Exception]$Exception,
+        [Parameter(Mandatory)]
+        [ValidateSet(
+            'normalized-observation-schema')]
+        [string]$Phase,
+        [Parameter(Mandatory)]
+        [ValidateSet(
+            'Boolean', 'String', 'Null',
+            'Array', 'Object', 'Number',
+            'Missing', 'Unknown')]
+        [string]$FindingsCompleteJsonKind
+    )
+    $message = [string]$Exception.Message
+    $schemaPath = 'unknown'
+    if ($message -match "at '([^']{1,512})'") {
+        $candidate = [string]$Matches[1]
+        if ($candidate -cin @(
+                '/findingsComplete')) {
+            $schemaPath = $candidate
+        }
+    }
+    $messageSha256 =
+        [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes(
+                    $message))).ToLowerInvariant()
+    $type = $Exception.GetType().Name
+    if ($type -cnotmatch '^[A-Za-z0-9_.]{1,128}$') {
+        $type = 'Exception'
+    }
+    return [InvalidOperationException]::new(
+        ('named-areequal-failure:type={0};phase={1};schemaPath={2};findingsCompleteJsonKind={3};messageSha256={4}' -f
+            $type, $Phase, $schemaPath,
+            $FindingsCompleteJsonKind,
+            $messageSha256))
+}
+
+function Get-NamedAreEqualFindingsCompleteJsonKind {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ObservationJson
+    )
+    try {
+        $parsed = ConvertFrom-Json `
+            -InputObject $ObservationJson `
+            -AsHashtable -Depth 64
+        if ($parsed -isnot
+                [Collections.IDictionary] -or
+            -not $parsed.Contains(
+                'findingsComplete')) {
+            return 'Missing'
+        }
+        $value = $parsed['findingsComplete']
+        if ($null -eq $value) {
+            return 'Null'
+        }
+        if ($value -is [bool]) {
+            return 'Boolean'
+        }
+        if ($value -is [string]) {
+            return 'String'
+        }
+        if ($value -is [array]) {
+            return 'Array'
+        }
+        if ($value -is
+                [Collections.IDictionary]) {
+            return 'Object'
+        }
+        if ($value -is [byte] -or
+            $value -is [short] -or
+            $value -is [int] -or
+            $value -is [long] -or
+            $value -is [decimal] -or
+            $value -is [single] -or
+            $value -is [double]) {
+            return 'Number'
+        }
+        return 'Unknown'
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Assert-NamedAreEqualObservationSchema {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Observation
+    )
+    $observationJson =
+        $Observation |
+            ConvertTo-Json -Depth 64 -Compress
+    $jsonKind =
+        Get-NamedAreEqualFindingsCompleteJsonKind `
+            -ObservationJson $observationJson
+    try {
+        $schemaValid = Test-Json `
+            -Json $observationJson `
+            -SchemaFile `
+                $script:OwnerV2ObservationSchemaPath `
+            -ErrorAction Stop
+    }
+    catch {
+        throw (New-NamedAreEqualBoundedPhaseException `
+                -Exception $_.Exception `
+                -Phase normalized-observation-schema `
+                -FindingsCompleteJsonKind $jsonKind)
+    }
+    if (-not $schemaValid) {
+        throw [InvalidOperationException]::new(
+            ('named-areequal-failure:type=SchemaValidation;phase=normalized-observation-schema;schemaPath=unknown;findingsCompleteJsonKind={0};messageSha256=unknown' -f
+                $jsonKind))
     }
 }
 
