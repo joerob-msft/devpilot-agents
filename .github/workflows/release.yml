@@ -37,6 +37,13 @@ jobs:
   preflight:
     name: Exact main and version preflight
     runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      approval-mode: ${{ steps.approval.outputs.mode }}
+      qualification-environment: ${{ steps.approval.outputs.qualification }}
+      publish-environment: ${{ steps.approval.outputs.publish }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -50,6 +57,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           WORKFLOW_RUN_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
           RELEASE_VERSION: ${{ inputs.version }}
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
         run: |
@@ -60,7 +68,8 @@ jobs:
           if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
             throw 'version must be a stable semantic version matching VERSION.'
           }
-          if ($env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
+          if ($env:WORKFLOW_REF -cne 'refs/heads/main' -or
+              $env:WORKFLOW_RUN_SHA -cne $env:WORKFLOW_COMMIT) {
             throw 'Dispatch Release from the exact current main workflow commit.'
           }
           if ($env:RESUME_PUBLISHED_TAG -cne 'true' -and
@@ -144,6 +153,38 @@ jobs:
             }
           }
 
+      - name: Load approval policy from the trusted workflow commit, including on resume
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-policy
+          persist-credentials: false
+
+      - name: Validate automatic patch eligibility and pre-provisioned environments
+        id: approval
+        uses: actions/github-script@v8
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
+          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
+        with:
+          script: |
+            const select = require('./.release-policy/.github/scripts/release-approval.cjs');
+            const policy = await select({
+              github, ...context.repo,
+              version: process.env.RELEASE_VERSION,
+              workflowCommit: process.env.WORKFLOW_COMMIT,
+              candidateCommit: process.env.CANDIDATE_COMMIT,
+              resumePublishedTag: process.env.RESUME_PUBLISHED_TAG === 'true',
+              automaticPatchEnabled: process.env.AUTOMATIC_PATCH_ENABLED || '',
+            });
+            core.setOutput('mode', policy.mode);
+            core.setOutput('qualification', policy.qualification);
+            core.setOutput('publish', policy.publish);
+            await core.summary.addRaw(`Release approval mode: ${policy.mode}`).write();
+
   windows-complete:
     name: Complete Windows qualification
     needs: preflight
@@ -223,10 +264,10 @@ jobs:
 
   installed-artifact:
     name: Clean consumer installation qualification
-    needs: [windows-complete, platform-safety, canary-gate]
+    needs: [preflight, windows-complete, platform-safety, canary-gate]
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: release-qualification
+    environment: ${{ needs.preflight.outputs.qualification-environment }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -312,10 +353,10 @@ jobs:
 
   publish-immutable:
     name: Publish immutable patch tag
-    needs: [windows-complete, platform-safety, canary-gate, installed-artifact]
+    needs: [preflight, windows-complete, platform-safety, canary-gate, installed-artifact]
     runs-on: windows-latest
     timeout-minutes: 30
-    environment: release-publish
+    environment: ${{ needs.preflight.outputs.publish-environment }}
     permissions:
       contents: read
     steps:
@@ -332,7 +373,13 @@ jobs:
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
+          APPROVAL_MODE: ${{ needs.preflight.outputs.approval-mode }}
+          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         run: |
+          if ($env:APPROVAL_MODE -ceq 'automatic-patch' -and
+              $env:AUTOMATIC_PATCH_ENABLED -cne 'true') {
+            throw 'Automatic patch publication was disabled; stop without materializing credentials.'
+          }
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and release tags at the publication boundary.' }
           $main = (git rev-parse origin/main).Trim()
@@ -436,10 +483,10 @@ jobs:
 
   immutable-smoke:
     name: Resolve immutable tag and repeat installed smoke
-    needs: publish-immutable
+    needs: [preflight, publish-immutable]
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: release-qualification
+    environment: ${{ needs.preflight.outputs.qualification-environment }}
     permissions:
       contents: read
     steps:
@@ -515,10 +562,10 @@ jobs:
 
   promote:
     name: Publish stable Release and advance channel
-    needs: immutable-smoke
+    needs: [preflight, immutable-smoke]
     runs-on: windows-latest
     timeout-minutes: 30
-    environment: release-publish
+    environment: ${{ needs.preflight.outputs.publish-environment }}
     permissions:
       contents: write
     steps:
@@ -535,7 +582,13 @@ jobs:
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
+          APPROVAL_MODE: ${{ needs.preflight.outputs.approval-mode }}
+          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         run: |
+          if ($env:APPROVAL_MODE -ceq 'automatic-patch' -and
+              $env:AUTOMATIC_PATCH_ENABLED -cne 'true') {
+            throw 'Automatic patch promotion was disabled; use manual recovery.'
+          }
           if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
             throw 'Invalid stable release version at the channel boundary.'
           }

@@ -38,11 +38,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  approval-policy:
+    name: Select validated release approval policy
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      canary-environment: ${{ steps.approval.outputs.canary }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read exact workflow version
+        id: version
+        shell: pwsh
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+        run: |
+          if ($env:WORKFLOW_REF -cne 'refs/heads/main' -or
+              $env:WORKFLOW_SHA -cne $env:WORKFLOW_COMMIT -or
+              (git rev-parse HEAD).Trim() -cne $env:WORKFLOW_SHA) {
+            throw 'Approval policy must execute only from the exact trusted main workflow.'
+          }
+          $version = ./tools/Test-DevPilotVersion.ps1
+          "version=$($version.Version)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Validate automatic patch eligibility and pre-provisioned environments
+        id: approval
+        uses: actions/github-script@v8
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+          RESOLUTION_MODE: ${{ inputs.resolutionMode }}
+          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
+        with:
+          script: |
+            const select = require('./.github/scripts/release-approval.cjs');
+            const policy = await select({
+              github, ...context.repo,
+              version: process.env.RELEASE_VERSION,
+              workflowCommit: process.env.WORKFLOW_COMMIT,
+              candidateCommit: process.env.CANDIDATE_COMMIT,
+              resolutionMode: process.env.RESOLUTION_MODE,
+              automaticPatchEnabled: process.env.AUTOMATIC_PATCH_ENABLED || '',
+            });
+            core.setOutput('canary', policy.canary);
+            await core.summary.addRaw(`Release approval mode: ${policy.mode}`).write();
+
   live-read-only:
     name: Protected ADO and WorkIQ canary
+    needs: approval-policy
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: release-canary
+    environment: ${{ needs.approval-policy.outputs.canary-environment }}
     steps:
       - uses: actions/checkout@v6
         with:

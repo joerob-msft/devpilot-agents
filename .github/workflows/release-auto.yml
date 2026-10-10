@@ -7,6 +7,8 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
@@ -19,6 +21,8 @@ jobs:
   coordinate:
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/main' &&
+        vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES == 'true') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: windows-latest
     timeout-minutes: 10
@@ -59,6 +63,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           VERSION_CHANGED: ${{ steps.version.outputs.changed }}
           WORKFLOW_COMMIT: ${{ github.sha }}
+          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         with:
           script: |
             const coordinate = require('./.github/scripts/release-automation.cjs');
@@ -67,6 +72,7 @@ jobs:
               version: process.env.RELEASE_VERSION,
               versionChanged: process.env.VERSION_CHANGED === 'true',
               workflowCommit: process.env.WORKFLOW_COMMIT,
+              automaticPatchEnabled: process.env.AUTOMATIC_PATCH_ENABLED || '',
             });
             await core.summary.addHeading('Release coordination')
               .addRaw(result).write();
