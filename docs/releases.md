@@ -26,6 +26,14 @@ workflow constant. Publishing `0.5.0` advances only `v0.5`; it never advances
 on that line until they explicitly opt in to `0.5`. The `0.5.0` feature release
 adds canonical skill-driven autonomous panels and read-only local Squad memory.
 
+The prepared `0.5.1` patch fixes skill-panel cycles aborting at `panel.completed`:
+the Reviewer emitted that diagnostic event, but the shared publisher rejected
+its type. The publisher now accepts it without widening the event contract to
+unknown types. Reviewer `-DryRun` exercises the real publisher, and regression
+tests cover successful and blocked panel output. Panel diagnostics remain
+incidental events, not completed reviews or delivered findings in PR History.
+This patch reaches consumers only after qualification and protected publication.
+
 Consumers resolve a channel to a full 40-character commit before installation.
 They execute only the verified commit-addressed cache at
 `~/.devpilot/toolkits/<commit>`. A mutable tag is never used as an execution

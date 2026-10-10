@@ -3263,7 +3263,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 22
+    $total = 23
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath, (Join-Path $PSScriptRoot 'ReviewerPanel.ps1'))) {
@@ -4869,6 +4869,31 @@ function Invoke-DryRunSelfChecks {
     }
     if ($keyFailures.Count -gt 0) { foreach ($kf in $keyFailures) { $failures.Add("Config key strictness: $kf") } }
     else { Write-Host "  OK - unrecognized keys throw, documentation keys are exempt by shape, and a typo is not mistaken for a comment" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 23/$total : panel completion reaches the real event publisher" -ForegroundColor Cyan
+    $priorOutputContext = $script:ReviewerOutputContext
+    $panelOutput = [System.Collections.Generic.List[string]]::new()
+    $panelOutputContext = $null
+    try {
+        $panelOutputContext = New-AgentOutputContext -Agent reviewer -OutputMode Json -WriteLine {
+            param($line)
+            [void]$panelOutput.Add([string]$line)
+        }.GetNewClosure()
+        $script:ReviewerOutputContext = $panelOutputContext
+        Send-ReviewerEvent panel.completed -Cycle 1 -PrId 42 -SourceCommit ('a' * 40) `
+            -Data @{ provenance = @{ models = @('gpt-5.6-terra') }; reason = '' }
+        $panelEvent = $panelOutput[0] | ConvertFrom-Json
+        if ($panelEvent.eventType -cne 'panel.completed' -or
+            $panelEvent.pullRequestId -ne 42 -or $panelEvent.sourceCommit -cne ('a' * 40)) {
+            $failures.Add("Panel event contract: publisher did not retain the event and source binding.")
+        }
+        else { Write-Host "  OK - the wrapper publishes panel completion without aborting the cycle" -ForegroundColor Green }
+    }
+    catch { $failures.Add("Panel event contract: $($_.Exception.Message)") }
+    finally {
+        if ($panelOutputContext) { Close-AgentOutputContext $panelOutputContext }
+        $script:ReviewerOutputContext = $priorOutputContext
+    }
 
     Write-Host ""
     if ($failures.Count -eq 0) {

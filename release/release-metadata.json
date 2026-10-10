@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "toolkitVersion": "0.5.0",
+  "toolkitVersion": "0.5.1",
   "versionLine": "0.5",
-  "immutableTag": "v0.5.0",
+  "immutableTag": "v0.5.1",
   "channelTag": "v0.5"
 }

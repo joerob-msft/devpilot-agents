@@ -383,6 +383,7 @@ $script:AgentOutputEventTypes = @(
     'candidate.skipped',
     'candidate.selected',
     'phase.changed',
+    'panel.completed',
     'delivery.retrying',
     'delivery.blocked',
     'notification.delivery',
