@@ -11,6 +11,8 @@ Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
 Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1')
+. (Join-Path $PSScriptRoot `
+    '..\DevPilot.ActivePrIntake\DevPilot.ChangeDerivation.ps1')
 
 $script:NamedCapability = 'bpm-named-areequal-arguments@1'
 $script:NamedCapabilityDigest =
@@ -329,26 +331,45 @@ function New-NamedBridgeAcquisitionProvider {
         -ReviewerIdentity $reviewer -Handler $handler
 }
 
+function Get-NamedBridgeChangeDisposition {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Entry,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Head
+    )
+
+    $result =
+        Get-DevPilotChangeDerivationDisposition `
+            -Entry $Entry -Head $Head
+    if ([bool]$result.knownEmptyIdentical) {
+        return 'known-empty-identical'
+    }
+    if ([bool]$result.knownEmptyDeletedFile) {
+        return 'known-empty-deleted-file'
+    }
+    if ([bool]$result.forceUnknown) {
+        return 'evaluate-unknown'
+    }
+    return 'evaluate'
+}
+
 function Get-NamedBridgeRelevantChangeSet {
     param(
         [Parameter(Mandatory)]
-        [Collections.IDictionary]$ChangeSet
+        [Collections.IDictionary]$ChangeSet,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Head
     )
     if ($ChangeSet -isnot
-            [Collections.IDictionary] -or
-        -not $ChangeSet.Contains('changedFiles') -or
-        $ChangeSet.changedFiles -isnot [int] -and
-        $ChangeSet.changedFiles -isnot [long] -or
-        -not $ChangeSet.Contains('changedLines') -or
-        $ChangeSet.changedLines -isnot [int] -and
-        $ChangeSet.changedLines -isnot [long] -or
-        $ChangeSet.entries -isnot [array] -or
-        [int]$ChangeSet.changedFiles -ne
-            @($ChangeSet.entries).Count -or
-        [long]$ChangeSet.changedFiles -lt 0 -or
-        [long]$ChangeSet.changedLines -lt 0 -or
-        ([long]$ChangeSet.changedFiles -eq 0 -and
-            [long]$ChangeSet.changedLines -ne 0)) {
+        [Collections.IDictionary]) {
+        throw 'changed-line-evidence-unavailable'
+    }
+    try {
+        Assert-DevPilotChangeInventory `
+            -Changes $ChangeSet
+    }
+    catch {
         throw 'changed-line-evidence-unavailable'
     }
     foreach ($entry in @($ChangeSet.entries)) {
@@ -361,13 +382,35 @@ function Get-NamedBridgeRelevantChangeSet {
             throw 'changed-path-evidence-unavailable'
         }
     }
-    $entries = @($ChangeSet.entries |
-        Where-Object {
-            [IO.Path]::GetExtension(
-                [string]$_.path) -ieq '.cs'
-        })
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($entry in @($ChangeSet.entries |
+            Where-Object {
+                [IO.Path]::GetExtension(
+                    [string]$_.path) -ieq '.cs'
+            })) {
+        $disposition =
+            Get-NamedBridgeChangeDisposition `
+                -Entry $entry -Head $Head
+        if ($disposition -ceq
+            'evaluate-unknown') {
+            $unknownEntry = $entry |
+                ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 32
+            $unknownEntry.state = 'unknown'
+            $unknownEntry.spans = @()
+            $unknownEntry.content = $null
+            $unknownEntry.byteLength = 0
+            [void]$entries.Add($unknownEntry)
+        }
+        elseif ($disposition -cnotin @(
+                'known-empty-identical',
+                'known-empty-deleted-file')) {
+            [void]$entries.Add($entry)
+        }
+    }
     $changedLines = [long]0
-    foreach ($entry in $entries) {
+    foreach ($entry in @($entries)) {
         foreach ($span in @($entry.spans)) {
             [long]$start = 0
             [long]$end = 0
@@ -393,7 +436,7 @@ function Get-NamedBridgeRelevantChangeSet {
     return [ordered]@{
         changedFiles = $entries.Count
         changedLines = $changedLines
-        entries = $entries
+        entries = $entries.ToArray()
     }
 }
 
@@ -577,7 +620,8 @@ function Invoke-NamedAreEqualCurrentPrBridge {
                 -Actual $snapshot.head
             $changeSet =
                 Get-NamedBridgeRelevantChangeSet `
-                    -ChangeSet $snapshot.changes
+                    -ChangeSet $snapshot.changes `
+                    -Head $head
             $heads[$id] = $head
             $changes[$id] = $changeSet
             $entriesById[$id] =

@@ -582,6 +582,17 @@ $response | ConvertTo-Json -Depth 8 -Compress
             $changes.changedFiles | Should -Be 110
             $changes.changedLines | Should -Be 0
             @($changes.entries) | Should -HaveCount 110
+            @($changes.entries |
+                    Where-Object {
+                        [string]$_.derivation.classification -cne
+                            'deletion-only' -or
+                        [string]$_.derivation.changeType -cne
+                            'deleted' -or
+                        [string]$_.derivation.sourceCommit -cne
+                            ('a' * 40) -or
+                        [string]$_.derivation.targetCommit -cne
+                            ('b' * 40)
+                    }) | Should -HaveCount 0
             @(Get-Content -LiteralPath $log) | Should -Be @('0', '37', '74', '110')
             $env:ACTIVE_PR_INTAKE_CHANGE_MODE = 'duplicate'
             { & $provider 'Changes' @{
@@ -975,6 +986,26 @@ else {
             }
             else { @() }
             $requests | Should -HaveCount $ExpectedItems
+            $expectedClassification = switch ($Mode) {
+                zero { 'identical-content' }
+                delete { 'deletion-only' }
+                default { 'current-lines' }
+            }
+            $changes.entries[0].derivation.
+                classification |
+                Should -BeExactly $expectedClassification
+            $changes.entries[0].derivation.
+                sourceCommit |
+                Should -BeExactly ('a' * 40)
+            $changes.entries[0].derivation.
+                targetCommit |
+                Should -BeExactly ('b' * 40)
+            $changes.entries[0].derivation.
+                spanCount |
+                Should -Be @($ExpectedStarts).Count
+            $changes.entries[0].derivation.
+                currentLineCount |
+                Should -Be $ExpectedLines
 
             if ($Mode -ceq 'multi') {
                 $c.config.limits.maxChangedLines = 2

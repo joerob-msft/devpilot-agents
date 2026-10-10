@@ -113,6 +113,169 @@ BeforeAll {
                 ToLowerInvariant()
     }
 
+    function Add-BatchChangeDerivations {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$ChangeSet,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Head
+        )
+        $copy = $ChangeSet |
+            ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable `
+                -Depth 32
+        foreach ($entry in @($copy.entries)) {
+            if ($entry -isnot
+                    [Collections.IDictionary] -or
+                [string]::IsNullOrWhiteSpace(
+                    [string]$entry.path) -or
+                [IO.Path]::GetExtension(
+                    [string]$entry.path) -ine '.cs') {
+                continue
+            }
+            if (-not $entry.Contains('changeType')) {
+                $entry.changeType = 'edit'
+            }
+            if ([string]$entry.state -ceq
+                'complete') {
+                $fixtureContent = 'fixture'
+                $fixtureBytes =
+                    [Text.Encoding]::UTF8.GetByteCount(
+                        $fixtureContent)
+                $fixtureDigest =
+                    Get-BridgeTextDigest $fixtureContent
+                $entry.content = $fixtureContent
+                $entry.byteLength = $fixtureBytes
+                $entry.sourceDigest = $fixtureDigest
+            }
+            else {
+                $entry.content = $null
+                $entry.byteLength = 0
+                if (-not $entry.Contains(
+                        'sourceDigest')) {
+                    $entry.sourceDigest =
+                        Get-BridgeTextDigest (
+                            'unknown-fixture')
+                }
+            }
+            $validLineCount = 0L
+            $validSpans = $true
+            foreach ($span in @($entry.spans)) {
+                [long]$start = 0
+                [long]$end = 0
+                if ($span -isnot
+                        [Collections.IDictionary] -or
+                    -not [long]::TryParse(
+                        [string]$span.startLine,
+                        [ref]$start) -or
+                    -not [long]::TryParse(
+                        [string]$span.endLine,
+                        [ref]$end) -or
+                    $start -lt 1 -or
+                    $end -lt $start -or
+                    $end -gt [int]::MaxValue) {
+                    $validSpans = $false
+                    continue
+                }
+                $validLineCount +=
+                    $end - $start + 1
+            }
+            $classification = if (
+                [string]$entry.state -ceq
+                    'complete' -and
+                $validSpans -and
+                @($entry.spans).Count -gt 0
+            ) {
+                'current-lines'
+            }
+            else {
+                'derivation-unknown'
+            }
+            $entry.derivation = [ordered]@{
+                schemaVersion = 1
+                kind =
+                    'devpilot-current-line-derivation-v1'
+                producer = 'active-pr-intake-v1'
+                state = $(if (
+                    [string]$entry.state -ceq
+                        'complete'
+                ) { 'complete' } else { 'unknown' })
+                classification = $classification
+                changeType = 'modified'
+                pathRelation = 'same-path'
+                sourceCommit =
+                    [string]$Head.sourceCommit
+                targetCommit =
+                    [string]$Head.targetCommit
+                sourceContentState = $(if (
+                    [string]$entry.state -ceq
+                        'complete'
+                ) { 'available' } else { 'unavailable' })
+                targetContentState = 'unavailable'
+                sourceContentSha256 = 'unknown'
+                targetContentSha256 = 'unknown'
+                sourceByteLength = 0
+                targetByteLength = 0
+                spanCount = @($entry.spans).Count
+                currentLineCount = $validLineCount
+            }
+            if ($classification -ceq
+                'current-lines') {
+                $entry.derivation.
+                    sourceContentSha256 =
+                    [string]$entry.sourceDigest
+                $entry.derivation.
+                    sourceByteLength =
+                    [long]$entry.byteLength
+            }
+        }
+        return $copy
+    }
+
+    function Get-BatchRelevantChangeSet {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$ChangeSet
+        )
+        $head = [ordered]@{
+            sourceCommit = 'a' * 40
+            targetCommit = 'f' * 40
+        }
+        if (-not $ChangeSet.Contains(
+                'changedFiles') -or
+            $ChangeSet.changedFiles -isnot [int] -and
+            $ChangeSet.changedFiles -isnot [long] -or
+            -not $ChangeSet.Contains(
+                'changedLines') -or
+            $ChangeSet.changedLines -isnot [int] -and
+            $ChangeSet.changedLines -isnot [long] -or
+            $ChangeSet.entries -isnot [array] -or
+            [long]$ChangeSet.changedFiles -ne
+                @($ChangeSet.entries).Count -or
+            [long]$ChangeSet.changedFiles -lt 0 -or
+            [long]$ChangeSet.changedLines -lt 0 -or
+            ([long]$ChangeSet.changedFiles -eq 0 -and
+                [long]$ChangeSet.changedLines -ne 0)) {
+            return & (
+                Get-Module DevPilot.NamedAreEqualBridge) {
+                param($InputChangeSet, $InputHead)
+                Get-NamedBridgeRelevantChangeSet `
+                    -ChangeSet $InputChangeSet `
+                    -Head $InputHead
+            } $ChangeSet $head
+        }
+        $prepared =
+            Add-BatchChangeDerivations `
+                -ChangeSet $ChangeSet -Head $head
+        return & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($InputChangeSet, $InputHead)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $InputChangeSet `
+                -Head $InputHead
+        } $prepared $head
+    }
+
     function New-BatchBridgeProvider {
         param(
             [Parameter(Mandatory)]
@@ -216,6 +379,37 @@ BeforeAll {
                                         GetByteCount($text)
                                 sourceDigest =
                                     & $digestCommand $text
+                                derivation = [ordered]@{
+                                    schemaVersion = 1
+                                    kind =
+                                        'devpilot-current-line-derivation-v1'
+                                    producer =
+                                        'active-pr-intake-v1'
+                                    state = 'complete'
+                                    classification =
+                                        'current-lines'
+                                    changeType = 'modified'
+                                    pathRelation =
+                                        'same-path'
+                                    sourceCommit =
+                                        ('{0:x40}' -f $id)
+                                    targetCommit = 'f' * 40
+                                    sourceContentState =
+                                        'available'
+                                    targetContentState =
+                                        'available'
+                                    sourceContentSha256 =
+                                        & $digestCommand $text
+                                    targetContentSha256 =
+                                        & $digestCommand 'target'
+                                    sourceByteLength =
+                                        [Text.Encoding]::UTF8.
+                                            GetByteCount($text)
+                                    targetByteLength = 6
+                                    spanCount = 1
+                                    currentLineCount =
+                                        $content.Count
+                                }
                             })
                     }
                 }
@@ -241,7 +435,7 @@ Describe 'Named batch cadence' {
     It 'routes only current CSharp files to the Named evaluator' {
         $changeSet = [ordered]@{
             changedFiles = 3
-            changedLines = 5
+            changedLines = 4
             entries = @(
                 [ordered]@{
                     path = 'src/Checks.cs'
@@ -265,15 +459,11 @@ Describe 'Named batch cadence' {
                         })
                 })
         }
-        $filtered = & (
-            Get-Module DevPilot.NamedAreEqualBridge) {
-            param($InputChangeSet)
-            Get-NamedBridgeRelevantChangeSet `
-                -ChangeSet $InputChangeSet
-        } $changeSet
+        $filtered = Get-BatchRelevantChangeSet `
+            -ChangeSet $changeSet
 
         $filtered.changedFiles | Should -Be 2
-        $filtered.changedLines | Should -Be 4
+        $filtered.changedLines | Should -Be 3
         @($filtered.entries.path) |
             Should -Be @(
                 'src/Checks.cs',
@@ -282,14 +472,10 @@ Describe 'Named batch cadence' {
                 [string]$_.state -ceq 'unknown'
             }) | Should -HaveCount 1
 
-        $irrelevant = & (
-            Get-Module DevPilot.NamedAreEqualBridge) {
-            param($InputChangeSet)
-            Get-NamedBridgeRelevantChangeSet `
-                -ChangeSet $InputChangeSet
-        } ([ordered]@{
+        $irrelevant = Get-BatchRelevantChangeSet `
+            -ChangeSet ([ordered]@{
                 changedFiles = 1
-                changedLines = 1
+                changedLines = 0
                 entries = @([ordered]@{
                         path = 'settings/app.yaml'
                         state = 'unknown'
@@ -299,85 +485,61 @@ Describe 'Named batch cadence' {
         $irrelevant.changedFiles | Should -Be 0
         @($irrelevant.entries) | Should -HaveCount 0
 
-        $invalidSpan = & (
-            Get-Module DevPilot.NamedAreEqualBridge) {
-            param($InputChangeSet)
-            Get-NamedBridgeRelevantChangeSet `
-                -ChangeSet $InputChangeSet
-        } ([ordered]@{
-                changedFiles = 1
-                changedLines = 1
-                entries = @([ordered]@{
-                        path = 'tests/InvalidSpan.cs'
-                        state = 'unknown'
-                        spans = @([ordered]@{
-                                startLine = 0
-                                endLine = 0
-                            })
-                    })
-            })
-        $invalidSpan.changedFiles | Should -Be 1
-        $invalidSpan.changedLines | Should -Be 0
-        @($invalidSpan.entries) | Should -HaveCount 1
-
-        $nonnumericSpan = & (
-            Get-Module DevPilot.NamedAreEqualBridge) {
-            param($InputChangeSet)
-            Get-NamedBridgeRelevantChangeSet `
-                -ChangeSet $InputChangeSet
-        } ([ordered]@{
-                changedFiles = 1
-                changedLines = 1
-                entries = @([ordered]@{
-                        path =
-                            'tests/NonnumericSpan.cs'
-                        state = 'unknown'
-                        spans = @([ordered]@{
-                                startLine = 'bad'
-                                endLine = 'worse'
-                            })
-                    })
-            })
-        $nonnumericSpan.changedFiles | Should -Be 1
-        $nonnumericSpan.changedLines | Should -Be 0
-        @($nonnumericSpan.entries) | Should -HaveCount 1
-
-        $oversizedSpans = & (
-            Get-Module DevPilot.NamedAreEqualBridge) {
-            param($InputChangeSet)
-            Get-NamedBridgeRelevantChangeSet `
-                -ChangeSet $InputChangeSet
-        } ([ordered]@{
-                changedFiles = 1
-                changedLines = 2
-                entries = @([ordered]@{
-                        path =
-                            'tests/OversizedSpans.cs'
-                        state = 'unknown'
-                        spans = @(
-                            [ordered]@{
-                                startLine = 1
-                                endLine =
-                                    [long]::MaxValue
-                            },
-                            [ordered]@{
-                                startLine = 1
-                                endLine =
-                                    [long]::MaxValue
-                            })
-                    })
-            })
-        $oversizedSpans.changedFiles | Should -Be 1
-        $oversizedSpans.changedLines | Should -Be 0
-        @($oversizedSpans.entries) | Should -HaveCount 1
+        foreach ($invalidSpanSet in @(
+                [ordered]@{
+                    changedFiles = 1
+                    changedLines = 1
+                    entries = @([ordered]@{
+                            path = 'tests/InvalidSpan.cs'
+                            state = 'unknown'
+                            spans = @([ordered]@{
+                                    startLine = 0
+                                    endLine = 0
+                                })
+                        })
+                },
+                [ordered]@{
+                    changedFiles = 1
+                    changedLines = 1
+                    entries = @([ordered]@{
+                            path =
+                                'tests/NonnumericSpan.cs'
+                            state = 'unknown'
+                            spans = @([ordered]@{
+                                    startLine = 'bad'
+                                    endLine = 'worse'
+                                })
+                        })
+                },
+                [ordered]@{
+                    changedFiles = 1
+                    changedLines = 2
+                    entries = @([ordered]@{
+                            path =
+                                'tests/OversizedSpans.cs'
+                            state = 'unknown'
+                            spans = @(
+                                [ordered]@{
+                                    startLine = 1
+                                    endLine =
+                                        [long]::MaxValue
+                                },
+                                [ordered]@{
+                                    startLine = 1
+                                    endLine =
+                                        [long]::MaxValue
+                                })
+                        })
+                })) {
+            {
+                Get-BatchRelevantChangeSet `
+                    -ChangeSet $invalidSpanSet
+            } | Should -Throw
+        }
 
         {
-            & (
-                Get-Module DevPilot.NamedAreEqualBridge) {
-                param($InputChangeSet)
-                Get-NamedBridgeRelevantChangeSet `
-                    -ChangeSet $InputChangeSet
-            } ([ordered]@{
+            Get-BatchRelevantChangeSet `
+                -ChangeSet ([ordered]@{
                     changedFiles = 2
                     changedLines = 1
                     entries = @([ordered]@{
@@ -392,12 +554,8 @@ Describe 'Named batch cadence' {
                 $null,
                 [decimal]0.4)) {
             {
-                & (
-                    Get-Module DevPilot.NamedAreEqualBridge) {
-                    param($InputChangeSet)
-                    Get-NamedBridgeRelevantChangeSet `
-                        -ChangeSet $InputChangeSet
-                } ([ordered]@{
+                Get-BatchRelevantChangeSet `
+                    -ChangeSet ([ordered]@{
                         changedFiles = $invalidCount
                         changedLines = 0
                         entries = [object[]]@()
@@ -440,12 +598,8 @@ Describe 'Named batch cadence' {
                         })
                 })) {
             {
-                & (
-                    Get-Module DevPilot.NamedAreEqualBridge) {
-                    param($InputChangeSet)
-                    Get-NamedBridgeRelevantChangeSet `
-                        -ChangeSet $InputChangeSet
-                } $invalidChangeSet
+                Get-BatchRelevantChangeSet `
+                    -ChangeSet $invalidChangeSet
             } | Should -Throw
         }
 

@@ -101,6 +101,34 @@ $provider = {
                         byteLength =
                             [Text.Encoding]::UTF8.GetByteCount($content)
                         sourceDigest = $contentDigest
+                        derivation = [ordered]@{
+                            schemaVersion = 1
+                            kind =
+                                'devpilot-current-line-derivation-v1'
+                            producer =
+                                'active-pr-intake-v1'
+                            state = 'complete'
+                            classification =
+                                'current-lines'
+                            changeType = 'modified'
+                            pathRelation = 'same-path'
+                            sourceCommit = $sourceCommit
+                            targetCommit = $targetCommit
+                            sourceContentState =
+                                'available'
+                            targetContentState =
+                                'available'
+                            sourceContentSha256 =
+                                $contentDigest
+                            targetContentSha256 =
+                                & $textDigest 'target'
+                            sourceByteLength =
+                                [Text.Encoding]::UTF8.
+                                    GetByteCount($content)
+                            targetByteLength = 6
+                            spanCount = 1
+                            currentLineCount = 1
+                        }
                     })
             }
         }

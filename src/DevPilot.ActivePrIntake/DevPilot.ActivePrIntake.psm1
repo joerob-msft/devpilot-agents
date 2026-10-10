@@ -5,6 +5,7 @@ Import-Module (Join-Path $PSScriptRoot '..\DevPilot.AgentHarness\DevPilot.AgentH
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
 . (Join-Path $PSScriptRoot `
     '..\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
+. (Join-Path $PSScriptRoot 'DevPilot.ChangeDerivation.ps1')
 
 function Assert-IntakeNumber {
     param($Value, [string]$Name, [int]$Minimum, [int]$Maximum)
@@ -1516,6 +1517,8 @@ function New-ActivePrAzureDevOpsProvider {
     $digestCommand = ${function:Get-IntakeDigest}
     $changedSpansCommand =
         ${function:Get-ApprovedOwnerV2ChangedSpans}
+    $changeDerivationCommand =
+        ${function:New-DevPilotChangeDerivation}
     $newTransportFailureCommand =
         ${function:New-IntakeTransportFailure}
     $copyFailureDataCommand =
@@ -2118,6 +2121,19 @@ print(json.dumps({
                                     sourceCommit = $sourceCommit
                                     state = 'binary'
                                 })
+                                derivation =
+                                    & $changeDerivationCommand `
+                                        -ChangeType $changeType `
+                                        -IsText $false `
+                                        -Deleted $deleted `
+                                        -Renamed (
+                                            $changeType -match
+                                                '(?i)rename') `
+                                        -SourceContent '' `
+                                        -TargetContent '' `
+                                        -Spans @() `
+                                        -SourceCommit $sourceCommit `
+                                        -TargetCommit $targetCommit
                             }
                         if ($changeType -match '(?i)rename' -and
                             $entry.originalPath) {
@@ -2189,6 +2205,19 @@ print(json.dumps({
                                         [Text.Encoding]::UTF8.GetBytes(
                                             $sourceContent))).
                                     ToLowerInvariant()
+                            derivation =
+                                & $changeDerivationCommand `
+                                    -ChangeType $changeType `
+                                    -IsText $true `
+                                    -Deleted $deleted `
+                                    -Renamed (
+                                        $changeType -match
+                                            '(?i)rename') `
+                                    -SourceContent $sourceContent `
+                                    -TargetContent $targetContent `
+                                    -Spans $spans `
+                                    -SourceCommit $sourceCommit `
+                                    -TargetCommit $targetCommit
                         }
                     if ($changeType -match '(?i)rename' -and
                         $entry.originalPath) {

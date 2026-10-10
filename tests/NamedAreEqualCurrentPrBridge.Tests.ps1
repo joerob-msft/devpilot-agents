@@ -28,6 +28,47 @@ BeforeAll {
             ToLowerInvariant()
     }
 
+    function New-BridgeDerivation {
+        param(
+            [Parameter(Mandatory)][string]$Classification,
+            [Parameter(Mandatory)][string]$State,
+            [Parameter(Mandatory)][string]$ChangeType,
+            [Parameter(Mandatory)][string]$SourceCommit,
+            [Parameter(Mandatory)][string]$TargetCommit,
+            [Parameter(Mandatory)][int]$SpanCount,
+            [Parameter(Mandatory)][long]$CurrentLineCount,
+            [string]$PathRelation = 'same-path',
+            [string]$SourceContentSha256 = 'unknown',
+            [string]$TargetContentSha256 = 'unknown',
+            [long]$SourceByteLength = 0,
+            [long]$TargetByteLength = 0,
+            [string]$SourceContentState = 'unavailable',
+            [string]$TargetContentState = 'unavailable'
+        )
+        return [ordered]@{
+            schemaVersion = 1
+            kind =
+                'devpilot-current-line-derivation-v1'
+            producer = 'active-pr-intake-v1'
+            state = $State
+            classification = $Classification
+            changeType = $ChangeType
+            pathRelation = $PathRelation
+            sourceCommit = $SourceCommit
+            targetCommit = $TargetCommit
+            sourceContentState = $SourceContentState
+            targetContentState = $TargetContentState
+            sourceContentSha256 =
+                $SourceContentSha256
+            targetContentSha256 =
+                $TargetContentSha256
+            sourceByteLength = $SourceByteLength
+            targetByteLength = $TargetByteLength
+            spanCount = $SpanCount
+            currentLineCount = $CurrentLineCount
+        }
+    }
+
     function New-BridgeConfig {
         $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
             -Id '33333333-3333-3333-3333-333333333333' `
@@ -181,6 +222,8 @@ BeforeAll {
         $malformedSpanContent = 'class Span {}'
         $malformedSpanDigest =
             Get-BridgeTextDigest $malformedSpanContent
+        $targetDigest =
+            Get-BridgeTextDigest 'target'
         $provider = {
             param($Operation, $Request)
             [void]$calls.Add([string]$Operation)
@@ -270,6 +313,35 @@ BeforeAll {
                                                 $malformedSpanContent)
                                     sourceDigest =
                                         $malformedSpanDigest
+                                    derivation = [ordered]@{
+                                        schemaVersion = 1
+                                        kind =
+                                            'devpilot-current-line-derivation-v1'
+                                        producer =
+                                            'active-pr-intake-v1'
+                                        state = 'complete'
+                                        classification =
+                                            'derivation-unknown'
+                                        changeType = 'modified'
+                                        pathRelation =
+                                            'same-path'
+                                        sourceCommit =
+                                            $SourceCommit
+                                        targetCommit =
+                                            'd' * 40
+                                        sourceContentState =
+                                            'available'
+                                        targetContentState =
+                                            'unavailable'
+                                        sourceContentSha256 =
+                                            'unknown'
+                                        targetContentSha256 =
+                                            'unknown'
+                                        sourceByteLength = 0
+                                        targetByteLength = 0
+                                        spanCount = 1
+                                        currentLineCount = 0
+                                    }
                                 })
                         }
                     }
@@ -291,6 +363,35 @@ BeforeAll {
                                     content = 'class Invalid {}'
                                     byteLength = 16
                                     sourceDigest = 'invalid'
+                                    derivation = [ordered]@{
+                                        schemaVersion = 1
+                                        kind =
+                                            'devpilot-current-line-derivation-v1'
+                                        producer =
+                                            'active-pr-intake-v1'
+                                        state = 'complete'
+                                        classification =
+                                            'current-lines'
+                                        changeType = 'modified'
+                                        pathRelation =
+                                            'same-path'
+                                        sourceCommit =
+                                            $SourceCommit
+                                        targetCommit =
+                                            'd' * 40
+                                        sourceContentState =
+                                            'available'
+                                        targetContentState =
+                                            'unavailable'
+                                        sourceContentSha256 =
+                                            'unknown'
+                                        targetContentSha256 =
+                                            'unknown'
+                                        sourceByteLength = 0
+                                        targetByteLength = 0
+                                        spanCount = 1
+                                        currentLineCount = 1
+                                    }
                                 })
                         }
                     }
@@ -314,6 +415,35 @@ BeforeAll {
                                     byteLength = 0
                                     sourceDigest =
                                         $unknownCSharpDigest
+                                    derivation = [ordered]@{
+                                        schemaVersion = 1
+                                        kind =
+                                            'devpilot-current-line-derivation-v1'
+                                        producer =
+                                            'active-pr-intake-v1'
+                                        state = 'unknown'
+                                        classification =
+                                            'derivation-unknown'
+                                        changeType = 'modified'
+                                        pathRelation =
+                                            'same-path'
+                                        sourceCommit =
+                                            $SourceCommit
+                                        targetCommit =
+                                            'd' * 40
+                                        sourceContentState =
+                                            'unavailable'
+                                        targetContentState =
+                                            'unavailable'
+                                        sourceContentSha256 =
+                                            'unknown'
+                                        targetContentSha256 =
+                                            'unknown'
+                                        sourceByteLength = 0
+                                        targetByteLength = 0
+                                        spanCount = 1
+                                        currentLineCount = 0
+                                    }
                                 })
                         }
                     }
@@ -354,6 +484,39 @@ BeforeAll {
                                 byteLength =
                                     [Text.Encoding]::UTF8.GetByteCount($content)
                                 sourceDigest = $contentDigest
+                                derivation = [ordered]@{
+                                    schemaVersion = 1
+                                    kind =
+                                        'devpilot-current-line-derivation-v1'
+                                    producer =
+                                        'active-pr-intake-v1'
+                                    state = 'complete'
+                                    classification =
+                                        'current-lines'
+                                    changeType = 'modified'
+                                    pathRelation =
+                                        'same-path'
+                                    sourceCommit =
+                                        $SourceCommit
+                                    targetCommit = 'd' * 40
+                                    sourceContentState =
+                                        'available'
+                                    targetContentState =
+                                        'available'
+                                    sourceContentSha256 =
+                                        $contentDigest
+                                    targetContentSha256 =
+                                        $targetDigest
+                                    sourceByteLength =
+                                        [Text.Encoding]::UTF8.
+                                            GetByteCount(
+                                                $content)
+                                    targetByteLength = 6
+                                    spanCount =
+                                        $callLines.Count
+                                    currentLineCount =
+                                        $callLines.Count
+                                }
                             })
                     }
                 }
@@ -482,6 +645,11 @@ Describe 'Named AreEqual current PR bridge' {
         $config = New-BridgeConfig
         $config.enabled = $true
         $provider = New-BridgeProvider -Config $config
+        $changeProbe = & $provider.Handler `
+            Changes @{ pullRequestId = 42 }
+        $changeProbe.entries[0].derivation.
+            classification |
+            Should -BeExactly 'current-lines'
         $state = Join-Path $TestDrive 'active-state'
         $manifest = Join-Path $TestDrive 'named-manifest.json'
         $result = Invoke-NamedAreEqualCurrentPrBridge `
@@ -746,7 +914,7 @@ Describe 'Named AreEqual current PR bridge' {
                 'file-evidence-unknown: File evidence for ordinal 0 was incomplete or unknown.')
     }
 
-    It 'retains a bounded package-preflight diagnostic' {
+    It 'refuses content digest mismatch before creating a rule view' {
         $config = New-BridgeConfig
         $config.enabled = $true
         $provider = New-BridgeProvider `
@@ -765,22 +933,12 @@ Describe 'Named AreEqual current PR bridge' {
         $failure = @($result.outcomes |
             Where-Object {
                 [string]$_.stage -ceq
-                    'package-preflight'
+                    'snapshot'
             })
         $failure | Should -HaveCount 1
         $failure[0].state | Should -BeExactly 'unknown'
-        $failure[0].diagnostic.category |
-            Should -BeExactly 'invalid-evidence'
-        $failure[0].diagnostic.operation |
-            Should -BeExactly 'package-preflight'
-        $failure[0].diagnostic.fileOrdinal |
-            Should -BeNullOrEmpty
-        $failure[0].diagnostic.messageSha256 |
-            Should -Match '^[0-9a-f]{64}$'
-        $failure[0].diagnostic.Keys |
-            Should -Not -Contain 'message'
-        $failure[0].diagnostic.Keys |
-            Should -Not -Contain 'path'
+        $failure[0].reason |
+            Should -BeExactly 'acquisition-incomplete'
     }
 
     It 'keeps malformed changed paths UNKNOWN for <Mode>' `
@@ -845,11 +1003,9 @@ Describe 'Named AreEqual current PR bridge' {
             })
         $failure | Should -HaveCount 1
         $failure[0].stage |
-            Should -BeExactly 'package-preflight'
+            Should -BeExactly 'snapshot'
         $failure[0].reason |
             Should -BeExactly 'acquisition-incomplete'
-        $failure[0].diagnostic.messageSha256 |
-            Should -Match '^[0-9a-f]{64}$'
         $result.providerWrites | Should -Be 0
         $result.modelWrites | Should -Be 0
     }

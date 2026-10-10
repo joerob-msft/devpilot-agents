@@ -34,6 +34,8 @@ exact changed call lines with a bounded 12-line display sample. Unknown syntax,
 receiver shape, containment, or changed-line provenance is not actionable. The rule
 does not reorder arguments or change assertion values.
 
+The current-PR bridge accepts `devpilot-current-line-derivation-v1` evidence from the shared intake. It derives that evidence from already-fetched source/target content and the existing changed-span invocation, without another fetch or diff pass. Only same-path modified C# with complete, byte-identical source/target proof and zero current spans, or a complete whole-file C# deletion, can be filtered as known-empty for Named. Proof validation binds the head, actual UTF-8 content SHA-256 and length, path, change type, and exact inventory/span counts before filtering. Missing or inconsistent proof, derivation-unknown, pure renames, retained-file deletion-only changes, and malformed or unavailable relevant evidence remain UNKNOWN; zero spans alone are not proof of compliance. Derivation metadata participates in the snapshot digest and acquisition identity, so old observations cannot qualify a new binding. The frozen Owner runtime can consume a separately derived view that omits only proven identical C#; relation and other consumers retain the immutable full shared snapshot. This contract does not authorize delivery or change Owner body-coverage semantics.
+
 Preview accepts a separate `named-areequal-v2-preview-cohort`, signed source
 and target generation, complete changed spans, pinned policy, and
 `replay.modelRecords: []`. The rule's comment uses its own exact
