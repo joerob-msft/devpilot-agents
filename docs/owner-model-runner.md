@@ -38,9 +38,9 @@ digest, or opaque subject-binding mismatch atomically fails that execution.
 Layer 3 can project sanitized attempts, latency, starts, and refusal outcome
 through the existing `owner-observation.execution` shape.
 
-## Deferred next layer
+## Layer 5 follow-up
 
-The next layer should add a parallel scheduler/orchestrator with a separate
-preview state root and a sustained parity cohort. Real model enablement,
-writer compatibility, deployment, notifications, votes, comments, and cutover
-remain separate later gates.
+Layer 5 adds the preview-only cohort orchestrator and separate v2 state root
+documented in `owner-preview-orchestrator.md`. Real model enablement, writer
+compatibility, deployment, notifications, votes, comments, and cutover remain
+separate later gates.
