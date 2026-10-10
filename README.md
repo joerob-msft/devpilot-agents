@@ -68,6 +68,11 @@ Immutable annotated patch tags such as `v0.4.0` are qualified first, while the
 protected `v0.4` channel moves only after installed-artifact and mandatory live
 read-only canary gates pass. See [DevPilot Agents releases](docs/releases.md)
 for the trust model, required rulesets, checklist, and rollback procedure.
+Existing-line patches can optionally run without additional deployment
+approvals after an explicit administrator opt-in and main-only environment
+provisioning. This is disabled by default; new lines and recovery keep manual
+approval. All CI, canary and installed-artifact gates remain mandatory. See
+[patch approval policy](docs/releases.md#optional-approval-free-existing-line-patches).
 
 ---
 

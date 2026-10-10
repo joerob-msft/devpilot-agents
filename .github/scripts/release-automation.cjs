@@ -1,7 +1,8 @@
 const assert = require("node:assert/strict");
+const selectReleaseApproval = require("./release-approval.cjs");
 
 module.exports = async function coordinateRelease({
-  github, context, core, version, versionChanged, workflowCommit,
+  github, context, core, version, versionChanged, workflowCommit, automaticPatchEnabled = "",
 }) {
   const { owner, repo } = context.repo;
   const repository = `${owner}/${repo}`;
@@ -53,6 +54,11 @@ module.exports = async function coordinateRelease({
         return "manual-canary";
       }
     }
+  } else if (context.eventName === "schedule") {
+    assert.equal(context.ref, "refs/heads/main", "Scheduled coordination must run on main.");
+    if (automaticPatchEnabled !== "true" || !versionChanged) {
+      return "scheduled-release-disabled";
+    }
   } else {
     assert.equal(context.eventName, "workflow_dispatch", "Unsupported automation event.");
     assert.equal(context.ref, "refs/heads/main", "Dispatch automation from main.");
@@ -74,33 +80,7 @@ module.exports = async function coordinateRelease({
   "CI has incomplete, failed, canceled, or skipped jobs.");
 
   const line = version.split(".").slice(0, 2).join(".");
-  const summaries = await github.paginate(github.rest.repos.getRepoRulesets, {
-    owner, repo, includes_parents: false, per_page: 100,
-  });
-  for (const [name, patterns, types] of [
-    ["release-tag-creation", [`refs/tags/v${line}`, `refs/tags/v${line}.*`], ["creation"]],
-    [`immutable-v${line}-patches`, [`refs/tags/v${line}.*`], ["update", "deletion"]],
-    [`v${line}-channel`, [`refs/tags/v${line}`], ["update", "deletion"]],
-  ]) {
-    const matches = summaries.filter(rule => rule.name === name);
-    assert.equal(matches.length, 1, `Missing or ambiguous protection: ${name}`);
-    const { data: rule } = await github.rest.repos.getRepoRuleset({
-      owner, repo, ruleset_id: matches[0].id, includes_parents: false,
-    });
-    assert.equal(rule.target, "tag");
-    assert.equal(rule.enforcement, "active", `Inactive protection: ${name}`);
-    assert.equal(rule.conditions.ref_name.exclude.length, 0, `Excluded tag protection: ${name}`);
-    assert.ok(patterns.every(pattern => rule.conditions.ref_name.include.includes(pattern)),
-      `Missing version-line pattern: ${name}`);
-    assert.ok(types.every(type => rule.rules.some(entry => entry.type === type)),
-      `Missing tag restriction: ${name}`);
-    // Read tokens may omit bypass actors; environment approvers still verify them.
-    if (rule.bypass_actors) {
-      assert.ok(name.startsWith("immutable-") ? rule.bypass_actors.length === 0 :
-        rule.bypass_actors.every(actor => actor.actor_type === "DeployKey"),
-      `Unexpected bypass actor: ${name}`);
-    }
-  }
+  await selectReleaseApproval.requireTagProtections(github, { owner, repo }, line);
 
   try {
     await github.rest.git.getRef({ owner, repo, ref: `tags/v${version}` });
@@ -110,6 +90,13 @@ module.exports = async function coordinateRelease({
     if (error.status !== 404) throw error;
   }
 
+  const approval = await selectReleaseApproval({
+    github, owner, repo, version, workflowCommit, candidateCommit: workflowCommit,
+    automaticPatchEnabled,
+  });
+  if (context.eventName === "schedule" && approval.mode !== "automatic-patch") {
+    return "scheduled-manual-release";
+  }
   const title = `Release v${version} from ${workflowCommit}`;
   const releases = await runs("release.yml");
   if (releases.some(run => run.head_sha === workflowCommit && run.display_title === title)) {
@@ -133,6 +120,10 @@ module.exports = async function coordinateRelease({
       return "waiting-canary";
     }
     validateRun(canary, ".github/workflows/release-canary.yml", "workflow_dispatch");
+    if (approval.mode === "automatic-patch") {
+      assert.equal(canary.actor.login, "github-actions[bot]",
+        "Automatic patch publication requires an automation-started canary.");
+    }
     await requireCurrentMain();
     await github.rest.actions.createWorkflowDispatch({
       owner, repo, workflow_id: "release.yml", ref: "main",
@@ -141,7 +132,7 @@ module.exports = async function coordinateRelease({
         canaryRunId: String(canary.id), resumePublishedTag: "false",
       },
     });
-    core.info(`Dispatched protected Release ${version} using canary ${canary.id}.`);
+    core.info(`Dispatched ${approval.mode} Release ${version} using canary ${canary.id}.`);
     return "release-dispatched";
   }
 

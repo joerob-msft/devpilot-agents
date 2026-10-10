@@ -52,10 +52,10 @@ Describe 'Release publication boundary' {
     }
 
     It 'keeps publication behind complete deterministic, installed, and live gates' {
-        $release | Should -Match '(?s)publish-immutable:.*needs: \[windows-complete, platform-safety, canary-gate, installed-artifact\]'
-        $release | Should -Match '(?s)immutable-smoke:.*needs: publish-immutable'
-        $release | Should -Match '(?s)promote:.*needs: immutable-smoke'
-        $release | Should -Match 'environment: release-publish'
+        $release | Should -Match '(?s)publish-immutable:.*needs: \[preflight, windows-complete, platform-safety, canary-gate, installed-artifact\]'
+        $release | Should -Match '(?s)immutable-smoke:.*needs: \[preflight, publish-immutable\]'
+        $release | Should -Match '(?s)promote:.*needs: \[preflight, immutable-smoke\]'
+        $release | Should -Match 'environment: \$\{\{ needs.preflight.outputs.publish-environment \}\}'
         $release | Should -Match '(?s)promote:.*permissions:\s+contents: write'
         $release | Should -Not -Match 'ssh-key:'
         $release | Should -Not -Match 'create-github-app-token'
@@ -95,7 +95,7 @@ Describe 'Release publication boundary' {
     }
 
     It 'makes the separate protected live canary mandatory' {
-        $canary | Should -Match 'environment: release-canary'
+        $canary | Should -Match 'environment: \$\{\{ needs.approval-policy.outputs.canary-environment \}\}'
         $canary | Should -Match 'runs-on: \[self-hosted, Windows, X64, devpilot-canary\]'
         $canary | Should -Match 'Get-Command \$command'
         $canary | Should -Match 'consecutiveRuns must be between 3 and 5'
@@ -108,6 +108,25 @@ Describe 'Release publication boundary' {
         $canary | Should -Match 'AGENCY_VERBOSITY: error'
         $canary | Should -Match '\$env:LOCALAPPDATA = Join-Path \$env:HOME ''localappdata'''
         $release | Should -Match 'Verify mandatory live canary'
+    }
+
+    It 'routes environments only from trusted main policy before accessing environment credentials' {
+        $canary | Should -Match '(?s)approval-policy:.*ref: \$\{\{ github.sha \}\}'
+        $canary | Should -Match '(?s)live-read-only:.*needs: approval-policy'
+        $release | Should -Match 'path: \.release-policy'
+        $release | Should -Match "require\('./\.release-policy/\.github/scripts/release-approval.cjs'\)"
+        $canary | Should -Match '\$env:WORKFLOW_REF -cne ''refs/heads/main'''
+        $release | Should -Match '\$env:WORKFLOW_REF -cne ''refs/heads/main'''
+        foreach ($text in @($canary, $release)) {
+            $text | Should -Match 'DEVPILOT_AUTOMATIC_PATCH_RELEASES'
+            $text | Should -Not -Match 'inputs\.(approval|environment)|approve.*pending_deployments'
+        }
+        $release | Should -Match 'Automatic patch publication was disabled'
+        $release | Should -Match 'Automatic patch promotion was disabled'
+        $automation | Should -Match 'cron: "\*/15 \* \* \* \*"'
+        $automation | Should -Match "vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES == 'true'"
+        $ci | Should -Match 'node --test ./tests/ReleaseAutomation.Tests.cjs ./tests/ReleaseApproval.Tests.cjs'
+        $ciRunner | Should -Match 'tests\\ReleaseApproval.Tests.cjs'
     }
 
     It 'allows only qualified immutable releases in the target line to receive rollback promotion' {

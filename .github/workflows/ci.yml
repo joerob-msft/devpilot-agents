@@ -100,7 +100,7 @@ jobs:
           }
       - name: Test release orchestration
         shell: pwsh
-        run: node --test ./tests/ReleaseAutomation.Tests.cjs
+        run: node --test ./tests/ReleaseAutomation.Tests.cjs ./tests/ReleaseApproval.Tests.cjs
 
   dashboard:
     name: Operations dashboard

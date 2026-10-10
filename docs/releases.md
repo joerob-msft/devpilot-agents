@@ -61,8 +61,8 @@ events and stale commits, requires every CI job to succeed, and dispatches
 `release-canary.yml`. When that automation-started exact-commit canary succeeds,
 it passes the verified run ID into `release.yml`.
 
-All existing canary, installed-qualification, and publication environment
-approvals remain. The coordinator has Actions write and Contents read only,
+By default, all existing canary, installed-qualification, and publication
+environment approvals remain. The coordinator has Actions write and Contents read only,
 does not receive the release deploy key, and cannot create releases or tags.
 It uses no PR artifacts or caches and never approves an environment.
 An independent manual canary or rollback canary does not authorize automatic
@@ -75,6 +75,85 @@ Existing pending canaries and any prior release attempt are not duplicated.
 An existing immutable tag, failed canary, or interrupted release requires the
 explicit manual recovery procedures below, never an automatic tag repair or
 resume. If `main` advances, qualification must restart for the new commit.
+
+### Optional approval-free existing-line patches
+
+This path is **disabled by default**. Preparing or merging the policy change
+does not change any live environment setting, publish a version, or opt in.
+Do not merge release-workflow changes or activate this path while a release is
+in progress: exact-main binding deliberately invalidates a superseded workflow.
+
+After the in-flight release is fully published, an administrator can explicitly
+enable approval-free patches. A protected-main PR merge with an increasing
+VERSION is then the release authorization; subsequent CI, live canary, clean
+installation, immutable-tag smoke and publication remain mandatory.
+
+The read-only `release-approval.cjs` classifier permits the automatic path only
+for a fresh, strictly newer patch on a line with a published stable predecessor.
+The floating channel must be annotated and point to the highest immutable
+patch, with exactly one compatible annotated binding and a stable GitHub
+Release. Missing new-line channels retain manual approval. Lightweight,
+malformed, ambiguous, rolled-back or partially published predecessors fail
+closed. An existing candidate tag, explicit resume, or exactVersion rollback
+retains the original manual environments. API errors are never treated as
+permission to use an automatic environment.
+The candidate must descend from the published predecessor; the active tag
+rulesets are checked by the same shared verifier used by the coordinator.
+
+The workflow independently requires exact-current-main green push CI, all jobs
+successful, protected-main PR/status-check rules and pre-provisioned automatic
+environments before any automatic job can access credentials. Environment
+names are fixed by trusted workflow policy, never a dispatch input. On resume,
+the policy is loaded from the current workflow commit, not the older candidate.
+Tag protections, existing permissions and the minimal publication jobs remain
+unchanged. The coordinator cannot approve jobs or write tags.
+
+Provision these **new** environments without modifying the original three:
+
+| Environment | Variables | Secret provisioned by administrator |
+|---|---|---|
+| `release-patch-canary` | Existing consumer repository/ref and Reviewer/Handler canary PR IDs | `RELEASE_CONSUMER_READ_PAT`, if required |
+| `release-patch-qualification` | Existing consumer repository/ref | `RELEASE_CONSUMER_READ_PAT`, if required |
+| `release-patch-publish` | None | `RELEASE_DEPLOY_KEY` through the existing authorized secret-management process |
+
+Each new environment must admit exactly the branch `main` (no tag selector or
+wildcard), with no required reviewer, wait timer or custom approval rule. The
+classifier verifies all three exist and have that branch policy before emitting
+an environment name. This prevents GitHub Actions from silently creating an
+unprotected environment when a name is missing. Keep credentials
+environment-scoped; never copy them into workflow code, files, logs, repository
+secrets or the coordinator. Preserve the existing dedicated runner and its
+read-only canary identity restrictions.
+
+Before activation, independently verify the main and tag rulesets, their bypass
+actors, current stable tag/Release bindings, consumer ref and eligible canary
+fixtures. Read tokens may omit tag bypass actors; an administrator must verify
+them, including no immutable-tag bypass and only the existing dedicated
+publication DeployKey bypass for tag creation/channel updates. Do not weaken
+those protections or the existing manual environments.
+
+Set the **repository** Actions variable `DEVPILOT_AUTOMATIC_PATCH_RELEASES` to
+exactly `true` only after provisioning and reviewing the policy. Leave it
+unset or `false` otherwise; do not shadow it in environment variables.
+First validate with an intentional reviewed patch-version merge. Inspect each
+workflow's `Release approval mode: automatic-patch` summary and confirm all
+qualification stages precede immutable publication and channel movement.
+
+The coordinator also checks every 15 minutes when this opt-in is true. It can
+continue a successful automation-started canary if the completion handoff was
+missed. Ordinary commits, disabled opt-in and manual new-line releases are not
+armed by this schedule; pending canaries and existing Release runs are not
+duplicated, and failed canaries or partial publication are never retried
+automatically.
+
+To stop future automatic publication, set the variable to `false`. Publication
+and promotion reject a disabled opt-in in their workflow context before write
+steps, but changing a repository variable is not a reliable live cancellation
+mechanism for an already-running workflow. Cancel that run as well when an
+immediate stop is required. A tag already published cannot
+be undone: use the existing manually approved recovery or channel rollback.
+Do not remove reviewers from `release-canary`, `release-qualification` or
+`release-publish`; new lines and recovery continue using those environments.
 
 Before approving a new line, configure its creation, immutable, and channel
 rulesets. Coordination verifies their active patterns and restrictions before

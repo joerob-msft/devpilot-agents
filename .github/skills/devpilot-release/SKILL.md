@@ -34,10 +34,20 @@ release or publish the version. Resuming an interrupted publication requires
 an explicit request to resume it.
 
 An increasing version-bump merge arms automatic qualification after exact-main
-push CI. Human protected-environment approval remains the publication gate.
+push CI. Human protected-environment approval remains the default publication gate.
+An explicitly enabled existing-line patch may use the separately provisioned
+`release-patch-*` environments after the read-only eligibility policy passes.
+See `docs/releases.md` for the default-off repository opt-in, strict main-only
+environment provisioning and verification. Never remove reviewers from the
+existing manual environments or auto-approve their pending jobs.
+New version lines, rollback, partial publication and explicit resume remain
+manually approved. Do not activate or merge policy changes during a release.
 Ordinary code merges do not arm a release. For an already-merged version,
 explicit publication authorization permits dispatching **Release Automation**
 from `main`; it passes the bound SHA and successful canary ID internally.
+The opt-in also enables a 15-minute coordinator continuation check for a
+successful automation-started patch canary whose completion handoff was missed.
+It never arms ordinary merges or duplicates an existing release.
 Manual/rollback canaries do not independently authorize automatic publication,
 and interrupted releases are never automatically resumed.
 
