@@ -3,6 +3,61 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:NamedAreEqualUnknownReasonCodes = @(
+    'receiver-spelling-uncertain'
+    'receiver-shadowing-uncertain'
+    'source-structure-uncertain'
+    'call-shape-uncertain'
+    'changed-anchor-uncertain'
+    'test-context-uncertain'
+    'symbol-identity-uncertain'
+    'argument-segment-empty'
+    'argument-terminal-uncertain'
+    'argument-leading-token-uncertain'
+    'named-argument-value-missing'
+    'argument-count-insufficient'
+    'generic-angle-parse-uncertain'
+    'same-line-call-ambiguity'
+    'group-cardinality-exceeded'
+)
+
+function Add-NamedAreEqualUnknownReason {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]
+        [Collections.Generic.List[string]]$Reasons,
+        [Parameter(Mandatory)][string]$Code
+    )
+    if ($Code -cnotin $script:NamedAreEqualUnknownReasonCodes) {
+        throw "Unrecognized Named AreEqual parser diagnostic code '$Code'."
+    }
+    [void]$Reasons.Add($Code)
+}
+
+function Get-NamedAreEqualUnknownReasonSummary {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]
+        [Collections.Generic.List[string]]$Reasons
+    )
+    $counts = @{}
+    foreach ($code in $Reasons) {
+        if ($code -cnotin $script:NamedAreEqualUnknownReasonCodes) {
+            throw "Unrecognized Named AreEqual parser diagnostic code '$code'."
+        }
+        if (-not $counts.ContainsKey($code)) { $counts[$code] = 0 }
+        $counts[$code]++
+    }
+    return @(
+        foreach ($code in $script:NamedAreEqualUnknownReasonCodes) {
+            if ($counts.ContainsKey($code)) {
+                [ordered]@{
+                    code = $code
+                    count = [int]$counts[$code]
+                }
+            }
+        }
+    )
+}
+
 function Get-CoverageMember {
     param([object]$Value, [string]$Name)
     if ($Value -is [Collections.IDictionary]) { return $Value[$Name] }
@@ -419,19 +474,66 @@ function Get-NamedAreEqualConstructs {
             ($receiverStart -eq 0 -or $tokens[$receiverStart - 1].text -notin @('.', '::', '?', '!'))
         $testClass = @($contexts | Where-Object { $_.kind -eq 'type' -and $_.isTestClass })
         $exactAnchor = Test-CoverageChanged $start $start $ranges
-        $known = $exactSpelling -and -not $assertShadowed -and
-            -not $malformed -and $callValid -and $exactAnchor -and
-            $method.Count -eq 1 -and $method[0].isTestMethod -and
-            $testClass.Count -eq 1 -and $method[0].declarationLine -ge 1 -and
-            $symbol.Length -gt 0 -and $symbol.Length -le 256 -and
-            $symbol -cmatch '^([\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*$' -and
-            $methodSymbols.ContainsKey($symbol) -and $methodSymbols[$symbol] -eq 1
+        $unknownReasons = [Collections.Generic.List[string]]::new()
+        if (-not $exactSpelling) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'receiver-spelling-uncertain'
+        }
+        if ($assertShadowed) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'receiver-shadowing-uncertain'
+        }
+        if ($malformed) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'source-structure-uncertain'
+        }
+        if (-not $callValid) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'call-shape-uncertain'
+        }
+        if (-not $exactAnchor) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'changed-anchor-uncertain'
+        }
+        if ($method.Count -ne 1) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'test-context-uncertain'
+        }
+        else {
+            if (-not $method[0].isTestMethod) {
+                Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                    -Code 'test-context-uncertain'
+            }
+            if ($method[0].declarationLine -lt 1) {
+                Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                    -Code 'test-context-uncertain'
+            }
+        }
+        if ($testClass.Count -ne 1) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'test-context-uncertain'
+        }
+        if ($symbol.Length -eq 0 -or $symbol.Length -gt 256) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'symbol-identity-uncertain'
+        }
+        if ($symbol -cnotmatch
+            '^([\p{L}_][\p{L}\p{N}_]*\.)*[\p{L}_][\p{L}\p{N}_]*$') {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'symbol-identity-uncertain'
+        }
+        if (-not $methodSymbols.ContainsKey($symbol) -or
+            $methodSymbols[$symbol] -ne 1) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'symbol-identity-uncertain'
+        }
+        $known = $unknownReasons.Count -eq 0
         $positional = $false
         $argumentCount = 0
+        $nestedAngles = 0
         if ($callValid) {
             $segment = $openParen + 1
             $closeParen = [int]$pairs[$openParen]
-            $nestedAngles = 0
             for ($j = $segment; $j -le $closeParen; $j++) {
                 $t = if ($j -eq $closeParen) { ',' } else { [string]$tokens[$j].text }
                 if ($t -eq '<') {
@@ -452,18 +554,30 @@ function Get-NamedAreEqualConstructs {
                         $argumentCount++
                         if ($tokens[$j - 1].text -in @(':', '.', '?', '+', '-', '*', '/', '=', '=>')) {
                             $known = $false
+                            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                                -Code 'argument-terminal-uncertain'
                         }
                     }
-                    if ($j -eq $segment) { $known = $false }
+                    if ($j -eq $segment) {
+                        $known = $false
+                        Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                            -Code 'argument-segment-empty'
+                    }
                     elseif ($segment + 1 -ge $j -or
                         [string]$tokens[$segment].text -cnotmatch '^@?[\p{L}_][\p{L}\p{N}_]*$' -or
                         $tokens[$segment + 1].text -ne ':') {
                         $positional = $true
                         if ($tokens[$segment].text -in @(':', '.', '?', '+', '-', '*', '/', '=')) {
                             $known = $false
+                            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                                -Code 'argument-leading-token-uncertain'
                         }
                     }
-                    elseif ($segment + 2 -ge $j) { $known = $false }
+                    elseif ($segment + 2 -ge $j) {
+                        $known = $false
+                        Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                            -Code 'named-argument-value-missing'
+                    }
                     $segment = $j + 1
                 }
                 elseif ($t -in @('(', '[', '{') -and $pairs.ContainsKey($j)) {
@@ -471,8 +585,20 @@ function Get-NamedAreEqualConstructs {
                 }
             }
         }
-        if (-not $callValid -or $argumentCount -lt 2 -or $nestedAngles -ne 0) {
+        if (-not $callValid) {
             $known = $false
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'call-shape-uncertain'
+        }
+        if ($argumentCount -lt 2) {
+            $known = $false
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'argument-count-insufficient'
+        }
+        if ($nestedAngles -ne 0) {
+            $known = $false
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'generic-angle-parse-uncertain'
         }
         $key = if ($method.Count -eq 1 -and $symbol.Length -le 256) {
             "$symbol`:$($method[0].declarationLine)"
@@ -483,12 +609,29 @@ function Get-NamedAreEqualConstructs {
         [void]$groups[$key].Add(@{ name = $(if ($symbol.Length -gt 0 -and
                     $symbol.Length -le 256) { $symbol } else { 'unrecognized' })
             declarationLine = $(if ($method.Count -eq 1) { [int]$method[0].declarationLine } else { 0 })
-            start = $start; end = $end; known = [bool]$known; positional = [bool]$positional })
+            start = $start; end = $end; known = [bool]$known
+            positional = [bool]$positional
+            unknownReasons = @($unknownReasons) })
     }
     foreach ($key in @($groups.Keys | Sort-Object)) {
         $calls = @($groups[$key] | Sort-Object start, end)
         $distinctLines = @($calls | ForEach-Object start | Sort-Object -Unique)
         $ambiguousLine = $distinctLines.Count -ne $calls.Count
+        $unknownReasons = [Collections.Generic.List[string]]::new()
+        foreach ($call in $calls) {
+            foreach ($code in @($call.unknownReasons)) {
+                Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                    -Code ([string]$code)
+            }
+        }
+        if ($ambiguousLine) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'same-line-call-ambiguity'
+        }
+        if ($calls.Count -gt 256) {
+            Add-NamedAreEqualUnknownReason -Reasons $unknownReasons `
+                -Code 'group-cardinality-exceeded'
+        }
         $allKnown = $calls.Count -le 256 -and -not $ambiguousLine -and
             @($calls | Where-Object { -not $_.known }).Count -eq 0
         $violations = @($calls | Where-Object positional)
@@ -496,7 +639,7 @@ function Get-NamedAreEqualConstructs {
         if ($allKnown -and $violations.Count) { $reported = $violations }
         $lines = @($reported | ForEach-Object start | Sort-Object -Unique | Select-Object -First 256)
         $anchor = $reported[0]
-        @{
+        $result = [ordered]@{
             name = [string]$calls[0].name
             declarationLine = [int]$calls[0].declarationLine
             startLine = [int]$lines[0]
@@ -512,6 +655,11 @@ function Get-NamedAreEqualConstructs {
                 else { 'named-areequal-arguments' })
             path = $Path
         }
+        if (-not $allKnown) {
+            $result.unknownReasonCounts =
+                @(Get-NamedAreEqualUnknownReasonSummary -Reasons $unknownReasons)
+        }
+        $result
     }
 }
 

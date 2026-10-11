@@ -415,6 +415,9 @@ Describe 'Owner v2 semantic capability' {
         $run.Observation.counts.uncovered | Should -Be 0
         @($run.Observation.outcomes | Where-Object state -CEQ advisory).Count | Should -Be 1
         @($run.Observation.outcomes | Where-Object writerEligible).Count | Should -Be 0
+        @($run.Observation.outcomes | Where-Object {
+                $_.Contains('unknownReasonCounts')
+            }).Count | Should -Be 0
         $run.Observation.lifecycle.completed | Should -BeTrue
         $run.Observation.findingsComplete | Should -BeTrue
         $run.Observation.execution.attempts | Should -Be 4

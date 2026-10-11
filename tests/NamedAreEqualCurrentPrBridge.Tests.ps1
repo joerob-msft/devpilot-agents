@@ -623,6 +623,57 @@ Describe 'Named AreEqual current PR bridge' {
         }
     }
 
+    It 'persists bounded parser diagnostics through the actual bridge path' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $configPath = Join-Path $TestDrive 'diagnostic-config.json'
+        [IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json -InputObject $config -Depth 32) + "`n",
+            [Text.UTF8Encoding]::new($false))
+        $state = Join-Path $TestDrive 'diagnostic-state'
+        $manifest = Join-Path $TestDrive 'diagnostic-manifest.json'
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-NamedAreEqualBridgeFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $output = @(& $pwsh -NoProfile -NonInteractive `
+            -File $fixture -ConfigPath $configPath `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepoRoot $repoRoot -DiscussionMode empty `
+            -DiagnosticUnknown 2>&1)
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $result.recordCount | Should -Be 1
+        $result.recordState | Should -BeExactly 'unknown'
+        $result.observation.capability | Should -BeExactly `
+            'bpm-named-areequal-arguments@1'
+        $result.observation.lifecycle.status | Should -BeExactly 'incomplete'
+        $result.observation.findingsComplete | Should -BeFalse
+        $result.observation.counts.unknown | Should -Be 1
+        $result.observation.execution.modelStarts | Should -Be 0
+        $result.observation.effects.providerWrites | Should -Be 0
+        $result.observation.effects.writeToolInvocations | Should -Be 0
+        $outcome = @($result.observation.outcomes)[0]
+        $outcome.state | Should -BeExactly 'unknown'
+        $outcome.reason | Should -BeExactly 'named-areequal-call-unknown'
+        $outcome.affectedCallCount | Should -Be 1
+        @($outcome.unknownReasonCounts.code) | Should -Be @(
+            'receiver-spelling-uncertain'
+        )
+        $outcome.unknownReasonCounts[0].count | Should -Be 1
+        @($outcome.unknownReasonCounts[0].Keys | Sort-Object) |
+            Should -Be @('code', 'count')
+        ($outcome.unknownReasonCounts | ConvertTo-Json -Compress) |
+            Should -Not -Match 'AreEqual|Checks|tests/|global::|Exception'
+        @($result.calls | Where-Object {
+                $_ -in @('CreateThread', 'UpdateThread', 'Model')
+            }).Count | Should -Be 0
+    }
+
     It 'is default-off with no reads or durable state' {
         $config = New-BridgeConfig
         $provider = New-BridgeProvider -Config $config

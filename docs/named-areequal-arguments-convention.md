@@ -34,6 +34,21 @@ exact changed call lines with a bounded 12-line display sample. Unknown syntax,
 receiver shape, containment, or changed-line provenance is not actionable. The rule
 does not reorder arguments or change assertion values.
 
+Unknown parser outcomes retain only a bounded diagnostic enum and aggregate
+counts. The fixed codes are `receiver-spelling-uncertain`,
+`receiver-shadowing-uncertain`, `source-structure-uncertain`,
+`call-shape-uncertain`, `changed-anchor-uncertain`,
+`test-context-uncertain`, `symbol-identity-uncertain`,
+`argument-segment-empty`, `argument-terminal-uncertain`,
+`argument-leading-token-uncertain`, `named-argument-value-missing`,
+`argument-count-insufficient`, `generic-angle-parse-uncertain`,
+`same-line-call-ambiguity`, and `group-cardinality-exceeded`. Counts are exact
+within the existing 200,000-token/line input bound, the array is emitted in
+that order with at most 15 entries, and no source text, argument value, path,
+exception message, or stack is included. The metadata is present only for the
+exact `bpm-named-areequal-arguments@1` capability and rule and does not change
+recognized state, outcome reason, anchors, completeness, or delivery.
+
 The current-PR bridge accepts `devpilot-current-line-derivation-v1` evidence from the shared intake. It derives that evidence from already-fetched source/target content and the existing changed-span invocation, without another fetch or diff pass. Only same-path modified C# with complete, byte-identical source/target proof and zero current spans, or a complete whole-file C# deletion, can be filtered as known-empty for Named. Proof validation binds the head, actual UTF-8 content SHA-256 and length, path, change type, and exact inventory/span counts before filtering. Missing or inconsistent proof, derivation-unknown, pure renames, retained-file deletion-only changes, and malformed or unavailable relevant evidence remain UNKNOWN; zero spans alone are not proof of compliance. Derivation metadata participates in the snapshot digest and acquisition identity, so old observations cannot qualify a new binding. The frozen Owner runtime can consume a separately derived view that omits only proven identical C#; relation and other consumers retain the immutable full shared snapshot. This contract does not authorize delivery or change Owner body-coverage semantics.
 
 Preview accepts a separate `named-areequal-v2-preview-cohort`, signed source

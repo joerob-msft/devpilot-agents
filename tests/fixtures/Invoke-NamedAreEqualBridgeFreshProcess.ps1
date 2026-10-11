@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory)][string]$ManifestPath,
     [Parameter(Mandatory)][string]$RepoRoot,
     [ValidateSet('empty', 'human', 'drift')]
-    [string]$DiscussionMode = 'empty'
+    [string]$DiscussionMode = 'empty',
+    [switch]$DiagnosticUnknown
 )
 
 Set-StrictMode -Version Latest
@@ -19,16 +20,22 @@ Import-Module (Join-Path $RepoRoot `
 
 $config = Get-Content -LiteralPath $ConfigPath -Raw |
     ConvertFrom-Json -AsHashtable -Depth 32
-$content = @'
+$call = if ($DiagnosticUnknown) {
+    'global::Microsoft.VisualStudio.TestTools.UnitTesting.Assert.AreEqual(1, items.Count);'
+}
+else {
+    'Assert.AreEqual(1, items.Count);'
+}
+$content = @"
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 [TestClass]
 class Checks {
     [TestMethod]
     void Verify() {
-        Assert.AreEqual(1, items.Count);
+        $call
     }
 }
-'@
+"@
 $sourceCommit = 'c' * 40
 $targetCommit = 'd' * 40
 $head = [ordered]@{

@@ -50,10 +50,81 @@ $script:NamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
+$script:NamedAreEqualUnknownReasonCodes = @(
+    'receiver-spelling-uncertain'
+    'receiver-shadowing-uncertain'
+    'source-structure-uncertain'
+    'call-shape-uncertain'
+    'changed-anchor-uncertain'
+    'test-context-uncertain'
+    'symbol-identity-uncertain'
+    'argument-segment-empty'
+    'argument-terminal-uncertain'
+    'argument-leading-token-uncertain'
+    'named-argument-value-missing'
+    'argument-count-insufficient'
+    'generic-angle-parse-uncertain'
+    'same-line-call-ambiguity'
+    'group-cardinality-exceeded'
+)
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
 )
+
+function Test-OwnerV2MemberPresent {
+    param([AllowNull()][object]$Value, [Parameter(Mandatory)][string]$Name)
+    if ($Value -is [Collections.IDictionary]) {
+        return $Value.Contains($Name)
+    }
+    return $null -ne $Value -and
+        $null -ne $Value.PSObject.Properties[$Name]
+}
+
+function ConvertTo-NamedAreEqualUnknownReasonSummary {
+    param(
+        [AllowNull()][object]$Value,
+        [switch]$Required
+    )
+    [object[]]$items = @()
+    if ($null -ne $Value) { $items = @($Value) }
+    if ($items.Count -gt $script:NamedAreEqualUnknownReasonCodes.Count) {
+        throw 'Named AreEqual parser diagnostics exceeded the fixed enum bound.'
+    }
+    if ($Required -and $items.Count -eq 0) {
+        throw 'Named AreEqual unknown outcome omitted parser diagnostics.'
+    }
+    $result = [Collections.Generic.List[object]]::new()
+    $previousIndex = -1
+    foreach ($item in $items) {
+        if ($null -eq $item -or
+            ($item -isnot [Collections.IDictionary] -and
+                $null -eq $item.PSObject)) {
+            throw 'Named AreEqual parser diagnostics contained an invalid entry.'
+        }
+        $code = [string](Get-OwnerV2Member -Value $item -Name code)
+        $count = Get-OwnerV2Member -Value $item -Name count
+        $index = [Array]::IndexOf(
+            [string[]]$script:NamedAreEqualUnknownReasonCodes, $code)
+        if ($index -lt 0) {
+            throw "Unrecognized Named AreEqual parser diagnostic code '$code'."
+        }
+        if ($index -le $previousIndex) {
+            throw 'Named AreEqual parser diagnostics were duplicated or out of order.'
+        }
+        if ($count -is [bool] -or $count -isnot [int] -and
+            $count -isnot [long] -or [long]$count -lt 1 -or
+            [long]$count -gt 200000) {
+            throw 'Named AreEqual parser diagnostic count was outside the bounded range.'
+        }
+        [void]$result.Add([ordered]@{
+                code = $code
+                count = [int]$count
+            })
+        $previousIndex = $index
+    }
+    return @($result)
+}
 
 function Assert-OwnerV2Text {
     param(
@@ -2198,6 +2269,17 @@ function Invoke-NamedAreEqualCapabilityResponse {
                 })
         }
         foreach ($construct in $constructs) {
+            $constructRecognized = [bool]$construct.recognized
+            $hasUnknownReasonCounts = Test-OwnerV2MemberPresent `
+                -Value $construct -Name unknownReasonCounts
+            if ($constructRecognized -and $hasUnknownReasonCounts) {
+                throw 'Recognized Named AreEqual construct included unknown diagnostics.'
+            }
+            $unknownReasonCounts =
+                @(ConvertTo-NamedAreEqualUnknownReasonSummary `
+                    -Value (Get-OwnerV2Member -Value $construct `
+                        -Name unknownReasonCounts) `
+                    -Required:(-not $constructRecognized))
             $material = [ordered]@{
                 bindingId = $bindingId
                 evidenceDigest = $evidenceDigest
@@ -2267,7 +2349,7 @@ function Invoke-NamedAreEqualCapabilityResponse {
                 $null
             }
             else {
-                [ordered]@{
+                $value = [ordered]@{
                     state = $state
                     reason = [string]$construct.reason
                     constructRef = $constructRef
@@ -2279,6 +2361,10 @@ function Invoke-NamedAreEqualCapabilityResponse {
                         } else { 'unrecognized' })
                     affectedCallCount = [int]$construct.affectedCallCount
                 }
+                if ($state -ceq 'unknown') {
+                    $value.unknownReasonCounts = $unknownReasonCounts
+                }
+                $value
             }
             [void]$assessments.Add([ordered]@{
                     assessmentId = $assessmentId
@@ -2396,7 +2482,9 @@ function ConvertTo-OwnerV2Observation {
     $rule = Get-OwnerV2Member -Value $ruleUnit -Name data
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
     $capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
-    $namedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability
+    $ruleSection = [string](Get-OwnerV2Member -Value $rule -Name section)
+    $namedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability -and
+        $ruleSection -ceq $script:NamedAreEqualCapability
     $methodAssessments = @($assessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
                 $(if ($namedAreEqual) { 'method:n:*' } else { 'method:*' })
@@ -2522,9 +2610,25 @@ function ConvertTo-OwnerV2Observation {
                 binding = $binding
                 writerEligible = $false
             }
+        $hasUnknownReasonCounts = Test-OwnerV2MemberPresent `
+            -Value $outcome -Name unknownReasonCounts
+        if (-not $namedAreEqual -and $hasUnknownReasonCounts) {
+            throw 'Non-Named outcome included Named parser diagnostics.'
+        }
         if ($namedAreEqual) {
             $normalizedOutcome.affectedCallCount =
                 [int](Get-OwnerV2Member -Value $outcome -Name affectedCallCount)
+            $isNamedParserUnknown = $assessmentId -like 'method:n:*' -and
+                $outcomeState -ceq 'unknown'
+            if ($isNamedParserUnknown) {
+                $normalizedOutcome.unknownReasonCounts =
+                    @(ConvertTo-NamedAreEqualUnknownReasonSummary `
+                        -Value (Get-OwnerV2Member -Value $outcome `
+                            -Name unknownReasonCounts) -Required)
+            }
+            elseif ($hasUnknownReasonCounts) {
+                throw 'Named parser diagnostics were attached to a non-parser outcome.'
+            }
         }
         [void]$normalizedOutcomes.Add($normalizedOutcome)
     }

@@ -218,6 +218,34 @@ class Checks {
         $result.Observation.counts.unknown | Should -Be 1
         @($result.Observation.findings).Count | Should -Be 0
         $result.Observation.effects.providerWrites | Should -Be 0
+        @($result.Observation.outcomes[0].unknownReasonCounts.code) |
+            Should -Contain 'receiver-shadowing-uncertain'
+    }
+
+    It 'rejects unknown, malformed, and noncanonical parser diagnostics' {
+        InModuleScope DevPilot.OwnerCapability {
+            { ConvertTo-NamedAreEqualUnknownReasonSummary -Required -Value @(
+                    [ordered]@{ code = 'not-a-supported-code'; count = 1 }
+                ) } | Should -Throw '*Unrecognized*'
+            { ConvertTo-NamedAreEqualUnknownReasonSummary -Required -Value @(
+                    [ordered]@{
+                        code = 'receiver-spelling-uncertain'
+                        count = 0
+                    }
+                ) } | Should -Throw '*bounded range*'
+            { ConvertTo-NamedAreEqualUnknownReasonSummary -Required -Value @(
+                    [ordered]@{
+                        code = 'argument-count-insufficient'
+                        count = 1
+                    }
+                    [ordered]@{
+                        code = 'receiver-spelling-uncertain'
+                        count = 1
+                    }
+                ) } | Should -Throw '*out of order*'
+            { ConvertTo-NamedAreEqualUnknownReasonSummary -Required -Value @() } |
+                Should -Throw '*omitted*'
+        }
     }
 
     It 'keeps an expression-bodied Assert property unknown and non-actionable' {

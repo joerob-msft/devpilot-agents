@@ -6,6 +6,15 @@ BeforeAll {
         return ,@(Get-NamedAreEqualConstructs -Content $Source -Path 'tests/Checks.cs' `
             -Spans @(@{ startLine = $First; endLine = $Last; state = 'complete' }))
     }
+
+    function Get-NamedReasonMap {
+        param([Collections.IDictionary]$Result)
+        $map = [ordered]@{}
+        foreach ($entry in @($Result.unknownReasonCounts)) {
+            $map[[string]$entry.code] = [int]$entry.count
+        }
+        return $map
+    }
 }
 
 Describe 'Get-NamedAreEqualConstructs' {
@@ -86,6 +95,8 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         $result.recognized | Should -BeFalse
         $result.hasPositional | Should -BeFalse
         $result.reason | Should -BeExactly 'same-line-call-ambiguity'
+        (Get-NamedReasonMap $result)['same-line-call-ambiguity'] |
+            Should -Be 1
         $result.startLine | Should -Be 3
         $result.affectedCallLines | Should -Be @(3)
         $result.affectedCallCount | Should -Be 1
@@ -105,6 +116,10 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
             $result.affectedCallLines | Should -Be @(3..(2 + $expected))
             $result.callListTruncated | Should -Be ($expected -gt 12)
             $result.recognized | Should -Be ($count -le 256)
+            if ($count -gt 256) {
+                (Get-NamedReasonMap $result)['group-cardinality-exceeded'] |
+                    Should -Be 1
+            }
         }
     }
 
@@ -344,7 +359,111 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         $result = Parse-NamedAreEqual $source 3
         $result.Count | Should -Be 1
         $result[0].recognized | Should -BeFalse
+        (Get-NamedReasonMap $result[0])['source-structure-uncertain'] |
+            Should -Be 1
         $broken = $source.Replace('#if TEST', '').Replace('#endif', '').Replace(');', ';')
         (Parse-NamedAreEqual $broken 3)[0].recognized | Should -BeFalse
+    }
+
+    It 'emits the fixed diagnostic code <Code> from its parser branch' `
+        -TestCases @(
+            @{ Code = 'receiver-spelling-uncertain' }
+            @{ Code = 'receiver-shadowing-uncertain' }
+            @{ Code = 'source-structure-uncertain' }
+            @{ Code = 'call-shape-uncertain' }
+            @{ Code = 'changed-anchor-uncertain' }
+            @{ Code = 'test-context-uncertain' }
+            @{ Code = 'symbol-identity-uncertain' }
+            @{ Code = 'argument-segment-empty' }
+            @{ Code = 'argument-terminal-uncertain' }
+            @{ Code = 'argument-leading-token-uncertain' }
+            @{ Code = 'named-argument-value-missing' }
+            @{ Code = 'argument-count-insufficient' }
+            @{ Code = 'generic-angle-parse-uncertain' }
+        ) {
+        param($Code)
+        $call = switch ($Code) {
+            'receiver-spelling-uncertain' {
+                'global::Microsoft.VisualStudio.TestTools.UnitTesting.Assert.AreEqual(1, 2);'
+            }
+            'call-shape-uncertain' { 'Assert.AreEqual;' }
+            'argument-segment-empty' { 'Assert.AreEqual(1, 2,);' }
+            'argument-terminal-uncertain' { 'Assert.AreEqual(1 +, 2);' }
+            'argument-leading-token-uncertain' { 'Assert.AreEqual(+ 1, 2);' }
+            'named-argument-value-missing' {
+                'Assert.AreEqual(expected: , actual: 2);'
+            }
+            'argument-count-insufficient' { 'Assert.AreEqual(1);' }
+            'generic-angle-parse-uncertain' {
+                'Assert.AreEqual(Foo<[T >], 2);'
+            }
+            default { 'Assert.AreEqual(1, 2);' }
+        }
+        $source = @(
+            'using Microsoft.VisualStudio.TestTools.UnitTesting;'
+            $(if ($Code -ceq 'receiver-shadowing-uncertain') {
+                    'class Assert { public static void AreEqual(int x, int y) {} }'
+                })
+            $(if ($Code -ceq 'source-structure-uncertain') { '#if TEST' })
+            $(if ($Code -ceq 'test-context-uncertain') {
+                    '[TestClass] class Checks { void Verify() {'
+                }
+                elseif ($Code -ceq 'symbol-identity-uncertain') {
+                    '[TestClass] class Checks { [TestMethod] void Verify(int x) {'
+                }
+                else {
+                    '[TestClass] class Checks { [TestMethod] void Verify() {'
+                })
+            $(if ($Code -ceq 'changed-anchor-uncertain') {
+                    'Assert'
+                    '    .AreEqual(1, 2);'
+                }
+                else { $call })
+            '} }'
+            $(if ($Code -ceq 'symbol-identity-uncertain') {
+                    '[TestClass] class Checks2 { [TestMethod] void Verify(int x) { Assert.AreEqual(1, 2); } }'
+                })
+            $(if ($Code -ceq 'source-structure-uncertain') { '#endif' })
+        ) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }
+        if ($Code -ceq 'symbol-identity-uncertain') {
+            $source = @(
+                'using Microsoft.VisualStudio.TestTools.UnitTesting;'
+                '[TestClass] class Checks {'
+                '[TestMethod] void Verify(int x) { Assert.AreEqual(1, 2); }'
+                '[TestMethod] void Verify(string x) { Assert.AreEqual(1, 2); }'
+                '}'
+            )
+        }
+        $line = if ($Code -ceq 'changed-anchor-uncertain') { 4 } else {
+            [Array]::IndexOf($source, $call) + 1
+        }
+        if ($Code -ceq 'receiver-shadowing-uncertain') { $line = 4 }
+        if ($Code -ceq 'source-structure-uncertain') { $line = 4 }
+        if ($Code -ceq 'test-context-uncertain') { $line = 3 }
+        if ($Code -ceq 'symbol-identity-uncertain') { $line = 3 }
+        $result = (Parse-NamedAreEqual ($source -join "`n") $line)[0]
+        $result.recognized | Should -BeFalse
+        @($result.unknownReasonCounts.code) | Should -Contain $Code
+    }
+
+    It 'aggregates diagnostic counts in fixed order without source material' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+[TestClass] class Checks { [TestMethod] void Verify() {
+    global::Microsoft.VisualStudio.TestTools.UnitTesting.Assert.AreEqual(1, 2);
+    global::Microsoft.VisualStudio.TestTools.UnitTesting.Assert.AreEqual(3, 4);
+    Assert.AreEqual(1 +, 2);
+} }
+'@
+        $result = (Parse-NamedAreEqual $source 3 5)[0]
+        @($result.unknownReasonCounts.code) | Should -Be @(
+            'receiver-spelling-uncertain'
+            'argument-terminal-uncertain'
+        )
+        $map = Get-NamedReasonMap $result
+        $map['receiver-spelling-uncertain'] | Should -Be 2
+        $map['argument-terminal-uncertain'] | Should -Be 1
+        ($result.unknownReasonCounts | ConvertTo-Json -Compress) |
+            Should -Not -Match 'AreEqual|tests/|global::|1 \+'
     }
 }
