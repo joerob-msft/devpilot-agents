@@ -28,11 +28,17 @@ $WarningPreference = 'SilentlyContinue'
 [Console]::OutputEncoding =
     [Text.UTF8Encoding]::new($false)
 
-$head = (& $GitPath -C $ContextualToolkitRoot `
+$head = (& $GitPath --no-optional-locks `
+    -c core.longpaths=true `
+    -C $ContextualToolkitRoot `
     rev-parse HEAD 2>$null).Trim()
-$tree = (& $GitPath -C $ContextualToolkitRoot `
+$tree = (& $GitPath --no-optional-locks `
+    -c core.longpaths=true `
+    -C $ContextualToolkitRoot `
     show -s --format=%T HEAD 2>$null).Trim()
-$status = @(& $GitPath -C $ContextualToolkitRoot `
+$status = @(& $GitPath --no-optional-locks `
+    -c core.longpaths=true `
+    -C $ContextualToolkitRoot `
     status --porcelain=v1 2>$null)
 if ($LASTEXITCODE -ne 0 -or
     $head -cne $ExpectedToolkitHead -or
@@ -67,11 +73,15 @@ $currentPrTool = Join-Path $ContextualToolkitRoot `
     'tools\Invoke-ContextualConventionsCurrentPr.ps1'
 $deliveryTool = Join-Path $ContextualToolkitRoot `
     'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+$deliveryProducer = Join-Path `
+    $ContextualToolkitRoot `
+    'tools\Invoke-ContextualDeliveryBatchJson.ps1'
 $policyPath = Join-Path $ContextualToolkitRoot `
     'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json'
 foreach ($path in @(
         $currentPrTool,
         $deliveryTool,
+        $deliveryProducer,
         $policyPath
     )) {
     if (-not (Test-Path -LiteralPath $path `
@@ -205,6 +215,7 @@ foreach ($record in $completed) {
         })
 }
 
+$deliveryEnvelope = $null
 $delivery = [ordered]@{
     schemaVersion = 1
     kind =
@@ -224,19 +235,30 @@ if (-not $deliveryEnabled) {
 if ($identities.Count -gt 0) {
     if ($deliveryEnabled) {
         $deliveryOutput = @(
-            & $deliveryTool invoke-batch `
-                -Delivery contextual-conventions `
+            & $deliveryProducer `
+                -AutomaticDeliveryTool $deliveryTool `
                 -DeliveryRoot $AutomaticDeliveryRoot `
                 -StateRoot $ContextualStateRoot `
                 -Identity $identities.ToArray() `
                 -ToolkitConfigPath $deliveryConfigPath `
-                -MaxCreatesPerRun 2 `
-                -MaxCreatesPerPullRequest 5 `
                 -AzureCliPath $AzureCliPath `
                 -GitPath $GitPath `
                 -RepoRoot $ContextualToolkitRoot)
-        $delivery = ($deliveryOutput -join "`n") |
-            ConvertFrom-Json -AsHashtable -Depth 64
+        $producerExit = $LASTEXITCODE
+        $deliveryEnvelope =
+            ($deliveryOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable `
+                -Depth 64
+        if ($producerExit -ne 0 -or
+            [string]$deliveryEnvelope.kind -cne
+                'contextual-conventions-delivery-producer-result' -or
+            [int]$deliveryEnvelope.toolExitCode -notin @(
+                0, 2, 3) -or
+            $deliveryEnvelope.result -isnot
+                [Collections.IDictionary]) {
+            throw 'contextual-phase-delivery-producer-unsafe'
+        }
+        $delivery = $deliveryEnvelope.result
     }
     else {
         $delivery.remainingWouldCreate = @(
@@ -265,6 +287,7 @@ if ([int]$delivery.providerWrites -lt 0 -or
     evaluation = $evaluation
     observations = $observations.ToArray()
     delivery = $delivery
+    deliveryEnvelope = $deliveryEnvelope
     deliveryEnabled = $deliveryEnabled
     evaluationEffects = [ordered]@{
         providerWrites =
