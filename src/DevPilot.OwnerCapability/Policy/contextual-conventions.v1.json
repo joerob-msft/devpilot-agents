@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "capability": "bpm-contextual-conventions@1",
+  "repository": "msazure/One/AzureUX-BPM",
+  "sourceAuthority": {
+    "codingPatterns": "documentation/EngineeringProcesses/Conventions/CodingPatterns.md",
+    "codingStyle": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+    "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
+  },
+  "rules": [
+    {
+      "id": "exception-logging",
+      "name": "Log exceptions once, with the exception object",
+      "sourceSection": "Telemetry and logging patterns / Log at Source or Sink"
+    },
+    {
+      "id": "exception-propagation",
+      "name": "Preserve exception stacks and let fatal exceptions escape",
+      "sourceSection": "Exception patterns"
+    },
+    {
+      "id": "type-based-decisions",
+      "name": "Use types, not exception-message text, for decisions",
+      "sourceSection": "Prefer type comparison"
+    },
+    {
+      "id": "explicit-string-comparison",
+      "name": "Make string comparison explicit",
+      "sourceSection": "Compare strings the correct way"
+    },
+    {
+      "id": "collection-cardinality",
+      "name": "Validate collection cardinality instead of arbitrarily taking the first item",
+      "sourceSection": "First and [0] vs Single"
+    },
+    {
+      "id": "cheap-validation",
+      "name": "Keep request-validation delegates cheap",
+      "sourceSection": "Quick validations"
+    },
+    {
+      "id": "async-all-the-way",
+      "name": "Use async all the way",
+      "sourceSection": "Asynchronous patterns / Asynchronous all the way"
+    },
+    {
+      "id": "async-io",
+      "name": "Use asynchronous I/O",
+      "sourceSection": "Asynchronous patterns / Use async for Input/Output"
+    },
+    {
+      "id": "async-wait-sync",
+      "name": "Use async-compatible waiting and synchronization",
+      "sourceSection": "Asynchronous patterns / Use appropriate lock construct and Wait asynchronously"
+    },
+    {
+      "id": "http-client-lifetime",
+      "name": "Reuse HTTP clients",
+      "sourceSection": "Singleton HTTP client or HTTP client factory"
+    },
+    {
+      "id": "thread-safe-immutable",
+      "name": "Use thread-safe initialization and prefer immutable state",
+      "sourceSection": "Immutable / Thread-safe lazy initialization"
+    },
+    {
+      "id": "cache-streaming",
+      "name": "Cache expensive repeated work; stream large payloads",
+      "sourceSection": "Cache results of Reflection calls / bounded payload handling"
+    },
+    {
+      "id": "typed-contracts",
+      "name": "Use explicit, typed contracts",
+      "sourceSection": "Declare data model for input-output contracts"
+    },
+    {
+      "id": "json-contracts",
+      "name": "Declare JSON serialization deliberately",
+      "sourceSection": "Serialization"
+    },
+    {
+      "id": "api-errors",
+      "name": "Use standard, actionable API error responses",
+      "sourceSection": "RESTful HTTP error response format"
+    },
+    {
+      "id": "secret-redaction",
+      "name": "Redact secrets on every response path, including cold-cache paths",
+      "sourceSection": "Contextual BPM secret-redaction evidence"
+    },
+    {
+      "id": "dependency-fanout",
+      "name": "Update dependency changes across all affected surfaces",
+      "sourceSection": "Strong-naming unsigned NuGet dependencies / contextual dependency fanout"
+    }
+  ]
+}

@@ -11,6 +11,7 @@ Import-Module "$PSScriptRoot\..\DevPilot.OwnerModelRunner\DevPilot.OwnerModelRun
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.RelationEvidence\DevPilot.RelationEvidence.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1" -Force
+Import-Module "$PSScriptRoot\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1" -Force
 
 $script:OwnerV2ObservationSchemaPath = Join-Path $PSScriptRoot `
     '..\OwnerObserver\schemas\owner-observation.v1.json'
@@ -49,6 +50,14 @@ $script:NamedAreEqualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
 $script:NamedAreEqualPolicyDigest =
     'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
+$script:ContextualCapabilityId =
+    'bpm-contextual-conventions@1'
+$script:ContextualCapabilityDigest =
+    'v1:sha256:aa316ea3ae651eb996441b56c852b19dee080e30c659e4570946dec24589d208'
+$script:ContextualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+$script:ContextualPolicyDigest =
+    'v1:sha256:6e7cf6e001efa9966a6edb29348ea2344c8450a7ff713d56bc9ba69c81e1aafd'
 $script:NamedAreEqualParserPath = Join-Path $PSScriptRoot `
     '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
 $script:NamedAreEqualParserManifestPath = Join-Path $PSScriptRoot `
@@ -61,6 +70,22 @@ $script:NamedAreEqualParserManifestSha256AtImport =
     ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
         [IO.File]::ReadAllBytes(
             $script:NamedAreEqualParserManifestPath)))).
+    ToLowerInvariant()
+$script:ContextualAnalyzerPath = Join-Path $PSScriptRoot `
+    '..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
+$script:ContextualAnalyzerManifestPath = Join-Path $PSScriptRoot `
+    '..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1'
+$script:ContextualAnalyzerSha256AtImport =
+    ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:ContextualAnalyzerPath)))).
+    ToLowerInvariant()
+$script:ContextualAnalyzerManifestSha256AtImport =
+    ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:ContextualAnalyzerManifestPath)))).
     ToLowerInvariant()
 $script:OwnerV2DigestPattern = '^v1:sha256:[0-9a-f]{64}$'
 $script:OwnerV2CommitPattern = '^[0-9a-f]{40}$'
@@ -723,6 +748,9 @@ function ConvertTo-OwnerV2Declaration {
     }
     $namedAreEqual =
         [string]$Entry.capability.id -ceq $script:NamedAreEqualCapabilityId
+    $contextual =
+        [string]$Entry.capability.id -ceq
+            $script:ContextualCapabilityId
     if ($namedAreEqual) {
         $policyPath = Join-Path $script:OwnerV2RepositoryRoot (
             $script:NamedAreEqualPolicyPath.Replace(
@@ -753,6 +781,44 @@ function ConvertTo-OwnerV2Declaration {
         if ($mode -ceq 'replay' -and
             @($Entry.replay.modelRecords).Count -ne 0) {
             throw 'Named AreEqual replay must not contain model records.'
+        }
+    }
+    elseif ($contextual) {
+        $policyPath = Join-Path `
+            $script:OwnerV2RepositoryRoot (
+                $script:ContextualPolicyPath.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar))
+        $policyText = [IO.File]::ReadAllText(
+            $policyPath,
+            [Text.UTF8Encoding]::new($false))
+        if ([string]$Entry.capability.digest -cne
+                $script:ContextualCapabilityDigest -or
+            [string]$Entry.rule.path -cne
+                $script:ContextualPolicyPath -or
+            [string]$Entry.rule.section -cne
+                $script:ContextualCapabilityId -or
+            [string]$Entry.rule.hash -cne
+                $script:ContextualPolicyDigest -or
+            [long]$Entry.rule.length -ne
+                [Text.Encoding]::UTF8.GetByteCount(
+                    $policyText) -or
+            (Get-OwnerV2RawTextDigest `
+                -Value $policyText) -cne
+                    $script:ContextualPolicyDigest -or
+            [string]$Entry.model.id -cne 'none' -or
+            [string]$Entry.model.digest -cne
+                (Get-OwnerV2RawTextDigest `
+                    -Value 'none') -or
+            [string]$Entry.config.id -cne
+                'contextual-conventions-v1-user-approved' -or
+            [string]$Entry.config.digest -cne
+                (Get-OwnerV2RawTextDigest -Value (
+                    'contextual-conventions-v1-user-approved'))) {
+            throw 'Contextual manifest entry does not match the exact source-backed rule bundle.'
+        }
+        if ($mode -ceq 'replay' -and
+            @($Entry.replay.modelRecords).Count -ne 0) {
+            throw 'Contextual replay must not contain model records.'
         }
     }
 
@@ -815,7 +881,11 @@ function ConvertTo-OwnerV2Declaration {
     return [pscustomobject][ordered]@{
         CapabilityKind = $(if ($namedAreEqual) {
                 'named-areequal'
-            } else { 'owner' })
+            }
+            elseif ($contextual) {
+                'contextual-conventions'
+            }
+            else { 'owner' })
         Identity = $identity
         StateDigest = $stateDigest
         Declaration = $declaration
@@ -1063,7 +1133,8 @@ function Read-OwnerV2Manifest {
         $kind -cnotin @(
             'owner-v2-preview-cohort',
             'relation-v2-preview-cohort',
-            'named-areequal-v2-preview-cohort'
+            'named-areequal-v2-preview-cohort',
+            'contextual-conventions-v1-preview-cohort'
         )) {
         throw 'Preview manifest must use schemaVersion 1 and a supported bounded cohort kind.'
     }
@@ -1085,9 +1156,16 @@ function Read-OwnerV2Manifest {
                 $entry = ConvertTo-OwnerV2Declaration -Entry $_
                 $expectedNamed =
                     $kind -ceq 'named-areequal-v2-preview-cohort'
+                $expectedContextual =
+                    $kind -ceq
+                        'contextual-conventions-v1-preview-cohort'
                 if ($expectedNamed -ne
-                    ([string]$entry.CapabilityKind -ceq 'named-areequal')) {
-                    throw 'Named AreEqual and Owner cohorts must have separate capability identities.'
+                        ([string]$entry.CapabilityKind -ceq
+                            'named-areequal') -or
+                    $expectedContextual -ne
+                        ([string]$entry.CapabilityKind -ceq
+                            'contextual-conventions')) {
+                    throw 'Deterministic and Owner cohorts must have separate capability identities.'
                 }
                 $entry
             }
@@ -1271,12 +1349,62 @@ function Add-NamedAreEqualParserArtifacts {
     )
 }
 
+function Get-ContextualAnalyzerBinding {
+    $moduleSha = ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:ContextualAnalyzerPath)))).
+        ToLowerInvariant()
+    $manifestSha = ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes(
+                $script:ContextualAnalyzerManifestPath)))).
+        ToLowerInvariant()
+    if ($moduleSha -cne
+            $script:ContextualAnalyzerSha256AtImport -or
+        $manifestSha -cne
+            $script:ContextualAnalyzerManifestSha256AtImport) {
+        throw 'Contextual analyzer bytes changed after module import.'
+    }
+    return [ordered]@{
+        analyzerSha256 = $moduleSha
+        analyzerManifestSha256 = $manifestSha
+    }
+}
+
+function Add-ContextualAnalyzerArtifacts {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Binding
+    )
+    $Observation.sourceArtifacts =
+        @($Observation.sourceArtifacts) + @(
+            [ordered]@{
+                kind =
+                    'contextual-conventions-analyzer-module'
+                sha256 =
+                    [string]$Binding.analyzerSha256
+                signature = 'not-applicable'
+            },
+            [ordered]@{
+                kind =
+                    'contextual-conventions-analyzer-manifest'
+                sha256 =
+                    [string]$Binding.
+                        analyzerManifestSha256
+                signature = 'not-applicable'
+            })
+}
+
 function Invoke-OwnerV2Replay {
     param([Parameter(Mandatory)][object]$Entry)
     $fixture = New-OwnerReplayFixture -Package $Entry.ManifestEntry.acquisition.package
     $acquisition = New-OwnerReplayAcquisitionAdapter -Contract $Entry.Contract `
         -Fixture $fixture -ExpectedPayloadDigest ([string]$Entry.Declaration.acquisitionPayloadDigest)
-    if ([string]$Entry.CapabilityKind -ceq 'named-areequal') {
+    if ([string]$Entry.CapabilityKind -ceq
+        'named-areequal') {
         $parserBinding = Get-NamedAreEqualParserBinding
         $capability = New-NamedAreEqualCapabilityAdapter `
             -CapabilityId ([string]$Entry.Declaration.capability.id) `
@@ -1300,6 +1428,45 @@ function Invoke-OwnerV2Replay {
             -Observation $observation -Binding $parserBinding
         Assert-OwnerV2PipelineNoWrites `
             -PipelineResult $result -Observation $observation
+        return [pscustomobject][ordered]@{
+            PipelineResult = $result
+            Observation = $observation
+        }
+    }
+    if ([string]$Entry.CapabilityKind -ceq
+        'contextual-conventions') {
+        $analyzerBinding =
+            Get-ContextualAnalyzerBinding
+        $capability =
+            New-ContextualConventionsCapabilityAdapter `
+                -CapabilityId (
+                    [string]$Entry.Declaration.
+                        capability.id) `
+                -CapabilityDigest (
+                    [string]$Entry.Declaration.
+                        capability.digest)
+        $result = Invoke-OwnerReviewPipeline `
+            -Binding $Entry.Contract.Binding `
+            -AcquisitionAdapter $acquisition `
+            -CapabilityAdapter $capability
+        if ($null -eq $result.evidence -or
+            $null -eq $result.validation -or
+            $null -eq $result.preview) {
+            throw 'Contextual facade did not complete.'
+        }
+        $observation =
+            ConvertTo-OwnerV2Observation `
+                -PipelineResult $result `
+                -ImplementationId (
+                    'contextual-conventions-v1-orchestrator') `
+                -ImplementationVersion '1.0.0'
+        [void](Get-ContextualAnalyzerBinding)
+        Add-ContextualAnalyzerArtifacts `
+            -Observation $observation `
+            -Binding $analyzerBinding
+        Assert-OwnerV2PipelineNoWrites `
+            -PipelineResult $result `
+            -Observation $observation
         return [pscustomobject][ordered]@{
             PipelineResult = $result
             Observation = $observation
@@ -1394,7 +1561,9 @@ function Test-OwnerV2LiveRetryEligible {
     if ([string]$Entry.Declaration.mode -cne 'live' -or -not $EnableLiveModel) {
         return $false
     }
-    if ([string]$Entry.CapabilityKind -ceq 'named-areequal') {
+    if ([string]$Entry.CapabilityKind -cin @(
+            'named-areequal',
+            'contextual-conventions')) {
         return [int]$Record.schemaVersion -eq 2 -and
             [string]$Record.modelExecutionState -ceq 'notAttempted' -and
             [int]$Record.attempts -lt [int]$Record.maxAttempts -and
@@ -1938,6 +2107,118 @@ function Invoke-NamedAreEqualLive {
                 'completed'
             } else { 'unknown' })
         Reason = [string]$observation.execution.incompleteReason
+    }
+}
+
+function Invoke-ContextualConventionsLive {
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][bool]$Enabled,
+        [AllowNull()][object]$AcquisitionProvider
+    )
+    if (-not $Enabled) {
+        return New-OwnerV2LiveOutcome `
+            -Entry $Entry `
+            -Reason contextual-conventions-disabled
+    }
+    if ($null -eq $AcquisitionProvider) {
+        return New-OwnerV2LiveOutcome `
+            -Entry $Entry `
+            -Reason acquisition-provider-unavailable
+    }
+    $analyzerBinding =
+        Get-ContextualAnalyzerBinding
+    $acquisition =
+        New-OwnerProductionAcquisitionAdapter `
+            -Contract $Entry.Contract `
+            -Provider $AcquisitionProvider
+    $capability =
+        New-ContextualConventionsCapabilityAdapter `
+            -CapabilityId (
+                [string]$Entry.Declaration.
+                    capability.id) `
+            -CapabilityDigest (
+                [string]$Entry.Declaration.
+                    capability.digest)
+    $result = Invoke-OwnerReviewPipeline `
+        -Binding $Entry.Contract.Binding `
+        -AcquisitionAdapter $acquisition `
+        -CapabilityAdapter $capability
+    if ($null -eq $result.evidence -or
+        $null -eq $result.validation -or
+        $null -eq $result.preview) {
+        throw 'Contextual convention facade did not complete.'
+    }
+    $observation =
+        ConvertTo-OwnerV2Observation `
+            -PipelineResult $result `
+            -ImplementationId (
+                'contextual-conventions-v1-orchestrator') `
+            -ImplementationVersion '1.0.0'
+    [void](Get-ContextualAnalyzerBinding)
+    Add-ContextualAnalyzerArtifacts `
+        -Observation $observation `
+        -Binding $analyzerBinding
+    if (@($observation.findings).Count -gt 0 -and
+        [string]$observation.lifecycle.status -ceq
+            'completed') {
+        $snapshot = $null
+        $failure = $null
+        try {
+            $snapshot = Get-OwnerDiscussionSnapshot `
+                -Contract $Entry.Contract `
+                -Provider $AcquisitionProvider `
+                -Limits (New-OwnerDiscussionLimits `
+                    -MaximumPages 20 -PageSize 100 `
+                    -MaximumThreads 1000 `
+                    -MaximumComments 5000 `
+                    -MaximumBytes 4194304) `
+                -RequireAzureDevOpsProvenance
+        }
+        catch {
+            $failure =
+                'discussion-acquisition-failed'
+        }
+        try {
+            $observation =
+                Resolve-OwnerV2DiscussionReconciliation `
+                    -Observation $observation `
+                    -Contract $Entry.Contract `
+                    -Snapshot $snapshot `
+                    -FailureReason $(if ($failure) {
+                        $failure
+                    }
+                    else {
+                        'discussion-acquisition-unavailable'
+                    })
+        }
+        catch {
+            $observation =
+                Resolve-OwnerV2DiscussionReconciliation `
+                    -Observation $observation `
+                    -Contract $Entry.Contract `
+                    -Snapshot $null `
+                    -FailureReason (
+                        'discussion-reconciliation-failed')
+        }
+    }
+    Assert-NamedAreEqualObservationSchema `
+        -Observation $observation
+    Assert-OwnerV2PipelineNoWrites `
+        -PipelineResult $result `
+        -Observation $observation
+    return [pscustomobject][ordered]@{
+        Observation = $observation
+        Telemetry = $null
+        State = $(if (
+            [string]$observation.lifecycle.status -ceq
+                'completed') {
+            'completed'
+        }
+        else { 'unknown' })
+        Reason =
+            [string]$observation.execution.
+                incompleteReason
     }
 }
 
@@ -2523,7 +2804,8 @@ function Invoke-OwnerV2PreviewRun {
             }
             if ([string]$record.state -ceq 'completed' -and
                 [string]$entry.CapabilityKind -cin @(
-                    'owner', 'named-areequal') -and
+                    'owner', 'named-areequal',
+                    'contextual-conventions') -and
                 [string]$entry.Declaration.mode -ceq 'live' -and
                 $null -ne $LiveAcquisitionProvider -and
                 (Test-Path -LiteralPath $observationPath -PathType Leaf)) {
@@ -2729,6 +3011,13 @@ function Invoke-OwnerV2PreviewRun {
                         -Enabled ([bool]$EnableLiveModel) `
                         -AcquisitionProvider $LiveAcquisitionProvider
                 }
+                elseif ([string]$entry.CapabilityKind -ceq
+                    'contextual-conventions') {
+                    Invoke-ContextualConventionsLive `
+                        -Entry $entry `
+                        -Enabled ([bool]$EnableLiveModel) `
+                        -AcquisitionProvider $LiveAcquisitionProvider
+                }
                 else {
                     Invoke-OwnerV2Live -Entry $entry `
                         -EnableLiveModel ([bool]$EnableLiveModel) `
@@ -2783,11 +3072,15 @@ function Invoke-OwnerV2PreviewRun {
                 $observation.lifecycle.pending = 'unknown'
                 $observation.execution.attempts = [int]$record.attempts
                 $observation.execution.modelStarts = $(if (
-                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                    [string]$entry.CapabilityKind -cin @(
+                        'named-areequal',
+                        'contextual-conventions')) {
                         0
                     } else { 'unknown' })
                 $observation.execution.latencyMs = $(if (
-                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                    [string]$entry.CapabilityKind -cin @(
+                        'named-areequal',
+                        'contextual-conventions')) {
                         0
                     } else { 'unknown' })
                 $observation.execution.refusalReason = $reason
@@ -2795,14 +3088,18 @@ function Invoke-OwnerV2PreviewRun {
                 $observation.measurements.execution.attempts =
                     New-OwnerMeasurement -Status measured -Value ([int]$record.attempts)
                 $observation.measurements.execution.modelStarts = $(if (
-                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                    [string]$entry.CapabilityKind -cin @(
+                        'named-areequal',
+                        'contextual-conventions')) {
                         New-OwnerMeasurement -Status measured -Value 0
                     }
                     else {
                         New-OwnerMeasurement -Status unavailable -Reason $reason
                     })
                 $observation.measurements.execution.latencyMs = $(if (
-                    [string]$entry.CapabilityKind -ceq 'named-areequal') {
+                    [string]$entry.CapabilityKind -cin @(
+                        'named-areequal',
+                        'contextual-conventions')) {
                         New-OwnerMeasurement -Status measured -Value 0
                     }
                     else {

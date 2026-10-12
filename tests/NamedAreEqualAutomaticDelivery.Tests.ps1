@@ -332,7 +332,13 @@ BeforeAll {
                 Snapshot = $snapshot
                 Anchors = @(
                     foreach ($selection in @($Arguments.selections)) {
-                        foreach ($line in @($selection.affectedCallLines)) {
+                        $lines = @(
+                            $selection.affectedCallLines |
+                                Where-Object { $null -ne $_ })
+                        if ($lines.Count -eq 0) {
+                            $lines = @([int]$selection.line)
+                        }
+                        foreach ($line in $lines) {
                             if ($Drift -ceq 'later-line' -and
                                 [int]$line -ne [int]$selection.line) {
                                 continue
@@ -520,6 +526,134 @@ BeforeAll {
             ConfigPath = $configPath
         }
     }
+
+    function New-ContextualDeliveryContext {
+        param([ValidateRange(1, 7)][int]$Count = 1)
+        $context = New-NamedDeliveryContext -Count $Count
+        $evidence = $context.Evidence
+        $capability = 'bpm-contextual-conventions@1'
+        $rulePath =
+            'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+        $evidence.Declaration.capability = [ordered]@{
+            id = $capability
+            digest = 'v1:sha256:' + ('8' * 64)
+        }
+        $evidence.Declaration.rule.path = $rulePath
+        $evidence.Declaration.rule.section = $capability
+        $evidence.Declaration.config.id =
+            'contextual-conventions-v1-user-approved'
+        $evidence.Contract = New-OwnerAcquisitionContract `
+            -RepositoryId $evidence.Declaration.subject.repositoryId `
+            -ProjectId $evidence.Declaration.subject.projectId `
+            -PullRequestId $evidence.Declaration.subject.pullRequestId `
+            -SourceCommit $evidence.Declaration.head.sourceCommit `
+            -TargetCommit $evidence.Declaration.target.targetCommit `
+            -TargetRef $evidence.Declaration.target.targetRef `
+            -RuleRepositoryId $evidence.Declaration.rule.repositoryId `
+            -RulePath $rulePath `
+            -RuleCommit $evidence.Declaration.rule.commit `
+            -RuleSection $capability `
+            -RuleHash $evidence.Declaration.rule.hash `
+            -RuleLength $evidence.Declaration.rule.length `
+            -ConfigId $evidence.Declaration.config.id `
+            -ConfigDigest $evidence.Declaration.config.digest `
+            -CapabilityId $capability `
+            -CapabilityDigest $evidence.Declaration.capability.digest `
+            -Limits (New-OwnerAdapterLimits `
+                -MaximumFiles 64 -MaximumBytes 16777216 `
+                -MaximumReads 128)
+        $index = 0
+        foreach ($finding in $evidence.Observation.findings) {
+            $index++
+            $finding.identity = 'contextual-v1:' +
+                $index.ToString('x').PadLeft(64, '0')
+            $finding['ruleId'] = 'exception-logging'
+            $finding['evidence'] =
+                'Log the exception exactly once and pass the caught exception object.'
+            $finding['reason'] =
+                'exception-object-not-logged'
+            [void]$finding.Remove('affectedCallCount')
+            [void]$finding.Remove('affectedCallLines')
+            [void]$finding.Remove('callListTruncated')
+            $marker = Get-ContextualConventionMarkerKey `
+                -Contract $evidence.Contract -Finding $finding
+            $body = Format-ContextualConventionComment `
+                -Contract $evidence.Contract -Finding $finding `
+                -MarkerKey $marker
+            $finding.providerMarker = [ordered]@{
+                integrity = 'verified'
+                sha256 =
+                    Get-ApprovedOwnerV2TextSha256 $marker
+            }
+            $finding.reconciliation.bodySha256 =
+                Get-ApprovedOwnerV2TextSha256 $body
+        }
+        $evidence.Observation.capability = $capability
+        $evidence.Observation.rule.section = $capability
+        $evidence.Observation.rule.path = $rulePath
+        $evidence.Observation.sourceArtifacts = @(
+            $evidence.Observation.sourceArtifacts[0],
+            [ordered]@{
+                kind =
+                    'contextual-conventions-analyzer-module'
+                sha256 = Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $repoRoot `
+                        'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1')
+                signature = 'not-applicable'
+            },
+            [ordered]@{
+                kind =
+                    'contextual-conventions-analyzer-manifest'
+                sha256 = Get-ApprovedOwnerV2FileSha256 (
+                    Join-Path $repoRoot `
+                        'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
+                signature = 'not-applicable'
+            })
+        $evidence.Paths.parser = Join-Path $repoRoot `
+            'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
+        $evidence.Paths.parserManifest = Join-Path $repoRoot `
+            'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1'
+        $evidence.Paths.contextualBridge = Join-Path $repoRoot `
+            'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1'
+        $evidence.Toolkit.analyzerSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.parser
+        $evidence.Toolkit.analyzerManifestSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.parserManifest
+        $evidence.Toolkit.contextualBridgeSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.contextualBridge
+        $evidence.Toolkit.contextualBridgeManifestSha256 =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $repoRoot `
+                    'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1')
+        $evidence.Toolkit.contextualCurrentPrToolSha256 =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $repoRoot `
+                    'tools\Invoke-ContextualConventionsCurrentPr.ps1')
+        $evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $evidence.Observation
+        $deliveryRoot = Join-Path (
+            Split-Path -Parent $context.Root) `
+            'contextual-conventions-v1'
+        foreach ($leaf in @(
+                'intents', 'outcomes', 'events', 'locks')) {
+            New-Item -ItemType Directory -Path (
+                Join-Path $deliveryRoot $leaf) `
+                -Force | Out-Null
+        }
+        return [pscustomobject]@{
+            Evidence = $evidence
+            Policy = New-AutomaticOwnerV2ServicePolicy `
+                -Evidence $evidence `
+                -PolicyId contextual-conventions-v1-production `
+                -MaxCreatesPerRun 2 `
+                -MaxCreatesPerPullRequest 5
+            Root = $deliveryRoot
+            Key = [byte[]](1..32)
+        }
+    }
 }
 
 Describe 'Named AreEqual automatic delivery' {
@@ -543,6 +677,7 @@ Describe 'Named AreEqual automatic delivery' {
         ($output -join "`n") | Should -Match 'disabled'
         Test-Path -LiteralPath $delivery | Should -BeFalse
     }
+
 
     It 'stays off independently; boolean true cannot bypass the signed policy' {
         $config = [ordered]@{
@@ -1095,3 +1230,102 @@ Describe 'Named AreEqual automatic delivery' {
 AfterAll {
     Remove-Item -LiteralPath $script:namedTestRoot -Recurse -Force
 }
+
+Describe 'Contextual convention automatic delivery' {
+        It 'creates and reads back one allowlisted contextual finding' {
+            $context = New-ContextualDeliveryContext
+            $proposal = Get-ApprovedOwnerV2Proposal `
+                -Evidence $context.Evidence `
+                -Finding $context.Evidence.Observation.findings[0] `
+                -Delivery contextual-conventions
+            $proposal.ruleId |
+                Should -BeExactly exception-logging
+            $provider = New-NamedDeliveryProvider `
+                -Evidence $context.Evidence
+            $live = & $provider.Handler 'ReadCurrent' @{
+                evidence = $context.Evidence
+                operator = $context.Evidence.Provider.reviewerIdentity
+                selections = @($proposal)
+            }
+            {
+                Assert-ApprovedOwnerV2LiveRead `
+                    -Evidence $context.Evidence `
+                    -Approval ([ordered]@{
+                        subject = [ordered]@{
+                            projectId = $context.Evidence.Declaration.subject.projectId
+                            repositoryId = $context.Evidence.Declaration.subject.repositoryId
+                            pullRequestId = 42
+                            sourceCommit = $context.Evidence.Declaration.head.sourceCommit
+                            targetCommit = $context.Evidence.Declaration.target.targetCommit
+                            targetRef = $context.Evidence.Declaration.target.targetRef
+                        }
+                        provider = $context.Evidence.Provider
+                        operator =
+                            $context.Evidence.Provider.reviewerIdentity
+                    }) `
+                    -Live $live -Selections @($proposal) `
+                    -ExpectedSnapshotSha256 ('9' * 64) `
+                    -Delivery contextual-conventions
+            } | Should -Not -Throw
+            $result = Invoke-AutomaticOwnerV2Comments `
+                -Evidence $context.Evidence `
+                -Policy $context.Policy `
+                -DeliveryRoot $context.Root `
+                -Key $context.Key `
+                -Provider $provider.Handler `
+                -MaximumCreates 2
+
+            $result.health | Should -BeExactly healthy `
+                -Because (
+                    $result.diagnostic |
+                        ConvertTo-Json -Compress)
+            $result.providerWrites | Should -Be 1
+            $result.modelWrites | Should -Be 0
+            $result.events[0].kind |
+                Should -BeExactly `
+                    contextual-conventions-v1-delivery-event
+            $result.events[0].finding.ruleId |
+                Should -BeExactly exception-logging
+            $provider.State.writes | Should -Be 1
+        }
+
+        It 'shares one two-create budget across rules and records' {
+            $first = New-ContextualDeliveryContext -Count 2
+            $second = New-ContextualDeliveryContext -Count 2
+            $second.Evidence.Identity = 'b' * 64
+            $provider = New-NamedDeliveryProvider `
+                -Evidence $first.Evidence
+            $result =
+                Invoke-AutomaticContextualConventionsBatch `
+                    -Evidence @(
+                        $first.Evidence,
+                        $second.Evidence) `
+                    -Policy $first.Policy `
+                    -DeliveryRoot $first.Root `
+                    -Key $first.Key `
+                    -Provider $provider.Handler `
+                    -MaximumCreates 2
+
+            $result.providerWrites |
+                Should -BeLessOrEqual 2
+            $result.remainingCreates | Should -Be 0
+            $result.modelWrites | Should -Be 0
+        }
+
+        It 'rejects a rule ID outside the signed allowset' {
+            $context = New-ContextualDeliveryContext
+            $context.Evidence.Observation.
+                findings[0].ruleId = 'unapproved-rule'
+            $provider = New-NamedDeliveryProvider `
+                -Evidence $context.Evidence
+            $result = Invoke-AutomaticOwnerV2Comments `
+                -Evidence $context.Evidence `
+                -Policy $context.Policy `
+                -DeliveryRoot $context.Root `
+                -Key $context.Key `
+                -Provider $provider.Handler
+
+            $result.health | Should -BeExactly refused
+            $provider.State.writes | Should -Be 0
+        }
+    }

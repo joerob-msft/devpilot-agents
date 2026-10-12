@@ -13,7 +13,7 @@ param(
     [ValidatePattern('^$|^[0-9a-f]{64}$')][string[]]$Identity,
     [string]$ToolkitConfigPath,
     [string]$PolicyPath,
-    [ValidateSet('owner', 'named-areequal')]
+    [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
     [string]$Delivery = 'owner',
     [ValidatePattern('^[a-z0-9][a-z0-9_.-]{2,63}$')]
     [string]$PolicyId = '',
@@ -39,7 +39,9 @@ Import-Module (Join-Path $RepoRoot `
 . (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
-if ($Delivery -ceq 'named-areequal') {
+if ($Delivery -cin @(
+        'named-areequal',
+        'contextual-conventions')) {
     if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
         $MaxCreatesPerRun = 2
     }
@@ -48,7 +50,7 @@ if ($Delivery -ceq 'named-areequal') {
     }
     if ($MaxCreatesPerRun -gt 2 -or
         $MaxCreatesPerPullRequest -gt 5) {
-        throw 'Named AreEqual policy limits cannot exceed 2 creates per run or 5 per pull request.'
+        throw 'Deterministic rule policy limits cannot exceed 2 creates per run or 5 per pull request.'
     }
 }
 
@@ -59,17 +61,21 @@ if ($Command -ceq 'invoke' -and $identities.Count -ne 1) {
     throw 'invoke requires exactly one state identity.'
 }
 if ($Command -ceq 'invoke-batch' -and (
-        $Delivery -cne 'named-areequal' -or
+        $Delivery -cnotin @(
+            'named-areequal',
+            'contextual-conventions') -or
         $identities.Count -lt 1 -or
         $identities.Count -gt 4 -or
         @($identities | Sort-Object -Unique).Count -ne
             $identities.Count)) {
-    throw 'invoke-batch requires one to four unique named AreEqual identities.'
+    throw 'invoke-batch requires one to four unique deterministic rule identities.'
 }
 
 $toolkitConfig = $null
 if ($Command -cin @('invoke', 'invoke-batch') -and
-    $Delivery -ceq 'named-areequal') {
+    $Delivery -cin @(
+        'named-areequal',
+        'contextual-conventions')) {
     if ([string]::IsNullOrWhiteSpace($StateRoot) -or
         [string]::IsNullOrWhiteSpace($ToolkitConfigPath) -or
         -not [IO.Path]::IsPathFullyQualified($StateRoot) -or
@@ -85,13 +91,18 @@ if ($Command -cin @('invoke', 'invoke-batch') -and
                     -StateRoot $StateRoot -Identity $_ `
                     -RepoRoot $RepoRoot `
                     -ToolkitConfigPath $ToolkitConfigPath `
-                    -Delivery named-areequal
+                    -Delivery $Delivery
                 [ordered]@{
                     identity = $_
                     result = [ordered]@{
                         schemaVersion = 1
                         kind =
-                            'named-areequal-v2-automatic-delivery-result'
+                            $(if ($Delivery -ceq
+                                'contextual-conventions') {
+                                'contextual-conventions-v1-automatic-delivery-result'
+                            } else {
+                                'named-areequal-v2-automatic-delivery-result'
+                            })
                         health = 'disabled'
                         providerWrites = 0
                         modelWrites = 0
@@ -112,7 +123,12 @@ if ($Command -cin @('invoke', 'invoke-batch') -and
             [pscustomobject][ordered]@{
                 schemaVersion = 1
                 kind =
-                    'named-areequal-v2-automatic-delivery-batch-result'
+                    $(if ($Delivery -ceq
+                        'contextual-conventions') {
+                        'contextual-conventions-v1-automatic-delivery-batch-result'
+                    } else {
+                        'named-areequal-v2-automatic-delivery-batch-result'
+                    })
                 batchRunId = 'disabled'
                 health = 'disabled'
                 providerWrites = 0
@@ -136,6 +152,8 @@ $context = Initialize-AutomaticOwnerV2DeliveryRoot `
 if (-not $PolicyId) {
     $PolicyId = if ($Delivery -ceq 'named-areequal') {
         'named-areequal-v1-production'
+    } elseif ($Delivery -ceq 'contextual-conventions') {
+        'contextual-conventions-v1-production'
     } else { 'owner-v2-production' }
 }
 if ($Command -ceq 'initialize-key') {
@@ -202,6 +220,9 @@ if (-not $automatic.Enabled) {
         schemaVersion = 1
         kind = $(if ($Delivery -ceq 'named-areequal') {
                 'named-areequal-v2-automatic-delivery-result'
+            } elseif ($Delivery -ceq
+                'contextual-conventions') {
+                'contextual-conventions-v1-automatic-delivery-result'
             } else { 'owner-v2-automatic-delivery-result' })
         health = 'disabled'
         providerWrites = 0
@@ -231,10 +252,20 @@ else {
         -AzureCliPath $AzureCliPath -GitPath $GitPath
 }
 $result = if ($Command -ceq 'invoke-batch') {
-    Invoke-AutomaticNamedAreEqualBatch `
-        -Evidence $evidenceList -Policy $policy `
-        -DeliveryRoot $context.Root -Key $key `
-        -Provider $provider -MaximumCreates $MaxCreatesPerRun
+    if ($Delivery -ceq 'contextual-conventions') {
+        Invoke-AutomaticContextualConventionsBatch `
+            -Evidence $evidenceList -Policy $policy `
+            -DeliveryRoot $context.Root -Key $key `
+            -Provider $provider `
+            -MaximumCreates $MaxCreatesPerRun
+    }
+    else {
+        Invoke-AutomaticNamedAreEqualBatch `
+            -Evidence $evidenceList -Policy $policy `
+            -DeliveryRoot $context.Root -Key $key `
+            -Provider $provider `
+            -MaximumCreates $MaxCreatesPerRun
+    }
 }
 else {
     Invoke-AutomaticOwnerV2Comments -Evidence $evidence `

@@ -1,0 +1,921 @@
+#requires -Version 7.0
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1')
+
+$script:ContextualCapability = 'bpm-contextual-conventions@1'
+$script:ContextualCapabilityDigest =
+    'v1:sha256:aa316ea3ae651eb996441b56c852b19dee080e30c659e4570946dec24589d208'
+$script:ContextualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+$script:ContextualPolicyDigest =
+    'v1:sha256:6e7cf6e001efa9966a6edb29348ea2344c8450a7ff713d56bc9ba69c81e1aafd'
+$script:ContextualConfigId = 'contextual-conventions-v1-user-approved'
+
+function Get-ContextualBridgeDigest {
+    param([Parameter(Mandatory)][AllowNull()][object]$Value)
+    return 'v1:sha256:' +
+        (Get-AgentCanonicalDigest -InputObject $Value)
+}
+
+function Get-ContextualBridgeTextDigest {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    return 'v1:sha256:' + [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($Value))).ToLowerInvariant()
+}
+
+function Assert-ContextualBridgeConfig {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][string]$RepositoryRoot
+    )
+
+    if ($Config.rules -isnot [array] -or $Config.rules.Count -ne 1 -or
+        [string]$Config.rules[0].id -cne $script:ContextualCapability -or
+        [string]$Config.rules[0].capability -cne $script:ContextualCapability -or
+        $Config.contextualRule -isnot [Collections.IDictionary] -or
+        $Config.toolkit -isnot [Collections.IDictionary] -or
+        $Config.capability -isnot [Collections.IDictionary] -or
+        [string]$Config.capability.id -cne $script:ContextualCapability -or
+        [string]$Config.capability.implementationSha256 -cne
+            $script:ContextualCapabilityDigest.Substring(10) -or
+        $Config.subjectProvider -isnot [Collections.IDictionary] -or
+        $Config.discussionProvider -isnot [Collections.IDictionary]) {
+        throw 'Contextual bridge requires exactly one fixed rule bundle.'
+    }
+    if ($Config.Contains('autoCreateContextualConventionComments') -and
+        ($Config.autoCreateContextualConventionComments -isnot [bool] -or
+            [bool]$Config.autoCreateContextualConventionComments)) {
+        throw 'Contextual bridge requires automatic delivery to remain literal false.'
+    }
+    $policyPath = Join-Path $RepositoryRoot (
+        $script:ContextualPolicyPath.Replace(
+            '/', [IO.Path]::DirectorySeparatorChar))
+    $policy = [IO.File]::ReadAllText(
+        $policyPath, [Text.UTF8Encoding]::new($false))
+    if ((Get-ContextualBridgeTextDigest $policy) -cne
+            $script:ContextualPolicyDigest -or
+        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 3502 -or
+        [string]$Config.contextualRule.path -cne
+            $script:ContextualPolicyPath -or
+        [string]$Config.contextualRule.section -cne
+            $script:ContextualCapability -or
+        [string]$Config.contextualRule.hash -cne
+            $script:ContextualPolicyDigest -or
+        [long]$Config.contextualRule.length -ne 3502 -or
+        [string]$Config.contextualRule.repositoryId -notmatch
+            '^[A-Za-z0-9_.-]{1,256}$' -or
+        [string]$Config.toolkit.head -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Config.toolkit.tree -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$Config.toolkit.ref -notmatch '^refs/heads/.+') {
+        throw 'Contextual bridge rule or toolkit binding is invalid.'
+    }
+    if ([int]$Config.limits.maxChangedFiles -gt 64 -or
+        [int]$Config.limits.maxChangedLines -gt 100000) {
+        throw 'Contextual bridge exceeds the existing acquisition bounds.'
+    }
+}
+
+function Assert-ContextualBridgeHead {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Expected,
+        [Parameter(Mandatory)][Collections.IDictionary]$Actual
+    )
+    foreach ($name in @(
+            'repositoryId', 'projectId', 'pullRequestId', 'sourceRef',
+            'targetRef', 'sourceCommit', 'targetCommit', 'iterationId',
+            'status', 'isDraft'
+        )) {
+        if ([string]$Expected[$name] -cne [string]$Actual[$name]) {
+            throw 'head-drift'
+        }
+    }
+}
+
+function New-ContextualBridgeManifestEntry {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Head,
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$SharedSnapshotDigest
+    )
+
+    $subject = [ordered]@{
+        repositoryId = ([string]$Head.repositoryId).ToLowerInvariant()
+        projectId = ([string]$Head.projectId).ToLowerInvariant()
+        pullRequestId = [long]$Head.pullRequestId
+    }
+    $headBinding = [ordered]@{
+        sourceCommit = ([string]$Head.sourceCommit).ToLowerInvariant()
+    }
+    $target = [ordered]@{
+        targetCommit = ([string]$Head.targetCommit).ToLowerInvariant()
+        targetRef = [string]$Head.targetRef
+    }
+    $rule = [ordered]@{
+        repositoryId = [string]$Config.contextualRule.repositoryId
+        path = $script:ContextualPolicyPath
+        commit = [string]$Config.toolkit.head
+        section = $script:ContextualCapability
+        hash = $script:ContextualPolicyDigest
+        length = 3502
+    }
+    $capability = [ordered]@{
+        id = $script:ContextualCapability
+        digest = $script:ContextualCapabilityDigest
+    }
+    $model = [ordered]@{
+        id = 'none'
+        digest = Get-ContextualBridgeTextDigest 'none'
+    }
+    $configBinding = [ordered]@{
+        id = $script:ContextualConfigId
+        digest = Get-ContextualBridgeTextDigest $script:ContextualConfigId
+    }
+    return [ordered]@{
+        id = "contextual-conventions-pr-$([long]$Head.pullRequestId)-$(
+            ([string]$Head.sourceCommit).Substring(0, 8))"
+        mode = 'live'
+        subject = $subject
+        head = $headBinding
+        target = $target
+        rule = $rule
+        capability = $capability
+        model = $model
+        config = $configBinding
+        acquisition = [ordered]@{
+            payloadDigest = Get-ContextualBridgeDigest ([ordered]@{
+                subject = $subject
+                head = $headBinding
+                target = $target
+                rule = $rule
+                capability = $capability
+                config = $configBinding
+                iterationId = [int]$Head.iterationId
+                sharedSnapshotDigest = $SharedSnapshotDigest
+            })
+        }
+    }
+}
+
+function New-ContextualBridgeAcquisitionProvider {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][Collections.IDictionary]$Heads,
+        [Parameter(Mandatory)][Collections.IDictionary]$Changes,
+        [Parameter(Mandatory)][Collections.IDictionary]$Snapshots,
+        [Parameter(Mandatory)][string]$PolicyText
+    )
+
+    $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+        -Id ([string]$Config.expectedAccount.id) `
+        -Descriptor ([string]$Config.expectedAccount.descriptor) `
+        -UniqueName ([string]$Config.expectedAccount.uniqueName)
+    $digestCommand = ${function:Get-ContextualBridgeDigest}
+    $discussionPageCommand = Get-Command `
+        -Name ConvertTo-OwnerAzureDevOpsDiscussionPage `
+        -Module DevPilot.OwnerAdapters -CommandType Function `
+        -ErrorAction Stop
+    $contextualPolicyPath = $script:ContextualPolicyPath
+    $contextualPolicyDigest = $script:ContextualPolicyDigest
+    $contextualCapability = $script:ContextualCapability
+    $handler = {
+        param($Operation, $Arguments)
+        $prId = [string][long]$Arguments.pullRequestId
+        if (-not $Heads.Contains($prId) -or
+            -not $Changes.Contains($prId) -or
+            -not $Snapshots.Contains($prId)) {
+            throw 'provider-contract'
+        }
+        $expected = $Heads[$prId]
+        $changeSet = $Changes[$prId]
+        $snapshot = $Snapshots[$prId]
+        switch ($Operation) {
+            'GetSubject' {
+                return [ordered]@{
+                    schemaVersion = 1
+                    repositoryId = [string]$expected.repositoryId
+                    projectId = [string]$expected.projectId
+                    pullRequestId = [long]$expected.pullRequestId
+                    sourceCommit = [string]$expected.sourceCommit
+                    targetCommit = [string]$expected.targetCommit
+                    targetRef = [string]$expected.targetRef
+                    changedFileCount = @($changeSet.entries).Count
+                    state = 'complete'
+                    sourceDigest = & $digestCommand $expected
+                }
+            }
+            'GetChangedFilesPage' {
+                if ([int]$Arguments.pageOrdinal -ne 0 -or
+                    $null -ne $Arguments.continuationToken) {
+                    throw 'provider-contract'
+                }
+                return [ordered]@{
+                    schemaVersion = 1
+                    repositoryId = [string]$expected.repositoryId
+                    projectId = [string]$expected.projectId
+                    pullRequestId = [long]$expected.pullRequestId
+                    sourceCommit = [string]$expected.sourceCommit
+                    targetCommit = [string]$expected.targetCommit
+                    targetRef = [string]$expected.targetRef
+                    pageOrdinal = 0
+                    continuationToken = $null
+                    nextToken = $null
+                    state = 'complete'
+                    sourceDigest = & $digestCommand @(
+                        $changeSet.entries | ForEach-Object {
+                            [ordered]@{
+                                path = $_.path
+                                changeType = $_.changeType
+                                sourceDigest = $_.sourceDigest
+                                spans = $_.spans
+                            }
+                        })
+                    changes = @($changeSet.entries | ForEach-Object {
+                        $change = [ordered]@{
+                            path = [string]$_.path
+                            changeType = $(switch -Regex (
+                                [string]$_.changeType) {
+                                '^add$' { 'added'; break }
+                                '^edit$' { 'modified'; break }
+                                '^delete$' { 'deleted'; break }
+                                'rename' { 'renamed'; break }
+                                default { throw 'provider-contract' }
+                            })
+                            isBinary = [string]$_.state -cne 'complete'
+                            sourceDigest = [string]$_.sourceDigest
+                            spans = @($_.spans)
+                        }
+                        if ($change.changeType -ceq 'renamed' -and
+                            $_.oldPath) {
+                            $change['oldPath'] = [string]$_.oldPath
+                        }
+                        $change
+                    })
+                }
+            }
+            'GetRule' {
+                return [ordered]@{
+                    schemaVersion = 1
+                    repositoryId = [string]$expected.repositoryId
+                    projectId = [string]$expected.projectId
+                    pullRequestId = [long]$expected.pullRequestId
+                    sourceCommit = [string]$expected.sourceCommit
+                    targetCommit = [string]$expected.targetCommit
+                    targetRef = [string]$expected.targetRef
+                    ruleRepositoryId =
+                        [string]$Arguments.ruleRepositoryId
+                    rulePath = [string]$Arguments.rulePath
+                    ruleCommit = [string]$Arguments.ruleCommit
+                    ruleSection = [string]$Arguments.ruleSection
+                    ruleHash = [string]$Arguments.ruleHash
+                    ruleLength = [long]$Arguments.ruleLength
+                    state = 'complete'
+                    content = $PolicyText
+                    sourceDigest = $contextualPolicyDigest
+                }
+            }
+            'GetFile' {
+                $matches = @($changeSet.entries | Where-Object {
+                        [string]$_.path -ceq [string]$Arguments.path
+                    })
+                if ($matches.Count -ne 1) { throw 'provider-contract' }
+                $file = $matches[0]
+                return [ordered]@{
+                    schemaVersion = 1
+                    repositoryId = [string]$expected.repositoryId
+                    projectId = [string]$expected.projectId
+                    pullRequestId = [long]$expected.pullRequestId
+                    sourceCommit = [string]$expected.sourceCommit
+                    targetCommit = [string]$expected.targetCommit
+                    targetRef = [string]$expected.targetRef
+                    path = [string]$file.path
+                    state = [string]$file.state
+                    byteLength = [long]$file.byteLength
+                    truncated = $false
+                    content = $file.content
+                    sourceDigest = [string]$file.sourceDigest
+                }
+            }
+            'GetDiscussionPage' {
+                return & $discussionPageCommand `
+                    -Arguments $Arguments `
+                    -RawResponse ([ordered]@{
+                        value = @($snapshot.discussions.threads)
+                        count =
+                            [int]$snapshot.discussions.count
+                    }) `
+                    -CurrentIteration ([ordered]@{
+                        id = [int]$expected.iterationId
+                        sourceCommit = [string]$expected.sourceCommit
+                        targetCommit = [string]$expected.targetCommit
+                    }) -ReviewerIdentity $reviewer
+            }
+            default { throw 'provider-contract' }
+        }
+    }.GetNewClosure()
+    return New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+        -Name 'contextual-conventions-current-pr-read-only' `
+        -ReviewerIdentity $reviewer -Handler $handler
+}
+
+function Get-ContextualBridgeRelevantChangeSet {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$ChangeSet
+    )
+    if ($ChangeSet -isnot
+            [Collections.IDictionary] -or
+        -not $ChangeSet.Contains('changedFiles') -or
+        $ChangeSet.changedFiles -isnot [int] -and
+        $ChangeSet.changedFiles -isnot [long] -or
+        -not $ChangeSet.Contains('changedLines') -or
+        $ChangeSet.changedLines -isnot [int] -and
+        $ChangeSet.changedLines -isnot [long] -or
+        $ChangeSet.entries -isnot [array] -or
+        [int]$ChangeSet.changedFiles -ne
+            @($ChangeSet.entries).Count -or
+        [long]$ChangeSet.changedFiles -lt 0 -or
+        [long]$ChangeSet.changedLines -lt 0 -or
+        ([long]$ChangeSet.changedFiles -eq 0 -and
+            [long]$ChangeSet.changedLines -ne 0)) {
+        throw 'changed-line-evidence-unavailable'
+    }
+    foreach ($entry in @($ChangeSet.entries)) {
+        if ($entry -isnot
+                [Collections.IDictionary] -or
+            -not $entry.Contains('path') -or
+            $entry.path -isnot [string] -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$entry.path)) {
+            throw 'changed-path-evidence-unavailable'
+        }
+    }
+    $entries = @($ChangeSet.entries |
+        Where-Object {
+            [IO.Path]::GetExtension(
+                [string]$_.path) -ieq '.cs' -or
+            [string]$_.path -imatch
+                '(?:\.csproj|\.props|packages\.config)$'
+        })
+    $changedLines = [long]0
+    foreach ($entry in $entries) {
+        foreach ($span in @($entry.spans)) {
+            [long]$start = 0
+            [long]$end = 0
+            $valid = $span -is
+                [Collections.IDictionary] -and
+                $span.Contains('startLine') -and
+                $span.Contains('endLine') -and
+                [long]::TryParse(
+                    [string]$span.startLine,
+                    [ref]$start) -and
+                [long]::TryParse(
+                    [string]$span.endLine,
+                    [ref]$end)
+            if ($valid -and $start -gt 0 -and
+                $start -le [int]::MaxValue -and
+                $end -ge $start -and
+                $end -le [int]::MaxValue) {
+                $changedLines +=
+                    ($end - $start + 1)
+            }
+        }
+    }
+    return [ordered]@{
+        changedFiles = $entries.Count
+        changedLines = $changedLines
+        entries = $entries
+    }
+}
+
+function Get-ContextualBridgeFailureDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory)]
+        [ValidateSet(
+            'provider-preflight',
+            'package-preflight')]
+        [string]$Operation
+    )
+    $message = [string]$ErrorRecord.Exception.Message
+    $fileOrdinal = $null
+    if ($message -match
+        '(?i)file evidence for ordinal ([0-9]+)') {
+        [int]$parsedOrdinal = 0
+        if ([int]::TryParse(
+                [string]$Matches[1],
+                [ref]$parsedOrdinal)) {
+            $fileOrdinal = $parsedOrdinal
+        }
+    }
+    $category = switch -Regex ($message) {
+        '(?i)file evidence.*incomplete|file-evidence-unknown' {
+            'file-evidence-incomplete'
+            break
+        }
+        '(?i)discussion.*incomplete|discussion.*unknown' {
+            'discussion-evidence-incomplete'
+            break
+        }
+        '^provider-contract$' {
+            'provider-contract'
+            break
+        }
+        '(?i)binding.*mismatch|stale.*binding' {
+            'binding-mismatch'
+            break
+        }
+        '(?i)budget' {
+            'budget-refusal'
+            break
+        }
+        '(?i)invalid|digest|malformed' {
+            'invalid-evidence'
+            break
+        }
+        default { 'unclassified-preflight-failure' }
+    }
+    return [ordered]@{
+        category = $category
+        operation = $Operation
+        exceptionType =
+            $ErrorRecord.Exception.GetType().Name
+        messageSha256 =
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes(
+                        $message))).ToLowerInvariant()
+        fileOrdinal = $fileOrdinal
+    }
+}
+
+function Write-ContextualBridgeManifest {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][Collections.IDictionary]$Manifest
+    )
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $temporary = Join-Path $directory (
+        '.named-manifest-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            (ConvertTo-Json -InputObject $Manifest -Depth 32) + "`n",
+            [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $backup = Join-Path $directory (
+                '.named-manifest-backup-' + [guid]::NewGuid().ToString('N'))
+            [IO.File]::Replace($temporary, $Path, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force
+        }
+        else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary `
+            -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-ContextualConventionsCurrentPrBridge {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Config,
+        [Parameter(Mandatory)][scriptblock]$Provider,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
+        [AllowNull()][Collections.IDictionary]$PreparedIntake = $null,
+        [switch]$Run
+    )
+
+    Assert-ContextualBridgeConfig `
+        -Config $Config -RepositoryRoot $RepositoryRoot
+    if (-not $Run -or -not [bool]$Config.enabled) {
+        $disabled = Invoke-ActivePrIntake `
+            -Config $Config -Provider $Provider `
+            -StateRoot $StateRoot -RepositoryRoot $RepositoryRoot
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'contextual-conventions-current-pr-bridge-result'
+            state = 'disabled'
+            intake = $disabled
+            manifestPath = $null
+            records = @()
+            providerWrites = 0
+            modelWrites = 0
+        }
+    }
+
+    $intake = if ($null -ne $PreparedIntake) {
+        $PreparedIntake
+    }
+    else {
+        Invoke-ActivePrIntake `
+            -Config $Config -Provider $Provider `
+            -StateRoot $StateRoot -RepositoryRoot $RepositoryRoot `
+            -MaximumHeadsThisRun $MaximumHeadsThisRun `
+            -IncludeTransientSnapshots -Run
+    }
+    $snapshots = $intake.transientSnapshots
+    [void]$intake.Remove('transientSnapshots')
+    $selected = @($intake.heads | Where-Object {
+            [string]$_.targetRef -ceq 'refs/heads/master' -and
+            [string]$_.reasonCode -cnotin @(
+                'not-selected', 'target-out-of-policy')
+        })
+    if ($selected.Count -lt 1) {
+        $knownEmpty = [bool]$intake.populationKnown -and
+            [string]$intake.inventory.state -ceq 'complete' -and
+            [int]$intake.counts.error -eq 0 -and
+            [int]$intake.inventory.eligible -eq 0
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'contextual-conventions-current-pr-bridge-result'
+            state = $(if ($knownEmpty) {
+                    'known-empty'
+                } else { 'unknown' })
+            intake = $intake
+            manifestPath = $null
+            records = @()
+            providerWrites = 0
+            modelWrites = 0
+        }
+    }
+
+    $heads = [ordered]@{}
+    $changes = [ordered]@{}
+    $entriesById = [ordered]@{}
+    $batchFailures = [Collections.Generic.List[object]]::new()
+    foreach ($selectedHead in $selected) {
+        $id = [string][long]$selectedHead.pullRequestId
+        try {
+            if ($selectedHead.declaration -isnot
+                    [Collections.IDictionary] -or
+                $snapshots -isnot [Collections.IDictionary] -or
+                -not $snapshots.Contains($id)) {
+                throw 'contextual-shared-snapshot-missing'
+            }
+            $head = [ordered]@{} + $selectedHead.declaration
+            $snapshot = $snapshots[$id]
+            Assert-ContextualBridgeHead -Expected $head `
+                -Actual $snapshot.head
+            $changeSet =
+                Get-ContextualBridgeRelevantChangeSet `
+                    -ChangeSet $snapshot.changes
+            $heads[$id] = $head
+            $changes[$id] = $changeSet
+            $entriesById[$id] =
+                New-ContextualBridgeManifestEntry `
+                    -Head $head -Config $Config `
+                    -SharedSnapshotDigest (
+                        [string]$snapshot.sourceDigest)
+        }
+        catch {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = [long]$selectedHead.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'snapshot'
+                })
+        }
+    }
+    $policyPath = Join-Path $RepositoryRoot (
+        $script:ContextualPolicyPath.Replace(
+            '/', [IO.Path]::DirectorySeparatorChar))
+    $policyText = [IO.File]::ReadAllText(
+        $policyPath, [Text.UTF8Encoding]::new($false))
+    $acquisition = New-ContextualBridgeAcquisitionProvider `
+        -Config $Config -Heads $heads -Changes $changes `
+        -Snapshots $snapshots -PolicyText $policyText
+    $acceptedIds = [Collections.Generic.List[string]]::new()
+    foreach ($pair in $heads.GetEnumerator()) {
+        $head = $pair.Value
+        $arguments = @{
+            repositoryId = [string]$head.repositoryId
+            projectId = [string]$head.projectId
+            pullRequestId = [long]$head.pullRequestId
+            sourceCommit = [string]$head.sourceCommit
+            targetCommit = [string]$head.targetCommit
+            targetRef = [string]$head.targetRef
+        }
+        try {
+            [void](& $acquisition.Handler 'GetSubject' $arguments)
+            $page = & $acquisition.Handler 'GetChangedFilesPage' (
+                $arguments + @{
+                    pageOrdinal = 0
+                    continuationToken = $null
+                    pageSize = 64
+                })
+            [void](& $acquisition.Handler 'GetRule' (
+                $arguments + @{
+                    ruleRepositoryId =
+                        [string]$Config.contextualRule.repositoryId
+                    rulePath = $script:ContextualPolicyPath
+                    ruleCommit = [string]$Config.toolkit.head
+                    ruleSection = $script:ContextualCapability
+                    ruleHash = $script:ContextualPolicyDigest
+                    ruleLength = 3502
+                }))
+            foreach ($change in @($page.changes | Where-Object {
+                        [string]$_.changeType -cne 'deleted' -and
+                        -not [bool]$_.isBinary
+                    })) {
+                [void](& $acquisition.Handler 'GetFile' (
+                    $arguments + @{ path = [string]$change.path }))
+            }
+            [void](& $acquisition.Handler 'GetDiscussionPage' (
+                $arguments + @{
+                    pageOrdinal = 0
+                    continuationToken = $null
+                    pageSize = 100
+                }))
+            [void]$acceptedIds.Add([string]$pair.Key)
+        }
+        catch {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = [long]$head.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'provider-preflight'
+                    diagnostic =
+                        Get-ContextualBridgeFailureDiagnostic `
+                            -ErrorRecord $_ `
+                            -Operation provider-preflight
+                })
+        }
+    }
+    $acceptedHeads = [ordered]@{}
+    $acceptedChanges = [ordered]@{}
+    $acceptedSnapshots = [ordered]@{}
+    $acceptedEntries = [Collections.Generic.List[object]]::new()
+    foreach ($id in $acceptedIds) {
+        $acceptedHeads[$id] = $heads[$id]
+        $acceptedChanges[$id] = $changes[$id]
+        $acceptedSnapshots[$id] = $snapshots[$id]
+        [void]$acceptedEntries.Add($entriesById[$id])
+    }
+    if ($acceptedEntries.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'contextual-conventions-current-pr-bridge-result'
+            state = 'partial'
+            intake = $intake
+            manifestPath = $null
+            records = @()
+            outcomes = $batchFailures.ToArray()
+            completedCount = 0
+            incompleteCount = $batchFailures.Count
+            providerWrites = 0
+            modelWrites = 0
+        }
+    }
+    $heads = $acceptedHeads
+    $changes = $acceptedChanges
+    $snapshots = $acceptedSnapshots
+    $acquisition = New-ContextualBridgeAcquisitionProvider `
+        -Config $Config -Heads $heads -Changes $changes `
+        -Snapshots $snapshots -PolicyText $policyText
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        kind = 'contextual-conventions-v1-preview-cohort'
+        entries = $acceptedEntries.ToArray()
+    }
+    Write-ContextualBridgeManifest -Path $ManifestPath -Manifest $manifest
+    [void](Invoke-OwnerV2PreviewPrepare `
+            -StateRoot $StateRoot -ManifestPath $ManifestPath)
+    $manifestModel = & (Get-Module DevPilot.OwnerOrchestrator) {
+        param($Path)
+        Read-OwnerV2Manifest -ManifestPath $Path
+    } $ManifestPath
+    $packageAccepted = [Collections.Generic.List[long]]::new()
+    foreach ($entry in $manifestModel.Entries) {
+        try {
+            [void](& (Get-Module DevPilot.OwnerAdapters) {
+                    param($Contract, $Provider)
+                    $package = Get-OwnerLivePackage `
+                        -Contract $Contract -Provider $Provider
+                    ConvertTo-OwnerAcquisitionResponse `
+                        -Package $package -Contract $Contract
+                } $entry.Contract $acquisition)
+            [void]$packageAccepted.Add(
+                [long]$entry.Declaration.subject.pullRequestId)
+        }
+        catch {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId =
+                        [long]$entry.Declaration.subject.pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason = 'acquisition-incomplete'
+                    stage = 'package-preflight'
+                    diagnostic =
+                        Get-ContextualBridgeFailureDiagnostic `
+                            -ErrorRecord $_ `
+                            -Operation package-preflight
+                })
+        }
+    }
+    if ($packageAccepted.Count -ne $manifestModel.Entries.Count) {
+        $manifest.entries = @($manifest.entries |
+            Where-Object {
+                $packageAccepted.Contains(
+                    [long]$_.subject.pullRequestId)
+            })
+        if (@($manifest.entries).Count -eq 0) {
+            return [pscustomobject][ordered]@{
+                schemaVersion = 1
+                kind = 'contextual-conventions-current-pr-bridge-result'
+                state = 'partial'
+                intake = $intake
+                manifestPath = $null
+                records = @()
+                outcomes = $batchFailures.ToArray()
+                completedCount = 0
+                incompleteCount = $batchFailures.Count
+                providerWrites = 0
+                modelWrites = 0
+            }
+        }
+        Write-ContextualBridgeManifest `
+            -Path $ManifestPath -Manifest $manifest
+        $manifestModel = & (Get-Module DevPilot.OwnerOrchestrator) {
+            param($Path)
+            Read-OwnerV2Manifest -ManifestPath $Path
+        } $ManifestPath
+    }
+    $runResult = Invoke-OwnerV2PreviewRun `
+        -StateRoot $StateRoot -ManifestPath $ManifestPath `
+        -EnableLiveModel -LiveAcquisitionProvider $acquisition
+    $postHeadFailures = [Collections.Generic.HashSet[long]]::new()
+    foreach ($head in @($heads.Values | Where-Object {
+                $packageAccepted.Contains(
+                    [long]$_.pullRequestId)
+            })) {
+        try {
+            $current = & $Provider 'Head' @{
+                pullRequestId = [long]$head.pullRequestId
+            }
+            Assert-ContextualBridgeHead -Expected $head -Actual $current
+        }
+        catch {
+            [void]$postHeadFailures.Add(
+                [long]$head.pullRequestId)
+        }
+    }
+    $records = [Collections.Generic.List[object]]::new()
+    $matchedPostHeadFailures =
+        [Collections.Generic.HashSet[long]]::new()
+    $recordOutcomes = @($runResult.records | ForEach-Object {
+            $record = $_
+            $observation = Get-ChildItem -LiteralPath $StateRoot `
+                -Recurse -File -Filter "$($record.identity).json" |
+                Where-Object { $_.Directory.Name -ceq 'observations' } |
+                Select-Object -First 1
+            $observationValue = if ($null -ne $observation) {
+                Get-Content -LiteralPath $observation.FullName -Raw |
+                    ConvertFrom-Json -AsHashtable -Depth 64
+            }
+            else { $null }
+            $pullRequestId = if (
+                $observationValue -is
+                    [Collections.IDictionary]
+            ) {
+                [long]$observationValue.subject.pullRequestId
+            }
+            else { 0 }
+            $postHeadRefused =
+                $pullRequestId -gt 0 -and
+                $postHeadFailures.Contains($pullRequestId)
+            if ($postHeadRefused) {
+                [void]$matchedPostHeadFailures.Add(
+                    $pullRequestId)
+            }
+            $recordValue = [ordered]@{}
+            if ($record -is [Collections.IDictionary]) {
+                foreach ($key in $record.Keys) {
+                    $recordValue[[string]$key] =
+                        $record[$key]
+                }
+            }
+            else {
+                foreach ($property in
+                    $record.PSObject.Properties) {
+                    $recordValue[$property.Name] =
+                        $property.Value
+                }
+            }
+            if ($postHeadRefused) {
+                $recordValue.state = 'unknown'
+                $recordValue.reason =
+                    'post-evaluation-head-refused'
+            }
+            [void]$records.Add(
+                [pscustomobject]$recordValue)
+            [ordered]@{
+                identity = [string]$record.identity
+                pullRequestId = $pullRequestId
+                state = $(if ($postHeadRefused) {
+                        'unknown'
+                    } else { [string]$record.state })
+                reason = $(if ($postHeadRefused) {
+                        'post-evaluation-head-refused'
+                    } else { [string]$record.reason })
+                stage = $(if ($postHeadRefused) {
+                        'post-head'
+                    } else { 'evaluation' })
+                observationPath = $(if ($null -ne $observation) {
+                        $observation.FullName
+                    } else { $null })
+                observationStatus = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [string]$observationValue.lifecycle.status
+                    } else { $null })
+                unknown = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [int]$observationValue.counts.unknown
+                    } else { $null })
+                findingsComplete = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        [bool]$observationValue.findingsComplete
+                    } else { $false })
+                validationErrors = $(if (
+                        $observationValue -is
+                            [Collections.IDictionary]
+                    ) {
+                        @($observationValue.validationErrors)
+                    } else { @() })
+            }
+        })
+    foreach ($pullRequestId in $postHeadFailures) {
+        if (-not $matchedPostHeadFailures.Contains(
+                $pullRequestId)) {
+            [void]$batchFailures.Add([ordered]@{
+                    pullRequestId = $pullRequestId
+                    identity = $null
+                    state = 'unknown'
+                    reason =
+                        'post-evaluation-head-refused'
+                    stage = 'post-head'
+                })
+        }
+    }
+    $outcomes = @($batchFailures.ToArray()) +
+        @($recordOutcomes)
+    $incomplete = @($outcomes | Where-Object {
+            [string]$_['state'] -cne 'completed' -or
+            -not $_.Contains('observationStatus') -or
+            [string]$_['observationStatus'] -cne
+                'completed' -or
+            -not $_.Contains('findingsComplete') -or
+            -not [bool]$_['findingsComplete'] -or
+            -not $_.Contains('unknown') -or
+            [int]$_['unknown'] -ne 0 -or
+            -not $_.Contains('validationErrors') -or
+            @($_['validationErrors']).Count -ne 0
+        })
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1
+        kind = 'contextual-conventions-current-pr-bridge-result'
+        state = $(if ($incomplete.Count -eq 0) {
+                'completed'
+            } else { 'partial' })
+        intake = $intake
+        manifestPath = [IO.Path]::GetFullPath($ManifestPath)
+        records = $records.ToArray()
+        outcomes = @($outcomes)
+        completedCount = @($records.ToArray() | Where-Object {
+                [string]$_.state -ceq 'completed'
+            }).Count
+        incompleteCount = $incomplete.Count
+        providerWrites = 0
+        modelWrites = 0
+    }
+}
+
+Export-ModuleMember -Function Invoke-ContextualConventionsCurrentPrBridge

@@ -987,15 +987,63 @@ Describe 'Owner capability module surface' {
     It 'exports only the preview contract, exact writer formatter, and adapter seam' {
         @((Get-Command -Module DevPilot.OwnerCapability).Name | Sort-Object) | Should -Be @(
             'ConvertTo-OwnerV2Observation',
+            'Format-ContextualConventionComment',
             'Format-NamedAreEqualComment',
             'Format-OwnerV1WriterComment',
+            'Get-ContextualConventionMarkerKey',
             'Get-NamedAreEqualMarkerKey',
             'Get-OwnerV1WriterMarkerKey',
+            'New-ContextualConventionsCapabilityAdapter',
             'New-NamedAreEqualCapabilityAdapter',
             'New-OwnerSemanticRunner',
             'New-OwnerV2CapabilityAdapter',
             'New-OwnerV2CapabilityLimits',
             'Resolve-OwnerV2DiscussionReconciliation'
         )
+    }
+
+    It 'formats a fixed contextual finding without including source values' {
+        $contract = [pscustomobject]@{
+            Request = [pscustomobject]@{
+                CapabilityId = 'bpm-contextual-conventions@1'
+                RuleSection = 'bpm-contextual-conventions@1'
+                RepositoryId = 'repo'
+                PullRequestId = 42
+                SourceCommit = 'a' * 40
+                RuleHash = 'v1:sha256:' + ('b' * 64)
+                RulePath = 'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+                RuleCommit = 'c' * 40
+            }
+        }
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'secret-redaction'
+            constructRef = 'construct:' + ('d' * 64)
+            evidence = 'Redact the sensitive field on the proven cache-miss response path.'
+            anchor = [ordered]@{
+                path = 'src/Response.cs'
+                line = 17
+                symbol = 'CreateResponse'
+            }
+        }
+        $marker = Get-ContextualConventionMarkerKey `
+            -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment `
+            -Contract $contract -Finding $finding `
+            -MarkerKey $marker
+
+        $marker | Should -Match '^[0-9a-f]{64}$'
+        $body | Should -Match 'secret-redaction'
+        $body | Should -Match 'CreateResponse'
+        $body | Should -Not -Match 'password|api.?key|token='
+        $body | Should -Match (
+            '<!-- devpilot-contextual-convention:v1:' +
+            [regex]::Escape($marker) + ' -->')
+
+        $finding.ruleId = 'unapproved-rule'
+        {
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract -Finding $finding
+        } | Should -Throw '*fixed capability*'
     }
 }

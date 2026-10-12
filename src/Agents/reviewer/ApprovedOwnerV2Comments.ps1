@@ -8,6 +8,28 @@ $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
 $script:ApprovedNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:ApprovedNamedAreEqualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/named-areequal-arguments.v1.txt'
+$script:ApprovedContextualCapability = 'bpm-contextual-conventions@1'
+$script:ApprovedContextualPolicyPath =
+    'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+$script:ApprovedContextualRuleIds = @(
+    'exception-logging',
+    'exception-propagation',
+    'type-based-decisions',
+    'explicit-string-comparison',
+    'collection-cardinality',
+    'cheap-validation',
+    'async-all-the-way',
+    'async-io',
+    'async-wait-sync',
+    'http-client-lifetime',
+    'thread-safe-immutable',
+    'cache-streaming',
+    'typed-contracts',
+    'json-contracts',
+    'api-errors',
+    'secret-redaction',
+    'dependency-fanout'
+)
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
 $script:ApprovedOwnerV2MaximumSelections = 5
@@ -212,13 +234,17 @@ function Read-ApprovedOwnerV2Evidence {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Identity,
         [Parameter(Mandatory)][string]$RepoRoot,
         [Parameter(Mandatory)][string]$ToolkitConfigPath,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     $state = [IO.Path]::GetFullPath($StateRoot)
     $namedAreEqual = $Delivery -ceq 'named-areequal'
+    $contextual = $Delivery -ceq 'contextual-conventions'
     $expectedCapability = if ($namedAreEqual) {
         $script:ApprovedNamedAreEqualCapability
+    }
+    elseif ($contextual) {
+        $script:ApprovedContextualCapability
     }
     else { $script:ApprovedOwnerV2Capability }
     $toolkitConfig = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
@@ -265,9 +291,10 @@ function Read-ApprovedOwnerV2Evidence {
     $pin = Read-ApprovedOwnerV2Json $evidencePath
     $record = Read-ApprovedOwnerV2Json $recordPath
     $observation = Read-ApprovedOwnerV2Json $observationPath
-    $telemetry = if ($namedAreEqual) {
+    $deterministic = $namedAreEqual -or $contextual
+    $telemetry = if ($deterministic) {
         if (Test-Path -LiteralPath $telemetryPath -PathType Leaf) {
-            throw 'Model-free named AreEqual state unexpectedly contains telemetry.'
+            throw 'Model-free deterministic state unexpectedly contains telemetry.'
         }
         $null
     }
@@ -285,6 +312,13 @@ function Read-ApprovedOwnerV2Evidence {
                 $script:ApprovedNamedAreEqualCapability -or
             [string]$declaration.config.id -cne
                 'named-areequal-arguments-v1-user-approved')) -or
+        ($contextual -and (
+            [string]$declaration.rule.path -cne
+                $script:ApprovedContextualPolicyPath -or
+            [string]$declaration.rule.section -cne
+                $script:ApprovedContextualCapability -or
+            [string]$declaration.config.id -cne
+                'contextual-conventions-v1-user-approved')) -or
         [string]$declaration.capability.digest -cne $capabilityDigest -or
         [string]$declaration.subject.projectId -cne
         [string]$subjectProvider.projectId -or
@@ -305,13 +339,13 @@ function Read-ApprovedOwnerV2Evidence {
         [int]$observation.counts.uncovered -ne 0 -or
         [int]$observation.effects.providerWrites -ne 0 -or
         [int]$observation.effects.writeToolInvocations -ne 0 -or
-        ($namedAreEqual -and
+        ($deterministic -and
             [int]$observation.execution.modelStarts -ne 0)) {
         throw 'Owner v2 observation is not a completed zero-write actionable result.'
     }
     Assert-ApprovedOwnerV2Record -Record $record -Declaration $declaration `
         -Identity $Identity -Observation $observation `
-        -ExpectedModelExecutionState $(if ($namedAreEqual) {
+        -ExpectedModelExecutionState $(if ($deterministic) {
             'notAttempted'
         } else { 'attempted' })
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
@@ -429,6 +463,62 @@ function Read-ApprovedOwnerV2Evidence {
             throw 'Named AreEqual observation parser binding is stale or foreign.'
         }
     }
+    elseif ($contextual) {
+        $toolkitBinding['analyzerSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1')
+        $toolkitBinding['analyzerManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
+        $toolkitBinding['activePrIntakeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1')
+        $toolkitBinding['activePrIntakeManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
+        $toolkitBinding['contextualBridgeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1')
+        $toolkitBinding['contextualBridgeManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1')
+        $toolkitBinding['sharedAcquisitionToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'tools\Invoke-SharedReviewAcquisition.ps1')
+        $toolkitBinding['contextualCurrentPrToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 (
+                Join-Path $RepoRoot `
+                    'tools\Invoke-ContextualConventionsCurrentPr.ps1')
+        $shared = $toolkitConfig.sharedAcquisition
+        if ($shared -isnot [Collections.IDictionary] -or
+            [string]$shared.kind -cne
+                'devpilot-shared-review-acquisition-v1' -or
+            [string]$shared.activePrIntakeSha256 -cne
+                [string]$toolkitBinding.activePrIntakeSha256 -or
+            [string]$shared.contextualBridgeSha256 -cne
+                [string]$toolkitBinding.contextualBridgeSha256 -or
+            [string]$shared.toolSha256 -cne
+                [string]$toolkitBinding.sharedAcquisitionToolSha256) {
+            throw 'Contextual shared acquisition implementation binding is invalid.'
+        }
+        if ((Get-ApprovedOwnerV2SourceArtifact `
+                -Observation $observation `
+                -Kind 'contextual-conventions-analyzer-module') -cne
+                [string]$toolkitBinding.analyzerSha256 -or
+            (Get-ApprovedOwnerV2SourceArtifact `
+                -Observation $observation `
+                -Kind 'contextual-conventions-analyzer-manifest') -cne
+                [string]$toolkitBinding.analyzerManifestSha256) {
+            throw 'Contextual observation analyzer binding is stale or foreign.'
+        }
+    }
     return [pscustomobject][ordered]@{
         StateRoot = $state
         CapabilityRoot = $root
@@ -449,12 +539,18 @@ function Read-ApprovedOwnerV2Evidence {
             parser = $(if ($namedAreEqual) {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'))
+            } elseif ($contextual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'))
             } else { $null })
             parserManifest = $(if ($namedAreEqual) {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'src\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1'))
+            } elseif ($contextual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1'))
             } else { $null })
-            activePrIntake = $(if ($namedAreEqual) {
+            activePrIntake = $(if ($deterministic) {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1'))
             } else { $null })
@@ -462,7 +558,11 @@ function Read-ApprovedOwnerV2Evidence {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psm1'))
             } else { $null })
-            sharedAcquisitionTool = $(if ($namedAreEqual) {
+            contextualBridge = $(if ($contextual) {
+                [IO.Path]::GetFullPath((Join-Path $RepoRoot `
+                    'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1'))
+            } else { $null })
+            sharedAcquisitionTool = $(if ($deterministic) {
                 [IO.Path]::GetFullPath((Join-Path $RepoRoot `
                     'tools\Invoke-SharedReviewAcquisition.ps1'))
             } else { $null })
@@ -489,7 +589,7 @@ function Get-ApprovedOwnerV2Proposal {
     param(
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     if ($Delivery -ceq 'named-areequal') {
@@ -549,6 +649,74 @@ function Get-ApprovedOwnerV2Proposal {
             affectedCallCount = [int]$Finding.affectedCallCount
             affectedCallLines = @($Finding.affectedCallLines)
             callListTruncated = [bool]$Finding.callListTruncated
+        }
+    }
+    if ($Delivery -ceq 'contextual-conventions') {
+        if ([string]$Evidence.Declaration.capability.id -cne
+                $script:ApprovedContextualCapability -or
+            [string]$Finding.identity -cnotmatch
+                '^contextual-v1:[0-9a-f]{64}$' -or
+            [string]$Finding.disposition -cne 'violation' -or
+            [string]$Finding.ruleId -cnotin @(
+                $script:ApprovedContextualRuleIds) -or
+            [string]$Finding.constructRef -cnotmatch
+                '^construct:[0-9a-f]{64}$' -or
+            $Finding.binding -isnot [Collections.IDictionary] -or
+            $Finding.anchor -isnot [Collections.IDictionary]) {
+            throw 'Only exact allowlisted contextual findings are writer eligible.'
+        }
+        $source = $Finding.binding.source.representation
+        if ($source -isnot [Collections.IDictionary] -or
+            [string]$source.constructIdentity -cne
+                [string]$Finding.constructRef -or
+            [string]$source.path -cne
+                [string]$Finding.anchor.path -or
+            [string]$source.symbol -cne
+                [string]$Finding.anchor.symbol -or
+            [int]$source.startLine -ne
+                [int]$Finding.anchor.line -or
+            [int]$source.endLine -ne
+                [int]$Finding.anchor.line) {
+            throw 'Contextual finding is not one exact changed anchor.'
+        }
+        $classification =
+            [string]$Finding.reconciliation.classification
+        if ($classification -cnotin @(
+                'wouldCreate', 'noOp', 'humanCovered')) {
+            throw 'Contextual finding is not safely actionable.'
+        }
+        $marker = Get-ContextualConventionMarkerKey `
+            -Contract $Evidence.Contract -Finding $Finding
+        $body = Format-ContextualConventionComment `
+            -Contract $Evidence.Contract -Finding $Finding `
+            -MarkerKey $marker
+        $bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+        if ([string]$Finding.reconciliation.bodySha256 -cne
+                $bodySha256 -or
+            [string]$Finding.providerMarker.integrity -cne
+                'verified' -or
+            [string]$Finding.providerMarker.sha256 -cne
+                (Get-ApprovedOwnerV2TextSha256 $marker)) {
+            throw "Contextual finding '$($Finding.identity)' does not match the exact formatter contract."
+        }
+        return [ordered]@{
+            findingId = [string]$Finding.identity
+            semanticKey = [string]$Finding.semanticKey
+            ruleId = [string]$Finding.ruleId
+            constructRef = [string]$Finding.constructRef
+            constructIdentity =
+                [string]$Finding.binding.constructIdentity
+            path = [string]$Finding.anchor.path
+            line = [int]$Finding.anchor.line
+            symbol = [string]$Finding.anchor.symbol
+            marker = $marker
+            markerComment =
+                "<!-- devpilot-contextual-convention:v1:$marker -->"
+            body = $body
+            bodySha256 = $bodySha256
+            classification = $classification
+            rationale =
+                [string]$Finding.reconciliation.reason
         }
     }
     if ([string]$Finding.identity -notmatch '^owner-v2:[0-9a-f]{64}$' -or
@@ -969,7 +1137,7 @@ function Assert-ApprovedOwnerV2LiveRead {
         [Parameter(Mandatory)]$Live,
         [Parameter(Mandatory)][object[]]$Selections,
         [Parameter(Mandatory)][string]$ExpectedSnapshotSha256,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     $subject = $Approval.subject
@@ -999,6 +1167,8 @@ function Assert-ApprovedOwnerV2LiveRead {
     }
     foreach ($selection in $Selections) {
         $namedAreEqual = $Delivery -ceq 'named-areequal'
+        $contextual = $Delivery -ceq
+            'contextual-conventions'
         $anchors = @($Live.Anchors | Where-Object {
                 [string]$_.path -ieq [string]$selection.path -and
                 [int]$selection.line -ge [int]$_.startLine -and
@@ -1025,6 +1195,8 @@ function Assert-ApprovedOwnerV2LiveRead {
         $entries = @(Get-ApprovedOwnerV2MarkerEntries -Snapshot $Live.Snapshot `
                 -Marker ([string]$selection.marker) -Pattern $(if ($namedAreEqual) {
                     '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+                } elseif ($contextual) {
+                    '<!--\s*devpilot-contextual-convention:v1:([0-9a-f]{64})\s*-->'
                 } else { $script:ApprovedOwnerV2MarkerPattern }))
         if (@($entries | Where-Object {
                     -not [bool]$_.Comment.reviewerOwned -or

@@ -6,10 +6,30 @@ $ErrorActionPreference = 'Stop'
 $script:AutomaticOwnerV2Capability = 'bpm-test-ownership@1'
 $script:AutomaticNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:AutomaticNamedAreEqualRoot = 'named-areequal-v1'
+$script:AutomaticContextualCapability = 'bpm-contextual-conventions@1'
+$script:AutomaticContextualRoot = 'contextual-conventions-v1'
 $script:AutomaticOwnerV2MaximumCreatesPerRun = 5
 $script:AutomaticOwnerV2MaximumCreatesPerPullRequest = 50
 $script:AutomaticNamedAreEqualMaximumCreatesPerRun = 2
 $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest = 5
+$script:AutomaticContextualMaximumCreatesPerRun = 2
+$script:AutomaticContextualMaximumCreatesPerPullRequest = 5
+
+function Read-AutomaticContextualEvidence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$Identity,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$ToolkitConfigPath
+    )
+    return Read-ApprovedOwnerV2Evidence `
+        -StateRoot $StateRoot -Identity $Identity `
+        -RepoRoot $RepoRoot `
+        -ToolkitConfigPath $ToolkitConfigPath `
+        -Delivery contextual-conventions
+}
 
 function Read-AutomaticNamedAreEqualEvidence {
     [CmdletBinding()]
@@ -82,13 +102,18 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
         [Parameter(Mandatory)][string]$RepoRoot,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     if ($Delivery -ceq 'named-areequal') {
         $base = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
             -Kind durable-state -RepositoryRoot $RepoRoot -Create
         $DeliveryRoot = Join-Path $base $script:AutomaticNamedAreEqualRoot
+    }
+    elseif ($Delivery -ceq 'contextual-conventions') {
+        $base = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
+            -Kind durable-state -RepositoryRoot $RepoRoot -Create
+        $DeliveryRoot = Join-Path $base $script:AutomaticContextualRoot
     }
     $created = $false
     $root = Resolve-AgentTrustedRoot -Path $DeliveryRoot -Kind durable-state `
@@ -104,6 +129,8 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
     $keyPath = Join-Path $root (
         'keys\' + $(if ($Delivery -ceq 'named-areequal') {
             'named-areequal-service-authorization.hmac'
+        } elseif ($Delivery -ceq 'contextual-conventions') {
+            'contextual-conventions-service-authorization.hmac'
         } else { 'owner-v2-service-authorization.hmac' }))
     if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
         $bytes = [byte[]]::new(32)
@@ -117,12 +144,14 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
 function Get-AutomaticOwnerV2ServiceKey {
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     $path = Join-Path $DeliveryRoot (
         'keys\' + $(if ($Delivery -ceq 'named-areequal') {
             'named-areequal-service-authorization.hmac'
+        } elseif ($Delivery -ceq 'contextual-conventions') {
+            'contextual-conventions-service-authorization.hmac'
         } else { 'owner-v2-service-authorization.hmac' }))
     [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $DeliveryRoot -Private)
     $key = [IO.File]::ReadAllBytes($path)
@@ -136,11 +165,13 @@ function Get-AutomaticOwnerV2Configuration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig,
-        [ValidateSet('owner', 'named-areequal')]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
     $configKey = if ($Delivery -ceq 'named-areequal') {
         'autoCreateNamedAreEqualComments'
+    } elseif ($Delivery -ceq 'contextual-conventions') {
+        'autoCreateContextualConventionComments'
     } else { 'autoCreateOwnerComments' }
     if (-not $ToolkitConfig.Contains($configKey)) {
         return [pscustomobject][ordered]@{
@@ -201,21 +232,31 @@ function New-AutomaticOwnerV2ServicePolicy {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
-    if ($namedAreEqual) {
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
+    if ($namedAreEqual -or $contextual) {
         if (-not $PSBoundParameters.ContainsKey('MaxCreatesPerRun')) {
-            $MaxCreatesPerRun =
+            $MaxCreatesPerRun = if ($contextual) {
+                $script:AutomaticContextualMaximumCreatesPerRun
+            } else {
                 $script:AutomaticNamedAreEqualMaximumCreatesPerRun
+            }
         }
         if (-not $PSBoundParameters.ContainsKey(
                 'MaxCreatesPerPullRequest')) {
-            $MaxCreatesPerPullRequest =
+            $MaxCreatesPerPullRequest = if ($contextual) {
+                $script:AutomaticContextualMaximumCreatesPerPullRequest
+            } else {
                 $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest
+            }
         }
     }
     if ($MaxCreatesPerPullRequest -lt $MaxCreatesPerRun) {
         throw 'The per-PR create ceiling cannot be lower than the per-run ceiling.'
     }
     if (-not $namedAreEqual -and
+        -not $contextual -and
         [string]$Evidence.Declaration.capability.id -cne
             $script:AutomaticOwnerV2Capability) {
         throw 'Automatic delivery evidence uses an unsupported capability.'
@@ -225,12 +266,24 @@ function New-AutomaticOwnerV2ServicePolicy {
             $script:ApprovedNamedAreEqualPolicyPath) {
         throw 'Named AreEqual requires its exact rule path.'
     }
+    if ($contextual -and
+        [string]$Evidence.Declaration.rule.path -cne
+            $script:ApprovedContextualPolicyPath) {
+        throw 'Contextual conventions require the exact fixed rule bundle.'
+    }
     if ($namedAreEqual -and (
             $MaxCreatesPerRun -gt
                 $script:AutomaticNamedAreEqualMaximumCreatesPerRun -or
             $MaxCreatesPerPullRequest -gt
                 $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest)) {
         throw 'Named AreEqual service policy create ceilings exceed 2 per run or 5 per pull request.'
+    }
+    if ($contextual -and (
+            $MaxCreatesPerRun -gt
+                $script:AutomaticContextualMaximumCreatesPerRun -or
+            $MaxCreatesPerPullRequest -gt
+                $script:AutomaticContextualMaximumCreatesPerPullRequest)) {
+        throw 'Contextual service policy create ceilings exceed 2 per run or 5 per pull request.'
     }
     $copy = {
         param($Value)
@@ -266,10 +319,29 @@ function New-AutomaticOwnerV2ServicePolicy {
                 [string]$Evidence.Toolkit[$name]
         }
     }
+    elseif ($contextual) {
+        $implementation['analyzerSha256'] =
+            [string]$Evidence.Toolkit.analyzerSha256
+        $implementation['analyzerManifestSha256'] =
+            [string]$Evidence.Toolkit.analyzerManifestSha256
+        foreach ($name in @(
+                'activePrIntakeSha256',
+                'activePrIntakeManifestSha256',
+                'contextualBridgeSha256',
+                'contextualBridgeManifestSha256',
+                'sharedAcquisitionToolSha256',
+                'contextualCurrentPrToolSha256'
+            )) {
+            $implementation[$name] =
+                [string]$Evidence.Toolkit[$name]
+        }
+    }
     return [ordered]@{
         schemaVersion = 1
         kind = $(if ($namedAreEqual) {
                 'named-areequal-v1-service-authorization-policy'
+            } elseif ($contextual) {
+                'contextual-conventions-v1-service-authorization-policy'
             } else { 'owner-v2-service-authorization-policy' })
         enabled = $true
         policyId = $PolicyId
@@ -290,6 +362,8 @@ function New-AutomaticOwnerV2ServicePolicy {
             classification = 'wouldCreate'
             construct = $(if ($namedAreEqual) {
                     'changed-mstest-method-areequal-calls'
+                } elseif ($contextual) {
+                    'changed-contextual-convention'
                 } else { 'changed-mstest-method' })
             disposition = 'violation'
             updates = $false
@@ -324,11 +398,18 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
     $expectedKind = if ($namedAreEqual) {
         'named-areequal-v1-service-authorization-policy'
+    } elseif ($contextual) {
+        'contextual-conventions-v1-service-authorization-policy'
     } else { 'owner-v2-service-authorization-policy' }
     $expectedConstruct = if ($namedAreEqual) {
         'changed-mstest-method-areequal-calls'
+    } elseif ($contextual) {
+        'changed-contextual-convention'
     } else { 'changed-mstest-method' }
     if ([int]$Policy.schemaVersion -ne 1 -or
         [string]$Policy.kind -cne $expectedKind -or
@@ -341,9 +422,15 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     $maximumRun = if ($namedAreEqual) {
         $script:AutomaticNamedAreEqualMaximumCreatesPerRun
     }
+    elseif ($contextual) {
+        $script:AutomaticContextualMaximumCreatesPerRun
+    }
     else { $script:AutomaticOwnerV2MaximumCreatesPerRun }
     $maximumPr = if ($namedAreEqual) {
         $script:AutomaticNamedAreEqualMaximumCreatesPerPullRequest
+    }
+    elseif ($contextual) {
+        $script:AutomaticContextualMaximumCreatesPerPullRequest
     }
     else { $script:AutomaticOwnerV2MaximumCreatesPerPullRequest }
     if ($runLimit -lt 1 -or
@@ -381,6 +468,22 @@ function Assert-AutomaticOwnerV2ServicePolicy {
             [string]$Policy.implementation.
                 sharedAcquisitionToolSha256,
             [string]$Policy.implementation.namedCurrentPrToolSha256
+        )
+    }
+    elseif ($contextual) {
+        $implementationDigests += @(
+            [string]$Policy.implementation.analyzerSha256,
+            [string]$Policy.implementation.analyzerManifestSha256,
+            [string]$Policy.implementation.activePrIntakeSha256,
+            [string]$Policy.implementation.
+                activePrIntakeManifestSha256,
+            [string]$Policy.implementation.contextualBridgeSha256,
+            [string]$Policy.implementation.
+                contextualBridgeManifestSha256,
+            [string]$Policy.implementation.
+                sharedAcquisitionToolSha256,
+            [string]$Policy.implementation.
+                contextualCurrentPrToolSha256
         )
     }
     foreach ($digest in $implementationDigests) {
@@ -424,6 +527,41 @@ function Assert-AutomaticOwnerV2ServicePolicy {
                 [string]$Policy.implementation.
                     sharedAcquisitionToolSha256) {
             throw 'Named AreEqual acquisition or parser implementation changed.'
+        }
+    }
+    elseif ($contextual) {
+        if ([string]::IsNullOrWhiteSpace(
+                [string]$Evidence.Paths.parser) -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$Evidence.Paths.parserManifest)) {
+            throw 'Contextual evidence has no analyzer implementation paths.'
+        }
+        $currentAnalyzer =
+            Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.parser
+        $currentManifest =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.parserManifest
+        $currentActivePrIntake =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.activePrIntake
+        $currentBridge =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.contextualBridge
+        $currentSharedAcquisition =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.sharedAcquisitionTool
+        if ($currentAnalyzer -cne
+                [string]$Policy.implementation.analyzerSha256 -or
+            $currentManifest -cne
+                [string]$Policy.implementation.analyzerManifestSha256 -or
+            $currentActivePrIntake -cne
+                [string]$Policy.implementation.activePrIntakeSha256 -or
+            $currentBridge -cne
+                [string]$Policy.implementation.contextualBridgeSha256 -or
+            $currentSharedAcquisition -cne
+                [string]$Policy.implementation.
+                    sharedAcquisitionToolSha256) {
+            throw 'Contextual acquisition or analyzer implementation changed.'
         }
     }
     $authority = $Policy.authority
@@ -495,10 +633,15 @@ function New-AutomaticOwnerV2Event {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
     $event = [ordered]@{
         schemaVersion = 1
         kind = $(if ($namedAreEqual) {
                 'named-areequal-v2-delivery-event'
+            } elseif ($contextual) {
+                'contextual-conventions-v1-delivery-event'
             } else { 'owner-v2-delivery-event' })
         eventId = [guid]::NewGuid().ToString('N')
         runId = $RunId
@@ -537,6 +680,20 @@ function New-AutomaticOwnerV2Event {
         $event['capabilityId'] =
             $script:AutomaticNamedAreEqualCapability
         $event.finding['bodySha256'] = [string]$Selection.bodySha256
+    }
+    elseif ($contextual) {
+        if ([string]$Selection.bodySha256 -cnotmatch
+            '^[0-9a-f]{64}$' -or
+            [string]$Selection.ruleId -cnotin @(
+                $script:ApprovedContextualRuleIds)) {
+            throw 'Contextual audit requires an allowlisted rule and exact body digest.'
+        }
+        $event['capabilityId'] =
+            $script:AutomaticContextualCapability
+        $event.finding['ruleId'] =
+            [string]$Selection.ruleId
+        $event.finding['bodySha256'] =
+            [string]$Selection.bodySha256
     }
     return $event
 }
@@ -614,6 +771,9 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
     $bindings = [ordered]@{
         declarationSha256 =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.declaration
@@ -621,7 +781,7 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
         recordSha256 = Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
         observationSha256 =
             Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-        telemetrySha256 = $(if ($namedAreEqual) {
+        telemetrySha256 = $(if ($namedAreEqual -or $contextual) {
                 'not-applicable'
             }
             else {
@@ -644,6 +804,23 @@ function Assert-AutomaticOwnerV2EvidenceCurrent {
             Get-ApprovedOwnerV2FileSha256 `
                 $Evidence.Paths.sharedAcquisitionTool
     }
+    elseif ($contextual) {
+        $bindings['parserSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.parser
+        $bindings['parserManifestSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.parserManifest
+        $bindings['activePrIntakeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.activePrIntake
+        $bindings['contextualBridgeSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.contextualBridge
+        $bindings['sharedAcquisitionToolSha256'] =
+            Get-ApprovedOwnerV2FileSha256 `
+                $Evidence.Paths.sharedAcquisitionTool
+    }
     foreach ($entry in $bindings.GetEnumerator()) {
         if ([string]$Intent.state[$entry.Key] -cne [string]$entry.Value) {
             throw "Automatic Owner state binding '$($entry.Key)' changed."
@@ -656,11 +833,14 @@ function Get-AutomaticOwnerV2ConfirmedEntry {
         [Parameter(Mandatory)]$Snapshot,
         [Parameter(Mandatory)][Collections.IDictionary]$Selection,
         [switch]$NamedAreEqual,
+        [switch]$Contextual,
         [string]$SourceCommit = ''
     )
     $entries = @(Get-ApprovedOwnerV2MarkerEntries -Snapshot $Snapshot `
             -Marker ([string]$Selection.marker) -Pattern $(if ($NamedAreEqual) {
                 '<!--\s*devpilot-named-areequal:v1:([0-9a-f]{64})\s*-->'
+            } elseif ($Contextual) {
+                '<!--\s*devpilot-contextual-convention:v1:([0-9a-f]{64})\s*-->'
             } else { $script:ApprovedOwnerV2MarkerPattern }))
     $confirmed = @($entries | Where-Object {
             [bool]$_.Comment.reviewerOwned -and
@@ -669,7 +849,7 @@ function Get-AutomaticOwnerV2ConfirmedEntry {
             -not [bool]$_.Comment.isDeleted
         })
     if ($confirmed.Count -eq 1 -and $entries.Count -eq 1) {
-        if ($NamedAreEqual -and (
+        if (($NamedAreEqual -or $Contextual) -and (
                 [string]::IsNullOrWhiteSpace($SourceCommit) -or
                 [bool]$confirmed[0].Thread.isDeleted -or
                 [bool]$confirmed[0].Thread.isOutdated -or
@@ -701,9 +881,14 @@ function Get-AutomaticOwnerV2DeliveryHistory {
         [StringComparer]::Ordinal)
     $blocked = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
-    $expectedKind = if ([string]$Evidence.Declaration.capability.id -ceq
+    $capabilityId =
+        [string]$Evidence.Declaration.capability.id
+    $expectedKind = if ($capabilityId -ceq
         $script:AutomaticNamedAreEqualCapability) {
         'named-areequal-v2-delivery-event'
+    } elseif ($capabilityId -ceq
+        $script:AutomaticContextualCapability) {
+        'contextual-conventions-v1-delivery-event'
     } else { 'owner-v2-delivery-event' }
     foreach ($file in @(Get-ChildItem -LiteralPath (
                     Join-Path $DeliveryRoot 'events') -Filter '*.json' -File `
@@ -745,6 +930,9 @@ function Repair-AutomaticOwnerV2Intents {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
     $intentRoot = Join-Path $DeliveryRoot "intents\$($Evidence.Identity)"
     $outcomeRoot = Join-Path $DeliveryRoot "outcomes\$($Evidence.Identity)"
     foreach ($file in @(Get-ChildItem -LiteralPath $intentRoot `
@@ -758,6 +946,8 @@ function Repair-AutomaticOwnerV2Intents {
         $intent = Read-ApprovedOwnerV2SignedRecord -Path $file.FullName -Key $Key
         $expectedIntentKind = if ($namedAreEqual) {
             'named-areequal-v2-service-create-intent'
+        } elseif ($contextual) {
+            'contextual-conventions-v1-service-create-intent'
         } else { 'owner-v2-service-create-intent' }
         if ([string]$intent.kind -cne $expectedIntentKind -or
             [string]$intent.state.identity -cne [string]$Evidence.Identity) {
@@ -776,8 +966,10 @@ function Repair-AutomaticOwnerV2Intents {
                 $entry = Get-AutomaticOwnerV2ConfirmedEntry `
                     -Snapshot $live.Snapshot -Selection $selection `
                     -NamedAreEqual:$namedAreEqual `
+                    -Contextual:$contextual `
                     -SourceCommit ([string]$Evidence.Declaration.head.sourceCommit)
-                if ($namedAreEqual -and $null -ne $entry) {
+                if (($namedAreEqual -or $contextual) -and
+                    $null -ne $entry) {
                     $approval = [ordered]@{
                         subject = $intent.subject
                         provider = $Evidence.Provider
@@ -792,7 +984,9 @@ function Repair-AutomaticOwnerV2Intents {
                         -Selections @($selection) `
                         -ExpectedSnapshotSha256 (
                             ([string]$live.Snapshot.Digest).Substring(10)) `
-                        -Delivery named-areequal
+                        -Delivery $(if ($contextual) {
+                            'contextual-conventions'
+                        } else { 'named-areequal' })
                     if ([string]$readback.Classifications[
                             [string]$selection.findingId] -cne 'noOp') {
                         throw 'Interrupted create has no current exact readback.'
@@ -834,6 +1028,8 @@ function Repair-AutomaticOwnerV2Intents {
             schemaVersion = 1
             kind = $(if ($namedAreEqual) {
                     'named-areequal-v2-service-create-outcome'
+                } elseif ($contextual) {
+                    'contextual-conventions-v1-service-create-outcome'
                 } else { 'owner-v2-service-create-outcome' })
             runId = [string]$intent.runId
             stateIdentity = [string]$Evidence.Identity
@@ -864,6 +1060,14 @@ function Get-AutomaticNamedAreEqualUnresolvedIntentMarkers {
     )
     $markers = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
+    $expectedKind = if (
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability) {
+        'contextual-conventions-v1-service-create-intent'
+    }
+    else {
+        'named-areequal-v2-service-create-intent'
+    }
     $intentsRoot = Join-Path $DeliveryRoot 'intents'
     foreach ($file in @(Get-ChildItem -LiteralPath $intentsRoot `
                 -Recurse -Filter '*.json' -File `
@@ -878,8 +1082,7 @@ function Get-AutomaticNamedAreEqualUnresolvedIntentMarkers {
         }
         $intent = Read-ApprovedOwnerV2SignedRecord `
             -Path $file.FullName -Key $Key
-        if ([string]$intent.kind -cne
-                'named-areequal-v2-service-create-intent') {
+        if ([string]$intent.kind -cne $expectedKind) {
             continue
         }
         if ([string]$intent.subject.repositoryId -cne
@@ -919,8 +1122,14 @@ function Invoke-AutomaticOwnerV2Comments {
     $namedAreEqual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticNamedAreEqualCapability
+    $contextual =
+        [string]$Evidence.Declaration.capability.id -ceq
+            $script:AutomaticContextualCapability
+    $deterministic = $namedAreEqual -or $contextual
     $resultKind = if ($namedAreEqual) {
         'named-areequal-v2-automatic-delivery-result'
+    } elseif ($contextual) {
+        'contextual-conventions-v1-automatic-delivery-result'
     } else { 'owner-v2-automatic-delivery-result' }
     $events = [Collections.Generic.List[object]]::new()
     $repaired = @()
@@ -931,6 +1140,12 @@ function Invoke-AutomaticOwnerV2Comments {
         (Split-Path -Leaf ([IO.Path]::GetFullPath($DeliveryRoot))) -cne
             $script:AutomaticNamedAreEqualRoot) {
         throw 'Named AreEqual requires its separate private delivery root.'
+    }
+    if ($contextual -and
+        (Split-Path -Leaf (
+            [IO.Path]::GetFullPath($DeliveryRoot))) -cne
+            $script:AutomaticContextualRoot) {
+        throw 'Contextual conventions require their separate private delivery root.'
     }
 
     $lockPath = Join-Path $DeliveryRoot 'locks\delivery.lock'
@@ -966,7 +1181,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 -Evidence $Evidence)
         $history = Get-AutomaticOwnerV2DeliveryHistory `
             -DeliveryRoot $DeliveryRoot -Key $Key -Evidence $Evidence
-        if ($namedAreEqual) {
+        if ($deterministic) {
             $unresolved =
                 Get-AutomaticNamedAreEqualUnresolvedIntentMarkers `
                     -DeliveryRoot $DeliveryRoot -Key $Key `
@@ -988,13 +1203,17 @@ function Invoke-AutomaticOwnerV2Comments {
         $available = [Math]::Max(0, [Math]::Min($runLimit, $prRemaining))
 
         try {
-            if ($namedAreEqual) {
-                $historical = @($Evidence.Observation.findings | Where-Object {
+            if ($deterministic) {
+                $historical = @()
+                if ($namedAreEqual) {
+                    $historical = @(
+                        $Evidence.Observation.findings | Where-Object {
                         [string]$_.reconciliation.classification -ceq
                             'unknown' -and
                         [string]$_.reconciliation.reason -ceq
                             'historical-human-review-needs-review'
                     })
+                }
                 if ($historical.Count -gt 0) {
                     foreach ($finding in $historical) {
                         $marker = Get-NamedAreEqualMarkerKey `
@@ -1048,7 +1267,9 @@ function Invoke-AutomaticOwnerV2Comments {
                     } | ForEach-Object {
                         Get-ApprovedOwnerV2Proposal `
                             -Evidence $Evidence -Finding $_ `
-                            -Delivery named-areequal
+                            -Delivery $(if ($contextual) {
+                                'contextual-conventions'
+                            } else { 'named-areequal' })
                     } | Sort-Object findingId)
                 $review = [pscustomobject]@{ proposals = $proposals }
             }
@@ -1071,7 +1292,7 @@ function Invoke-AutomaticOwnerV2Comments {
                     -Message 'Observation contains an ineligible Owner finding.'
             }
         }
-        if ($namedAreEqual -and @($review.proposals | Where-Object {
+        if ($deterministic -and @($review.proposals | Where-Object {
                     [string]$_.classification -ceq 'humanCovered'
                 }).Count -gt 0) {
             return [pscustomobject][ordered]@{
@@ -1175,8 +1396,10 @@ function Invoke-AutomaticOwnerV2Comments {
                 -Selections $selections -ExpectedSnapshotSha256 $snapshot `
                 -Delivery $(if ($namedAreEqual) {
                     'named-areequal'
+                } elseif ($contextual) {
+                    'contextual-conventions'
                 } else { 'owner' })
-            if ($namedAreEqual -and @($selections | Where-Object {
+            if ($deterministic -and @($selections | Where-Object {
                         [string]$liveState.Classifications[
                             [string]$_.findingId] -cnotin @(
                                 'wouldCreate', 'noOp')
@@ -1215,7 +1438,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.record
             observationSha256 =
                 Get-ApprovedOwnerV2FileSha256 $Evidence.Paths.observation
-            telemetrySha256 = $(if ($namedAreEqual) {
+            telemetrySha256 = $(if ($deterministic) {
                     'not-applicable'
                 }
                 else {
@@ -1238,10 +1461,29 @@ function Invoke-AutomaticOwnerV2Comments {
                 Get-ApprovedOwnerV2FileSha256 `
                     $Evidence.Paths.sharedAcquisitionTool
         }
+        elseif ($contextual) {
+            $intentState['parserSha256'] =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $Evidence.Paths.parser
+            $intentState['parserManifestSha256'] =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $Evidence.Paths.parserManifest
+            $intentState['activePrIntakeSha256'] =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $Evidence.Paths.activePrIntake
+            $intentState['contextualBridgeSha256'] =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $Evidence.Paths.contextualBridge
+            $intentState['sharedAcquisitionToolSha256'] =
+                    Get-ApprovedOwnerV2FileSha256 `
+                        $Evidence.Paths.sharedAcquisitionTool
+        }
         $intent = [ordered]@{
             schemaVersion = 1
             kind = $(if ($namedAreEqual) {
                     'named-areequal-v2-service-create-intent'
+                } elseif ($contextual) {
+                    'contextual-conventions-v1-service-create-intent'
                 } else { 'owner-v2-service-create-intent' })
             runId = $runId
             policyDigest = Get-ApprovedOwnerV2Digest $Policy
@@ -1282,6 +1524,8 @@ function Invoke-AutomaticOwnerV2Comments {
                     -ExpectedSnapshotSha256 $expectedSnapshot `
                     -Delivery $(if ($namedAreEqual) {
                         'named-areequal'
+                    } elseif ($contextual) {
+                        'contextual-conventions'
                     } else { 'owner' })
                 Assert-AutomaticOwnerV2EvidenceCurrent `
                     -Evidence $Evidence -Intent $intent
@@ -1350,6 +1594,7 @@ function Invoke-AutomaticOwnerV2Comments {
                     $entry = Get-AutomaticOwnerV2ConfirmedEntry `
                         -Snapshot $confirmed.Snapshot -Selection $selection `
                         -NamedAreEqual:$namedAreEqual `
+                        -Contextual:$contextual `
                         -SourceCommit ([string]$Evidence.Declaration.head.sourceCommit)
                 }
                 catch { $entry = $null }
@@ -1425,6 +1670,8 @@ function Invoke-AutomaticOwnerV2Comments {
             schemaVersion = 1
             kind = $(if ($namedAreEqual) {
                     'named-areequal-v2-service-create-outcome'
+                } elseif ($contextual) {
+                    'contextual-conventions-v1-service-create-outcome'
                 } else { 'owner-v2-service-create-outcome' })
             runId = $runId
             stateIdentity = [string]$Evidence.Identity
@@ -1477,6 +1724,7 @@ function Invoke-AutomaticNamedAreEqualBatch {
     if ($Evidence.Count -lt 1 -or $Evidence.Count -gt 4) {
         throw 'Named AreEqual batch requires one to four evidence records.'
     }
+
     Assert-AutomaticOwnerV2ServicePolicy `
         -Evidence $Evidence[0] -Policy $Policy
     $batchRunId = [guid]::NewGuid().ToString('N')
@@ -1553,6 +1801,129 @@ function Invoke-AutomaticNamedAreEqualBatch {
     return [pscustomobject][ordered]@{
         schemaVersion = 1
         kind = 'named-areequal-v2-automatic-delivery-batch-result'
+        batchRunId = $batchRunId
+        health = $health
+        providerWrites = $providerWrites
+        modelWrites = 0
+        remainingCreates = $remainingCreates
+        remainingWouldCreate = $remainingWouldCreate
+        results = $results.ToArray()
+        deferred = $deferred.ToArray()
+        events = $events.ToArray()
+    }
+}
+
+function Invoke-AutomaticContextualConventionsBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Evidence,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Policy,
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [Parameter(Mandatory)][scriptblock]$Provider,
+        [ValidateRange(0, 2)][int]$MaximumCreates = 2
+    )
+    if ($Evidence.Count -lt 1 -or
+        $Evidence.Count -gt 4) {
+        throw 'Contextual batch requires one to four evidence records.'
+    }
+    Assert-AutomaticOwnerV2ServicePolicy `
+        -Evidence $Evidence[0] -Policy $Policy
+    $batchRunId = [guid]::NewGuid().ToString('N')
+    $remainingCreates = [Math]::Min(
+        $MaximumCreates,
+        [Math]::Min(
+            [int]$Policy.limits.maxCreatesPerRun,
+            $script:AutomaticContextualMaximumCreatesPerRun))
+    $providerWrites = 0
+    $remainingWouldCreate = 0
+    $results =
+        [Collections.Generic.List[object]]::new()
+    $events =
+        [Collections.Generic.List[object]]::new()
+    $deferred =
+        [Collections.Generic.List[object]]::new()
+    $health = 'healthy'
+    for ($index = 0;
+        $index -lt $Evidence.Count;
+        $index++) {
+        $item = $Evidence[$index]
+        $wouldCreate = @(
+            $item.Observation.findings |
+                Where-Object {
+                    [string]$_.reconciliation.
+                        classification -ceq 'wouldCreate'
+                }).Count
+        if ($remainingCreates -eq 0 -and
+            $wouldCreate -gt 0) {
+            [void]$deferred.Add([ordered]@{
+                    identity = [string]$item.Identity
+                    reason =
+                        'scheduled-run-create-budget-exhausted'
+                    remainingWouldCreate = $wouldCreate
+                })
+            $remainingWouldCreate += $wouldCreate
+            $health = 'partial'
+            continue
+        }
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $item -Policy $Policy `
+            -DeliveryRoot $DeliveryRoot -Key $Key `
+            -Provider $Provider `
+            -MaximumCreates $remainingCreates
+        if ([int]$result.providerWrites -lt 0 -or
+            [int]$result.providerWrites -gt
+                $remainingCreates) {
+            throw 'Contextual batch exceeded its shared budget.'
+        }
+        $providerWrites +=
+            [int]$result.providerWrites
+        $remainingCreates -=
+            [int]$result.providerWrites
+        $remainingWouldCreate +=
+            [int]$result.remainingWouldCreate
+        [void]$results.Add([ordered]@{
+                identity = [string]$item.Identity
+                result = $result
+            })
+        foreach ($event in @($result.events)) {
+            [void]$events.Add($event)
+        }
+        if ([string]$result.health -cin @(
+                'partial', 'refused')) {
+            $health = [string]$result.health
+            for ($remainingIndex = $index + 1;
+                $remainingIndex -lt $Evidence.Count;
+                $remainingIndex++) {
+                $remainingEvidence =
+                    $Evidence[$remainingIndex]
+                $remainingCount = @(
+                    $remainingEvidence.
+                        Observation.findings |
+                        Where-Object {
+                            [string]$_.reconciliation.
+                                classification -ceq
+                                'wouldCreate'
+                        }).Count
+                [void]$deferred.Add([ordered]@{
+                        identity =
+                            [string]$remainingEvidence.Identity
+                        reason =
+                            'prior-batch-delivery-incomplete'
+                        remainingWouldCreate =
+                            $remainingCount
+                    })
+                $remainingWouldCreate +=
+                    $remainingCount
+            }
+            break
+        }
+    }
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1
+        kind =
+            'contextual-conventions-v1-automatic-delivery-batch-result'
         batchRunId = $batchRunId
         health = $health
         providerWrites = $providerWrites

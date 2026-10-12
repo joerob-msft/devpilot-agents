@@ -9,10 +9,13 @@
     PowerShellVersion = '7.0'
     FunctionsToExport = @(
         'ConvertTo-OwnerV2Observation',
+        'Format-ContextualConventionComment',
         'Format-NamedAreEqualComment',
         'Format-OwnerV1WriterComment',
+        'Get-ContextualConventionMarkerKey',
         'Get-NamedAreEqualMarkerKey',
         'Get-OwnerV1WriterMarkerKey',
+        'New-ContextualConventionsCapabilityAdapter',
         'New-NamedAreEqualCapabilityAdapter',
         'New-OwnerSemanticRunner',
         'New-OwnerV2CapabilityAdapter',

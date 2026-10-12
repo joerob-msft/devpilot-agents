@@ -7,6 +7,7 @@ Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.ps
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1"
 Import-Module "$PSScriptRoot\..\OwnerObservationContract\OwnerObservationContract.psd1"
 Import-Module "$PSScriptRoot\..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psd1" -Force
+Import-Module "$PSScriptRoot\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1" -Force
 
 $limitsTypeName = 'DevPilot.OwnerCapability.OwnerV2CapabilityLimits'
 if (-not ($limitsTypeName -as [type])) {
@@ -50,6 +51,10 @@ $script:NamedAreEqualCapability = 'bpm-named-areequal-arguments@1'
 $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a'
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
+$script:ContextualCapability = 'bpm-contextual-conventions@1'
+$script:ContextualDigest = 'v1:sha256:aa316ea3ae651eb996441b56c852b19dee080e30c659e4570946dec24589d208'
+$script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
+$script:ContextualPolicyDigest = 'v1:sha256:6e7cf6e001efa9966a6edb29348ea2344c8450a7ff713d56bc9ba69c81e1aafd'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -260,6 +265,312 @@ function Format-NamedAreEqualComment {
         ''
         "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
     ) -join "`n"
+}
+
+function Get-ContextualConventionMarkerKey {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Finding
+    )
+    $request = $Contract.Request
+    if ([string]$request.CapabilityId -cne
+            $script:ContextualCapability -or
+        [string]$request.RuleSection -cne
+            $script:ContextualCapability -or
+        [string]$Finding.ruleId -cnotin @(
+            Get-ContextualConventionRuleIds) -or
+        [string]$Finding.disposition -cne 'violation') {
+        throw 'Contextual convention finding is not bound to the fixed capability.'
+    }
+    $anchor = $Finding.anchor
+    if ($anchor -isnot [Collections.IDictionary] -or
+        [int]$anchor.line -lt 1 -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$anchor.path) -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$anchor.symbol)) {
+        throw 'Contextual convention finding has no precise changed anchor.'
+    }
+    $material = @(
+        $script:ContextualMarkerPrefix
+        [string]$request.RepositoryId
+        [string]$request.PullRequestId
+        [string]$request.SourceCommit
+        [string]$request.RuleHash
+        [string]$Finding.ruleId
+        (ConvertTo-OwnerV1WriterPath -Path (
+            [string]$anchor.path))
+        [string][int]$anchor.line
+        [string]$anchor.symbol
+        [string]$Finding.constructRef
+    ) -join "`n"
+    return Get-OwnerV1WriterSha256 -Text $material
+}
+
+function Format-ContextualConventionComment {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$MarkerKey
+    )
+    if ($MarkerKey -cne (
+        Get-ContextualConventionMarkerKey `
+            -Contract $Contract -Finding $Finding)) {
+        throw 'Contextual convention marker does not match its finding.'
+    }
+    $request = $Contract.Request
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path (
+            [string]$Finding.anchor.path))
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
+        [string]$Finding.anchor.symbol)
+    $ruleId = ConvertTo-OwnerV1WriterMarkdownCode (
+        [string]$Finding.ruleId)
+    $summary = ConvertTo-OwnerV1WriterMarkdownCode (
+        [string]$Finding.evidence)
+    if ([string]::IsNullOrWhiteSpace($summary) -or
+        $summary.Length -gt 512) {
+        throw 'Contextual convention evidence summary is invalid.'
+    }
+    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path (
+            [string]$request.RulePath))
+    return @(
+        "**$ruleId**"
+        ''
+        "$summary"
+        ''
+        "Changed code: ``$symbol`` at ``$path``:$([int]$Finding.anchor.line)."
+        ''
+        "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        ''
+        "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
+    ) -join "`n"
+}
+
+function Resolve-ContextualConventionDiscussionReconciliation {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][object]$Contract,
+        [AllowNull()]
+        [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]$Snapshot,
+        [Parameter(Mandatory)][string]$FailureReason
+    )
+    $counts = [ordered]@{
+        created = 0
+        updated = 0
+        noOp = 0
+        wouldCreate = 0
+        wouldUpdate = 0
+        unknown = 0
+        humanCovered = 0
+    }
+    $available = $null -ne $Snapshot -and
+        $Snapshot.State -ceq 'complete' -and
+        $Snapshot.Digest -match
+            $script:OwnerV2DigestPattern
+    $discussionDigest = if ($available) {
+        $Snapshot.Digest.Substring(10)
+    }
+    else { 'unknown' }
+    $targetPattern =
+        '<!--\s*devpilot-contextual-convention:v1:([0-9a-f]{64})\s*-->'
+    $anyMarkerPattern =
+        '<!--\s*devpilot-[a-z0-9-]+:v1:[0-9a-f]{64}\s*-->'
+    foreach ($finding in @($Observation.findings)) {
+        try {
+            $marker =
+                Get-ContextualConventionMarkerKey `
+                    -Contract $Contract -Finding $finding
+            $body =
+                Format-ContextualConventionComment `
+                    -Contract $Contract `
+                    -Finding $finding -MarkerKey $marker
+        }
+        catch {
+            $finding.providerMarker =
+                New-OwnerProviderMarker
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown `
+                    -Reason marker-derivation-failed `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest unknown
+            $counts.unknown++
+            continue
+        }
+        $bodyDigest =
+            Get-OwnerV1WriterSha256 -Text $body
+        if (-not $available) {
+            $finding.providerMarker =
+                New-OwnerProviderMarker
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown `
+                    -Reason $FailureReason `
+                    -DiscussionDigest unknown `
+                    -BodyDigest $bodyDigest
+            $counts.unknown++
+            continue
+        }
+        $matches =
+            [Collections.Generic.List[object]]::new()
+        $foreign = $false
+        $ambiguous = $false
+        $humanCurrent = $false
+        $crossRule = $false
+        foreach ($thread in @($Snapshot.Threads)) {
+            $sameAnchor = $null -ne $thread.anchor -and
+                [string]$thread.anchor.path -ieq
+                    [string]$finding.anchor.path -and
+                [int]$thread.anchor.line -eq
+                    [int]$finding.anchor.line
+            foreach ($comment in @($thread.comments)) {
+                if ([string]$comment.commentType -cne
+                        'text' -or
+                    [bool]$comment.isDeleted) {
+                    continue
+                }
+                $markerMatches = [regex]::Matches(
+                    [string]$comment.body,
+                    $targetPattern)
+                $target = @($markerMatches |
+                    Where-Object {
+                        $_.Groups[1].Value -ceq
+                            $marker
+                    })
+                if ($target.Count -gt 0) {
+                    if ([string]$comment.
+                        reviewerIdentityState -ceq
+                            'ambiguous') {
+                        $ambiguous = $true
+                    }
+                    elseif (-not [bool]$comment.
+                        reviewerOwned) {
+                        $foreign = $true
+                    }
+                    else {
+                        [void]$matches.Add(
+                            [pscustomobject]@{
+                                Thread = $thread
+                                Comment = $comment
+                                Count = $target.Count
+                            })
+                    }
+                    continue
+                }
+                if ($sameAnchor -and
+                    -not [bool]$thread.isDeleted -and
+                    -not [bool]$thread.isOutdated -and
+                    [string]$thread.status -ceq
+                        'active' -and
+                    [string]$thread.contextState -ceq
+                        'current' -and
+                    [string]$thread.sourceCommit -ceq
+                        [string]$Contract.Request.
+                            SourceCommit) {
+                    if ([regex]::IsMatch(
+                        [string]$comment.body,
+                        $anyMarkerPattern)) {
+                        $crossRule = $true
+                    }
+                    elseif ([string]$comment.
+                        reviewerIdentityState -ceq
+                            'ambiguous') {
+                        $ambiguous = $true
+                    }
+                    else {
+                        $humanCurrent = $true
+                    }
+                }
+            }
+        }
+        if ($ambiguous -or $foreign -or
+            $matches.Count -gt 1 -or
+            ($matches.Count -eq 1 -and
+                [int]$matches[0].Count -ne 1)) {
+            $finding.providerMarker =
+                New-OwnerProviderMarker `
+                    -Value $marker `
+                    -Integrity invalid
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown `
+                    -Reason duplicate-or-foreign-reviewer-marker `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest $bodyDigest `
+                    -ThreadAvailability ambiguous
+            $counts.unknown++
+            continue
+        }
+        if ($matches.Count -eq 1) {
+            $entry = $matches[0]
+            $sameBody =
+                Get-OwnerV1WriterSha256 -Text (
+                    [string]$entry.Comment.body) -ceq
+                    $bodyDigest
+            $finding.providerMarker =
+                New-OwnerProviderMarker `
+                    -Value $marker
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification $(if ($sameBody) {
+                        'noOp'
+                    } else { 'unknown' }) `
+                    -Reason $(if ($sameBody) {
+                        'exact-current-comment'
+                    } else {
+                        'existing-comment-body-changed'
+                    }) `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest $bodyDigest `
+                    -ThreadAvailability available `
+                    -ThreadId ([long]$entry.Thread.threadId) `
+                    -CommentId (
+                        [long]$entry.Comment.commentId) `
+                    -ThreadStatus (
+                        [string]$entry.Thread.status)
+            if ($sameBody) {
+                $counts.noOp++
+            }
+            else {
+                $counts.unknown++
+            }
+            continue
+        }
+        if ($crossRule -or $ambiguous) {
+            $classification = 'unknown'
+            $reason = 'other-review-at-anchor'
+            $counts.unknown++
+        }
+        elseif ($humanCurrent) {
+            $classification = 'humanCovered'
+            $reason = 'current-human-review-at-anchor'
+            $counts.humanCovered++
+        }
+        else {
+            $classification = 'wouldCreate'
+            $reason = 'no-current-review-at-anchor'
+            $counts.wouldCreate++
+        }
+        $finding.providerMarker =
+            New-OwnerProviderMarker -Value $marker
+        $finding.reconciliation =
+            New-OwnerV2DiscussionReconciliation `
+                -Classification $classification `
+                -Reason $reason `
+                -DiscussionDigest $discussionDigest `
+                -BodyDigest $bodyDigest
+    }
+    $Observation.effects.dedupe = $counts
+    $Observation.findingsComplete =
+        [string]$Observation.lifecycle.status -ceq
+            'completed' -and
+        $counts.unknown -eq 0
+    return $Observation
 }
 
 function New-OwnerV2DiscussionReconciliation {
@@ -604,6 +915,12 @@ function Resolve-OwnerV2DiscussionReconciliation {
         return Resolve-NamedAreEqualDiscussionReconciliation `
             -Observation $Observation -Contract $Contract -Snapshot $Snapshot `
             -FailureReason $FailureReason
+    }
+    if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
+        $script:ContextualCapability) {
+        return Resolve-ContextualConventionDiscussionReconciliation `
+            -Observation $Observation -Contract $Contract `
+            -Snapshot $Snapshot -FailureReason $FailureReason
     }
 
     $findings = @($Observation.findings)
@@ -2330,6 +2647,294 @@ function New-NamedAreEqualCapabilityAdapter {
     }.GetNewClosure()
 }
 
+function Invoke-ContextualConventionsCapabilityResponse {
+    param(
+        [Parameter(Mandatory)][object]$Context,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [Parameter(Mandatory)]
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits
+    )
+    $binding = Get-OwnerV2Member `
+        -Value $Context -Name binding
+    $evidence = Get-OwnerV2Member `
+        -Value $Context -Name evidence
+    $bindingId = [string](Get-OwnerV2Member `
+            -Value $binding -Name BindingId)
+    $evidenceDigest = [string](Get-OwnerV2Member `
+            -Value $evidence -Name evidenceDigest)
+    $units = @(Get-OwnerV2Member `
+            -Value $evidence -Name evidenceUnits)
+    $identityUnits = @($units | Where-Object {
+            [string]$_.unitId -ceq 'identity'
+        })
+    $ruleUnits = @($units | Where-Object {
+            [string]$_.unitId -ceq 'rule'
+        })
+    $files = @($units | Where-Object {
+            [string]$_.unitId -like 'file:*'
+        } | Sort-Object { [string]$_.unitId })
+    $diagnostics =
+        [Collections.Generic.List[object]]::new()
+    $policyPath = Join-Path $PSScriptRoot `
+        'Policy\contextual-conventions.v1.json'
+    $policyText = [IO.File]::ReadAllText(
+        $policyPath,
+        [Text.UTF8Encoding]::new($false))
+    $policyDigest =
+        Get-OwnerV2Digest -Value $policyText
+    $controlsComplete =
+        -not [string]::IsNullOrWhiteSpace($bindingId) -and
+        [string](Get-OwnerV2Member `
+            -Value $evidence -Name bindingId) -ceq
+                $bindingId -and
+        $evidenceDigest -cmatch
+            $script:OwnerV2DigestPattern -and
+        $identityUnits.Count -eq 1 -and
+        $ruleUnits.Count -eq 1 -and
+        [string]$identityUnits[0].state -ceq
+            'complete' -and
+        [string]$ruleUnits[0].state -ceq
+            'complete' -and
+        [string]$identityUnits[0].data.
+            capabilityId -ceq
+                $script:ContextualCapability -and
+        [string]$identityUnits[0].data.
+            capabilityDigest -ceq
+                $CapabilityDigest -and
+        [string]$ruleUnits[0].data.section -ceq
+            $script:ContextualCapability -and
+        [string]$ruleUnits[0].data.hash -ceq
+            $policyDigest -and
+        [string]$ruleUnits[0].data.content -ceq
+            $policyText -and
+        $policyDigest -ceq
+            $script:ContextualPolicyDigest -and
+        $files.Count -le $Limits.MaximumFiles
+    if (-not $controlsComplete) {
+        Add-OwnerV2Diagnostic `
+            -Diagnostics $diagnostics -Limits $Limits `
+            -Code contextual-rule-evidence-unknown `
+            -Message (
+                'The independently pinned contextual rule ' +
+                'bundle, identity, or bounded files are unavailable.')
+        return [ordered]@{
+            schemaVersion = 1
+            bindingId = $bindingId
+            state = 'unknown'
+            assessments =
+                New-OwnerV2UnknownEvidenceAssessments `
+                    -EvidenceUnits $units `
+                    -BindingId $bindingId
+            diagnostics = @($diagnostics)
+        }
+    }
+    $ruleData = $ruleUnits[0].data
+    $ruleRef = 'rule:' +
+        (Get-OwnerV2Digest -Value ([ordered]@{
+                repositoryId =
+                    $ruleData.repositoryId
+                path = $ruleData.path
+                commit = $ruleData.commit
+                section = $ruleData.section
+                hash = $ruleData.hash
+            })).Substring(10)
+    $assessments =
+        [Collections.Generic.List[object]]::new()
+    [void]$assessments.Add([ordered]@{
+            assessmentId = 'binding:' +
+                (Get-OwnerV2Digest -Value (
+                    "$bindingId|$ruleRef")).
+                Substring(10)
+            evidenceUnitIds = @('identity', 'rule')
+            state = 'complete'
+            findings = @()
+        })
+    $snapshotFiles = @($files | ForEach-Object {
+            [ordered]@{
+                path = [string]$_.data.path
+                content = $(if (
+                    [string]$_.state -ceq 'complete' -and
+                    $_.data.content -is [string]) {
+                    [string]$_.data.content
+                } else { '' })
+                state = [string]$_.state
+                spans = @($_.data.spans)
+            }
+        })
+    $withheldRules =
+        [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal)
+    $semanticCount = 0
+    foreach ($file in $files) {
+        $id = [string]$file.unitId
+        $data = $file.data
+        $path = [string]$data.path
+        $evidenceIds = @('identity', 'rule', $id)
+        if ([string]$file.state -cne 'complete' -or
+            $data -isnot [Collections.IDictionary] -or
+            $data.content -isnot [string]) {
+            foreach ($ruleId in @(
+                    Get-ContextualConventionRuleIds)) {
+                [void]$withheldRules.Add(
+                    [string]$ruleId)
+            }
+            continue
+        }
+        $outcomes =
+            Get-ContextualConventionOutcomes `
+                -Content ([string]$data.content) `
+                -Path $path -Spans @($data.spans) `
+                -SnapshotFiles $snapshotFiles
+        foreach ($outcome in $outcomes) {
+            $state = [string]$outcome.state
+            $ruleId = [string]$outcome.ruleId
+            if ($state -ceq 'unknown') {
+                [void]$withheldRules.Add($ruleId)
+                continue
+            }
+            if ($state -cne 'violation') {
+                continue
+            }
+            $semanticCount++
+            if ($semanticCount -gt
+                $Limits.MaximumSemanticUnits) {
+                Add-OwnerV2Diagnostic `
+                    -Diagnostics $diagnostics `
+                    -Limits $Limits `
+                    -Code contextual-construct-cap-exhausted `
+                    -Message (
+                        'Contextual findings exceed the bounded ' +
+                        'semantic capacity.') -UnitId $id
+                [void]$withheldRules.Add($ruleId)
+                continue
+            }
+            $material = [ordered]@{
+                bindingId = $bindingId
+                evidenceDigest = $evidenceDigest
+                capabilityId =
+                    $script:ContextualCapability
+                capabilityDigest = $CapabilityDigest
+                ruleRef = $ruleRef
+                ruleId = $ruleId
+                evidenceUnitId = $id
+                path = $path
+                line = [int]$outcome.line
+                endLine = [int]$outcome.endLine
+                symbol = [string]$outcome.symbol
+                reason = [string]$outcome.reason
+            }
+            $digest = (Get-OwnerV2Digest `
+                    -Value $material).Substring(10)
+            $constructRef = "construct:$digest"
+            $assessmentId = "method:c:$digest"
+            $findingData = [ordered]@{
+                disposition = 'violation'
+                eligibility =
+                    'changed-contextual-convention'
+                capabilityId =
+                    $script:ContextualCapability
+                bindingId = $bindingId
+                evidenceDigest = $evidenceDigest
+                ruleRef = $ruleRef
+                ruleId = $ruleId
+                constructRef = $constructRef
+                groupRef = $assessmentId
+                headCommit = [string]$identityUnits[
+                    0].data.sourceCommit
+                anchor = [ordered]@{
+                    path = $path
+                    line = [int]$outcome.line
+                    symbol =
+                        [string]$outcome.symbol
+                }
+                evidence =
+                    [string]$outcome.evidence
+                reason = [string]$outcome.reason
+            }
+            [void]$assessments.Add([ordered]@{
+                assessmentId = $assessmentId
+                evidenceUnitIds = $evidenceIds
+                state = 'complete'
+                findings = @([ordered]@{
+                            findingId =
+                                'contextual-v1:' +
+                                (Get-OwnerV2Digest -Value (
+                                    [ordered]@{
+                                        bindingId =
+                                            $bindingId
+                                        capabilityId =
+                                            $script:ContextualCapability
+                                        ruleId = $ruleId
+                                        constructRef =
+                                            $constructRef
+                                        disposition =
+                                            'violation'
+                                    })).Substring(10)
+                            summary =
+                                [string]$outcome.evidence
+                            data = $findingData
+                        })
+                })
+        }
+    }
+    foreach ($ruleId in @($withheldRules |
+            Sort-Object)) {
+        $digest = (Get-OwnerV2Digest -Value (
+                "$bindingId|$ruleRef|$ruleId|withheld")).
+            Substring(10)
+        [void]$assessments.Add([ordered]@{
+                assessmentId = "method:c:$digest"
+                evidenceUnitIds = @('identity', 'rule')
+                state = 'complete'
+                data = [ordered]@{
+                    state = 'advisory'
+                    reason =
+                        'contextual-proof-withheld'
+                    constructRef = "construct:$digest"
+                    ruleId = $ruleId
+                }
+                findings = @()
+            })
+    }
+    return [ordered]@{
+        schemaVersion = 1
+        bindingId = $bindingId
+        state = 'complete'
+        assessments = @($assessments)
+        diagnostics = @($diagnostics)
+    }
+}
+
+function New-ContextualConventionsCapabilityAdapter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CapabilityId,
+        [Parameter(Mandatory)][string]$CapabilityDigest,
+        [DevPilot.OwnerCapability.OwnerV2CapabilityLimits]$Limits =
+            (New-OwnerV2CapabilityLimits)
+    )
+    if ($CapabilityId -cne
+            $script:ContextualCapability -or
+        $CapabilityDigest -cne
+            $script:ContextualDigest) {
+        throw 'Contextual capability identity or digest is invalid.'
+    }
+    $capturedDigest = $CapabilityDigest
+    $capturedLimits = $Limits
+    $command = Get-Command `
+        Invoke-ContextualConventionsCapabilityResponse `
+        -CommandType Function
+    return New-OwnerPipelineAdapter `
+        -Stage capability `
+        -Name contextual-conventions-v1-capability `
+        -Handler {
+            param($context)
+            return & $command -Context $context `
+                -CapabilityDigest $capturedDigest `
+                -Limits $capturedLimits
+        }.GetNewClosure()
+}
+
 function New-OwnerV2CapabilityAdapter {
     [CmdletBinding()]
     param(
@@ -2397,9 +3002,17 @@ function ConvertTo-OwnerV2Observation {
     $assessments = @(Get-OwnerV2Member -Value $validation -Name assessments)
     $capabilityId = [string](Get-OwnerV2Member -Value $identity -Name capabilityId)
     $namedAreEqual = $capabilityId -ceq $script:NamedAreEqualCapability
+    $contextual = $capabilityId -ceq
+        $script:ContextualCapability
     $methodAssessments = @($assessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like
-                $(if ($namedAreEqual) { 'method:n:*' } else { 'method:*' })
+                $(if ($namedAreEqual) {
+                    'method:n:*'
+                }
+                elseif ($contextual) {
+                    'method:c:*'
+                }
+                else { 'method:*' })
         })
     $outcomeAssessments = @($assessments | Where-Object {
             $null -ne (Get-OwnerV2Member -Value $_ -Name data)
@@ -2473,6 +3086,17 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.callListTruncated =
                 [bool](Get-OwnerV2Member -Value $data -Name callListTruncated)
         }
+        elseif ($contextual) {
+            $normalizedFinding.ruleId =
+                [string](Get-OwnerV2Member `
+                    -Value $data -Name ruleId)
+            $normalizedFinding.evidence =
+                [string](Get-OwnerV2Member `
+                    -Value $data -Name evidence)
+            $normalizedFinding.reason =
+                [string](Get-OwnerV2Member `
+                    -Value $data -Name reason)
+        }
         [void]$normalizedFindings.Add($normalizedFinding)
     }
     $normalizedOutcomes = [Collections.Generic.List[object]]::new()
@@ -2526,6 +3150,11 @@ function ConvertTo-OwnerV2Observation {
             $normalizedOutcome.affectedCallCount =
                 [int](Get-OwnerV2Member -Value $outcome -Name affectedCallCount)
         }
+        elseif ($contextual) {
+            $normalizedOutcome.ruleId =
+                [string](Get-OwnerV2Member `
+                    -Value $outcome -Name ruleId)
+        }
         [void]$normalizedOutcomes.Add($normalizedOutcome)
     }
     $sortedFindings = @($normalizedFindings | Sort-Object identity)
@@ -2539,12 +3168,13 @@ function ConvertTo-OwnerV2Observation {
     $runnerAttemptCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
         }).Count
-    $modelStarts = $(if ($namedAreEqual) { 0 } else { 'unknown' })
-    $modelStartsReason = $(if ($namedAreEqual) {
+    $deterministic = $namedAreEqual -or $contextual
+    $modelStarts = $(if ($deterministic) { 0 } else { 'unknown' })
+    $modelStartsReason = $(if ($deterministic) {
             'deterministic-rule-no-model'
         } else { 'runner-telemetry-not-requested' })
-    $latencyMs = $(if ($namedAreEqual) { 0 } else { 'unknown' })
-    $refusalReason = $(if ($namedAreEqual) { 'none' } else { 'unknown' })
+    $latencyMs = $(if ($deterministic) { 0 } else { 'unknown' })
+    $refusalReason = $(if ($deterministic) { 'none' } else { 'unknown' })
     if ($null -ne $Runner) {
         Test-OwnerV2Runner -Runner $Runner
         if ($null -eq $Runner.PSObject.Properties['TelemetryProvider']) {
@@ -2714,10 +3344,13 @@ function ConvertTo-OwnerV2Observation {
 
 Export-ModuleMember -Function @(
     'ConvertTo-OwnerV2Observation',
+    'Format-ContextualConventionComment',
     'Format-NamedAreEqualComment',
     'Format-OwnerV1WriterComment',
+    'Get-ContextualConventionMarkerKey',
     'Get-NamedAreEqualMarkerKey',
     'Get-OwnerV1WriterMarkerKey',
+    'New-ContextualConventionsCapabilityAdapter',
     'New-NamedAreEqualCapabilityAdapter',
     'New-OwnerSemanticRunner',
     'New-OwnerV2CapabilityAdapter',
