@@ -107,13 +107,22 @@ $deliveryConfig = Get-Content `
     ConvertFrom-Json -AsHashtable -Depth 64
 $automatic = $deliveryConfig.
     autoCreateContextualConventionComments
-if ($automatic -isnot
-        [Collections.IDictionary] -or
-    $automatic.enabled -isnot [bool] -or
-    -not [bool]$automatic.enabled -or
-    [string]$automatic.policyPath -eq '' -or
-    [string]$automatic.policySha256 -cnotmatch
+$deliveryEnabled = $false
+if ($automatic -is [bool]) {
+    if ([bool]$automatic) {
+        throw 'contextual-phase-delivery-policy-missing'
+    }
+}
+elseif ($automatic -is
+        [Collections.IDictionary] -and
+    $automatic.enabled -is [bool] -and
+    [bool]$automatic.enabled -and
+    [string]$automatic.policyPath -ne '' -and
+    [string]$automatic.policySha256 -cmatch
         '^[0-9a-f]{64}$') {
+    $deliveryEnabled = $true
+}
+else {
     throw 'contextual-phase-delivery-policy-invalid'
 }
 
@@ -209,21 +218,32 @@ $delivery = [ordered]@{
     deferred = @()
     events = @()
 }
+if (-not $deliveryEnabled) {
+    $delivery.health = 'disabled'
+}
 if ($identities.Count -gt 0) {
-    $deliveryOutput = @(
-        & $deliveryTool invoke-batch `
-            -Delivery contextual-conventions `
-            -DeliveryRoot $AutomaticDeliveryRoot `
-            -StateRoot $ContextualStateRoot `
-            -Identity $identities.ToArray() `
-            -ToolkitConfigPath $deliveryConfigPath `
-            -MaxCreatesPerRun 2 `
-            -MaxCreatesPerPullRequest 5 `
-            -AzureCliPath $AzureCliPath `
-            -GitPath $GitPath `
-            -RepoRoot $ContextualToolkitRoot)
-    $delivery = ($deliveryOutput -join "`n") |
-        ConvertFrom-Json -AsHashtable -Depth 64
+    if ($deliveryEnabled) {
+        $deliveryOutput = @(
+            & $deliveryTool invoke-batch `
+                -Delivery contextual-conventions `
+                -DeliveryRoot $AutomaticDeliveryRoot `
+                -StateRoot $ContextualStateRoot `
+                -Identity $identities.ToArray() `
+                -ToolkitConfigPath $deliveryConfigPath `
+                -MaxCreatesPerRun 2 `
+                -MaxCreatesPerPullRequest 5 `
+                -AzureCliPath $AzureCliPath `
+                -GitPath $GitPath `
+                -RepoRoot $ContextualToolkitRoot)
+        $delivery = ($deliveryOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 64
+    }
+    else {
+        $delivery.remainingWouldCreate = @(
+            $observations | ForEach-Object {
+                [int]$_.wouldCreate
+            } | Measure-Object -Sum).Sum
+    }
 }
 if ([int]$delivery.providerWrites -lt 0 -or
     [int]$delivery.providerWrites -gt 2 -or
@@ -245,6 +265,7 @@ if ([int]$delivery.providerWrites -lt 0 -or
     evaluation = $evaluation
     observations = $observations.ToArray()
     delivery = $delivery
+    deliveryEnabled = $deliveryEnabled
     evaluationEffects = [ordered]@{
         providerWrites =
             [int]$evaluation.providerWrites
