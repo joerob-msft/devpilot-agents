@@ -309,6 +309,9 @@ Describe 'Contextual convention current PR bridge' {
         $observation.findings[0].
             reconciliation.classification |
             Should -BeExactly wouldCreate
+        $observation.findings[0].
+            providerMarker.integrity |
+            Should -BeExactly verified
     }
 
     It 'withholds a changed head without provider writes' {

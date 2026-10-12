@@ -557,7 +557,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             $counts.wouldCreate++
         }
         $finding.providerMarker =
-            New-OwnerProviderMarker -Value $marker
+            New-OwnerProviderMarker `
+                -Value $marker -Integrity verified
         $finding.reconciliation =
             New-OwnerV2DiscussionReconciliation `
                 -Classification $classification `

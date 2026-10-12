@@ -363,10 +363,14 @@ function Get-ContextualBridgeRelevantChangeSet {
     }
     $entries = @($ChangeSet.entries |
         Where-Object {
-            [IO.Path]::GetExtension(
-                [string]$_.path) -ieq '.cs' -or
-            [string]$_.path -imatch
-                '(?:\.csproj|\.props|packages\.config)$'
+            $path = [string]$_.path
+            $relevant = [IO.Path]::GetExtension(
+                $path) -ieq '.cs' -or
+                $path -imatch
+                    '(?:\.csproj|\.props|packages\.config)$'
+            $generated = $path -imatch
+                '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\\.g|\\.designer)\\.cs$'
+            $relevant -and -not $generated
         })
     $changedLines = [long]0
     foreach ($entry in $entries) {
