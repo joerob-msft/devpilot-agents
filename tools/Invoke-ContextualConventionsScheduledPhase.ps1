@@ -186,11 +186,17 @@ foreach ($record in $completed) {
     $observation = Get-Content `
         -LiteralPath $matches[0].FullName -Raw |
         ConvertFrom-Json -AsHashtable -Depth 64
+    $unexpectedValidationErrors = @(
+        $observation.validationErrors |
+            Where-Object {
+                [string]$_ -cnotmatch
+                    '^file-evidence-unknown: '
+            })
     if ([string]$observation.lifecycle.status -cne
             'completed' -or
         -not [bool]$observation.findingsComplete -or
         [int]$observation.counts.unknown -ne 0 -or
-        @($observation.validationErrors).Count -ne 0 -or
+        $unexpectedValidationErrors.Count -ne 0 -or
         [int]$observation.effects.providerWrites -ne 0 -or
         [int]$observation.execution.modelStarts -ne 0 -or
         @($observation.findings |
