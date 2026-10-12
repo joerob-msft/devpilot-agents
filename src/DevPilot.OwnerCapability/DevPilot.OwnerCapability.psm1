@@ -54,7 +54,7 @@ $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b5406
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualDigest = 'v1:sha256:aa316ea3ae651eb996441b56c852b19dee080e30c659e4570946dec24589d208'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:6e7cf6e001efa9966a6edb29348ea2344c8450a7ff713d56bc9ba69c81e1aafd'
+$script:ContextualPolicyDigest = 'v1:sha256:5dab00b07fadfd3bb16a095da7cd960d00b4cb579cc8392ce5812436654a1cad'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'

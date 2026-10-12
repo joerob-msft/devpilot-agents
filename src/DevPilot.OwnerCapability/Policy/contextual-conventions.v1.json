@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "capability": "bpm-contextual-conventions@1",
-  "repository": "msazure/One/AzureUX-BPM",
+  "repository": "consumer-configured",
   "sourceAuthority": {
     "codingPatterns": "documentation/EngineeringProcesses/Conventions/CodingPatterns.md",
     "codingStyle": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
