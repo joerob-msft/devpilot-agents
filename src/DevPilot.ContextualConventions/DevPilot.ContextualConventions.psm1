@@ -1801,7 +1801,7 @@ function Get-ContextualRoslynOutcomes {
                     }).Count -gt 0
             })
         if ($changedCandidates.Count -gt 0) {
-            $results[$rule] = $changedCandidates[0]
+            $results[$rule] = $changedCandidates[-1]
             continue
         }
         $outcome = $results[$rule]
