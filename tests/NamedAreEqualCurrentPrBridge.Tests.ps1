@@ -7,6 +7,8 @@ BeforeAll {
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1') -Force
     Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
         'src\DevPilot.NamedAreEqualBridge\DevPilot.NamedAreEqualBridge.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
@@ -538,6 +540,104 @@ BeforeAll {
 }
 
 Describe 'Named AreEqual current PR bridge' {
+    It 'skips generated C# while preserving a definite file and an unknown capped file' {
+        $head = [ordered]@{
+            sourceCommit = 'a' * 40
+            targetCommit = 'b' * 40
+        }
+        $completeDerivation = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            New-DevPilotChangeDerivation `
+                -ChangeType edit -IsText $true `
+                -Deleted $false -Renamed $false `
+                -SourceContent 'Assert.AreEqual(1, actual);' `
+                -TargetContent '' `
+                -Spans @([ordered]@{
+                        startLine = 1
+                        endLine = 1
+                    }) `
+                -SourceCommit ('a' * 40) `
+                -TargetCommit ('b' * 40)
+        }
+        $unknownDerivation = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            New-DevPilotChangeDerivation `
+                -ChangeType edit -IsText $true `
+                -Deleted $false -Renamed $false `
+                -SourceContent 'changed' `
+                -TargetContent 'old' -Spans @() `
+                -SourceCommit ('a' * 40) `
+                -TargetCommit ('b' * 40)
+        }
+        $completeContent =
+            'Assert.AreEqual(1, actual);'
+        $unknownContent = 'changed'
+        $changeSet = [ordered]@{
+            changedFiles = 3
+            changedLines = 6001
+            entries = @(
+                [ordered]@{
+                    path = 'src/Resources.Designer.cs'
+                    changeType = 'edit'
+                    state = 'complete'
+                    spans = @([ordered]@{
+                            startLine = 1
+                            endLine = 6000
+                        })
+                    derivation = $completeDerivation
+                    content = 'generated'
+                    byteLength = 9
+                    sourceDigest = 'v1:sha256:' +
+                        ('a' * 64)
+                },
+                [ordered]@{
+                    path = 'tests/Checks.cs'
+                    changeType = 'edit'
+                    state = 'complete'
+                    spans = @([ordered]@{
+                            startLine = 1
+                            endLine = 1
+                        })
+                    derivation = $completeDerivation
+                    content = $completeContent
+                    byteLength =
+                        [Text.Encoding]::UTF8.GetByteCount(
+                            $completeContent)
+                    sourceDigest =
+                        Get-BridgeTextDigest $completeContent
+                },
+                [ordered]@{
+                    path = 'tests/Deferred.cs'
+                    changeType = 'edit'
+                    state = 'unknown'
+                    spans = @()
+                    derivation = $unknownDerivation
+                    content = $unknownContent
+                    byteLength =
+                        [Text.Encoding]::UTF8.GetByteCount(
+                            $unknownContent)
+                    sourceDigest =
+                        Get-BridgeTextDigest $unknownContent
+                })
+        }
+        $result = & (
+            Get-Module DevPilot.NamedAreEqualBridge) {
+            param($Changes, $Head)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $Changes -Head $Head
+        } $changeSet $head
+        $result.changedFiles | Should -Be 2
+        $result.changedLines | Should -Be 1
+        @($result.entries.path) |
+            Should -Be @(
+                'tests/Checks.cs',
+                'tests/Deferred.cs')
+        $result.entries[0].state |
+            Should -BeExactly 'complete'
+        $result.entries[1].state |
+            Should -BeExactly 'unknown'
+    }
+
     It 'completes in a fresh process with only bridge imports' `
         -TestCases @(
             @{ Mode = 'empty'; ExpectedExit = 0

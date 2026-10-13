@@ -146,6 +146,37 @@ AfterAll {
     }
 }
 Describe 'Active PR read-only intake' {
+    It 'uses originalPath only for a deletion whose item path is absent' {
+        $path = & (Get-Module DevPilot.ActivePrIntake) {
+            Resolve-ActivePrIterationChangePath `
+                -Entry ([ordered]@{
+                    changeType = 'delete'
+                    item = [ordered]@{
+                        path = $null
+                    }
+                    originalPath =
+                        '/src/Deleted.cs'
+                })
+        }
+        $path | Should -BeExactly 'src/Deleted.cs'
+    }
+
+    It 'refuses an absent item path for a non-delete change' {
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                Resolve-ActivePrIterationChangePath `
+                    -Entry ([ordered]@{
+                        changeType = 'edit'
+                        item = [ordered]@{
+                            path = $null
+                        }
+                        originalPath =
+                            '/src/Old.cs'
+                    })
+            }
+        } | Should -Throw 'change-list-truncated'
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }

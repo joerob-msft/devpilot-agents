@@ -60,6 +60,55 @@ function Get-ApprovedOwnerV2ChangedSpans {
     }
 }
 
+function Resolve-ApprovedOwnerV2LiveHead {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$PullRequest,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Iteration,
+        [Parameter(Mandatory)]
+        [object[]]$SourceRefs
+    )
+    $sourceRef = [string](
+        $PullRequest['sourceRefName'])
+    $sourceCommit =
+        [string](($Iteration[
+            'sourceRefCommit'])['commitId'])
+    $targetCommit =
+        [string](($Iteration[
+            'targetRefCommit'])['commitId'])
+    $matchingSourceCommits = @(
+        foreach ($ref in $SourceRefs) {
+            if ($ref -is
+                    [Collections.IDictionary] -and
+                [string]($ref['name']) -ceq
+                    $sourceRef -and
+                [string]($ref['objectId']) -cmatch
+                    '^[a-fA-F0-9]{40}$') {
+                [string]($ref['objectId'])
+            }
+        })
+    $liveSourceCommit = [string](
+        $matchingSourceCommits |
+            Select-Object -First 1)
+    if ($sourceRef -cnotmatch '^refs/heads/.+' -or
+        $sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        $targetCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        $matchingSourceCommits.Count -ne 1 -or
+        $liveSourceCommit -ine
+            $sourceCommit) {
+        throw 'Live pull request source ref or iteration is inconsistent.'
+    }
+    return [ordered]@{
+        sourceCommit = $sourceCommit
+        targetCommit = $targetCommit
+        targetRef = [string](
+            $PullRequest['targetRefName'])
+        iterationId = [int](
+            $Iteration['id'])
+    }
+}
+
 function New-ApprovedOwnerV2AzureDevOpsProvider {
     [CmdletBinding()]
     param(
@@ -183,6 +232,31 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             throw 'Azure DevOps change listing may be incomplete.'
         }
         return $entries
+    }.GetNewClosure()
+
+    $getSourceRefs = {
+        param([Parameter(Mandatory)][string]$SourceRef)
+        if ($SourceRef -cnotmatch
+            '^refs/heads/(?<filter>.+)$') {
+            throw 'Live pull request source ref is invalid.'
+        }
+        $response = & $invokeAzJson @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'refs',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            '--query-parameters',
+            "filter=heads/$($Matches.filter)",
+            'includeStatuses=false',
+            'peelTags=false',
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        return @($response.value)
     }.GetNewClosure()
 
     $getItemContent = {
@@ -311,6 +385,10 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                 )
                 $iterations = @(& $getIterations $pullRequestId)
                 $current = $iterations[-1]
+                $liveHead = Resolve-ApprovedOwnerV2LiveHead `
+                    -PullRequest $pr -Iteration $current `
+                    -SourceRefs @(& $getSourceRefs (
+                        [string]$pr.sourceRefName))
                 $changes = @(& $getChanges $pullRequestId ([int]$current.id))
                 $rawThreads = & $invokeAzJson @(
                     'devops', 'invoke',
@@ -370,15 +448,15 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                     $change = $matches[0]
                     $spans = @(& $getChangedSpans -Path ([string]$path) `
                             -ChangeType ([string]$change.changeType) `
-                            -SourceCommit ([string]$pr.lastMergeSourceCommit.commitId) `
-                            -TargetCommit ([string]$pr.lastMergeTargetCommit.commitId))
+                            -SourceCommit ([string]$liveHead.sourceCommit) `
+                            -TargetCommit ([string]$liveHead.targetCommit))
                     foreach ($span in $spans) {
                         [void]$anchors.Add([ordered]@{
                                 path = [string]$path
                                 startLine = [int]$span.startLine
                                 endLine = [int]$span.endLine
                                 changeTrackingId = [int]$change.changeTrackingId
-                                iterationId = [int]$current.id
+                                iterationId = [int]$liveHead.iterationId
                             })
                     }
                 }
@@ -390,9 +468,9 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                         isDraft = [bool]$pr.isDraft
                         repositoryId = [string]$pr.repository.id
                         projectId = [string]$pr.repository.project.id
-                        sourceCommit = [string]$pr.lastMergeSourceCommit.commitId
-                        targetCommit = [string]$pr.lastMergeTargetCommit.commitId
-                        targetRef = [string]$pr.targetRefName
+                        sourceCommit = [string]$liveHead.sourceCommit
+                        targetCommit = [string]$liveHead.targetCommit
+                        targetRef = [string]$liveHead.targetRef
                     }
                     Reviewer = [ordered]@{
                         id = ([string]$reviewer.id).ToLowerInvariant()

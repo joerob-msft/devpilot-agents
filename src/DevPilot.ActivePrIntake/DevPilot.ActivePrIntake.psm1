@@ -1499,6 +1499,83 @@ function Invoke-ActivePrIntake {
     finally { $lock.Dispose() }
 }
 
+function Resolve-ActivePrHeadSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$PullRequest,
+        [Parameter(Mandatory)]
+        [object[]]$Iterations,
+        [Parameter(Mandatory)]
+        [object[]]$SourceRefs
+    )
+    if ($Iterations.Count -eq 0 -or
+        $Iterations.Count -gt 200) {
+        throw 'iteration-inaccessible'
+    }
+    $latest = $Iterations |
+        Sort-Object { [int]$_.id } |
+        Select-Object -Last 1
+    $sourceRef = [string]$PullRequest.sourceRefName
+    $sourceCommit =
+        [string]$latest.sourceRefCommit.commitId
+    $targetCommit =
+        [string]$latest.targetRefCommit.commitId
+    if ($sourceRef -cnotmatch '^refs/heads/.+' -or
+        $sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        $targetCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
+        throw 'head-inconsistent'
+    }
+    $exactRefs = @($SourceRefs | Where-Object {
+            $_ -is [Collections.IDictionary] -and
+            [string]$_.name -ceq $sourceRef -and
+            [string]$_.objectId -cmatch
+                '^[a-fA-F0-9]{40}$'
+        })
+    if ($exactRefs.Count -ne 1 -or
+        [string]$exactRefs[0].objectId -ine
+            $sourceCommit) {
+        throw 'head-inconsistent'
+    }
+    return [ordered]@{
+        pullRequestId = $PullRequest.pullRequestId
+        repositoryId = $PullRequest.repository.id
+        projectId = $PullRequest.repository.project.id
+        status = $PullRequest.status
+        isDraft = $PullRequest.isDraft
+        sourceRef = $sourceRef
+        targetRef = $PullRequest.targetRefName
+        sourceCommit = $sourceCommit
+        targetCommit = $targetCommit
+        iterationId = $latest.id
+    }
+}
+
+function Resolve-ActivePrIterationChangePath {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Entry
+    )
+    if ($Entry.item -isnot
+            [Collections.IDictionary]) {
+        throw 'change-list-truncated'
+    }
+    $changeType = [string]$Entry.changeType
+    $itemPath = [string]$Entry.item.path
+    $originalPath = if (
+        $null -ne $Entry['originalPath']) {
+        [string]$Entry.originalPath
+    }
+    else { '' }
+    if ($itemPath -match '^/.+') {
+        return $itemPath.TrimStart('/')
+    }
+    if ($changeType -match '(?i)^delete' -and
+        $originalPath -match '^/.+') {
+        return $originalPath.TrimStart('/')
+    }
+    throw 'change-list-truncated'
+}
+
 function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
     param(
@@ -1852,6 +1929,102 @@ print(json.dumps({
         }
         return $response
     }.GetNewClosure()
+    $getProjectContext = {
+        param(
+            [string]$Path,
+            [string]$Commit,
+            [DateTime]$Deadline
+        )
+        $directory = [IO.Path]::GetDirectoryName(
+            $Path.Replace('/', [IO.Path]::DirectorySeparatorChar)).
+            Replace([IO.Path]::DirectorySeparatorChar, '/')
+        while (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $apiPath = if ($directory.StartsWith('/')) {
+                $directory
+            }
+            else { "/$directory" }
+            try {
+                $response = & $invoke 'git' 'items' @(
+                    "project=$project", "repositoryId=$repo") @(
+                    "scopePath=$apiPath",
+                    'recursionLevel=OneLevel',
+                    "versionDescriptor.version=$Commit",
+                    'versionDescriptor.versionType=commit',
+                    'includeContentMetadata=true') $Deadline
+            }
+            catch {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-unavailable'
+                }
+            }
+            $items = if ($response -is [Collections.IDictionary] -and
+                $response.value -is [array]) {
+                @($response.value)
+            }
+            elseif ($response -is [array]) {
+                @($response)
+            }
+            else {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-unavailable'
+                }
+            }
+            $projects = @($items | Where-Object {
+                    $_ -is [Collections.IDictionary] -and
+                    -not [bool]$_.isFolder -and
+                    [string]$_.path -match '(?i)\.csproj$' -and
+                    [IO.Path]::GetDirectoryName(
+                        ([string]$_.path).Replace(
+                            '/', [IO.Path]::DirectorySeparatorChar)).
+                        Replace(
+                            [IO.Path]::DirectorySeparatorChar, '/').
+                        TrimStart('/') -ceq
+                        $apiPath.TrimStart('/')
+                })
+            if ($projects.Count -gt 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-ambiguous'
+                }
+            }
+            if ($projects.Count -eq 1) {
+                $projectPath = ([string]$projects[0].path).TrimStart('/')
+                $item = & $getItem $projectPath $Commit $Deadline
+                $content = [string]$item.content
+                return [ordered]@{
+                    state = 'complete'
+                    path = $projectPath
+                    content = $content
+                    byteLength =
+                        [Text.Encoding]::UTF8.GetByteCount($content)
+                    sourceDigest = 'v1:sha256:' +
+                        [Convert]::ToHexString(
+                            [Security.Cryptography.SHA256]::HashData(
+                                [Text.Encoding]::UTF8.GetBytes($content))).
+                            ToLowerInvariant()
+                }
+            }
+            $parent = [IO.Path]::GetDirectoryName(
+                $directory.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar))
+            if ([string]::IsNullOrWhiteSpace($parent) -or
+                $parent -ceq $directory) {
+                break
+            }
+            $directory = $parent.Replace(
+                [IO.Path]::DirectorySeparatorChar, '/')
+        }
+        return [ordered]@{
+            state = 'unknown'
+            reason = 'project-context-missing'
+        }
+    }.GetNewClosure()
+    $resolveHeadSnapshot =
+        ${function:Resolve-ActivePrHeadSnapshot}
+    $resolveChangePath =
+        ${function:Resolve-ActivePrIterationChangePath}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -1977,22 +2150,21 @@ print(json.dumps({
                 $iterations = & $invoke 'git' 'pullRequestIterations' @(
                     "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
                 $list = @($iterations.value)
-                if ($list.Count -eq 0 -or $list.Count -gt 200) { throw 'iteration-inaccessible' }
-                $last = $list | Sort-Object { [int]$_.id } | Select-Object -Last 1
-                if (($null -ne $r['lastMergeSourceCommit'] -and
-                        [string]$r.lastMergeSourceCommit.commitId -ine
-                        [string]$last.sourceRefCommit.commitId) -or
-                    ($null -ne $r['lastMergeTargetCommit'] -and
-                        [string]$r.lastMergeTargetCommit.commitId -ine
-                        [string]$last.targetRefCommit.commitId)) {
+                $sourceRefName = [string]$r.sourceRefName
+                if ($sourceRefName -cnotmatch
+                    '^refs/heads/(?<filter>.+)$') {
                     throw 'head-inconsistent'
                 }
-                return @{ pullRequestId = $r.pullRequestId
-                    repositoryId = $r.repository.id; projectId = $r.repository.project.id
-                    status = $r.status; isDraft = $r.isDraft
-                    sourceRef = $r.sourceRefName; targetRef = $r.targetRefName
-                    sourceCommit = $last.sourceRefCommit.commitId
-                    targetCommit = $last.targetRefCommit.commitId; iterationId = $last.id }
+                $refs = & $invoke 'git' 'refs' @(
+                    "project=$project",
+                    "repositoryId=$repo") @(
+                    "filter=heads/$($Matches.filter)",
+                    'includeStatuses=false',
+                    'peelTags=false') $deadline
+                return & $resolveHeadSnapshot `
+                    -PullRequest $r `
+                    -Iterations $list `
+                    -SourceRefs @($refs.value)
             }
             Changes {
                 $id = [int]$Request.pullRequestId
@@ -2044,10 +2216,10 @@ print(json.dumps({
                     foreach ($entry in $entries) {
                         if ($entry -isnot [Collections.IDictionary] -or
                             $null -eq $entry['changeTrackingId'] -or
-                            $entry.item -isnot [Collections.IDictionary] -or
-                            [string]$entry.item.path -notmatch '^/.+') {
+                            $entry.item -isnot [Collections.IDictionary]) {
                             throw 'change-list-truncated'
                         }
+                        $path = & $resolveChangePath -Entry $entry
                         $trackingId = & $parseNumber $entry['changeTrackingId'] `
                             changeTrackingId 1 ([int]::MaxValue)
                         if (-not $seenChanges.Add($trackingId)) {
@@ -2055,7 +2227,7 @@ print(json.dumps({
                         }
                         [void]$changeEntries.Add([ordered]@{
                                 changeTrackingId = $trackingId
-                                path = ([string]$entry.item.path).TrimStart('/')
+                                path = $path
                                 changeType = [string]$entry.changeType
                                 originalPath = $(if (
                                     $null -ne $entry['originalPath']
@@ -2079,6 +2251,8 @@ print(json.dumps({
                 }
                 if (-not $complete) { throw 'change-page-budget' }
                 $normalized = [Collections.Generic.List[object]]::new()
+                $projectContexts = @{}
+                $projectContextByDirectory = @{}
                 $changedLines = 0
                 $totalBytes = 0L
                 foreach ($entry in @($changeEntries |
@@ -2165,13 +2339,25 @@ print(json.dumps({
                             -SourceContent $sourceContent `
                             -TargetContent $targetContent |
                         ForEach-Object { $_ })
-                    foreach ($span in $spans) {
-                        $changedLines +=
-                            [int]$span.endLine - [int]$span.startLine + 1
+                    $generated = [string]$entry.path -imatch
+                        '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\.g|\.designer)\.cs$'
+                    $reviewable = (
+                        $isCSharp -and -not $generated) -or
+                        [string]$entry.path -imatch
+                            '(?:\.csproj|\.props|packages\.config)$'
+                    $entryChangedLines = 0
+                    if ($reviewable) {
+                        foreach ($span in $spans) {
+                            $entryChangedLines +=
+                                [int]$span.endLine -
+                                [int]$span.startLine + 1
+                        }
                     }
-                    if ($changedLines -gt
-                        [int]$Config.limits.maxChangedLines) {
-                        throw 'line-budget'
+                    $withinLineBudget =
+                        $changedLines + $entryChangedLines -le
+                            [int]$Config.limits.maxChangedLines
+                    if ($withinLineBudget) {
+                        $changedLines += $entryChangedLines
                     }
                     $bytes = [Text.Encoding]::UTF8.GetByteCount($sourceContent)
                     $totalBytes += $bytes
@@ -2182,8 +2368,12 @@ print(json.dumps({
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
                             changeType = $changeType
-                            state = 'complete'
-                            spans = @($spans | ForEach-Object {
+                            state = $(if ($withinLineBudget) {
+                                'complete'
+                            } else { 'unknown' })
+                            spans = @($(if ($withinLineBudget) {
+                                $spans
+                            } else { @() }) | ForEach-Object {
                                 [ordered]@{
                                     startLine = [int]$_.startLine
                                     endLine = [int]$_.endLine
@@ -2197,6 +2387,12 @@ print(json.dumps({
                                         }))
                                 }
                             })
+                            unavailableReason = $(if (
+                                $withinLineBudget) {
+                                $null
+                            } else {
+                                'cap-exhausted'
+                            })
                             content = $sourceContent
                             byteLength = $bytes
                             sourceDigest = 'v1:sha256:' +
@@ -2205,20 +2401,62 @@ print(json.dumps({
                                         [Text.Encoding]::UTF8.GetBytes(
                                             $sourceContent))).
                                     ToLowerInvariant()
-                            derivation =
-                                & $changeDerivationCommand `
-                                    -ChangeType $changeType `
-                                    -IsText $true `
-                                    -Deleted $deleted `
-                                    -Renamed (
-                                        $changeType -match
-                                            '(?i)rename') `
-                                    -SourceContent $sourceContent `
-                                    -TargetContent $targetContent `
-                                    -Spans $spans `
-                                    -SourceCommit $sourceCommit `
-                                    -TargetCommit $targetCommit
                         }
+                    $derivationSpans =
+                        [object[]]@()
+                    if ($withinLineBudget) {
+                        $derivationSpans =
+                            [object[]]$spans
+                    }
+                    $normalizedChange.derivation =
+                        & $changeDerivationCommand `
+                            -ChangeType $changeType `
+                            -IsText $true `
+                            -Deleted $deleted `
+                            -Renamed (
+                                $changeType -match
+                                    '(?i)rename') `
+                            -SourceContent $sourceContent `
+                            -TargetContent $targetContent `
+                            -Spans $derivationSpans `
+                            -SourceCommit $sourceCommit `
+                            -TargetCommit $targetCommit
+                    if ($isCSharp) {
+                        $sourceDirectory =
+                            [IO.Path]::GetDirectoryName(
+                                ([string]$entry.path).Replace(
+                                    '/',
+                                    [IO.Path]::DirectorySeparatorChar)).
+                                Replace(
+                                    [IO.Path]::DirectorySeparatorChar,
+                                    '/')
+                        $context = if (
+                            $projectContextByDirectory.ContainsKey(
+                                $sourceDirectory)) {
+                            $projectContextByDirectory[
+                                $sourceDirectory]
+                        }
+                        else {
+                            $resolved = & $getProjectContext `
+                                ([string]$entry.path) `
+                                $sourceCommit $deadline
+                            $projectContextByDirectory[
+                                $sourceDirectory] = $resolved
+                            $resolved
+                        }
+                        $contextKey = if (
+                            [string]$context.state -ceq 'complete') {
+                            [string]$context.path
+                        }
+                        else {
+                            ([string]$entry.path) + '|' +
+                                [string]$context.reason
+                        }
+                        if (-not $projectContexts.ContainsKey($contextKey)) {
+                            $projectContexts[$contextKey] = $context
+                        }
+                        $normalizedChange['projectContext'] = $context
+                    }
                     if ($changeType -match '(?i)rename' -and
                         $entry.originalPath) {
                         $normalizedChange['oldPath'] =
@@ -2230,6 +2468,7 @@ print(json.dumps({
                     changedFiles = $seenChanges.Count
                     changedLines = $changedLines
                     entries = $normalized.ToArray()
+                    projectContexts = @($projectContexts.Values)
                 }
             }
             Discussions {

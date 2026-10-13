@@ -365,13 +365,6 @@ function Get-NamedBridgeRelevantChangeSet {
         [Collections.IDictionary]) {
         throw 'changed-line-evidence-unavailable'
     }
-    try {
-        Assert-DevPilotChangeInventory `
-            -Changes $ChangeSet
-    }
-    catch {
-        throw 'changed-line-evidence-unavailable'
-    }
     foreach ($entry in @($ChangeSet.entries)) {
         if ($entry -isnot
                 [Collections.IDictionary] -or
@@ -382,12 +375,37 @@ function Get-NamedBridgeRelevantChangeSet {
             throw 'changed-path-evidence-unavailable'
         }
     }
+    $candidateEntries = @($ChangeSet.entries |
+        Where-Object {
+            $path = [string]$_.path
+            [IO.Path]::GetExtension(
+                $path) -ieq '.cs' -and
+            $path -inotmatch
+                '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\.g|\.designer)\.cs$'
+        })
+    $candidateLines = [long]0
+    foreach ($entry in $candidateEntries) {
+        foreach ($span in @($entry.spans)) {
+            $candidateLines +=
+                [int]$span.endLine -
+                [int]$span.startLine + 1
+        }
+    }
+    try {
+        Assert-DevPilotChangeInventory `
+            -Changes ([ordered]@{
+                changedFiles =
+                    $candidateEntries.Count
+                changedLines =
+                    $candidateLines
+                entries = $candidateEntries
+            })
+    }
+    catch {
+        throw 'changed-line-evidence-unavailable'
+    }
     $entries = [Collections.Generic.List[object]]::new()
-    foreach ($entry in @($ChangeSet.entries |
-            Where-Object {
-                [IO.Path]::GetExtension(
-                    [string]$_.path) -ieq '.cs'
-            })) {
+    foreach ($entry in $candidateEntries) {
         $disposition =
             Get-NamedBridgeChangeDisposition `
                 -Entry $entry -Head $Head
