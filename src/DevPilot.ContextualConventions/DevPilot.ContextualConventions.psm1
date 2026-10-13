@@ -1038,15 +1038,30 @@ function Get-ContextualRoslynOutcomes {
         }
         $generic = [string]$catch.Declaration.Type -in @(
             'Exception', 'System.Exception')
-        $filtered = $null -ne $catch.Filter -and
-            [string]$catch.Filter.FilterExpression.
-                ToString() -match
-                    '!\s*\w+\.IsFatal\s*\('
+        $filterText = if ($null -ne $catch.Filter) {
+            [string]$catch.Filter.FilterExpression.ToString()
+        }
+        else { '' }
+        $hasFilter = -not [string]::IsNullOrWhiteSpace($filterText)
+        $fatalFiltered = $hasFilter -and
+            $filterText -match '!\s*\w+\.IsFatal\s*\('
         $onlyThrow = $catch.Block.Statements.Count -eq 1 -and
             $catch.Block.Statements[0] -is [
                 Microsoft.CodeAnalysis.CSharp.Syntax.ThrowStatementSyntax] -and
             $null -eq $catch.Block.Statements[0].Expression
-        if ($generic -and -not $filtered -and
+        if ($generic -and $hasFilter -and -not $fatalFiltered -and
+            -not $onlyThrow) {
+            $results['exception-propagation'] =
+                New-ContextualOutcome `
+                    -RuleId exception-propagation `
+                    -State unknown `
+                    -Reason typed-filter-fatal-semantics-unproven `
+                    -Path $Path `
+                    -Line (Get-ContextualNodeLine $catch) `
+                    -EndLine (Get-ContextualNodeLine $catch) `
+                    -Symbol $variable
+        }
+        elseif ($generic -and -not $hasFilter -and
             -not $onlyThrow) {
             $results['exception-propagation'] =
                 New-ContextualOutcome `
@@ -1181,6 +1196,20 @@ function Get-ContextualRoslynOutcomes {
                         [string]$_.Expression.ToString() -match
                             '\.First(?:OrDefault)?$'
                     })) {
+            if ($first.ArgumentList.Arguments.Count -gt 0) {
+                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
+                    $results['collection-cardinality'] =
+                        New-ContextualOutcome `
+                            -RuleId collection-cardinality `
+                            -State unknown `
+                            -Reason predicate-selection-cardinality-unproven `
+                            -Path $Path `
+                            -Line (Get-ContextualNodeLine $first) `
+                            -EndLine (Get-ContextualNodeLine $first) `
+                            -Symbol ([string]$method.Identifier.ValueText)
+                }
+                continue
+            }
             $receiver = if ($first.Expression -is [
                 Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
                 [string]$first.Expression.Expression.ToString()

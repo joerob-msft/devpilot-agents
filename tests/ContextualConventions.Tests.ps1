@@ -453,4 +453,19 @@ Describe 'Contextual convention analyzer' {
         $outcome.state | Should -BeExactly violation
         $outcome.line | Should -Be 4
     }
+    It 'withholds typed generic catch filters without fatal classification semantics' {
+        $source = 'class C { object M() { try { return Read(); } catch (Exception ex) when (ex is FormatException || ex is ArgumentException) { return null; } } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId exception-propagation -Content $source
+        $outcome.state | Should -BeExactly unknown
+        $outcome.reason | Should -BeExactly typed-filter-fatal-semantics-unproven
+    }
+
+    It 'withholds predicate First selection without a proven uniqueness contract' {
+        $source = 'class C { object M(object[] values) { return values.FirstOrDefault(value => value != null); } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId collection-cardinality -Content $source
+        $outcome.state | Should -BeExactly unknown
+        $outcome.reason | Should -BeExactly predicate-selection-cardinality-unproven
+    }
 }
