@@ -468,4 +468,26 @@ Describe 'Contextual convention analyzer' {
         $outcome.state | Should -BeExactly unknown
         $outcome.reason | Should -BeExactly predicate-selection-cardinality-unproven
     }
+    It 'withholds protocol and positional First selections without uniqueness proof' {
+        $controls = @(
+            'class C { string M(HttpRequest request) { return request.Headers.GetValues("x").FirstOrDefault(); } }'
+            'class C { object M(ItemList items) { if (items.Any()) { return items.First(); } return null; } }'
+            'class C { object M(Part[] parts) { return parts.OfType<TextPart>().FirstOrDefault(); } }'
+            'class C { object M(Flow flow) { return flow.Definition.Triggers.FirstOrDefault(); } }'
+        )
+        foreach ($source in $controls) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId collection-cardinality -Content $source
+            $outcome.state | Should -BeExactly unknown
+            $outcome.reason | Should -BeExactly positional-selection-cardinality-unproven
+        }
+    }
+
+    It 'retains predicate First when the method proves a unique collection contract' {
+        $source = 'class C { object M(ChannelMap channels) { var selected = channels.Out.First(kvp => kvp.Value != null); var only = channels?.Out.Values.SingleOrDefault(); return selected; } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId collection-cardinality -Content $source
+        $outcome.state | Should -BeExactly violation
+        $outcome.reason | Should -BeExactly arbitrary-first-selection
+    }
 }

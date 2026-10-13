@@ -1196,20 +1196,8 @@ function Get-ContextualRoslynOutcomes {
                         [string]$_.Expression.ToString() -match
                             '\.First(?:OrDefault)?$'
                     })) {
-            if ($first.ArgumentList.Arguments.Count -gt 0) {
-                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
-                    $results['collection-cardinality'] =
-                        New-ContextualOutcome `
-                            -RuleId collection-cardinality `
-                            -State unknown `
-                            -Reason predicate-selection-cardinality-unproven `
-                            -Path $Path `
-                            -Line (Get-ContextualNodeLine $first) `
-                            -EndLine (Get-ContextualNodeLine $first) `
-                            -Symbol ([string]$method.Identifier.ValueText)
-                }
-                continue
-            }
+            $predicateSelection = $first.ArgumentList.Arguments.Count -gt 0
+
             $receiver = if ($first.Expression -is [
                 Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
                 [string]$first.Expression.Expression.ToString()
@@ -1231,6 +1219,26 @@ function Get-ContextualRoslynOutcomes {
                     [Math]::Min(
                         $method.ToString().Length,
                         $offset))
+            $normalizedReceiver = $receiver.Replace('?.', '.')
+            $normalizedMethodText = ([string]$method.ToString()).Replace('?.', '.')
+            $predicateUniquenessProof = $predicateSelection -and
+                $normalizedMethodText -match (
+                    [regex]::Escape($normalizedReceiver) +
+                    '(?:\.Values)?\.Single(?:OrDefault)?(?:<[^>]+>)?\s*\(')
+            if ($predicateSelection -and -not $predicateUniquenessProof) {
+                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
+                    $results['collection-cardinality'] =
+                        New-ContextualOutcome `
+                            -RuleId collection-cardinality `
+                            -State unknown `
+                            -Reason predicate-selection-cardinality-unproven `
+                            -Path $Path `
+                            -Line (Get-ContextualNodeLine $first) `
+                            -EndLine (Get-ContextualNodeLine $first) `
+                            -Symbol ([string]$method.Identifier.ValueText)
+                }
+                continue
+            }
             $orderedSelection = $receiver -match
                 '\.(?:OrderBy|OrderByDescending|ThenBy|ThenByDescending)\s*\(' -or
                 $receiver -match '\.Split\s*\('
@@ -1251,6 +1259,27 @@ function Get-ContextualRoslynOutcomes {
                 "\b$([regex]::Escape($receiver))\." +
                 '(?:Count\s*(?:\(\s*\))?\s*(?:==|!=)\s*1|' +
                 'Single\s*\()')
+            $positionalContractUnproven =
+                $receiver -match '(?i)(?:Headers\.GetValues|HeaderValues|\.GetValues\s*\()' -or
+                $receiver -match '\.OfType\s*<' -or
+                $receiver -match '(?:^|\.)Triggers$' -or
+                $priorText -match (
+                    [regex]::Escape($receiver) + '\.Any\s*\(')
+            if (-not $validated -and -not $orderedSelection -and
+                $positionalContractUnproven) {
+                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
+                    $results['collection-cardinality'] =
+                        New-ContextualOutcome `
+                            -RuleId collection-cardinality `
+                            -State unknown `
+                            -Reason positional-selection-cardinality-unproven `
+                            -Path $Path `
+                            -Line (Get-ContextualNodeLine $first) `
+                            -EndLine (Get-ContextualNodeLine $first) `
+                            -Symbol ([string]$method.Identifier.ValueText)
+                }
+                continue
+            }
             if (-not $validated -and -not $orderedSelection) {
                 $results['collection-cardinality'] =
                     New-ContextualOutcome `
