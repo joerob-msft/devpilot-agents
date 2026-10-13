@@ -1445,8 +1445,32 @@ function Invoke-OwnerV2CapabilityResponse {
         $constructs += @(Get-OwnerV2NonEligibleConstructs -FileData $fileData -Limits $Limits)
 
         foreach ($construct in $constructs) {
-                $constructMaterial = [ordered]@{
-                bindingId = $bindingId
+            $constructStartLine = [int]$construct.startLine
+            $constructDeclarationLine = [int]$construct.declarationLine
+            $constructAnchorLine = $constructDeclarationLine
+            $fileSpans = @(Get-OwnerV2Member -Value $fileData -Name spans)
+            if (-not (Test-OwnerV2ChangedRange `
+                    -StartLine $constructDeclarationLine `
+                    -EndLine $constructDeclarationLine `
+                    -Spans $fileSpans)) {
+                $constructAnchorLine = 0
+                foreach ($span in @($fileSpans | Sort-Object {
+                            [int](Get-OwnerV2Member -Value $_ -Name startLine)
+                        })) {
+                    $spanStart = [int](Get-OwnerV2Member -Value $span -Name startLine)
+                    $spanEnd = [int](Get-OwnerV2Member -Value $span -Name endLine)
+                    $candidate = [Math]::Max($constructStartLine, $spanStart)
+                    if ($candidate -le $constructDeclarationLine -and
+                        $spanEnd -ge $constructStartLine) {
+                        $constructAnchorLine = $candidate
+                        break
+                    }
+                }
+                if ($constructAnchorLine -lt 1) {
+                    throw 'Changed Owner construct has no exact changed anchor.'
+                }
+            }
+            $constructMaterial = [ordered]@{                bindingId = $bindingId
                 evidenceDigest = $evidenceDigest
                 capabilityId = $CapabilityId
                 capabilityDigest = $CapabilityDigest
@@ -1457,6 +1481,7 @@ function Invoke-OwnerV2CapabilityResponse {
                 name = $construct.name
                 startLine = $construct.startLine
                 declarationLine = $construct.declarationLine
+                anchorLine = $constructAnchorLine
                 attributes = @($construct.attributes)
                 hasOwner = [bool]$construct.hasOwner
                 recognized = [bool]$construct.recognized
@@ -1590,7 +1615,7 @@ function Invoke-OwnerV2CapabilityResponse {
                             headCommit = [string](Get-OwnerV2Member -Value $identityData -Name sourceCommit)
                             anchor = [ordered]@{
                                 path = $path
-                                line = [int]$construct.declarationLine
+                                line = $constructAnchorLine
                                 symbol = [string]$construct.name
                             }
                         }

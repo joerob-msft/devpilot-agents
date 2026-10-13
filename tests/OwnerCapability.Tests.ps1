@@ -995,4 +995,29 @@ Describe 'Owner capability module surface' {
             'Resolve-OwnerV2DiscussionReconciliation'
         )
     }
+    It 'anchors a valid Owner finding to the changed test attribute when the declaration is unchanged' {
+        $case = [ordered]@{
+            id = 'changed-test-attribute-anchor'
+            path = 'src/ChangedAttributeTests.cs'
+            lines = @(
+                'public class ChangedAttributeTests'
+                '{'
+                '    [TestMethod, TestCategory("Changed")]'
+                '    public void NeedsOwner()'
+                '    {'
+                '    }'
+                '}'
+            )
+            spans = @([ordered]@{ startLine = 3; endLine = 3 })
+        }
+        $run = Invoke-TestOwnerV2Case -Case $case
+        $run.Requests | Should -HaveCount 1
+        $run.Requests[0].construct.name | Should -BeExactly NeedsOwner
+        $run.Observation.findings | Should -HaveCount 1
+        $finding = $run.Observation.findings[0]
+        $finding.anchor.line | Should -Be 3
+        $finding.anchor.symbol | Should -BeExactly NeedsOwner
+        $finding.binding.source.representation.startLine | Should -Be 3
+        $finding.binding.source.representation.endLine | Should -Be 3
+    }
 }
