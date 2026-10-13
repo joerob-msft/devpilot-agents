@@ -1189,11 +1189,27 @@ function Get-ContextualRoslynOutcomes {
                     [Math]::Min(
                         $method.ToString().Length,
                         $offset))
+            $orderedSelection = $receiver -match
+                '\.(?:OrderBy|OrderByDescending|ThenBy|ThenByDescending)\s*\(' -or
+                $receiver -match '\.Split\s*\('
+            if (-not $orderedSelection -and $receiver -match '^[A-Za-z_][A-Za-z0-9_]*$') {
+                $orderedSelection = @(
+                    $method.DescendantNodes() |
+                        Where-Object {
+                            $_ -is [
+                                Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax] -and
+                            [string]$_.Identifier.ValueText -ceq $receiver -and
+                            $_.SpanStart -lt $first.SpanStart -and
+                            $null -ne $_.Initializer -and
+                            [string]$_.Initializer.Value.ToString() -match
+                                '\.(?:OrderBy|OrderByDescending|ThenBy|ThenByDescending)\s*\('
+                        }).Count -gt 0
+            }
             $validated = $priorText -match (
                 "\b$([regex]::Escape($receiver))\." +
-                '(?:Count\s*(?:==|!=)\s*1|' +
+                '(?:Count\s*(?:\(\s*\))?\s*(?:==|!=)\s*1|' +
                 'Single\s*\()')
-            if (-not $validated) {
+            if (-not $validated -and -not $orderedSelection) {
                 $results['collection-cardinality'] =
                     New-ContextualOutcome `
                         -RuleId collection-cardinality `
@@ -1286,10 +1302,42 @@ function Get-ContextualRoslynOutcomes {
                         $_ -is [
                             Microsoft.CodeAnalysis.CSharp.Syntax.AnonymousFunctionExpressionSyntax]
                     })) {
-            $parentText = [string](
-                @($lambda.AncestorsAndSelf() |
-                    Select-Object -First 5) -join ' ')
-            if ($parentText -notmatch '(?i)validat') {
+            $validationCallback = $false
+            $argument = @($lambda.AncestorsAndSelf() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.ArgumentSyntax]
+                } | Select-Object -First 1)
+            if ($argument.Count -eq 1) {
+                $argumentName = if ($null -ne $argument[0].NameColon) {
+                    [string]$argument[0].NameColon.Name.Identifier.ValueText
+                }
+                else { '' }
+                $invocation = @($argument[0].Ancestors() |
+                    Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax]
+                    } | Select-Object -First 1)
+                $invocationName = if ($invocation.Count -eq 1) {
+                    [string]$invocation[0].Expression.ToString()
+                }
+                else { '' }
+                $validationCallback = $argumentName -match
+                    '(?i)^(?:validator|validation(?:Delegate|Callback)?)$' -or
+                    $invocationName -match
+                    '(?i)(?:^|\.)(?:Validate|ValidateAsync|RegisterValidation|SetValidator)$'
+            }
+            if (-not $validationCallback) {
+                $declarator = @($lambda.AncestorsAndSelf() |
+                    Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax]
+                    } | Select-Object -First 1)
+                $validationCallback = $declarator.Count -eq 1 -and
+                    [string]$declarator[0].Identifier.ValueText -match
+                        '(?i)validat'
+            }
+            if (-not $validationCallback) {
                 continue
             }
             $lambdaInvocations = @(
@@ -1724,6 +1772,24 @@ function Get-ContextualRoslynOutcomes {
                         -Line (Get-ContextualNodeLine $assignment) `
                         -EndLine (Get-ContextualNodeLine $assignment)
             }
+        }
+    }
+
+    foreach ($rule in $script:RuleIds) {
+        $outcome = $results[$rule]
+        if ([string]$outcome.state -cne 'violation') {
+            continue
+        }
+        $first = [int]$outcome.line
+        $last = [Math]::Max($first, [int]$outcome.endLine)
+        $changed = @($Spans | Where-Object {
+                $first -le [int]$_.endLine -and
+                $last -ge [int]$_.startLine
+            }).Count -gt 0
+        if (-not $changed) {
+            $outcome.state = 'compliant'
+            $outcome.reason = 'candidate-outside-changed-spans'
+            $outcome.evidence = ''
         }
     }
 

@@ -383,4 +383,51 @@ Describe 'Contextual convention analyzer' {
             -SnapshotFiles $files).state |
             Should -Not -BeExactly violation
     }
+    It 'withholds violation anchors outside the changed spans' {
+        $cases = @(
+            @{ rule = 'collection-cardinality'; line = 1; source = "class C { object M(System.Collections.Generic.IEnumerable<object> values) { var item = values.First();`nvar changed = 1; return item; } }" },
+            @{ rule = 'async-all-the-way'; line = 1; source = "class C { int M(System.Threading.Tasks.Task<int> task) { var item = task.Result;`nvar changed = 1; return item; } }" },
+            @{ rule = 'explicit-string-comparison'; line = 1; source = "class C { bool M(string left, string right) { var item = left == right;`nvar changed = 1; return item; } }" }
+        )
+        foreach ($case in $cases) {
+            $outcome = @(Get-ContextualConventionOutcomes `
+                    -Content $case.source -Path 'src/Changed.cs' `
+                    -Spans @([ordered]@{ startLine = 2; endLine = 2 }) `
+                    -SnapshotFiles @([ordered]@{
+                            path = 'src/Changed.cs'
+                            content = $case.source
+                            state = 'complete'
+                            spans = @([ordered]@{ startLine = 2; endLine = 2 })
+                        }) | Where-Object ruleId -CEQ $case.rule)[0]
+            $outcome.state | Should -Not -BeExactly violation
+            $outcome.reason | Should -BeExactly candidate-outside-changed-spans
+        }
+    }
+
+    It 'honors terminating Count(), stable ordering, and protocol ordering' {
+        $controls = @(
+            'class C { int M(int[] values) { if (values.Count() != 1) throw new Exception(); return values.First(); } }',
+            'class C { int M(int[] values) { var ordered = values.OrderBy(value => value); return ordered.FirstOrDefault(); } }',
+            'class C { string M(string header) { return header.Split(";").First(); } }'
+        )
+        foreach ($source in $controls) {
+            (Invoke-ConventionCase `
+                -RuleId collection-cardinality `
+                -Content $source).state |
+                Should -Not -BeExactly violation
+        }
+    }
+
+    It 'binds cheap validation only to actual validation callback APIs' {
+        $wrapper = 'class C { Task<string> ValidateAndCreateFlow() { return TemplateEngine.HandleTemplateException(protectedMethod: async () => await Database.ReadAsync()); } }'
+        (Invoke-ConventionCase `
+            -RuleId cheap-validation `
+            -Content $wrapper).state |
+            Should -Not -BeExactly violation
+        $validation = 'class C { Task<bool> M() { return RequestValidation.Validate(validationDelegate: async () => await Database.ExistsAsync()); } }'
+        (Invoke-ConventionCase `
+            -RuleId cheap-validation `
+            -Content $validation).state |
+            Should -BeExactly violation
+    }
 }
