@@ -1020,4 +1020,26 @@ Describe 'Owner capability module surface' {
         $finding.binding.source.representation.startLine | Should -Be 3
         $finding.binding.source.representation.endLine | Should -Be 3
     }
+    It 'preserves the declaration anchor when the method declaration changed' {
+        $case = [ordered]@{
+            id = 'changed-test-declaration-anchor'
+            path = 'src/ChangedDeclarationTests.cs'
+            lines = @(
+                'public class ChangedDeclarationTests'
+                '{'
+                '    [TestMethod]'
+                '    public void NeedsOwner()'
+                '    {'
+                '    }'
+                '}'
+            )
+            spans = @([ordered]@{ startLine = 4; endLine = 4 })
+        }
+        $run = Invoke-TestOwnerV2Case -Case $case
+        $run.Observation.findings | Should -HaveCount 1
+        $finding = $run.Observation.findings[0]
+        $finding.anchor.line | Should -Be 4
+        $finding.binding.source.representation.startLine | Should -Be 4
+        $finding.binding.source.representation.endLine | Should -Be 4
+    }
 }
