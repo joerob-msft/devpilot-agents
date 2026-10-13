@@ -1068,8 +1068,17 @@ else {
                 $c.config.limits.maxChangedLines = 2
                 $bounded = New-ActivePrAzureDevOpsProvider `
                     -Config $c.config -AzureCliPath $stub
-                { & $bounded 'Changes' $request } |
-                    Should -Throw 'line-budget'
+                $boundedResult =
+                    & $bounded 'Changes' $request
+                $boundedResult.changedLines |
+                    Should -Be 0
+                $boundedResult.entries[0].state |
+                    Should -BeExactly 'unknown'
+                $boundedResult.entries[0].
+                    unavailableReason |
+                    Should -BeExactly 'cap-exhausted'
+                @($boundedResult.entries[0].spans) |
+                    Should -HaveCount 0
             }
         }
         finally {

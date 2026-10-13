@@ -2295,13 +2295,25 @@ print(json.dumps({
                             -SourceContent $sourceContent `
                             -TargetContent $targetContent |
                         ForEach-Object { $_ })
-                    foreach ($span in $spans) {
-                        $changedLines +=
-                            [int]$span.endLine - [int]$span.startLine + 1
+                    $generated = [string]$entry.path -imatch
+                        '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\.g|\.designer)\.cs$'
+                    $reviewable = (
+                        $isCSharp -and -not $generated) -or
+                        [string]$entry.path -imatch
+                            '(?:\.csproj|\.props|packages\.config)$'
+                    $entryChangedLines = 0
+                    if ($reviewable) {
+                        foreach ($span in $spans) {
+                            $entryChangedLines +=
+                                [int]$span.endLine -
+                                [int]$span.startLine + 1
+                        }
                     }
-                    if ($changedLines -gt
-                        [int]$Config.limits.maxChangedLines) {
-                        throw 'line-budget'
+                    $withinLineBudget =
+                        $changedLines + $entryChangedLines -le
+                            [int]$Config.limits.maxChangedLines
+                    if ($withinLineBudget) {
+                        $changedLines += $entryChangedLines
                     }
                     $bytes = [Text.Encoding]::UTF8.GetByteCount($sourceContent)
                     $totalBytes += $bytes
@@ -2312,8 +2324,12 @@ print(json.dumps({
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
                             changeType = $changeType
-                            state = 'complete'
-                            spans = @($spans | ForEach-Object {
+                            state = $(if ($withinLineBudget) {
+                                'complete'
+                            } else { 'unknown' })
+                            spans = @($(if ($withinLineBudget) {
+                                $spans
+                            } else { @() }) | ForEach-Object {
                                 [ordered]@{
                                     startLine = [int]$_.startLine
                                     endLine = [int]$_.endLine
@@ -2326,6 +2342,12 @@ print(json.dumps({
                                             sourceCommit = $sourceCommit
                                         }))
                                 }
+                            })
+                            unavailableReason = $(if (
+                                $withinLineBudget) {
+                                $null
+                            } else {
+                                'cap-exhausted'
                             })
                             content = $sourceContent
                             byteLength = $bytes
