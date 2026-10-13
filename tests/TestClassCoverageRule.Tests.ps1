@@ -71,7 +71,6 @@ Describe 'Test-project class coverage exclusion rule' {
         }
 
         $unrelated = @(
-            'using Other; [ExcludeFromCodeCoverage] class Helper { }'
             'using System.Diagnostics.CodeAnalysis; class ExcludeFromCodeCoverageAttribute : System.Attribute { } [ExcludeFromCodeCoverage] class Helper { }'
             '[assembly: System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage] class Helper { }'
         )
@@ -80,6 +79,47 @@ Describe 'Test-project class coverage exclusion rule' {
                 -Project $script:TestProject).state |
                 Should -BeExactly 'violation'
         }
+
+        $ambiguous = Invoke-CoverageRule `
+            -Source 'using Other; [ExcludeFromCodeCoverage] class Helper { }' `
+            -Project $script:TestProject
+        $ambiguous.state | Should -BeExactly 'unknown'
+        $ambiguous.reason | Should -BeExactly `
+            'coverage-attribute-binding-unproven'
+    }
+
+    It 'recognizes an exact same-project global framework import' {
+        $source = '[ExcludeFromCodeCoverage] class Helper { }'
+        $files = @(
+            [ordered]@{
+                path = 'src/Tests/Cases.cs'
+                content = $source
+                state = 'complete'
+                spans = @([ordered]@{
+                        startLine = 1
+                        endLine = 1
+                    })
+            },
+            [ordered]@{
+                path = 'src/Tests/GlobalUsings.cs'
+                content = 'global using System.Diagnostics.CodeAnalysis;'
+                state = 'complete'
+                spans = @()
+            },
+            [ordered]@{
+                path = 'src/Tests/Tests.csproj'
+                content = $script:TestProject
+                state = 'complete'
+                spans = @()
+            })
+        $result = @(Get-ContextualConventionOutcomes `
+                -Content $source -Path 'src/Tests/Cases.cs' `
+                -Spans $files[0].spans -SnapshotFiles $files |
+                Where-Object {
+                    $_.ruleId -ceq
+                        'test-class-code-coverage'
+                })[0]
+        $result.state | Should -BeExactly 'compliant'
     }
 
     It 'uses parsed unconditional project metadata' {

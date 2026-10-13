@@ -934,7 +934,8 @@ function Get-ContextualReceiverType {
 function Get-ContextualCoverageAttributeState {
     param(
         [Parameter(Mandatory)]$Type,
-        [Parameter(Mandatory)]$Root
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
     )
     $namespace = 'System.Diagnostics.CodeAnalysis'
     $full = "$namespace.ExcludeFromCodeCoverage"
@@ -981,10 +982,34 @@ function Get-ContextualCoverageAttributeState {
                 }).Count -gt 0
             if ($name -ceq 'ExcludeFromCodeCoverage' -and
                 -not $localShadow -and
-                $namespace -cin $imports -and
                 -not $aliases.ContainsKey(
                     'ExcludeFromCodeCoverage')) {
-                return 'present'
+                if ($namespace -cin $imports) {
+                    return 'present'
+                }
+                foreach ($file in @($SnapshotFiles |
+                        Where-Object {
+                            [string]$_.state -ceq 'complete' -and
+                            [string]$_.path -imatch '\.cs$' -and
+                            $_.content -is [string]
+                        })) {
+                    $tree = [
+                        Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+                            [string]$file.content)
+                    $globalImports = @($tree.GetRoot().Usings |
+                        Where-Object {
+                            [string]$_.GlobalKeyword.Text -ceq
+                                'global' -and
+                            $null -eq $_.Alias
+                        } | ForEach-Object {
+                            ([string]$_.Name.ToString()) `
+                                -replace '^global::', ''
+                        })
+                    if ($namespace -cin $globalImports) {
+                        return 'present'
+                    }
+                }
+                return 'ambiguous'
             }
             $parts = $name -split '\.|::', 2
             if ($aliases.ContainsKey($parts[0])) {
@@ -1165,8 +1190,20 @@ function Get-ContextualCoverageOutcomes {
         }
         $attributeState =
             Get-ContextualCoverageAttributeState `
-                -Type $type -Root $Root
+                -Type $type -Root $Root `
+                -SnapshotFiles $SnapshotFiles
         if ($attributeState -ceq 'present') {
+            continue
+        }
+        if ($attributeState -ceq 'ambiguous') {
+            [void]$outcomes.Add(
+                (New-ContextualOutcome `
+                    -RuleId test-class-code-coverage `
+                    -State unknown `
+                    -Reason coverage-attribute-binding-unproven `
+                    -Path $Path -Line $changedLines[0] `
+                    -EndLine $changedLines[0] `
+                    -Symbol ([string]$type.Identifier.ValueText)))
             continue
         }
         if (@($type.Modifiers | Where-Object {
