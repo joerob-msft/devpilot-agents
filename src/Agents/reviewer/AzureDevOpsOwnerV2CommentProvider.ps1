@@ -165,9 +165,9 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         $source = & $getItemContent $Path $SourceCommit
         if ($ChangeType -match '(?i)^add') {
             $count = [Math]::Max(1, [regex]::Split($source, '\r?\n').Count)
-            return , @([ordered]@{ startLine = 1; endLine = $count })
+            return [ordered]@{ startLine = 1; endLine = $count }
         }
-        if ($ChangeType -match '(?i)^delete') { return , @() }
+        if ($ChangeType -match '(?i)^delete') { return @() }
         $target = & $getItemContent $Path $TargetCommit
         $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
             'owner-v2-diff-' + [guid]::NewGuid().ToString('N'))
@@ -186,7 +186,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                 if ([string]$line -match
                     '^@@ -\d+(?:,\d+)? \+(?<start>\d+)(?:,(?<count>\d+))? @@') {
                     $start = [int]$Matches.start
-                    $count = if ($Matches.count) { [int]$Matches.count } else { 1 }
+                    $count = if ($Matches['count']) { [int]$Matches['count'] } else { 1 }
                     if ($count -gt 0) {
                         [void]$spans.Add([ordered]@{
                                 startLine = $start
@@ -195,7 +195,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                     }
                 }
             }
-            return , $spans.ToArray()
+            return $spans.ToArray()
         }
         finally {
             Remove-Item -LiteralPath $before, $after -Force -ErrorAction SilentlyContinue
