@@ -165,7 +165,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         $source = & $getItemContent $Path $SourceCommit
         if ($ChangeType -match '(?i)^add') {
             $count = [Math]::Max(1, [regex]::Split($source, '\r?\n').Count)
-            return , @([ordered]@{ startLine = 1; endLine = $count })
+            return @([ordered]@{ startLine = 1; endLine = $count })
         }
         if ($ChangeType -match '(?i)^delete') { return , @() }
         $target = & $getItemContent $Path $TargetCommit
@@ -195,7 +195,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                     }
                 }
             }
-            return , $spans.ToArray()
+            return $spans.ToArray()
         }
         finally {
             Remove-Item -LiteralPath $before, $after -Force -ErrorAction SilentlyContinue
