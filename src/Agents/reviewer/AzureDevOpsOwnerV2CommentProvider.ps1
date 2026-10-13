@@ -177,7 +177,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         try {
             [IO.File]::WriteAllText($before, $target, [Text.UTF8Encoding]::new($false))
             [IO.File]::WriteAllText($after, $source, [Text.UTF8Encoding]::new($false))
-            $diff = @(& $GitPath --no-pager diff --no-index --unified=0 -- $before $after 2>$null)
+            $diff = @(& $GitPath --no-optional-locks -c core.longpaths=true --no-pager diff --no-index --unified=0 -- $before $after 2>$null)
             if ($LASTEXITCODE -notin @(0, 1)) {
                 throw "Unable to derive changed-line spans for '$Path'."
             }
