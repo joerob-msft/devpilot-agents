@@ -232,6 +232,40 @@ BeforeAll {
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'excludes generated C# from the contextual line denominator' {
+        $changes = [ordered]@{
+            changedFiles = 2
+            changedLines = 1
+            entries = @(
+                [ordered]@{
+                    path = 'src/Auto.g.cs'
+                    state = 'complete'
+                    spans = @([ordered]@{
+                            startLine = 1
+                            endLine = 6000
+                        })
+                },
+                [ordered]@{
+                    path = 'src/Real.cs'
+                    state = 'complete'
+                    spans = @([ordered]@{
+                            startLine = 1
+                            endLine = 1
+                        })
+                })
+        }
+        $result = & (
+            Get-Module DevPilot.ContextualConventionsBridge) {
+            param($Changes)
+            Get-ContextualBridgeRelevantChangeSet `
+                -ChangeSet $Changes
+        } $changes
+        $result.changedFiles | Should -Be 1
+        $result.changedLines | Should -Be 1
+        @($result.entries.path) |
+            Should -Be @('src/Real.cs')
+    }
+
     It 'is default-off with no reads or durable state' {
         $config = New-ContextualTestConfig
         $reads =

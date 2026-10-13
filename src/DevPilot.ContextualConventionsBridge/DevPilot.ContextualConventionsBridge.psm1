@@ -384,7 +384,7 @@ function Get-ContextualBridgeRelevantChangeSet {
                 $path -imatch
                     '(?:\.csproj|\.props|packages\.config)$'
             $generated = $path -imatch
-                '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\\.g|\\.designer)\\.cs$'
+                '(^|[\\/])(?:obj|generated|Ignore-AddedForReferenceOnly)([\\/]|$)|(?:\.g|\.designer)\.cs$'
             $relevant -and -not $generated
         })
     $changedLines = [long]0
