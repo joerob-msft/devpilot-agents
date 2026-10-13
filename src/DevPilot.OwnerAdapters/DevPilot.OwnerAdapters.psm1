@@ -1605,7 +1605,6 @@ function Get-OwnerDiscussionSnapshot {
             maximumBytes = $Limits.MaximumBytes
         }
         sourceDigests = @($sourceDigests)
-        rawProvenanceDigests = @($rawProvenanceDigests)
         mappingDigest = $(if ($null -eq $mappingDigest) { 'unknown' } else { $mappingDigest })
         reviewerIdentityDigest = $(if ($null -eq $reviewerIdentityDigest) {
                 'unknown'
