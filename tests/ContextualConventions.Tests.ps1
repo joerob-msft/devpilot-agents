@@ -126,9 +126,9 @@ BeforeAll {
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed seventeen-rule allow set' {
+    It 'exports the fixed eighteen-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 17
+            Should -HaveCount 18
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {

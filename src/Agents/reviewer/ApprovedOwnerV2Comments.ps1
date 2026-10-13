@@ -28,7 +28,8 @@ $script:ApprovedContextualRuleIds = @(
     'json-contracts',
     'api-errors',
     'secret-redaction',
-    'dependency-fanout'
+    'dependency-fanout',
+    'test-class-code-coverage'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'

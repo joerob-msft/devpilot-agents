@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:44f001e35795fdd016fc723e276d58b256a0a3500ffd07faa1780f185f61ae48'
+$script:ContextualDigest = 'v1:sha256:2f86f6a23741808238810b56a5f19661c7feeeb9afc7e6bb68b72ca861261a32'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:5dab00b07fadfd3bb16a095da7cd960d00b4cb579cc8392ce5812436654a1cad'
+$script:ContextualPolicyDigest = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -2810,18 +2810,44 @@ function Invoke-ContextualConventionsCapabilityResponse {
             state = 'complete'
             findings = @()
         })
-    $snapshotFiles = @($files | ForEach-Object {
+    $snapshotFiles = [Collections.Generic.List[object]]::new()
+    $snapshotPaths =
+        [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $files) {
+        [void]$snapshotFiles.Add(
             [ordered]@{
-                path = [string]$_.data.path
+                path = [string]$file.data.path
                 content = $(if (
-                    [string]$_.state -ceq 'complete' -and
-                    $_.data.content -is [string]) {
-                    [string]$_.data.content
+                    [string]$file.state -ceq 'complete' -and
+                    $file.data.content -is [string]) {
+                    [string]$file.data.content
                 } else { '' })
-                state = [string]$_.state
-                spans = @($_.data.spans)
+                state = [string]$file.state
+                spans = @($file.data.spans)
             }
-        })
+        )
+        [void]$snapshotPaths.Add(
+            [string]$file.data.path)
+        $context = Get-OwnerV2Member `
+            -Value $file.data -Name projectContext
+        if ($context -is
+                [Collections.IDictionary] -and
+            [string]$context.state -ceq 'complete' -and
+            -not $snapshotPaths.Contains(
+                [string]$context.path)) {
+            [void]$snapshotFiles.Add(
+                [ordered]@{
+                    path = [string]$context.path
+                    content = [string]$context.content
+                    state = 'complete'
+                    spans = @()
+                    contextOnly = $true
+                })
+            [void]$snapshotPaths.Add(
+                [string]$context.path)
+        }
+    }
     $withheldRules =
         [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::Ordinal)
@@ -2845,7 +2871,7 @@ function Invoke-ContextualConventionsCapabilityResponse {
             Get-ContextualConventionOutcomes `
                 -Content ([string]$data.content) `
                 -Path $path -Spans @($data.spans) `
-                -SnapshotFiles $snapshotFiles
+                -SnapshotFiles $snapshotFiles.ToArray()
         foreach ($outcome in $outcomes) {
             $state = [string]$outcome.state
             $ruleId = [string]$outcome.ruleId

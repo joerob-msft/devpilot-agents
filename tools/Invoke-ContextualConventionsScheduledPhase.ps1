@@ -93,9 +93,9 @@ $allowedRuleIds = @(
     (Get-Content -LiteralPath $policyPath -Raw |
         ConvertFrom-Json -AsHashtable `
             -Depth 32).rules.id)
-if ($allowedRuleIds.Count -ne 17 -or
+if ($allowedRuleIds.Count -ne 18 -or
     @($allowedRuleIds |
-        Sort-Object -Unique).Count -ne 17) {
+        Sort-Object -Unique).Count -ne 18) {
     throw 'contextual-phase-rule-allowset-invalid'
 }
 

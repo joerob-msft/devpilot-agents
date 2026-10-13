@@ -23,7 +23,8 @@ $script:RuleIds = @(
     'json-contracts',
     'api-errors',
     'secret-redaction',
-    'dependency-fanout'
+    'dependency-fanout',
+    'test-class-code-coverage'
 )
 
 function Get-ContextualConventionRuleIds {
@@ -930,11 +931,290 @@ function Get-ContextualReceiverType {
     return [string]$Expression.ToString()
 }
 
+function Get-ContextualCoverageAttributeState {
+    param(
+        [Parameter(Mandatory)]$Type,
+        [Parameter(Mandatory)]$Root
+    )
+    $namespace = 'System.Diagnostics.CodeAnalysis'
+    $full = "$namespace.ExcludeFromCodeCoverage"
+    $usingNodes = @($Root.Usings)
+    foreach ($ancestor in @($Type.Ancestors())) {
+        if ($ancestor -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]) {
+            $usingNodes += @($ancestor.Usings)
+        }
+    }
+    $imports = @($usingNodes | Where-Object {
+            $null -eq $_.Alias
+        } | ForEach-Object {
+            ([string]$_.Name.ToString()) -replace '^global::', ''
+        })
+    $aliases = @{}
+    foreach ($using in @($usingNodes | Where-Object {
+                $null -ne $_.Alias
+            })) {
+        $aliases[[string]$using.Alias.Name.Identifier.ValueText] =
+            ((([string]$using.Name.ToString()) -replace '^global::', '') `
+                -replace 'Attribute$', '')
+    }
+    foreach ($list in @($Type.AttributeLists)) {
+        if ($null -ne $list.Target) {
+            continue
+        }
+        foreach ($attribute in @($list.Attributes)) {
+            $name = ([string]$attribute.Name.ToString()) `
+                -replace '^global::', '' `
+                -replace 'Attribute$', ''
+            if ($name -ceq $full) {
+                return 'present'
+            }
+            $localShadow = @($Root.DescendantNodes() |
+                Where-Object {
+                    ($_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax] -or
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.StructDeclarationSyntax]) -and
+                    [string]$_.Identifier.ValueText -cin @(
+                        'ExcludeFromCodeCoverage',
+                        'ExcludeFromCodeCoverageAttribute')
+                }).Count -gt 0
+            if ($name -ceq 'ExcludeFromCodeCoverage' -and
+                -not $localShadow -and
+                $namespace -cin $imports -and
+                -not $aliases.ContainsKey(
+                    'ExcludeFromCodeCoverage')) {
+                return 'present'
+            }
+            $parts = $name -split '\.|::', 2
+            if ($aliases.ContainsKey($parts[0])) {
+                $resolved = [string]$aliases[$parts[0]]
+                if ($parts.Count -gt 1) {
+                    $resolved += '.' + $parts[1]
+                }
+                if ($resolved -ceq $full) {
+                    return 'present'
+                }
+            }
+        }
+    }
+    return 'missing'
+}
+
+function Get-ContextualTestProject {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $candidates = @($SnapshotFiles | Where-Object {
+            [string]$_.state -ceq 'complete' -and
+            [string]$_.path -imatch '\.csproj$' -and
+            $Path.StartsWith(
+                ([IO.Path]::GetDirectoryName(
+                    ([string]$_.path).Replace(
+                        '/', [IO.Path]::DirectorySeparatorChar)).
+                    Replace(
+                        [IO.Path]::DirectorySeparatorChar, '/') + '/'),
+                [StringComparison]::OrdinalIgnoreCase)
+        } | Sort-Object {
+            -([string]$_.path).Length
+        })
+    if ($candidates.Count -lt 1) {
+        return [pscustomobject]@{
+            State = 'unknown'
+            Reason = 'test-project-evidence-missing'
+        }
+    }
+    $directoryLength = [IO.Path]::GetDirectoryName(
+        ([string]$candidates[0].path).Replace(
+            '/', [IO.Path]::DirectorySeparatorChar)).Length
+    $nearest = @($candidates | Where-Object {
+            [IO.Path]::GetDirectoryName(
+                ([string]$_.path).Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar)).Length -eq
+                $directoryLength
+        })
+    if ($nearest.Count -ne 1) {
+        return [pscustomobject]@{
+            State = 'unknown'
+            Reason = 'test-project-evidence-ambiguous'
+        }
+    }
+    $content = [string]$nearest[0].content
+    try {
+        [xml]$xml = $content
+    }
+    catch {
+        return [pscustomobject]@{
+            State = 'unknown'
+            Reason = 'test-project-xml-invalid'
+        }
+    }
+    $testNodes = @($xml.SelectNodes(
+            '//*[local-name()="IsTestProject"]') |
+        Where-Object {
+            [string]$_.InnerText -match '^\s*true\s*$'
+        })
+    $sdkNodes = @($xml.SelectNodes(
+            '//*[local-name()="PackageReference"]') |
+        Where-Object {
+            [string]$_.GetAttribute('Include') -ceq
+                'Microsoft.NET.Test.Sdk'
+        })
+    if (@($testNodes + $sdkNodes | Where-Object {
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$_.GetAttribute('Condition'))
+            }).Count -gt 0) {
+        return [pscustomobject]@{
+            State = 'unknown'
+            Reason = 'test-project-condition-unproven'
+        }
+    }
+    $isTest = $testNodes.Count -gt 0 -or
+        $sdkNodes.Count -gt 0
+    if (-not $isTest) {
+        return [pscustomobject]@{
+            State = 'not-test'
+            Path = [string]$nearest[0].path
+        }
+    }
+    $compileSetting = @($xml.SelectNodes(
+            '//*[local-name()="EnableDefaultCompileItems"]') |
+        Where-Object {
+            [string]$_.InnerText -match '^\s*false\s*$'
+        })
+    if ($compileSetting.Count -gt 0) {
+        return [pscustomobject]@{
+            State = 'unknown'
+            Reason = 'test-project-compile-membership-unproven'
+        }
+    }
+    $projectDirectory = [IO.Path]::GetDirectoryName(
+        ([string]$nearest[0].path).Replace(
+            '/', [IO.Path]::DirectorySeparatorChar))
+    $relative = [IO.Path]::GetRelativePath(
+        $projectDirectory,
+        $Path.Replace(
+            '/', [IO.Path]::DirectorySeparatorChar)).
+        Replace([IO.Path]::DirectorySeparatorChar, '\')
+    foreach ($node in @($xml.SelectNodes(
+            '//*[local-name()="Compile" and @Remove]'))) {
+        $pattern = [WildcardPattern]::new(
+            ([string]$node.GetAttribute('Remove')).Replace('/', '\'),
+            [WildcardOptions]::IgnoreCase)
+        if ($pattern.IsMatch($relative)) {
+            return [pscustomobject]@{
+                State = 'excluded'
+                Path = [string]$nearest[0].path
+            }
+        }
+    }
+    return [pscustomobject]@{
+        State = 'test'
+        Path = [string]$nearest[0].path
+    }
+}
+
+function Get-ContextualCoverageOutcomes {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Spans,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $project = Get-ContextualTestProject `
+        -Path $Path -SnapshotFiles $SnapshotFiles
+    if ([string]$project.State -ceq 'unknown') {
+        return , (New-ContextualOutcome `
+            -RuleId test-class-code-coverage `
+            -State unknown -Reason $project.Reason `
+            -Path $Path)
+    }
+    if ([string]$project.State -cne 'test') {
+        return , (New-ContextualOutcome `
+            -RuleId test-class-code-coverage `
+            -State compliant -Reason not-a-compiled-test-project-class `
+            -Path $Path)
+    }
+    $types = @($Root.DescendantNodes() | Where-Object {
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax] -or
+            ($_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.RecordDeclarationSyntax] -and
+                [string]$_.ClassOrStructKeyword.Text -cne 'struct')
+        })
+    $outcomes = [Collections.Generic.List[object]]::new()
+    foreach ($type in $types) {
+        $keywordLine = [int](
+            $type.Keyword.GetLocation().
+                GetLineSpan().StartLinePosition.Line + 1)
+        $identifierLine = [int](
+            $type.Identifier.GetLocation().
+                GetLineSpan().StartLinePosition.Line + 1)
+        $attributeLines = @($type.AttributeLists | ForEach-Object {
+                Get-ContextualNodeLine $_
+            })
+        $headerLines = @($keywordLine..$identifierLine)
+        $changedLines = @($attributeLines + $headerLines |
+            Where-Object {
+                Test-ContextualChangedLine `
+                    -Line $_ -Spans $Spans
+            } | Sort-Object -Unique)
+        if ($changedLines.Count -lt 1) {
+            continue
+        }
+        $attributeState =
+            Get-ContextualCoverageAttributeState `
+                -Type $type -Root $Root
+        if ($attributeState -ceq 'present') {
+            continue
+        }
+        if (@($type.Modifiers | Where-Object {
+                    [string]$_.Text -ceq 'partial'
+                }).Count -gt 0) {
+            [void]$outcomes.Add(
+                (New-ContextualOutcome `
+                    -RuleId test-class-code-coverage `
+                    -State unknown `
+                    -Reason partial-class-coverage-attribute-unproven `
+                    -Path $Path -Line $changedLines[0] `
+                    -EndLine $changedLines[0] `
+                    -Symbol ([string]$type.Identifier.ValueText)))
+            continue
+        }
+        [void]$outcomes.Add(
+            (New-ContextualOutcome `
+                -RuleId test-class-code-coverage `
+                -State violation `
+                -Reason test-class-coverage-exclusion-missing `
+                -Path $Path -Line $changedLines[0] `
+                -EndLine $changedLines[0] `
+                -Symbol ([string]$type.Identifier.ValueText) `
+                -Evidence (
+                    'Add System.Diagnostics.CodeAnalysis.' +
+                    'ExcludeFromCodeCoverage to this test-project class.')))
+    }
+    if ($outcomes.Count -gt 0) {
+        $definite = @($outcomes | Where-Object {
+                [string]$_.state -ceq 'violation'
+            })
+        if ($definite.Count -gt 0) {
+            return $definite
+        }
+        return $outcomes.ToArray()
+    }
+    return , (New-ContextualOutcome `
+        -RuleId test-class-code-coverage `
+        -State compliant -Reason no-changed-class-without-coverage-exclusion `
+        -Path $Path)
+}
+
 function Get-ContextualRoslynOutcomes {
     param(
         [Parameter(Mandatory)][string]$Content,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][object[]]$Spans
+        [Parameter(Mandatory)][object[]]$Spans,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
     )
     $tree = [
         Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::
@@ -954,6 +1234,10 @@ function Get-ContextualRoslynOutcomes {
             -Reason no-applicable-violation `
             -Path $Path
     }
+    $coverageOutcomes = @(
+        Get-ContextualCoverageOutcomes `
+            -Root $root -Path $Path -Spans $Spans `
+            -SnapshotFiles $SnapshotFiles)
     $nodes = @($root.DescendantNodes())
     $methods = @($nodes | Where-Object {
             $_ -is [
@@ -1877,10 +2161,19 @@ function Get-ContextualRoslynOutcomes {
                 'csharp-syntax-incomplete'
             $results[$rule].evidence = ''
         }
+        $coverageOutcomes = @(
+            New-ContextualOutcome `
+                -RuleId test-class-code-coverage `
+                -State unknown `
+                -Reason csharp-syntax-incomplete `
+                -Path $Path)
     }
-    return @($script:RuleIds | ForEach-Object {
+    $baseOutcomes = @($script:RuleIds | Where-Object {
+            $_ -cne 'test-class-code-coverage'
+        } | ForEach-Object {
             $results[$_]
         })
+    return @($baseOutcomes + $coverageOutcomes)
 }
 
 function Get-ContextualConventionOutcomes {
@@ -1908,7 +2201,8 @@ function Get-ContextualConventionOutcomes {
             '.cs',
             [StringComparison]::OrdinalIgnoreCase)) {
         Get-ContextualRoslynOutcomes `
-            -Content $Content -Path $Path -Spans $Spans
+            -Content $Content -Path $Path -Spans $Spans `
+            -SnapshotFiles $SnapshotFiles
     }
     else {
         @($script:RuleIds | ForEach-Object {
@@ -1930,7 +2224,11 @@ function Get-ContextualConventionOutcomes {
                 $_
             }
         })
-    if ($outcomes.Count -ne $script:RuleIds.Count -or
+    if ($outcomes.Count -lt $script:RuleIds.Count -or
+        @($outcomes | Where-Object {
+                [string]$_.ruleId -cnotin
+                    $script:RuleIds
+            }).Count -gt 0 -or
         @($outcomes.ruleId | Sort-Object -Unique).Count -ne
             $script:RuleIds.Count) {
         throw 'Contextual analyzer returned an invalid rule set.'

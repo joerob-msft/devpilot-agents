@@ -14,11 +14,11 @@ Import-Module (Join-Path $PSScriptRoot `
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:44f001e35795fdd016fc723e276d58b256a0a3500ffd07faa1780f185f61ae48'
+    'v1:sha256:2f86f6a23741808238810b56a5f19661c7feeeb9afc7e6bb68b72ca861261a32'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
-    'v1:sha256:5dab00b07fadfd3bb16a095da7cd960d00b4cb579cc8392ce5812436654a1cad'
+    'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
 $script:ContextualConfigId = 'contextual-conventions-v1-user-approved'
 
 function Get-ContextualBridgeDigest {
@@ -65,14 +65,14 @@ function Assert-ContextualBridgeConfig {
         $policyPath, [Text.UTF8Encoding]::new($false))
     if ((Get-ContextualBridgeTextDigest $policy) -cne
             $script:ContextualPolicyDigest -or
-        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 3498 -or
+        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 3706 -or
         [string]$Config.contextualRule.path -cne
             $script:ContextualPolicyPath -or
         [string]$Config.contextualRule.section -cne
             $script:ContextualCapability -or
         [string]$Config.contextualRule.hash -cne
             $script:ContextualPolicyDigest -or
-        [long]$Config.contextualRule.length -ne 3498 -or
+        [long]$Config.contextualRule.length -ne 3706 -or
         [string]$Config.contextualRule.repositoryId -notmatch
             '^[A-Za-z0-9_.-]{1,256}$' -or
         [string]$Config.toolkit.head -cnotmatch '^[0-9a-f]{40}$' -or
@@ -128,7 +128,7 @@ function New-ContextualBridgeManifestEntry {
         commit = [string]$Config.toolkit.head
         section = $script:ContextualCapability
         hash = $script:ContextualPolicyDigest
-        length = 3498
+        length = 3706
     }
     $capability = [ordered]@{
         id = $script:ContextualCapability
@@ -239,6 +239,13 @@ function New-ContextualBridgeAcquisitionProvider {
                                 changeType = $_.changeType
                                 sourceDigest = $_.sourceDigest
                                 spans = $_.spans
+                                projectContext = $(if (
+                                    $_ -is
+                                        [Collections.IDictionary] -and
+                                    $_.Contains(
+                                        'projectContext')) {
+                                    $_.projectContext
+                                } else { $null })
                             }
                         })
                     changes = @($changeSet.entries | ForEach-Object {
@@ -255,6 +262,14 @@ function New-ContextualBridgeAcquisitionProvider {
                             isBinary = [string]$_.state -cne 'complete'
                             sourceDigest = [string]$_.sourceDigest
                             spans = @($_.spans)
+                        }
+                        if ($_ -is
+                                [Collections.IDictionary] -and
+                            $_.Contains('projectContext') -and
+                            $_.projectContext -is
+                                [Collections.IDictionary]) {
+                            $change['projectContext'] =
+                                $_.projectContext
                         }
                         if ($change.changeType -ceq 'renamed' -and
                             $_.oldPath) {
@@ -400,6 +415,15 @@ function Get-ContextualBridgeRelevantChangeSet {
         changedFiles = $entries.Count
         changedLines = $changedLines
         entries = $entries
+        projectContexts = @($entries | ForEach-Object {
+                if ($_ -is
+                        [Collections.IDictionary] -and
+                    $_.Contains('projectContext') -and
+                    $_.projectContext -is
+                    [Collections.IDictionary]) {
+                    $_.projectContext
+                }
+            } | Sort-Object path -Unique)
     }
 }
 
@@ -637,7 +661,7 @@ function Invoke-ContextualConventionsCurrentPrBridge {
                     ruleCommit = [string]$Config.toolkit.head
                     ruleSection = $script:ContextualCapability
                     ruleHash = $script:ContextualPolicyDigest
-                    ruleLength = 3498
+                    ruleLength = 3706
                 }))
             foreach ($change in @($page.changes | Where-Object {
                         [string]$_.changeType -cne 'deleted' -and

@@ -92,6 +92,11 @@
       "id": "dependency-fanout",
       "name": "Update dependency changes across all affected surfaces",
       "sourceSection": "Strong-naming unsigned NuGet dependencies / contextual dependency fanout"
+    },
+    {
+      "id": "test-class-code-coverage",
+      "name": "Exclude every class compiled by a test project from code coverage",
+      "sourceSection": "Automated tests / code-coverage exclusion"
     }
   ]
 }

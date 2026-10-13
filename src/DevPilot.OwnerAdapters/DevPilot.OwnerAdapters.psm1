@@ -2051,6 +2051,66 @@ function ConvertTo-OwnerAcquisitionResponse {
         Assert-OwnerAdapterDigest -Value $changeDigest -Name change.sourceDigest
         $spanValues = @(Get-OwnerAdapterMember -Value $change -Name spans -Required)
         $spans = ConvertTo-OwnerSpanData -Spans $spanValues
+        $projectContext = Get-OwnerAdapterMember `
+            -Value $change -Name projectContext
+        if ($null -ne $projectContext) {
+            if ($projectContext -isnot
+                    [Collections.IDictionary]) {
+                throw 'Project context must be a dictionary.'
+            }
+            $contextState = [string](Get-OwnerAdapterMember `
+                -Value $projectContext -Name state -Required)
+            if ($contextState -cnotin @(
+                    'complete', 'unknown')) {
+                throw 'Project context state is invalid.'
+            }
+            if ($contextState -ceq 'complete') {
+                $contextPath = ConvertTo-OwnerSafePath `
+                    -Path ([string](Get-OwnerAdapterMember `
+                        -Value $projectContext -Name path -Required)) `
+                    -Name projectContext.path
+                if (-not $contextPath.EndsWith(
+                        '.csproj',
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Project context must be a C# project file.'
+                }
+                $contextContent = Get-OwnerAdapterMember `
+                    -Value $projectContext -Name content -Required
+                if ($contextContent -isnot [string]) {
+                    throw 'Project context content must be text.'
+                }
+                $contextDigest = [string](Get-OwnerAdapterMember `
+                    -Value $projectContext -Name sourceDigest -Required)
+                Assert-OwnerAdapterDigest `
+                    -Value $contextDigest -Name projectContext.sourceDigest
+                $contextBytes = Get-OwnerAdapterInt64 `
+                    -Value (Get-OwnerAdapterMember `
+                        -Value $projectContext -Name byteLength -Required) `
+                    -Name projectContext.byteLength -Minimum 0
+                if ($contextBytes -ne
+                        [Text.Encoding]::UTF8.GetByteCount(
+                            [string]$contextContent) -or
+                    (Get-OwnerAdapterDigest -Value (
+                        [string]$contextContent)) -cne
+                        $contextDigest) {
+                    throw 'Project context content did not match its digest.'
+                }
+                $projectContext = [ordered]@{
+                    state = 'complete'
+                    path = $contextPath
+                    content = [string]$contextContent
+                    byteLength = $contextBytes
+                    sourceDigest = $contextDigest
+                }
+            }
+            else {
+                $projectContext = [ordered]@{
+                    state = 'unknown'
+                    reason = [string](Get-OwnerAdapterMember `
+                        -Value $projectContext -Name reason -Required)
+                }
+            }
+        }
         [void]$normalizedChanges.Add([ordered]@{
                 path = $path
                 oldPath = $oldPath
@@ -2059,6 +2119,7 @@ function ConvertTo-OwnerAcquisitionResponse {
                     -Value (Get-OwnerAdapterMember -Value $change -Name isBinary -Required) -Name change.isBinary
                 sourceDigest = $changeDigest
                 spans = $spans
+                projectContext = $projectContext
             })
     }
     $changeArray = @($normalizedChanges)
@@ -2243,6 +2304,8 @@ function ConvertTo-OwnerAcquisitionResponse {
                     byteLength = $byteLength
                     truncated = $truncated
                     content = $content
+                    projectContext =
+                        $change['projectContext']
                 }
             })
         $ordinal++

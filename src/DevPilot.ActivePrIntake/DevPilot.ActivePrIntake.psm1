@@ -1849,6 +1849,87 @@ print(json.dumps({
         }
         return $response
     }.GetNewClosure()
+    $getProjectContext = {
+        param(
+            [string]$Path,
+            [string]$Commit,
+            [DateTime]$Deadline
+        )
+        $directory = [IO.Path]::GetDirectoryName(
+            $Path.Replace('/', [IO.Path]::DirectorySeparatorChar)).
+            Replace([IO.Path]::DirectorySeparatorChar, '/')
+        while (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $apiPath = if ($directory.StartsWith('/')) {
+                $directory
+            }
+            else { "/$directory" }
+            $response = & $invoke 'git' 'items' @(
+                "project=$project", "repositoryId=$repo") @(
+                "scopePath=$apiPath",
+                'recursionLevel=OneLevel',
+                "versionDescriptor.version=$Commit",
+                'versionDescriptor.versionType=commit',
+                'includeContentMetadata=true') $Deadline
+            $items = if ($response -is [Collections.IDictionary] -and
+                $response.value -is [array]) {
+                @($response.value)
+            }
+            elseif ($response -is [array]) {
+                @($response)
+            }
+            else {
+                throw 'project-context-unavailable'
+            }
+            $projects = @($items | Where-Object {
+                    $_ -is [Collections.IDictionary] -and
+                    -not [bool]$_.isFolder -and
+                    [string]$_.path -match '(?i)\.csproj$' -and
+                    [IO.Path]::GetDirectoryName(
+                        ([string]$_.path).Replace(
+                            '/', [IO.Path]::DirectorySeparatorChar)).
+                        Replace(
+                            [IO.Path]::DirectorySeparatorChar, '/').
+                        TrimStart('/') -ceq
+                        $apiPath.TrimStart('/')
+                })
+            if ($projects.Count -gt 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-ambiguous'
+                }
+            }
+            if ($projects.Count -eq 1) {
+                $projectPath = ([string]$projects[0].path).TrimStart('/')
+                $item = & $getItem $projectPath $Commit $Deadline
+                $content = [string]$item.content
+                return [ordered]@{
+                    state = 'complete'
+                    path = $projectPath
+                    content = $content
+                    byteLength =
+                        [Text.Encoding]::UTF8.GetByteCount($content)
+                    sourceDigest = 'v1:sha256:' +
+                        [Convert]::ToHexString(
+                            [Security.Cryptography.SHA256]::HashData(
+                                [Text.Encoding]::UTF8.GetBytes($content))).
+                            ToLowerInvariant()
+                }
+            }
+            $parent = [IO.Path]::GetDirectoryName(
+                $directory.Replace(
+                    '/', [IO.Path]::DirectorySeparatorChar))
+            if ([string]::IsNullOrWhiteSpace($parent) -or
+                $parent -ceq $directory) {
+                break
+            }
+            $directory = $parent.Replace(
+                [IO.Path]::DirectorySeparatorChar, '/')
+        }
+        return [ordered]@{
+            state = 'unknown'
+            reason = 'project-context-missing'
+        }
+    }.GetNewClosure()
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -2076,6 +2157,8 @@ print(json.dumps({
                 }
                 if (-not $complete) { throw 'change-page-budget' }
                 $normalized = [Collections.Generic.List[object]]::new()
+                $projectContexts = @{}
+                $projectContextByDirectory = @{}
                 $changedLines = 0
                 $totalBytes = 0L
                 foreach ($entry in @($changeEntries |
@@ -2190,6 +2273,42 @@ print(json.dumps({
                                             $sourceContent))).
                                     ToLowerInvariant()
                         }
+                    if ($isCSharp) {
+                        $sourceDirectory =
+                            [IO.Path]::GetDirectoryName(
+                                ([string]$entry.path).Replace(
+                                    '/',
+                                    [IO.Path]::DirectorySeparatorChar)).
+                                Replace(
+                                    [IO.Path]::DirectorySeparatorChar,
+                                    '/')
+                        $context = if (
+                            $projectContextByDirectory.ContainsKey(
+                                $sourceDirectory)) {
+                            $projectContextByDirectory[
+                                $sourceDirectory]
+                        }
+                        else {
+                            $resolved = & $getProjectContext `
+                                ([string]$entry.path) `
+                                $sourceCommit $deadline
+                            $projectContextByDirectory[
+                                $sourceDirectory] = $resolved
+                            $resolved
+                        }
+                        $contextKey = if (
+                            [string]$context.state -ceq 'complete') {
+                            [string]$context.path
+                        }
+                        else {
+                            ([string]$entry.path) + '|' +
+                                [string]$context.reason
+                        }
+                        if (-not $projectContexts.ContainsKey($contextKey)) {
+                            $projectContexts[$contextKey] = $context
+                        }
+                        $normalizedChange['projectContext'] = $context
+                    }
                     if ($changeType -match '(?i)rename' -and
                         $entry.originalPath) {
                         $normalizedChange['oldPath'] =
@@ -2201,6 +2320,7 @@ print(json.dumps({
                     changedFiles = $seenChanges.Count
                     changedLines = $changedLines
                     entries = $normalized.ToArray()
+                    projectContexts = @($projectContexts.Values)
                 }
             }
             Discussions {

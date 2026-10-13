@@ -64,8 +64,8 @@ BeforeAll {
                 section =
                     'bpm-contextual-conventions@1'
                 hash =
-                    'v1:sha256:5dab00b07fadfd3bb16a095da7cd960d00b4cb579cc8392ce5812436654a1cad'
-                length = 3498
+                    'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+                length = 3706
             }
             toolkit = [ordered]@{
                 ref =
@@ -110,7 +110,7 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    '44f001e35795fdd016fc723e276d58b256a0a3500ffd07faa1780f185f61ae48'
+                    '2f86f6a23741808238810b56a5f19661c7feeeb9afc7e6bb68b72ca861261a32'
             }
             sharedAcquisition = [ordered]@{
                 kind =
