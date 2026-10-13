@@ -1124,9 +1124,10 @@ function Get-ContextualTestProject {
         Replace([IO.Path]::DirectorySeparatorChar, '\')
     foreach ($node in @($xml.SelectNodes(
             '//*[local-name()="Compile" and @Remove]'))) {
-        $pattern = [WildcardPattern]::new(
+        $pattern = [
+            System.Management.Automation.WildcardPattern]::new(
             ([string]$node.GetAttribute('Remove')).Replace('/', '\'),
-            [WildcardOptions]::IgnoreCase)
+            [System.Management.Automation.WildcardOptions]::IgnoreCase)
         if ($pattern.IsMatch($relative)) {
             return [pscustomobject]@{
                 State = 'excluded'
@@ -1188,6 +1189,14 @@ function Get-ContextualCoverageOutcomes {
         if ($changedLines.Count -lt 1) {
             continue
         }
+        $anchorLine = if (
+            Test-ContextualChangedLine `
+                -Line $identifierLine -Spans $Spans) {
+            $identifierLine
+        }
+        else {
+            [int]$changedLines[0]
+        }
         $attributeState =
             Get-ContextualCoverageAttributeState `
                 -Type $type -Root $Root `
@@ -1201,8 +1210,8 @@ function Get-ContextualCoverageOutcomes {
                     -RuleId test-class-code-coverage `
                     -State unknown `
                     -Reason coverage-attribute-binding-unproven `
-                    -Path $Path -Line $changedLines[0] `
-                    -EndLine $changedLines[0] `
+                    -Path $Path -Line $anchorLine `
+                    -EndLine $anchorLine `
                     -Symbol ([string]$type.Identifier.ValueText)))
             continue
         }
@@ -1214,8 +1223,8 @@ function Get-ContextualCoverageOutcomes {
                     -RuleId test-class-code-coverage `
                     -State unknown `
                     -Reason partial-class-coverage-attribute-unproven `
-                    -Path $Path -Line $changedLines[0] `
-                    -EndLine $changedLines[0] `
+                    -Path $Path -Line $anchorLine `
+                    -EndLine $anchorLine `
                     -Symbol ([string]$type.Identifier.ValueText)))
             continue
         }
@@ -1224,8 +1233,8 @@ function Get-ContextualCoverageOutcomes {
                 -RuleId test-class-code-coverage `
                 -State violation `
                 -Reason test-class-coverage-exclusion-missing `
-                -Path $Path -Line $changedLines[0] `
-                -EndLine $changedLines[0] `
+                -Path $Path -Line $anchorLine `
+                -EndLine $anchorLine `
                 -Symbol ([string]$type.Identifier.ValueText) `
                 -Evidence (
                     'Add System.Diagnostics.CodeAnalysis.' +

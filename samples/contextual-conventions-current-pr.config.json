@@ -54,12 +54,12 @@
   },
   "capability": {
     "id": "bpm-contextual-conventions@1",
-    "implementationSha256": "545415b92826ad14e65d4fdbcefca69d68632d84aaf6e2ffb258a16990796cee"
+    "implementationSha256": "6a74d7de1e57103fd95bbbec2c294d92738f5e965fd85d1b3684fbe1bc7769ea"
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
     "activePrIntakeSha256": "f4e022f5fc23ec1822340b72d1337974896ad99db434198c97af7347e42bd00d",
-    "contextualBridgeSha256": "809fdfa8d9eca4670778e370f9e7c4b53a27fc1ac8fc55234636b247b2d6009e",
+    "contextualBridgeSha256": "cb550e3f1f9c6f5bb7069ef0eeb052f1b9d4f4a46e33c274f0c9699850782e38",
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
   "autoCreateContextualConventionComments": false,
