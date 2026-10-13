@@ -43,7 +43,7 @@ function New-ContextualOutcome {
         [string]$Symbol = 'file',
         [string]$Evidence = ''
     )
-    return [ordered]@{
+    $outcome = [ordered]@{
         ruleId = $RuleId
         state = $State
         reason = $Reason
@@ -53,6 +53,15 @@ function New-ContextualOutcome {
         symbol = $Symbol
         evidence = $Evidence
     }
+    if ($State -ceq 'violation') {
+        $collector = Get-Variable -Name contextualCandidateOutcomes `
+            -Scope 1 -ErrorAction SilentlyContinue
+        if ($null -ne $collector -and
+            $collector.Value -is [Collections.Generic.List[object]]) {
+            [void]$collector.Value.Add($outcome)
+        }
+    }
+    return $outcome
 }
 
 function Test-ContextualChangedLine {
@@ -187,6 +196,8 @@ function Get-ContextualCSharpOutcomes {
     $tokens = @($model.tokens)
     $lines = $model.lines
     $joined = @($tokens.text) -join ' '
+    $contextualCandidateOutcomes =
+        [Collections.Generic.List[object]]::new()
     $results = [ordered]@{}
     foreach ($rule in $script:RuleIds) {
         $results[$rule] = New-ContextualOutcome `
@@ -934,6 +945,8 @@ function Get-ContextualRoslynOutcomes {
             $_.Severity -eq [
                 Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
         })
+    $contextualCandidateOutcomes =
+        [Collections.Generic.List[object]]::new()
     $results = [ordered]@{}
     foreach ($rule in $script:RuleIds) {
         $results[$rule] = New-ContextualOutcome `
@@ -1776,17 +1789,23 @@ function Get-ContextualRoslynOutcomes {
     }
 
     foreach ($rule in $script:RuleIds) {
-        $outcome = $results[$rule]
-        if ([string]$outcome.state -cne 'violation') {
+        $changedCandidates = @($contextualCandidateOutcomes |
+            Where-Object { [string]$_.ruleId -ceq $rule } |
+            Where-Object {
+                $candidate = $_
+                $first = [int]$candidate.line
+                $last = [Math]::Max($first, [int]$candidate.endLine)
+                @($Spans | Where-Object {
+                        $first -le [int]$_.endLine -and
+                        $last -ge [int]$_.startLine
+                    }).Count -gt 0
+            })
+        if ($changedCandidates.Count -gt 0) {
+            $results[$rule] = $changedCandidates[0]
             continue
         }
-        $first = [int]$outcome.line
-        $last = [Math]::Max($first, [int]$outcome.endLine)
-        $changed = @($Spans | Where-Object {
-                $first -le [int]$_.endLine -and
-                $last -ge [int]$_.startLine
-            }).Count -gt 0
-        if (-not $changed) {
+        $outcome = $results[$rule]
+        if ([string]$outcome.state -ceq 'violation') {
             $outcome.state = 'compliant'
             $outcome.reason = 'candidate-outside-changed-spans'
             $outcome.evidence = ''

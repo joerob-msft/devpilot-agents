@@ -430,4 +430,27 @@ Describe 'Contextual convention analyzer' {
             -Content $validation).state |
             Should -BeExactly violation
     }
+    It 'keeps a changed violation when an unchanged neighbor follows it' {
+        $source = @(
+            'using System.Linq;'
+            'class C {'
+            '    object M(object[] changed, object[] old) {'
+            '        var current = changed.First();'
+            '        var previous = old.First();'
+            '        return current;'
+            '    }'
+            '}'
+        ) -join "`n"
+        $outcome = @(Get-ContextualConventionOutcomes `
+                -Content $source -Path 'src/Mixed.cs' `
+                -Spans @([ordered]@{ startLine = 4; endLine = 4 }) `
+                -SnapshotFiles @([ordered]@{
+                        path = 'src/Mixed.cs'
+                        content = $source
+                        state = 'complete'
+                        spans = @([ordered]@{ startLine = 4; endLine = 4 })
+                    }) | Where-Object ruleId -CEQ collection-cardinality)[0]
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 4
+    }
 }
