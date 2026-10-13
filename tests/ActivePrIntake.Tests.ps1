@@ -146,6 +146,87 @@ AfterAll {
     }
 }
 Describe 'Active PR read-only intake' {
+    It 'uses the latest iteration when cached merge commits are stale but the source ref matches' {
+        $pr = [ordered]@{
+            pullRequestId = 42
+            status = 'active'
+            isDraft = $false
+            sourceRefName = 'refs/heads/feature'
+            targetRefName = 'refs/heads/master'
+            repository = [ordered]@{
+                id = 'repository'
+                project = [ordered]@{ id = 'project' }
+            }
+            lastMergeSourceCommit =
+                [ordered]@{ commitId = 'a' * 40 }
+            lastMergeTargetCommit =
+                [ordered]@{ commitId = 'b' * 40 }
+        }
+        $iterations = @(
+            [ordered]@{
+                id = 3
+                sourceRefCommit =
+                    [ordered]@{ commitId = 'a' * 40 }
+                targetRefCommit =
+                    [ordered]@{ commitId = 'b' * 40 }
+            },
+            [ordered]@{
+                id = 4
+                sourceRefCommit =
+                    [ordered]@{ commitId = 'c' * 40 }
+                targetRefCommit =
+                    [ordered]@{ commitId = 'd' * 40 }
+            })
+        $result = & (Get-Module DevPilot.ActivePrIntake) {
+            param($PullRequest, $Iterations)
+            Resolve-ActivePrHeadSnapshot `
+                -PullRequest $PullRequest `
+                -Iterations $Iterations `
+                -SourceRefs @([ordered]@{
+                        name = 'refs/heads/feature'
+                        objectId = 'c' * 40
+                    })
+        } $pr $iterations
+        $result.sourceCommit |
+            Should -BeExactly ('c' * 40)
+        $result.targetCommit |
+            Should -BeExactly ('d' * 40)
+        $result.iterationId | Should -Be 4
+    }
+
+    It 'refuses the latest iteration when the live source ref differs' {
+        $pr = [ordered]@{
+            pullRequestId = 42
+            status = 'active'
+            isDraft = $false
+            sourceRefName = 'refs/heads/feature'
+            targetRefName = 'refs/heads/master'
+            repository = [ordered]@{
+                id = 'repository'
+                project = [ordered]@{ id = 'project' }
+            }
+        }
+        $iterations = @([ordered]@{
+                id = 4
+                sourceRefCommit =
+                    [ordered]@{ commitId = 'c' * 40 }
+                targetRefCommit =
+                    [ordered]@{ commitId = 'd' * 40 }
+            })
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($PullRequest, $Iterations)
+                Resolve-ActivePrHeadSnapshot `
+                    -PullRequest $PullRequest `
+                    -Iterations $Iterations `
+                    -SourceRefs @([ordered]@{
+                            name = 'refs/heads/feature'
+                            objectId = 'e' * 40
+                        })
+            } $pr $iterations
+        } | Should -Throw 'head-inconsistent'
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }
@@ -774,8 +855,13 @@ else {
                 @(Get-Content -LiteralPath $log)
             }
             else { @() }
-            $requests | Should -HaveCount $ExpectedItems
-            foreach ($request in $requests) {
+            $contentRequests = @($requests |
+                Where-Object {
+                    $_ -match '\|path=/'
+                })
+            $contentRequests |
+                Should -HaveCount $ExpectedItems
+            foreach ($request in $contentRequests) {
                 $request | Should -Match 'includeContent=true'
                 $request | Should -Match 'includeContentMetadata=true'
             }
@@ -974,7 +1060,9 @@ else {
                 @(Get-Content -LiteralPath $log)
             }
             else { @() }
-            $requests | Should -HaveCount $ExpectedItems
+            @($requests | Where-Object {
+                    $_ -match '\|path=/'
+                }) | Should -HaveCount $ExpectedItems
 
             if ($Mode -ceq 'multi') {
                 $c.config.limits.maxChangedLines = 2

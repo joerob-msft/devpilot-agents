@@ -1498,6 +1498,57 @@ function Invoke-ActivePrIntake {
     finally { $lock.Dispose() }
 }
 
+function Resolve-ActivePrHeadSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$PullRequest,
+        [Parameter(Mandatory)]
+        [object[]]$Iterations,
+        [Parameter(Mandatory)]
+        [object[]]$SourceRefs
+    )
+    if ($Iterations.Count -eq 0 -or
+        $Iterations.Count -gt 200) {
+        throw 'iteration-inaccessible'
+    }
+    $latest = $Iterations |
+        Sort-Object { [int]$_.id } |
+        Select-Object -Last 1
+    $sourceRef = [string]$PullRequest.sourceRefName
+    $sourceCommit =
+        [string]$latest.sourceRefCommit.commitId
+    $targetCommit =
+        [string]$latest.targetRefCommit.commitId
+    if ($sourceRef -cnotmatch '^refs/heads/.+' -or
+        $sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
+        $targetCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
+        throw 'head-inconsistent'
+    }
+    $exactRefs = @($SourceRefs | Where-Object {
+            $_ -is [Collections.IDictionary] -and
+            [string]$_.name -ceq $sourceRef -and
+            [string]$_.objectId -cmatch
+                '^[a-fA-F0-9]{40}$'
+        })
+    if ($exactRefs.Count -ne 1 -or
+        [string]$exactRefs[0].objectId -ine
+            $sourceCommit) {
+        throw 'head-inconsistent'
+    }
+    return [ordered]@{
+        pullRequestId = $PullRequest.pullRequestId
+        repositoryId = $PullRequest.repository.id
+        projectId = $PullRequest.repository.project.id
+        status = $PullRequest.status
+        isDraft = $PullRequest.isDraft
+        sourceRef = $sourceRef
+        targetRef = $PullRequest.targetRefName
+        sourceCommit = $sourceCommit
+        targetCommit = $targetCommit
+        iterationId = $latest.id
+    }
+}
+
 function New-ActivePrAzureDevOpsProvider {
     [CmdletBinding()]
     param(
@@ -1863,13 +1914,21 @@ print(json.dumps({
                 $directory
             }
             else { "/$directory" }
-            $response = & $invoke 'git' 'items' @(
-                "project=$project", "repositoryId=$repo") @(
-                "scopePath=$apiPath",
-                'recursionLevel=OneLevel',
-                "versionDescriptor.version=$Commit",
-                'versionDescriptor.versionType=commit',
-                'includeContentMetadata=true') $Deadline
+            try {
+                $response = & $invoke 'git' 'items' @(
+                    "project=$project", "repositoryId=$repo") @(
+                    "scopePath=$apiPath",
+                    'recursionLevel=OneLevel',
+                    "versionDescriptor.version=$Commit",
+                    'versionDescriptor.versionType=commit',
+                    'includeContentMetadata=true') $Deadline
+            }
+            catch {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-unavailable'
+                }
+            }
             $items = if ($response -is [Collections.IDictionary] -and
                 $response.value -is [array]) {
                 @($response.value)
@@ -1878,7 +1937,10 @@ print(json.dumps({
                 @($response)
             }
             else {
-                throw 'project-context-unavailable'
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = 'project-context-unavailable'
+                }
             }
             $projects = @($items | Where-Object {
                     $_ -is [Collections.IDictionary] -and
@@ -1930,6 +1992,8 @@ print(json.dumps({
             reason = 'project-context-missing'
         }
     }.GetNewClosure()
+    $resolveHeadSnapshot =
+        ${function:Resolve-ActivePrHeadSnapshot}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -2055,22 +2119,21 @@ print(json.dumps({
                 $iterations = & $invoke 'git' 'pullRequestIterations' @(
                     "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
                 $list = @($iterations.value)
-                if ($list.Count -eq 0 -or $list.Count -gt 200) { throw 'iteration-inaccessible' }
-                $last = $list | Sort-Object { [int]$_.id } | Select-Object -Last 1
-                if (($null -ne $r['lastMergeSourceCommit'] -and
-                        [string]$r.lastMergeSourceCommit.commitId -ine
-                        [string]$last.sourceRefCommit.commitId) -or
-                    ($null -ne $r['lastMergeTargetCommit'] -and
-                        [string]$r.lastMergeTargetCommit.commitId -ine
-                        [string]$last.targetRefCommit.commitId)) {
+                $sourceRefName = [string]$r.sourceRefName
+                if ($sourceRefName -cnotmatch
+                    '^refs/heads/(?<filter>.+)$') {
                     throw 'head-inconsistent'
                 }
-                return @{ pullRequestId = $r.pullRequestId
-                    repositoryId = $r.repository.id; projectId = $r.repository.project.id
-                    status = $r.status; isDraft = $r.isDraft
-                    sourceRef = $r.sourceRefName; targetRef = $r.targetRefName
-                    sourceCommit = $last.sourceRefCommit.commitId
-                    targetCommit = $last.targetRefCommit.commitId; iterationId = $last.id }
+                $refs = & $invoke 'git' 'refs' @(
+                    "project=$project",
+                    "repositoryId=$repo") @(
+                    "filter=heads/$($Matches.filter)",
+                    'includeStatuses=false',
+                    'peelTags=false') $deadline
+                return & $resolveHeadSnapshot `
+                    -PullRequest $r `
+                    -Iterations $list `
+                    -SourceRefs @($refs.value)
             }
             Changes {
                 $id = [int]$Request.pullRequestId
