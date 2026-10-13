@@ -571,6 +571,66 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         [string]$Observation.lifecycle.status -ceq
             'completed' -and
         $counts.unknown -eq 0
+    $artifacts =
+        [Collections.Generic.List[object]]::new()
+    foreach ($artifact in @(
+            $Observation.sourceArtifacts)) {
+        if ([string](Get-OwnerV2Member `
+                -Value $artifact -Name kind) -cnotin @(
+                'owner-v2-discussion-snapshot',
+                'owner-v2-discussion-mapping',
+                'owner-v2-discussion-reviewer-identity',
+                'owner-v2-discussion-raw-page'
+            )) {
+            [void]$artifacts.Add($artifact)
+        }
+    }
+    if ($available) {
+        [void]$artifacts.Add([ordered]@{
+                kind =
+                    'owner-v2-discussion-snapshot'
+                sha256 =
+                    $Snapshot.Digest.Substring(10)
+                signature = 'not-applicable'
+            })
+        if ([string]$Snapshot.MappingDigest -match
+            $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind =
+                        'owner-v2-discussion-mapping'
+                    sha256 = ([string]$Snapshot.
+                        MappingDigest).Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        if ([string]$Snapshot.
+            ReviewerIdentityDigest -match
+            $script:OwnerV2DigestPattern) {
+            [void]$artifacts.Add([ordered]@{
+                    kind =
+                        'owner-v2-discussion-reviewer-identity'
+                    sha256 = ([string]$Snapshot.
+                        ReviewerIdentityDigest).
+                        Substring(10)
+                    signature = 'not-applicable'
+                })
+        }
+        foreach ($rawDigest in @(
+                $Snapshot.RawProvenanceDigests)) {
+            if ([string]$rawDigest -match
+                $script:OwnerV2DigestPattern) {
+                [void]$artifacts.Add([ordered]@{
+                        kind =
+                            'owner-v2-discussion-raw-page'
+                        sha256 = ([string]$rawDigest).
+                            Substring(10)
+                        signature =
+                            'not-applicable'
+                    })
+            }
+        }
+    }
+    $Observation.sourceArtifacts = @($artifacts)
     return $Observation
 }
 

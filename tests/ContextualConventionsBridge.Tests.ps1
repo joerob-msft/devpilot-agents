@@ -312,6 +312,9 @@ Describe 'Contextual convention current PR bridge' {
         $observation.findings[0].
             providerMarker.integrity |
             Should -BeExactly verified
+        @($observation.sourceArtifacts.kind) |
+            Should -Contain `
+                owner-v2-discussion-snapshot
     }
 
     It 'withholds a changed head without provider writes' {

@@ -16,7 +16,7 @@ function Get-ApprovedOwnerV2ChangedSpans {
     if ($ChangeType -match '(?i)^add') {
         $count = [Math]::Max(
             1, [regex]::Split($SourceContent, '\r?\n').Count)
-        return , @([ordered]@{ startLine = 1; endLine = $count })
+        return @([ordered]@{ startLine = 1; endLine = $count })
     }
     if ($ChangeType -match '(?i)^delete') { return @() }
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
@@ -50,7 +50,7 @@ function Get-ApprovedOwnerV2ChangedSpans {
                 }
             }
         }
-        return , $spans.ToArray()
+        return $spans.ToArray()
     }
     finally {
         Remove-Item -LiteralPath $before, $after `
