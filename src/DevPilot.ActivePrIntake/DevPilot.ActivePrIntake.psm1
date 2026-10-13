@@ -343,19 +343,32 @@ function Assert-IntakeConfig {
 
 function Invoke-IntakeRead {
     param([scriptblock]$Provider, [string]$Operation, [Collections.IDictionary]$Arguments,
-        [Collections.IDictionary]$Config, [ref]$Reads, [Diagnostics.Stopwatch]$Clock)
+        [Collections.IDictionary]$Config, [ref]$Reads, [Diagnostics.Stopwatch]$Clock,
+        [long]$DeadlineMilliseconds = 0)
     if ($Operation -cnotin @('Identity', 'ListPage', 'Head', 'Changes', 'Discussions')) {
         throw 'provider-contract'
     }
     if ($Reads.Value -ge [int]$Config.limits.maxReads) { throw 'read-budget' }
-    if ($Clock.Elapsed.TotalSeconds -ge [int]$Config.limits.maxSeconds) { throw 'time-budget' }
+    $remainingMilliseconds =
+        [long]([int]$Config.limits.maxSeconds * 1000) -
+        $Clock.ElapsedMilliseconds
+    if ($DeadlineMilliseconds -gt 0) {
+        $remainingMilliseconds = [Math]::Min(
+            $remainingMilliseconds,
+            $DeadlineMilliseconds - $Clock.ElapsedMilliseconds)
+    }
+    if ($remainingMilliseconds -le 0) { throw 'time-budget' }
     $Reads.Value++
-    $Arguments.timeoutMilliseconds = [Math]::Max(1,
-        [int]([int]$Config.limits.maxSeconds * 1000 - $Clock.ElapsedMilliseconds))
+    $Arguments.timeoutMilliseconds = [Math]::Max(
+        1,
+        [int][Math]::Min([int]::MaxValue, $remainingMilliseconds))
     try {
         $answer = & $Provider $Operation $Arguments
         if ($Clock.Elapsed.TotalSeconds -ge
-            [int]$Config.limits.maxSeconds) {
+                [int]$Config.limits.maxSeconds -or
+            ($DeadlineMilliseconds -gt 0 -and
+                $Clock.ElapsedMilliseconds -ge
+                    $DeadlineMilliseconds)) {
             throw 'time-budget'
         }
         if ($answer -isnot [Collections.IDictionary]) {
@@ -1114,6 +1127,7 @@ function Invoke-ActivePrIntake {
                 }
                 $processingOrder = @($selectedOrder.ToArray()) +
                     @($nonDraftIds | Where-Object { -not $selected.Contains($_) })
+                $selectedOrdinal = 0
                 foreach ($id in $processingOrder) {
                     $item = $first.seen[[string]$id].value
                     $entry = [ordered]@{
@@ -1147,11 +1161,25 @@ function Invoke-ActivePrIntake {
                     }
                     else {
                         $envelope.counts.attempted++
+                        $remainingSelected =
+                            $selectedOrder.Count - $selectedOrdinal
+                        $remainingStageMilliseconds =
+                            [long]($effectiveMaximumSeconds * 1000) -
+                            $clock.ElapsedMilliseconds
+                        $headDeadlineMilliseconds =
+                            $clock.ElapsedMilliseconds +
+                            [Math]::Max(
+                                1,
+                                [long][Math]::Floor(
+                                    $remainingStageMilliseconds /
+                                    $remainingSelected))
+                        $selectedOrdinal++
                         try {
                             $before = Assert-IntakeHead (
                                 Invoke-IntakeRead $Provider Head @{
                                     pullRequestId = $id
-                                } $readConfig ([ref]$reads) $clock
+                                } $readConfig ([ref]$reads) $clock `
+                                    $headDeadlineMilliseconds
                             ) $id $Config
                             $entry.targetRef = $before.targetRef
                             $entry.declaration = $before
@@ -1186,7 +1214,8 @@ function Invoke-ActivePrIntake {
                                     iterationId = $before.iterationId
                                     sourceCommit = $before.sourceCommit
                                     targetCommit = $before.targetCommit
-                                } $readConfig ([ref]$reads) $clock
+                                } $readConfig ([ref]$reads) $clock `
+                                    $headDeadlineMilliseconds
                                 $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
                                 if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
                                 $lines = $null
@@ -1196,7 +1225,8 @@ function Invoke-ActivePrIntake {
                                 }
                                 $discussion = Invoke-IntakeRead $Provider Discussions @{
                                     pullRequestId = $id; iterationId = $before.iterationId
-                                } $readConfig ([ref]$reads) $clock
+                                } $readConfig ([ref]$reads) $clock `
+                                    $headDeadlineMilliseconds
                                 $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
@@ -1238,7 +1268,8 @@ function Invoke-ActivePrIntake {
                                     $after = Assert-IntakeHead (
                                         Invoke-IntakeRead $Provider Head @{
                                             pullRequestId = $id
-                                        } $readConfig ([ref]$reads) $clock
+                                        } $readConfig ([ref]$reads) $clock `
+                                            $headDeadlineMilliseconds
                                     ) $id $Config
                                     if ((Get-IntakeDigest $before) -cne (Get-IntakeDigest $after)) {
                                         throw 'head-drift'

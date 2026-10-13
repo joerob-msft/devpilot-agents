@@ -712,6 +712,46 @@ Describe 'Named batch cadence' {
         $third.cursor.nextPullRequestId | Should -Be 2
     }
 
+    It 'prevents one slow head from consuming the whole stage budget' {
+        $config = New-BatchIntakeConfig
+        $baseProvider =
+            New-BatchIntakeProvider -Config $config
+        $slowTimeouts =
+            [Collections.Generic.List[int]]::new()
+        $provider = {
+            param($Operation, $Request)
+            if ($Operation -ceq 'Changes' -and
+                [int]$Request.pullRequestId -eq 1) {
+                $timeout = [int]$Request.timeoutMilliseconds
+                $slowTimeouts.Add($timeout)
+                Start-Sleep -Milliseconds ($timeout + 25)
+                throw 'time-budget'
+            }
+            return & $baseProvider $Operation $Request
+        }.GetNewClosure()
+        $state = Join-Path $TestDrive 'slow-head-state'
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $config -Provider $provider `
+            -StateRoot $state -RepositoryRoot $repo `
+            -MaximumHeadsThisRun 4 `
+            -MaximumSecondsThisRun 2 -Run
+
+        $watch.Stop()
+        $slowTimeouts.Count | Should -Be 1
+        $slowTimeouts[0] | Should -BeLessThan 1000
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 3
+        @($result.heads | Where-Object {
+                [int]$_.pullRequestId -eq 1
+            }).reasonCode | Should -BeExactly 'time-budget'
+        @($result.heads | Where-Object {
+                [string]$_.reasonCode -ceq 'rules-incomplete'
+            }).pullRequestId | Should -Be @(2, 3, 4)
+        $result.cursor.nextPullRequestId |
+            Should -Be 5
+    }
+
     It 'enforces one shared create budget of two across four identities' {
         $script:requested = [Collections.Generic.List[int]]::new()
         Mock Assert-AutomaticOwnerV2ServicePolicy {}
