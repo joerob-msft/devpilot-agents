@@ -51,6 +51,158 @@ function Resolve-ApprovedOwnerV2LiveHead {
     }
 }
 
+function Get-ApprovedOwnerV2AzureCliLaunchPlan {
+    param(
+        [Parameter(Mandatory)][string]$AzureCliPath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $commands = @(Get-Command $AzureCliPath -CommandType Application `
+            -ErrorAction SilentlyContinue)
+    if ($commands.Count -ne 1) {
+        throw 'Azure CLI command resolution was ambiguous or unavailable.'
+    }
+    $tool = Get-Item -LiteralPath $commands[0].Source -Force
+    if ($tool.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Azure CLI command path cannot be a reparse point.'
+    }
+    if ($tool.Extension -cne '.cmd') {
+        return [ordered]@{
+            fileName = $tool.FullName
+            argumentList = $Arguments
+            environment = [ordered]@{}
+        }
+    }
+    if ($tool.Name -cne 'az.cmd' -or $tool.Length -gt 4096) {
+        throw 'Azure CLI command shim was not the supported az.cmd launcher.'
+    }
+    $lines = @(Get-Content -LiteralPath $tool.FullName | ForEach-Object {
+            ([string]$_).Trim()
+        } | Where-Object {
+            $_ -and -not $_.StartsWith('::')
+        })
+    $expected = @(
+        '@IF EXIST "%~dp0\..\python.exe" (',
+        'SET AZ_INSTALLER=MSI',
+        '"%~dp0\..\python.exe" -IBm azure.cli %*',
+        ') ELSE (',
+        'echo Failed to load python executable.',
+        'exit /b 1',
+        ')'
+    )
+    if ($lines.Count -ne $expected.Count) {
+        throw 'Azure CLI command shim content was not recognized.'
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($lines[$index] -cne $expected[$index]) {
+            throw 'Azure CLI command shim content was not recognized.'
+        }
+    }
+    $python = Join-Path (
+        Split-Path -Parent (
+            Split-Path -Parent $tool.FullName)
+    ) 'python.exe'
+    $pythonItem = Get-Item -LiteralPath $python -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $pythonItem -or
+        $pythonItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) {
+        throw 'Azure CLI Python runtime was unavailable or unsafe.'
+    }
+    return [ordered]@{
+        fileName = $pythonItem.FullName
+        argumentList = [string[]]@(
+            '-X', 'utf8', '-I', '-B', '-m', 'azure.cli'
+        ) + $Arguments
+        environment = [ordered]@{
+            AZ_INSTALLER = 'MSI'
+        }
+    }
+}
+
+function Invoke-ApprovedOwnerV2AzureCliJson {
+    param(
+        [Parameter(Mandatory)][string]$AzureCliPath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$InputPath = '',
+        [ValidateRange(1, 300000)]
+        [int]$TimeoutMilliseconds = 120000
+    )
+    $argv = @($Arguments)
+    if ($InputPath) {
+        $argv += @('--in-file', $InputPath)
+    }
+    $plan = Get-ApprovedOwnerV2AzureCliLaunchPlan `
+        -AzureCliPath $AzureCliPath -Arguments $argv
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = [string]$plan.fileName
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @($plan.argumentList)) {
+        [void]$start.ArgumentList.Add([string]$argument)
+    }
+    [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
+    [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
+    foreach ($entry in $plan.environment.GetEnumerator()) {
+        $start.Environment[[string]$entry.Key] =
+            [string]$entry.Value
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $output = [IO.MemoryStream]::new()
+    $error = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw 'Azure CLI process did not start.'
+        }
+        $outputTask =
+            $process.StandardOutput.BaseStream.CopyToAsync(
+                $output)
+        $errorTask =
+            $process.StandardError.BaseStream.CopyToAsync(
+                $error)
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $process.WaitForExit(100)) {
+            if ($output.Length -gt 16777216 -or
+                $error.Length -gt 65536) {
+                $process.Kill($true)
+                throw 'Azure CLI output exceeded its bounded size.'
+            }
+            if ($watch.ElapsedMilliseconds -ge
+                $TimeoutMilliseconds) {
+                $process.Kill($true)
+                throw 'Azure CLI operation exceeded its time budget.'
+            }
+        }
+        [Threading.Tasks.Task]::WaitAll(
+            [Threading.Tasks.Task[]]@(
+                $outputTask, $errorTask))
+        if ($output.Length -gt 16777216 -or
+            $error.Length -gt 65536) {
+            throw 'Azure CLI output exceeded its bounded size.'
+        }
+        if ($process.ExitCode -ne 0) {
+            throw (
+                'Azure CLI REST operation failed with exit code ' +
+                "$($process.ExitCode).")
+        }
+        $text = [Text.UTF8Encoding]::new(
+            $false, $true).GetString(
+                $output.ToArray())
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return $null
+        }
+        return $text | ConvertFrom-Json `
+            -AsHashtable -Depth 64
+    }
+    finally {
+        $output.Dispose()
+        $error.Dispose()
+        $process.Dispose()
+    }
+}
+
 function New-ApprovedOwnerV2AzureDevOpsProvider {
     [CmdletBinding()]
     param(
@@ -114,15 +266,10 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             [Parameter(Mandatory)][string[]]$Arguments,
             [string]$InputPath = ''
         )
-        $argv = @($Arguments)
-        if ($InputPath) { $argv += @('--in-file', $InputPath) }
-        $output = @(& $AzureCliPath @argv 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            throw "Azure CLI REST operation failed with exit code $LASTEXITCODE."
-        }
-        $text = $output -join "`n"
-        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-        return $text | ConvertFrom-Json -AsHashtable -Depth 64
+        return Invoke-ApprovedOwnerV2AzureCliJson `
+            -AzureCliPath $AzureCliPath `
+            -Arguments $Arguments `
+            -InputPath $InputPath
     }.GetNewClosure()
 
     $getIterations = {
