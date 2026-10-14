@@ -752,6 +752,155 @@ Describe 'Named batch cadence' {
             Should -Be 5
     }
 
+    It 'durably advances bounded file chunks before exposing one complete snapshot' {
+        $config = New-BatchIntakeConfig
+        $config.limits.maxChangedFiles = 2
+        $state = Join-Path $TestDrive 'file-progress-state'
+        $starts =
+            [Collections.Generic.List[int]]::new()
+        $provider = {
+            param($Operation, $Request)
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{} +
+                        $config.expectedAccount
+                }
+                ListPage {
+                    $items =
+                        [Collections.Generic.List[object]]::
+                            new()
+                    if ([int]$Request.skip -eq 0) {
+                        $items.Add([ordered]@{
+                                pullRequestId = 1
+                                status = 'active'
+                                isDraft = $false
+                                targetRef =
+                                    'refs/heads/master'
+                            })
+                    }
+                    return [ordered]@{
+                        items = $items.ToArray()
+                        count = $items.Count
+                        totalCount = 1
+                    }
+                }
+                Head {
+                    return [ordered]@{
+                        pullRequestId = 1
+                        repositoryId =
+                            $config.repositoryId
+                        projectId =
+                            $config.projectId
+                        sourceRef =
+                            'refs/heads/feature'
+                        targetRef =
+                            'refs/heads/master'
+                        sourceCommit = 'a' * 40
+                        targetCommit = 'b' * 40
+                        iterationId = 1
+                        status = 'active'
+                        isDraft = $false
+                    }
+                }
+                Changes {
+                    $start = [int]$Request.
+                        fileStartOrdinal
+                    $starts.Add($start)
+                    $count = if ($start -eq 0) {
+                        2
+                    }
+                    else { 1 }
+                    $entries = @(
+                        for ($index = $start;
+                            $index -lt
+                                ($start + $count);
+                            $index++) {
+                            [ordered]@{
+                                changeTrackingId =
+                                    [int]($index + 1)
+                                path =
+                                    "src/File$index.cs"
+                                changeType = 'edit'
+                                state = 'complete'
+                                spans = @()
+                                content = ''
+                                byteLength = 0
+                                sourceDigest =
+                                    'v1:sha256:' +
+                                    (('{0:x}' -f
+                                        ($index + 1)).
+                                        PadLeft(64, '0'))
+                            }
+                        })
+                    return [ordered]@{
+                        changedFiles = $count
+                        changedLines = $count
+                        entries = $entries
+                        projectContexts = @()
+                        fileProgress =
+                            [ordered]@{
+                                inventoryDigest =
+                                    ('c' * 64) -join ''
+                                totalFiles = 3
+                                startOrdinal = $start
+                                nextOrdinal =
+                                    $start + $count
+                                complete = $(if (
+                                    ($start + $count) -eq 3) {
+                                        $true
+                                    }
+                                    else { $false })
+                                cumulativeChangedLines =
+                                    $start + $count
+                            }
+                    }
+                }
+                Discussions {
+                    return [ordered]@{
+                        threads = @()
+                        count = 0
+                    }
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-ActivePrIntake `
+            -Config $config -Provider $provider `
+            -StateRoot $state `
+            -RepositoryRoot $repo `
+            -MaximumHeadsThisRun 1 `
+            -IncludeTransientSnapshots -Run
+        $first.heads[0].reasonCode |
+            Should -BeExactly 'file-progress-pending'
+        $first.heads[0].fileProgress.
+            processedFiles | Should -Be 2
+        $first.cursor.nextPullRequestId |
+            Should -Be 1
+        @($first.transientSnapshots.Keys) |
+            Should -HaveCount 0
+
+        $second = Invoke-ActivePrIntake `
+            -Config $config -Provider $provider `
+            -StateRoot $state `
+            -RepositoryRoot $repo `
+            -MaximumHeadsThisRun 1 `
+            -IncludeTransientSnapshots -Run
+        $starts.ToArray() | Should -Be @(0, 2)
+        $second.heads[0].reasonCode |
+            Should -BeExactly 'rules-incomplete'
+        @($second.transientSnapshots.Keys) |
+            Should -Be @('1')
+        @($second.transientSnapshots[
+                '1'].changes.entries) |
+            Should -HaveCount 3
+        Test-Path (Join-Path $state `
+                'active-pr-intake-v1\file-progress\1.json') |
+            Should -BeFalse
+    }
+
     It 'enforces one shared create budget of two across four identities' {
         $script:requested = [Collections.Generic.List[int]]::new()
         Mock Assert-AutomaticOwnerV2ServicePolicy {}

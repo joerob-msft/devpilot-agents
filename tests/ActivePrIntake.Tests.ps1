@@ -610,9 +610,13 @@ $response | ConvertTo-Json -Depth 8 -Compress
                 sourceCommit = 'a' * 40; targetCommit = 'b' * 40
                 timeoutMilliseconds = 15000
             }
-            $changes.changedFiles | Should -Be 110
+            $changes.changedFiles | Should -Be 16
             $changes.changedLines | Should -Be 0
-            @($changes.entries) | Should -HaveCount 110
+            @($changes.entries) | Should -HaveCount 16
+            $changes.fileProgress.totalFiles | Should -Be 110
+            $changes.fileProgress.startOrdinal | Should -Be 0
+            $changes.fileProgress.nextOrdinal | Should -Be 16
+            $changes.fileProgress.complete | Should -BeFalse
             @($changes.entries |
                     Where-Object {
                         [string]$_.derivation.classification -cne
@@ -625,6 +629,22 @@ $response | ConvertTo-Json -Depth 8 -Compress
                             ('b' * 40)
                     }) | Should -HaveCount 0
             @(Get-Content -LiteralPath $log) | Should -Be @('0', '37', '74', '110')
+                    $next = & $provider 'Changes' @{
+                        pullRequestId = 1; iterationId = 1
+                        sourceCommit = 'a' * 40; targetCommit = 'b' * 40
+                        fileStartOrdinal = 16
+                        lineBudgetConsumed = 0
+                        timeoutMilliseconds = 15000
+                    }
+                    $next.changedFiles | Should -Be 16
+                    $next.fileProgress.startOrdinal | Should -Be 16
+                    $next.fileProgress.nextOrdinal | Should -Be 32
+                    $next.fileProgress.inventoryDigest |
+                        Should -BeExactly (
+                            $changes.fileProgress.inventoryDigest)
+                    @($changes.entries.path | Where-Object {
+                            $_ -in @($next.entries.path)
+                        }) | Should -HaveCount 0
             $env:ACTIVE_PR_INTAKE_CHANGE_MODE = 'duplicate'
             { & $provider 'Changes' @{
                     pullRequestId = 1; iterationId = 1
@@ -648,11 +668,13 @@ $response | ConvertTo-Json -Depth 8 -Compress
             $c.config.limits.maxChangedFiles = 109
             $capped = New-ActivePrAzureDevOpsProvider -Config $c.config `
                 -AzureCliPath $stub
-            { & $capped 'Changes' @{
+            $cappedChanges = & $capped 'Changes' @{
                     pullRequestId = 1; iterationId = 1
                     sourceCommit = 'a' * 40; targetCommit = 'b' * 40
                     timeoutMilliseconds = 15000
-                } } | Should -Throw 'file-budget'
+            }
+            $cappedChanges.changedFiles | Should -Be 16
+            $cappedChanges.fileProgress.totalFiles | Should -Be 110
             $c.config.limits.maxChangedFiles = 200
             $c.config.limits.maxReads = 2
             $readLimited = New-ActivePrAzureDevOpsProvider -Config $c.config `

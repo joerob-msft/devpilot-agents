@@ -888,6 +888,10 @@ function Invoke-ActivePrIntake {
         -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
     $generationRoot = Resolve-AgentTrustedRoot -Path (Join-Path $root 'generations') `
         -Kind durable-state -RepositoryRoot $RepositoryRoot -Create
+    $fileProgressRoot = Resolve-AgentTrustedRoot `
+        -Path (Join-Path $root 'file-progress') `
+        -Kind durable-state `
+        -RepositoryRoot $RepositoryRoot -Create
     $lock = [IO.File]::Open((Join-Path $root 'cohort.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
         $path = Join-Path $root 'cohort.json'
@@ -1208,60 +1212,300 @@ function Invoke-ActivePrIntake {
                                         $previous $id $ruleResult.id $ruleResult.capability `
                                         $entry.declarationDigest $envelope.binding.configDigest
                                 }
+                                $progressPath = Join-Path `
+                                    $fileProgressRoot "$id.json"
+                                $priorProgress = $null
+                                if (Test-Path -LiteralPath `
+                                        $progressPath `
+                                        -PathType Leaf) {
+                                    $progressFile =
+                                        Get-Item -LiteralPath `
+                                            $progressPath -Force
+                                    if ($progressFile.Attributes -band
+                                            [IO.FileAttributes]::
+                                                ReparsePoint -or
+                                        $progressFile.Length -gt
+                                            33554432) {
+                                        throw 'file-progress-invalid'
+                                    }
+                                    [void](
+                                        Assert-AgentTrustedFile `
+                                            -Path $progressPath `
+                                            -AllowedRoot `
+                                                $fileProgressRoot `
+                                            -Private)
+                                    $priorProgress =
+                                        Get-Content `
+                                            -LiteralPath `
+                                                $progressPath `
+                                            -Raw |
+                                        ConvertFrom-Json `
+                                            -AsHashtable `
+                                            -Depth 64
+                                    if (
+                                        [int]$priorProgress.
+                                            schemaVersion -ne 1 -or
+                                        [string]$priorProgress.kind -cne
+                                            'active-pr-file-progress' -or
+                                        [long]$priorProgress.
+                                            pullRequestId -ne $id -or
+                                        [string]$priorProgress.
+                                            configDigest -cne
+                                            [string]$envelope.
+                                                binding.
+                                                configDigest -or
+                                        [string]$priorProgress.
+                                            declarationDigest -cne
+                                            [string]$entry.
+                                                declarationDigest -or
+                                        [int]$priorProgress.
+                                            nextOrdinal -lt 1 -or
+                                        [int]$priorProgress.
+                                            nextOrdinal -gt 1999 -or
+                                        $priorProgress.entries -isnot
+                                            [array]) {
+                                        $priorProgress = $null
+                                    }
+                                }
+                                $fileStartOrdinal = if (
+                                    $null -ne $priorProgress) {
+                                    [int]$priorProgress.
+                                        nextOrdinal
+                                }
+                                else { 0 }
+                                $lineBudgetConsumed = if (
+                                    $null -ne $priorProgress) {
+                                    [int]$priorProgress.
+                                        changedLines
+                                }
+                                else { 0 }
+                                $progressPending = $false
+                                $progressRecord = $null
+                                $removeProgress = $false
                                 try {
                                 $changes = Invoke-IntakeRead $Provider Changes @{
                                     pullRequestId = $id
                                     iterationId = $before.iterationId
                                     sourceCommit = $before.sourceCommit
                                     targetCommit = $before.targetCommit
+                                    fileStartOrdinal =
+                                        $fileStartOrdinal
+                                    lineBudgetConsumed =
+                                        $lineBudgetConsumed
                                 } $readConfig ([ref]$reads) $clock `
                                     $headDeadlineMilliseconds
-                                $files = Assert-IntakeNumber $changes.changedFiles changedFiles 0 100000
-                                if ($files -gt [int]$Config.limits.maxChangedFiles) { throw 'file-budget' }
+                                $files = Assert-IntakeNumber `
+                                    $changes.changedFiles `
+                                    changedFiles 0 `
+                                    ([int]$Config.limits.
+                                        maxChangedFiles)
                                 $lines = $null
                                 if ($null -ne $changes['changedLines']) {
                                     $lines = Assert-IntakeNumber $changes.changedLines changedLines 0 1000000
-                                    if ($lines -gt [int]$Config.limits.maxChangedLines) { throw 'line-budget' }
                                 }
-                                $discussion = Invoke-IntakeRead $Provider Discussions @{
-                                    pullRequestId = $id; iterationId = $before.iterationId
-                                } $readConfig ([ref]$reads) $clock `
-                                    $headDeadlineMilliseconds
-                                $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
                                 if ($null -eq $lines) {
                                     throw 'line-count-unavailable'
                                 }
-                                $entry.rules = @()
-                                foreach ($rule in $Config.rules) {
-                                    $result = [ordered]@{
-                                        id = [string]$rule.id
-                                        capability = [string]$rule.capability
-                                        state = 'pending'
-                                        reasonCode = 'no-evaluator'
-                                        observationDigest = $null
-                                        observation = $null
-                                        priorObservation = Get-IntakePriorObservation `
-                                            $previous $id ([string]$rule.id) ([string]$rule.capability) `
-                                            $entry.declarationDigest $envelope.binding.configDigest
-                                        writerEligible = $false
-                                        identityDigest = Get-IntakeRuleIdentity `
-                                            $before ([string]$rule.id) ([string]$rule.capability) `
-                                            $envelope.binding.configDigest
+                                if ($changes.Contains(
+                                        'fileProgress') -and
+                                    $changes.fileProgress -is
+                                        [Collections.IDictionary]) {
+                                    $fileProgress =
+                                        $changes.fileProgress
+                                    if (
+                                        [string]$fileProgress.
+                                            inventoryDigest -cnotmatch
+                                            '^[0-9a-f]{64}$' -or
+                                        [int]$fileProgress.
+                                            totalFiles -lt 1 -or
+                                        [int]$fileProgress.
+                                            totalFiles -gt 2000 -or
+                                        [int]$fileProgress.
+                                            startOrdinal -ne
+                                            $fileStartOrdinal -or
+                                        [int]$fileProgress.
+                                            nextOrdinal -ne
+                                            ($fileStartOrdinal +
+                                                $files)) {
+                                        throw 'file-progress-invalid'
                                     }
-                                    if ($result.priorObservation) {
-                                        $result.reasonCode = if ($result.priorObservation.state -ceq 'stale') {
-                                            'stale-observation'
-                                        } else { 'no-new-observation' }
+                                    $progressComplete =
+                                        $false
+                                    if (-not [bool]::TryParse(
+                                            [string]$fileProgress.
+                                                complete,
+                                            [ref]$progressComplete)) {
+                                        throw 'file-progress-invalid'
                                     }
-                                    if ($entry.discussion.ambiguous -gt 0 -and
-                                        -not (
-                                            Test-IntakeUsesFindingScopedDiscussionReconciliation `
-                                                -Rule $rule
+                                    if ($null -ne
+                                            $priorProgress -and
+                                        (
+                                            [string]$priorProgress.
+                                                inventoryDigest -cne
+                                                [string]$fileProgress.
+                                                    inventoryDigest -or
+                                            [int]$priorProgress.
+                                                totalFiles -ne
+                                                [int]$fileProgress.
+                                                    totalFiles
                                         )) {
-                                        $result.state = 'unknown'
-                                        $result.reasonCode = 'ambiguous-discussion'
+                                        throw 'file-progress-invalid'
                                     }
-                                    $entry.rules += $result
+                                    $accumulatedEntries = @(
+                                        $(if ($null -ne
+                                            $priorProgress) {
+                                            @($priorProgress.entries)
+                                        }) +
+                                        @($changes.entries)
+                                    )
+                                    $progressTrackingIds =
+                                        [Collections.Generic.HashSet[int]]::new()
+                                    foreach ($progressEntry in
+                                        $accumulatedEntries) {
+                                        if (-not
+                                            $progressTrackingIds.Add(
+                                                [int]$progressEntry.
+                                                    changeTrackingId)) {
+                                            throw 'file-progress-invalid'
+                                        }
+                                    }
+                                    $expectedEntryCount =
+                                        [int]$fileProgress.
+                                            nextOrdinal
+                                    if ($accumulatedEntries.Count -ne
+                                            $expectedEntryCount) {
+                                        throw 'file-progress-invalid'
+                                    }
+                                    $contextByDigest =
+                                        [ordered]@{}
+                                    foreach ($context in @(
+                                        $(if ($null -ne
+                                            $priorProgress) {
+                                            @($priorProgress.
+                                                projectContexts)
+                                        }) +
+                                        @($changes.
+                                            projectContexts)
+                                    )) {
+                                        $contextDigest =
+                                            Get-IntakeDigest `
+                                                $context
+                                        $contextByDigest[
+                                            $contextDigest] =
+                                            $context
+                                    }
+                                    $totalBytes = 0L
+                                    foreach ($progressEntry in
+                                        $accumulatedEntries) {
+                                        $totalBytes +=
+                                            [long]$progressEntry.
+                                                byteLength
+                                    }
+                                    if ([long]$totalBytes -gt
+                                        16777216) {
+                                        throw 'read-budget'
+                                    }
+                                    $progressRecord =
+                                        [ordered]@{
+                                            schemaVersion = 1
+                                            kind =
+                                                'active-pr-file-progress'
+                                            pullRequestId = $id
+                                            configDigest =
+                                                [string]$envelope.
+                                                    binding.
+                                                    configDigest
+                                            declarationDigest =
+                                                [string]$entry.
+                                                    declarationDigest
+                                            inventoryDigest =
+                                                [string]$fileProgress.
+                                                    inventoryDigest
+                                            totalFiles =
+                                                [int]$fileProgress.
+                                                    totalFiles
+                                            nextOrdinal =
+                                                [int]$fileProgress.
+                                                    nextOrdinal
+                                            changedLines =
+                                                [int]$fileProgress.
+                                                    cumulativeChangedLines
+                                            totalBytes =
+                                                [long]$totalBytes
+                                            entries =
+                                                $accumulatedEntries
+                                            projectContexts =
+                                                @($contextByDigest.
+                                                    Values)
+                                        }
+                                    if (-not $progressComplete) {
+                                        $progressPending = $true
+                                    }
+                                    else {
+                                        if ($accumulatedEntries.
+                                                Count -ne
+                                            [int]$fileProgress.
+                                                totalFiles) {
+                                            throw 'file-progress-invalid'
+                                        }
+                                        $changes =
+                                            [ordered]@{
+                                                changedFiles =
+                                                    $accumulatedEntries.
+                                                        Count
+                                                changedLines =
+                                                    [int]$progressRecord.
+                                                        changedLines
+                                                entries =
+                                                    $accumulatedEntries
+                                                projectContexts =
+                                                    @($contextByDigest.
+                                                        Values)
+                                            }
+                                        $lines =
+                                            [int]$progressRecord.
+                                                changedLines
+                                        $removeProgress = $true
+                                    }
+                                }
+                                if (-not $progressPending) {
+                                    $discussion = Invoke-IntakeRead $Provider Discussions @{
+                                        pullRequestId = $id; iterationId = $before.iterationId
+                                    } $readConfig ([ref]$reads) $clock `
+                                        $headDeadlineMilliseconds
+                                    $entry.discussion = Get-IntakeDiscussionCounts $discussion $Config $before
+                                    $entry.rules = @()
+                                    foreach ($rule in $Config.rules) {
+                                        $result = [ordered]@{
+                                            id = [string]$rule.id
+                                            capability = [string]$rule.capability
+                                            state = 'pending'
+                                            reasonCode = 'no-evaluator'
+                                            observationDigest = $null
+                                            observation = $null
+                                            priorObservation = Get-IntakePriorObservation `
+                                                $previous $id ([string]$rule.id) ([string]$rule.capability) `
+                                                $entry.declarationDigest $envelope.binding.configDigest
+                                            writerEligible = $false
+                                            identityDigest = Get-IntakeRuleIdentity `
+                                                $before ([string]$rule.id) ([string]$rule.capability) `
+                                                $envelope.binding.configDigest
+                                        }
+                                        if ($result.priorObservation) {
+                                            $result.reasonCode = if ($result.priorObservation.state -ceq 'stale') {
+                                                'stale-observation'
+                                            } else { 'no-new-observation' }
+                                        }
+                                        if ($entry.discussion.ambiguous -gt 0 -and
+                                            -not (
+                                                Test-IntakeUsesFindingScopedDiscussionReconciliation `
+                                                    -Rule $rule
+                                            )) {
+                                            $result.state = 'unknown'
+                                            $result.reasonCode = 'ambiguous-discussion'
+                                        }
+                                        $entry.rules += $result
+                                    }
                                 }
                                 }
                                 finally {
@@ -1275,42 +1519,123 @@ function Invoke-ActivePrIntake {
                                         throw 'head-drift'
                                     }
                                 }
-                                if ($IncludeTransientSnapshots) {
-                                    $transientSnapshots[[string]$id] =
-                                        [ordered]@{
-                                            schemaVersion = 1
-                                            kind =
-                                                'active-pr-transient-snapshot'
-                                            generation =
-                                                $envelope.generation
-                                            head = $before
-                                            changes = $changes
-                                            discussions = $discussion
-                                            sourceDigest =
-                                                Get-IntakeDigest (
-                                                    [ordered]@{
-                                                        head = $before
-                                                        changes = $changes
-                                                        discussions =
-                                                            $discussion
-                                                    })
-                                        }
-                                }
-                                $envelope.counts.evaluatedRules += @(
-                                    $entry.rules | Where-Object state -eq 'evaluated'
-                                ).Count
-                                $envelope.gaps.unknownRules += @(
-                                    $entry.rules | Where-Object state -eq 'unknown'
-                                ).Count
-                                $envelope.gaps.staleRules += @(
-                                    $entry.rules | Where-Object {
-                                        $_.priorObservation -and
-                                        $_.priorObservation.state -ceq 'stale' -and
-                                        $_.state -cne 'evaluated'
+                                if ($progressPending) {
+                                    $progressBytes =
+                                        [Text.UTF8Encoding]::new(
+                                            $false).GetBytes(
+                                            (ConvertTo-Json `
+                                                -InputObject `
+                                                    $progressRecord `
+                                                -Depth 64))
+                                    if ($progressBytes.Length -gt
+                                        33554432) {
+                                        throw 'read-budget'
                                     }
-                                ).Count
-                                $entry.state = 'pending'
-                                $entry.reasonCode = 'rules-incomplete'
+                                    $progressTemp =
+                                        "$progressPath.new-" +
+                                        [guid]::NewGuid().
+                                            ToString('N')
+                                    try {
+                                        [IO.File]::WriteAllBytes(
+                                            $progressTemp,
+                                            $progressBytes)
+                                        [IO.File]::Move(
+                                            $progressTemp,
+                                            $progressPath,
+                                            $true)
+                                    }
+                                    finally {
+                                        Remove-Item `
+                                            -LiteralPath `
+                                                $progressTemp `
+                                            -Force `
+                                            -ErrorAction `
+                                                SilentlyContinue
+                                    }
+                                    [void](
+                                        Assert-AgentTrustedFile `
+                                            -Path $progressPath `
+                                            -AllowedRoot `
+                                                $fileProgressRoot `
+                                            -Private)
+                                    $entry.fileProgress =
+                                        [ordered]@{
+                                            inventoryDigest =
+                                                [string]$progressRecord.
+                                                    inventoryDigest
+                                            totalFiles =
+                                                [int]$progressRecord.
+                                                    totalFiles
+                                            processedFiles =
+                                                [int]$progressRecord.
+                                                    nextOrdinal
+                                            remainingFiles =
+                                                [int]$progressRecord.
+                                                    totalFiles -
+                                                [int]$progressRecord.
+                                                    nextOrdinal
+                                        }
+                                    $entry.state = 'unknown'
+                                    $entry.reasonCode =
+                                        'file-progress-pending'
+                                    foreach ($ruleResult in
+                                        $entry.rules) {
+                                        $ruleResult.state =
+                                            'unknown'
+                                        $ruleResult.reasonCode =
+                                            'file-progress-pending'
+                                    }
+                                    $envelope.counts.error++
+                                    $envelope.gaps.
+                                        unknownHeads++
+                                    $envelope.gaps.
+                                        unknownRules +=
+                                        $Config.rules.Count
+                                }
+                                if (-not $progressPending) {
+                                    if ($removeProgress -and
+                                        (Test-Path -LiteralPath `
+                                            $progressPath)) {
+                                        Remove-Item -LiteralPath `
+                                            $progressPath -Force
+                                    }
+                                    if ($IncludeTransientSnapshots) {
+                                        $transientSnapshots[[string]$id] =
+                                            [ordered]@{
+                                                schemaVersion = 1
+                                                kind =
+                                                    'active-pr-transient-snapshot'
+                                                generation =
+                                                    $envelope.generation
+                                                head = $before
+                                                changes = $changes
+                                                discussions = $discussion
+                                                sourceDigest =
+                                                    Get-IntakeDigest (
+                                                        [ordered]@{
+                                                            head = $before
+                                                            changes = $changes
+                                                            discussions =
+                                                                $discussion
+                                                        })
+                                            }
+                                    }
+                                    $envelope.counts.evaluatedRules += @(
+                                        $entry.rules | Where-Object state -eq 'evaluated'
+                                    ).Count
+                                    $envelope.gaps.unknownRules += @(
+                                        $entry.rules | Where-Object state -eq 'unknown'
+                                    ).Count
+                                    $envelope.gaps.staleRules += @(
+                                        $entry.rules | Where-Object {
+                                            $_.priorObservation -and
+                                            $_.priorObservation.state -ceq 'stale' -and
+                                            $_.state -cne 'evaluated'
+                                        }
+                                    ).Count
+                                    $entry.state = 'pending'
+                                    $entry.reasonCode = 'rules-incomplete'
+                                }
                             }
                         }
                         catch {
@@ -1360,6 +1685,20 @@ function Invoke-ActivePrIntake {
                         }
                     }
                     [void]$heads.Add($entry)
+                }
+                $pendingFileProgress = @(
+                    $heads |
+                        Where-Object {
+                            [string]$_.reasonCode -ceq
+                                'file-progress-pending'
+                        } |
+                        Sort-Object {
+                            [int]$_.pullRequestId
+                        })
+                if ($pendingFileProgress.Count -gt 0) {
+                    $envelope.cursor.nextPullRequestId =
+                        [int]$pendingFileProgress[0].
+                            pullRequestId
                 }
                 $envelope.state = if ($envelope.counts.error -gt 0 -or
                     $envelope.counts.deferred -gt 0 -or
@@ -2327,6 +2666,20 @@ print(json.dumps({
                 $iteration = [int]$Request.iterationId
                 $sourceCommit = [string]$Request.sourceCommit
                 $targetCommit = [string]$Request.targetCommit
+                $fileStartOrdinal = if (
+                    $null -ne $Request['fileStartOrdinal']) {
+                    & $parseNumber $Request['fileStartOrdinal'] `
+                        fileStartOrdinal 0 1999
+                }
+                else { 0 }
+                $lineBudgetConsumed = if (
+                    $null -ne $Request['lineBudgetConsumed']) {
+                    & $parseNumber $Request[
+                        'lineBudgetConsumed'] `
+                        lineBudgetConsumed 0 1000000
+                }
+                else { 0 }
+                $maximumInventoryFiles = 2000
                 if ($sourceCommit -cnotmatch '^[a-fA-F0-9]{40}$' -or
                     $targetCommit -cnotmatch '^[a-fA-F0-9]{40}$') {
                     throw 'invalid-head'
@@ -2335,7 +2688,7 @@ print(json.dumps({
                 $seenChanges = [Collections.Generic.HashSet[int]]::new()
                 $changeEntries = [Collections.Generic.List[object]]::new()
                 $declaredTotal = $null
-                $pageSize = [Math]::Min(100, $maxFiles + 1)
+                $pageSize = 100
                 $complete = $false
                 for ($page = 0; $page -lt [int]$Config.limits.maxPages; $page++) {
                     $r = & $invoke 'git' 'pullRequestIterationChanges' @(
@@ -2355,7 +2708,9 @@ print(json.dumps({
                         if ($null -ne $declaredTotal -and $total -ne $declaredTotal) {
                             throw 'change-list-truncated'
                         }
-                        if ($total -gt $maxFiles) { throw 'file-budget' }
+                        if ($total -gt $maximumInventoryFiles) {
+                            throw 'file-budget'
+                        }
                         $declaredTotal = $total
                     }
                     if ($entries.Count -eq 0) {
@@ -2393,7 +2748,10 @@ print(json.dumps({
                                 } else { $null })
                             })
                     }
-                    if ($seenChanges.Count -gt $maxFiles) { throw 'file-budget' }
+                    if ($seenChanges.Count -gt
+                        $maximumInventoryFiles) {
+                        throw 'file-budget'
+                    }
                     $next = $skip + $entries.Count
                     if ($null -ne $r['nextSkip']) {
                         $nextSkip = & $parseNumber $r['nextSkip'] nextSkip 0 100000
@@ -2406,20 +2764,108 @@ print(json.dumps({
                     $skip = $next
                 }
                 if (-not $complete) { throw 'change-page-budget' }
+                $orderedChangeEntries = @(
+                    $changeEntries |
+                        Sort-Object path, changeTrackingId)
+                if ($orderedChangeEntries.Count -gt 0 -and
+                    $fileStartOrdinal -ge
+                        $orderedChangeEntries.Count) {
+                    throw 'file-progress-invalid'
+                }
+                $chunkFileLimit =
+                    [Math]::Min($maxFiles, 16)
+                $selectedChangeEntries = @(
+                    $orderedChangeEntries |
+                        Select-Object `
+                            -Skip $fileStartOrdinal `
+                            -First $chunkFileLimit)
+                $inventoryDigest =
+                    & $digestCommand @(
+                        $orderedChangeEntries |
+                            ForEach-Object {
+                                [ordered]@{
+                                    changeTrackingId =
+                                        [int]$_.changeTrackingId
+                                    path = [string]$_.path
+                                    changeType =
+                                        [string]$_.changeType
+                                    originalPath =
+                                        $_.originalPath
+                                }
+                            })
                 $normalized = [Collections.Generic.List[object]]::new()
                 $projectContexts = @{}
                 $projectContextByDirectory = @{}
-                $changedLines = 0
+                $changedLines = $lineBudgetConsumed
                 $totalBytes = 0L
-                foreach ($entry in @($changeEntries |
-                        Sort-Object path, changeTrackingId)) {
+                foreach ($entry in $selectedChangeEntries) {
                     $changeType = [string]$entry.changeType
                     $deleted = $changeType -match '(?i)^delete'
+                    $sourceUnavailable = $false
                     $sourceItem = if ($deleted) {
                         $null
                     }
                     else {
-                        & $getItem ([string]$entry.path) $sourceCommit $deadline
+                        try {
+                            & $getItem ([string]$entry.path) `
+                                $sourceCommit $deadline
+                        }
+                        catch {
+                            if ([int]$_.Exception.Data[
+                                    'httpStatus'] -eq 404) {
+                                $sourceUnavailable = $true
+                                $null
+                            }
+                            else { throw }
+                        }
+                    }
+                    if ($sourceUnavailable) {
+                        $unknownChange = [ordered]@{
+                            changeTrackingId =
+                                [int]$entry.changeTrackingId
+                            path = [string]$entry.path
+                            changeType = $changeType
+                            state = 'unknown'
+                            unavailableReason =
+                                'source-content-unavailable'
+                            spans = @()
+                            content = $null
+                            byteLength = 0
+                            sourceDigest =
+                                & $digestCommand (
+                                    [ordered]@{
+                                        path =
+                                            [string]$entry.path
+                                        sourceCommit =
+                                            $sourceCommit
+                                        state =
+                                            'source-unavailable'
+                                    })
+                            derivation =
+                                & $changeDerivationCommand `
+                                    -ChangeType $changeType `
+                                    -IsText $false `
+                                    -Deleted $false `
+                                    -Renamed (
+                                        $changeType -match
+                                            '(?i)rename') `
+                                    -SourceContent '' `
+                                    -TargetContent '' `
+                                    -Spans @() `
+                                    -SourceCommit `
+                                        $sourceCommit `
+                                    -TargetCommit `
+                                        $targetCommit
+                        }
+                        if ($changeType -match
+                                '(?i)rename' -and
+                            $entry.originalPath) {
+                            $unknownChange['oldPath'] =
+                                [string]$entry.originalPath
+                        }
+                        [void]$normalized.Add(
+                            $unknownChange)
+                        continue
                     }
                     $sourceContent = if ($null -eq $sourceItem) {
                         ''
@@ -2473,6 +2919,7 @@ print(json.dumps({
                         [void]$normalized.Add($binaryChange)
                         continue
                     }
+                    $targetUnavailable = $false
                     $targetContent = if ($deleted -or
                         $changeType -match '(?i)^add') {
                         ''
@@ -2485,9 +2932,80 @@ print(json.dumps({
                             [string]$entry.originalPath
                         }
                         else { [string]$entry.path }
-                        $targetItem = & $getItem `
-                            $targetPath $targetCommit $deadline
-                        [string]$targetItem.content
+                        try {
+                            $targetItem = & $getItem `
+                                $targetPath $targetCommit `
+                                $deadline
+                            [string]$targetItem.content
+                        }
+                        catch {
+                            if ([int]$_.Exception.Data[
+                                    'httpStatus'] -eq 404) {
+                                $targetUnavailable =
+                                    $true
+                                ''
+                            }
+                            else { throw }
+                        }
+                    }
+                    if ($targetUnavailable) {
+                        $bytes =
+                            [Text.Encoding]::UTF8.
+                                GetByteCount(
+                                    $sourceContent)
+                        if ($totalBytes + $bytes -gt
+                            16777216) {
+                            if ($normalized.Count -eq 0) {
+                                throw 'read-budget'
+                            }
+                            break
+                        }
+                        $totalBytes += $bytes
+                        $unknownChange = [ordered]@{
+                            changeTrackingId =
+                                [int]$entry.changeTrackingId
+                            path = [string]$entry.path
+                            changeType = $changeType
+                            state = 'unknown'
+                            unavailableReason =
+                                'target-content-unavailable'
+                            spans = @()
+                            content = $sourceContent
+                            byteLength = $bytes
+                            sourceDigest =
+                                'v1:sha256:' +
+                                [Convert]::ToHexString(
+                                    [Security.Cryptography.SHA256]::
+                                        HashData(
+                                        [Text.Encoding]::UTF8.
+                                            GetBytes(
+                                                $sourceContent))).
+                                    ToLowerInvariant()
+                            derivation =
+                                & $changeDerivationCommand `
+                                    -ChangeType $changeType `
+                                    -IsText $false `
+                                    -Deleted $false `
+                                    -Renamed (
+                                        $changeType -match
+                                            '(?i)rename') `
+                                    -SourceContent '' `
+                                    -TargetContent '' `
+                                    -Spans @() `
+                                    -SourceCommit `
+                                        $sourceCommit `
+                                    -TargetCommit `
+                                        $targetCommit
+                        }
+                        if ($changeType -match
+                                '(?i)rename' -and
+                            $entry.originalPath) {
+                            $unknownChange['oldPath'] =
+                                [string]$entry.originalPath
+                        }
+                        [void]$normalized.Add(
+                            $unknownChange)
+                        continue
                     }
                     $spans = @(& $changedSpansCommand `
                             -Path ([string]$entry.path) `
@@ -2516,10 +3034,14 @@ print(json.dumps({
                         $changedLines += $entryChangedLines
                     }
                     $bytes = [Text.Encoding]::UTF8.GetByteCount($sourceContent)
-                    $totalBytes += $bytes
-                    if ($totalBytes -gt 16777216) {
-                        throw 'read-budget'
+                    if ($totalBytes + $bytes -gt
+                        16777216) {
+                        if ($normalized.Count -eq 0) {
+                            throw 'read-budget'
+                        }
+                        break
                     }
+                    $totalBytes += $bytes
                     $normalizedChange = [ordered]@{
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
@@ -2620,11 +3142,31 @@ print(json.dumps({
                     }
                     [void]$normalized.Add($normalizedChange)
                 }
+                $nextFileOrdinal =
+                    $fileStartOrdinal +
+                    $normalized.Count
                 return @{
-                    changedFiles = $seenChanges.Count
-                    changedLines = $changedLines
+                    changedFiles = $normalized.Count
+                    changedLines =
+                        $changedLines -
+                        $lineBudgetConsumed
                     entries = $normalized.ToArray()
                     projectContexts = @($projectContexts.Values)
+                    fileProgress = [ordered]@{
+                        inventoryDigest =
+                            $inventoryDigest
+                        totalFiles =
+                            $orderedChangeEntries.Count
+                        startOrdinal =
+                            $fileStartOrdinal
+                        nextOrdinal =
+                            $nextFileOrdinal
+                        complete =
+                            $nextFileOrdinal -ge
+                                $orderedChangeEntries.Count
+                        cumulativeChangedLines =
+                            $changedLines
+                    }
                 }
             }
             Discussions {
