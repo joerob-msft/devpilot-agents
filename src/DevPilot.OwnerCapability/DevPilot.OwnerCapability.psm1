@@ -1393,7 +1393,39 @@ function Invoke-OwnerV2CapabilityResponse {
         $fileData = Get-OwnerV2Member -Value $fileUnit -Name data
         $path = [string](Get-OwnerV2Member -Value $fileData -Name path)
         $atomicEvidenceIds = @('identity', 'rule', $fileUnitId)
-        if ($fileState -cne 'complete' -or [string]::IsNullOrWhiteSpace($path)) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
+                    evidenceUnitIds = $atomicEvidenceIds
+                    state = 'unknown'
+                    data = [ordered]@{
+                        state = 'uncovered'
+                        reason = 'file-evidence-unavailable'
+                        constructRef = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        if (-not $path.EndsWith(
+                '.cs',
+                [StringComparison]::OrdinalIgnoreCase)) {
+            [void]$assessments.Add([ordered]@{
+                    assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
+                    evidenceUnitIds = $atomicEvidenceIds
+                    state = 'complete'
+                    data = [ordered]@{
+                        state = 'not-applicable'
+                        reason =
+                            'capability-scope-not-applicable'
+                        evidenceUnitIds =
+                            @($fileUnitId)
+                    }
+                    findings = @()
+                })
+            continue
+        }
+        if ($fileState -cne 'complete') {
             [void]$assessments.Add([ordered]@{
                     assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)
                     evidenceUnitIds = $atomicEvidenceIds
@@ -1408,12 +1440,9 @@ function Invoke-OwnerV2CapabilityResponse {
             continue
         }
 
-        $constructs = @(if ($path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase)) {
-            @(Get-OwnerV2FileConstructs -FileData $fileData -Limits $Limits)
-        }
-        else {
-            @()
-        })
+        $constructs = @(
+            Get-OwnerV2FileConstructs `
+                -FileData $fileData -Limits $Limits)
         if ($constructs.Count -eq 0) {
             [void]$assessments.Add([ordered]@{
                     assessmentId = 'file:' + (Get-OwnerV2Digest -Value "$bindingId|$fileUnitId").Substring(10)

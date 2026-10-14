@@ -467,6 +467,44 @@ Describe 'Owner v2 semantic capability' {
         @($run.Observation.outcomes | Where-Object state -CEQ uncovered).Count | Should -BeGreaterThan 0
     }
 
+    It 'completes an unknown non-CSharp file as irrelevant to Owner' {
+        $case = Get-TestOwnerV2Case `
+            -Id 'proven-owner-cases'
+        $copy = $case |
+            ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable `
+                -Depth 32
+        $copy.path = 'src/Dockerfile'
+
+        $run = Invoke-TestOwnerV2Case `
+            -Case $copy -Variant file-incomplete
+
+        $run.Result.state | Should -BeExactly 'complete'
+        $run.Requests | Should -HaveCount 0
+        $run.Observation.lifecycle.completed |
+            Should -BeTrue
+        $run.Observation.findingsComplete |
+            Should -BeTrue
+        $run.Observation.counts.unknown |
+            Should -Be 0
+        $run.Observation.findings |
+            Should -HaveCount 0
+    }
+
+    It 'keeps an unknown CSharp file withheld from Owner' {
+        $case = Get-TestOwnerV2Case `
+            -Id 'proven-owner-cases'
+        $run = Invoke-TestOwnerV2Case `
+            -Case $case -Variant file-incomplete
+
+        $run.Result.state | Should -BeExactly 'unknown'
+        $run.Observation.lifecycle.completed |
+            Should -BeFalse
+        $run.Observation.findingsComplete |
+            Should -BeFalse
+        $run.Requests | Should -HaveCount 0
+    }
+
     It 'produces stable wrapper identities and changes them when the bound head changes' {
         $case = Get-TestOwnerV2Case -Id 'proven-owner-cases'
         $first = Invoke-TestOwnerV2Case -Case $case

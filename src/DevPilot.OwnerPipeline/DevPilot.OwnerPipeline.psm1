@@ -641,6 +641,9 @@ function Invoke-OwnerReviewPipeline {
         $unitAssessmentStates = [Collections.Generic.Dictionary[
             string, Collections.Generic.List[string]]]::new([StringComparer]::Ordinal)
         $normalizedAssessments = [Collections.Generic.List[object]]::new()
+        $notApplicableUnits =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
         $findingCount = 0
         $validationFailed = $false
 
@@ -721,6 +724,37 @@ function Invoke-OwnerReviewPipeline {
                     $validationFailed = $true
                     break
                 }
+                $assessmentData =
+                    $normalizedAssessment['data']
+                if ($assessmentState -ceq 'complete' -and
+                    $normalizedFindings.Count -eq 0 -and
+                    $assessmentData -is
+                        [Collections.IDictionary] -and
+                    [string]$assessmentData['state'] -ceq
+                        'not-applicable' -and
+                    [string]$assessmentData['reason'] -ceq
+                        'capability-scope-not-applicable' -and
+                    $assessmentData['evidenceUnitIds'] -is
+                        [array]) {
+                    foreach ($notApplicableUnitId in
+                        @($assessmentData[
+                                'evidenceUnitIds'])) {
+                        $unitId =
+                            [string]$notApplicableUnitId
+                        if (-not $assessmentUnitSet.
+                                Contains($unitId) -or
+                            -not $knownUnits.
+                                Contains($unitId)) {
+                            $validationFailed = $true
+                            break
+                        }
+                        [void]$notApplicableUnits.
+                            Add($unitId)
+                    }
+                    if ($validationFailed) {
+                        break
+                    }
+                }
             }
             [void]$normalizedAssessments.Add($normalizedAssessment)
         }
@@ -741,7 +775,12 @@ function Invoke-OwnerReviewPipeline {
                 $assessmentStates = @(
                     if ($unitAssessmentStates.ContainsKey($unitId)) { $unitAssessmentStates[$unitId] }
                 )
-                $coverageState = if ($evidenceState -eq 'unknown') {
+                $coverageState = if (
+                    $notApplicableUnits.Contains(
+                        $unitId)) {
+                    'complete'
+                }
+                elseif ($evidenceState -eq 'unknown') {
                     'unknown'
                 }
                 elseif ($evidenceState -eq 'incomplete') {
@@ -766,11 +805,11 @@ function Invoke-OwnerReviewPipeline {
             $validationState = if ($coverageStates.Count -eq 0) {
                 'unknown'
             }
-            elseif ($evidence.state -eq 'unknown' -or $capability.state -eq 'unknown' -or
+            elseif ($capability.state -eq 'unknown' -or
                 $coverageStates -contains 'unknown') {
                 'unknown'
             }
-            elseif ($evidence.state -eq 'complete' -and $capability.state -eq 'complete' -and
+            elseif ($capability.state -eq 'complete' -and
                 @($coverageStates | Where-Object { $_ -ne 'complete' }).Count -eq 0) {
                 'complete'
             }
