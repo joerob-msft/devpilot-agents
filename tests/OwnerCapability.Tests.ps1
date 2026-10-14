@@ -505,6 +505,89 @@ Describe 'Owner v2 semantic capability' {
         $run.Requests | Should -HaveCount 0
     }
 
+    It 'emits a schema-valid complete observation for multiple unknown non-CSharp files' {
+        $case = Get-TestOwnerV2Case `
+            -Id 'proven-owner-cases'
+        $contract = New-TestOwnerV2Contract
+        $package = New-TestOwnerV2Package `
+            -Case $case -Contract $contract `
+            -Variant file-incomplete
+        $changes =
+            [Collections.Generic.List[object]]::new()
+        $files =
+            [Collections.Generic.List[object]]::new()
+        foreach ($ordinal in 0..4) {
+            $path =
+                "expressV2/File$ordinal.json"
+            $change = $package.changePages[
+                0].changes[0] |
+                ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 32
+            $change.path = $path
+            $change.sourceDigest =
+                Get-TestOwnerV2Digest (
+                    "change:$ordinal")
+            [void]$changes.Add($change)
+            $file = $package.files[0] |
+                ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 32
+            $file.path = $path
+            $file.sourceDigest =
+                [string]$change.sourceDigest
+            [void]$files.Add($file)
+        }
+        $package.changePages[0].changes =
+            $changes.ToArray()
+        $package.files = $files.ToArray()
+        $package.subjectBefore.
+            changedFileCount = 5
+        $package.subjectAfter.
+            changedFileCount = 5
+        $fixture =
+            New-OwnerReplayFixture `
+                -Package $package
+        $runner = New-TestOwnerV2Runner
+        $capabilityAdapter =
+            New-OwnerV2CapabilityAdapter `
+                -Runner $runner.Runner `
+                -CapabilityId `
+                    $script:OwnerCapabilityId `
+                -CapabilityDigest `
+                    $script:OwnerCapabilityDigest
+        $result = Invoke-OwnerReviewPipeline `
+            -Binding $contract.Binding `
+            -AcquisitionAdapter (
+                New-OwnerReplayAcquisitionAdapter `
+                    -Contract $contract `
+                    -Fixture $fixture `
+                    -ExpectedPayloadDigest `
+                        $fixture.PayloadDigest) `
+            -CapabilityAdapter $capabilityAdapter
+        $observation =
+            ConvertTo-OwnerV2Observation `
+                -PipelineResult $result
+        $schemaPath = Join-Path (
+            Split-Path $PSScriptRoot -Parent) `
+            'src\OwnerObserver\schemas\owner-observation.v1.json'
+
+        $result.state |
+            Should -BeExactly 'complete'
+        $runner.Requests |
+            Should -HaveCount 0
+        $observation.lifecycle.status |
+            Should -BeExactly 'completed'
+        $observation.findingsComplete |
+            Should -BeTrue
+        {
+            $observation |
+                ConvertTo-Json -Depth 64 -Compress |
+                Test-Json -SchemaFile `
+                    $schemaPath -ErrorAction Stop
+        } | Should -Not -Throw
+    }
+
     It 'rejects foreign not-applicable claims for identity and CSharp evidence' `
         -TestCases @(
             @{
@@ -548,9 +631,11 @@ Describe 'Owner v2 semantic capability' {
                                 data =
                                     [ordered]@{
                                         state =
-                                            'not-applicable'
+                                            'notEligible'
                                         reason =
                                             'capability-scope-not-applicable'
+                                        evidenceScope =
+                                            'not-applicable'
                                         evidenceUnitIds =
                                             @($UnitId)
                                     }

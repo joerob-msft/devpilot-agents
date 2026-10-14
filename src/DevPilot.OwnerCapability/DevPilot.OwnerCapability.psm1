@@ -1415,11 +1415,19 @@ function Invoke-OwnerV2CapabilityResponse {
                     evidenceUnitIds = $atomicEvidenceIds
                     state = 'complete'
                     data = [ordered]@{
-                        state = 'not-applicable'
+                        state = 'notEligible'
                         reason =
                             'capability-scope-not-applicable'
+                        evidenceScope =
+                            'not-applicable'
                         evidenceUnitIds =
                             @($fileUnitId)
+                        constructRef =
+                            'file:' +
+                            (Get-OwnerV2Digest `
+                                -Value (
+                                    "$bindingId|$fileUnitId")).
+                                Substring(10)
                     }
                     findings = @()
                 })

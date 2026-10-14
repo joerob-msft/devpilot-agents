@@ -736,7 +736,7 @@ function Invoke-OwnerReviewPipeline {
                     $normalizedFindings.Count -eq 0 -and
                     $assessmentData -is
                         [Collections.IDictionary] -and
-                    [string]$assessmentData['state'] -ceq
+                    [string]$assessmentData['evidenceScope'] -ceq
                         'not-applicable' -and
                     [string]$assessmentData['reason'] -ceq
                         'capability-scope-not-applicable' -and
