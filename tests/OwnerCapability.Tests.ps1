@@ -505,6 +505,76 @@ Describe 'Owner v2 semantic capability' {
         $run.Requests | Should -HaveCount 0
     }
 
+    It 'rejects foreign not-applicable claims for identity and CSharp evidence' `
+        -TestCases @(
+            @{
+                UnitId = 'identity'
+                Variant = 'complete'
+            }
+            @{
+                UnitId = 'file:000000'
+                Variant = 'file-incomplete'
+            }
+        ) {
+        param($UnitId, $Variant)
+        $case = Get-TestOwnerV2Case `
+            -Id 'proven-owner-cases'
+        $contract = New-TestOwnerV2Contract
+        $package = New-TestOwnerV2Package `
+            -Case $case -Contract $contract `
+            -Variant $Variant
+        $fixture =
+            New-OwnerReplayFixture `
+                -Package $package
+        $capability =
+            New-OwnerPipelineAdapter `
+                -Stage capability `
+                -Name 'foreign-scope-claim' `
+                -Handler {
+                    param($context)
+                    return [ordered]@{
+                        schemaVersion = 1
+                        bindingId =
+                            $context.binding.
+                                BindingId
+                        state = 'complete'
+                        assessments = @(
+                            [ordered]@{
+                                assessmentId =
+                                    'foreign-scope'
+                                evidenceUnitIds =
+                                    @($UnitId)
+                                state = 'complete'
+                                data =
+                                    [ordered]@{
+                                        state =
+                                            'not-applicable'
+                                        reason =
+                                            'capability-scope-not-applicable'
+                                        evidenceUnitIds =
+                                            @($UnitId)
+                                    }
+                                findings = @()
+                            })
+                    }
+                }.GetNewClosure()
+
+        $result = Invoke-OwnerReviewPipeline `
+            -Binding $contract.Binding `
+            -AcquisitionAdapter (
+                New-OwnerReplayAcquisitionAdapter `
+                    -Contract $contract `
+                    -Fixture $fixture `
+                    -ExpectedPayloadDigest `
+                        $fixture.PayloadDigest) `
+            -CapabilityAdapter $capability
+
+        $result.state |
+            Should -Not -BeExactly 'complete'
+        @($result.diagnostics.code) |
+            Should -Contain 'findings-invalid'
+    }
+
     It 'produces stable wrapper identities and changes them when the bound head changes' {
         $case = Get-TestOwnerV2Case -Id 'proven-owner-cases'
         $first = Invoke-TestOwnerV2Case -Case $case

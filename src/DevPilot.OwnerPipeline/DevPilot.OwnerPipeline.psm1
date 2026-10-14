@@ -632,9 +632,15 @@ function Invoke-OwnerReviewPipeline {
         $stages['Validate findings']['state'] = 'running'
         $knownUnits = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $unitEvidenceStates = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+        $unitEvidenceData =
+            [Collections.Generic.Dictionary[
+                string, object]]::new(
+                [StringComparer]::Ordinal)
         foreach ($unit in $evidence.evidenceUnits) {
             [void]$knownUnits.Add([string]($unit['unitId']))
             $unitEvidenceStates[[string]($unit['unitId'])] = [string]($unit['state'])
+            $unitEvidenceData[[string]($unit['unitId'])] =
+                $unit['data']
         }
         $assessmentIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $findingIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -741,10 +747,30 @@ function Invoke-OwnerReviewPipeline {
                                 'evidenceUnitIds'])) {
                         $unitId =
                             [string]$notApplicableUnitId
+                        $scopeData = if (
+                            $unitEvidenceData.
+                                ContainsKey($unitId)) {
+                            $unitEvidenceData[$unitId]
+                        }
+                        else { $null }
+                        $scopePath = if (
+                            $scopeData -is
+                                [Collections.IDictionary]) {
+                            [string]$scopeData['path']
+                        }
+                        else { '' }
                         if (-not $assessmentUnitSet.
                                 Contains($unitId) -or
                             -not $knownUnits.
-                                Contains($unitId)) {
+                                Contains($unitId) -or
+                            $unitId -cnotmatch
+                                '^file:[0-9]{6}$' -or
+                            [string]::IsNullOrWhiteSpace(
+                                $scopePath) -or
+                            $scopePath.EndsWith(
+                                '.cs',
+                                [StringComparison]::
+                                    OrdinalIgnoreCase)) {
                             $validationFailed = $true
                             break
                         }
