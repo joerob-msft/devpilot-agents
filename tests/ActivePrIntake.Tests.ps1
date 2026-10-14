@@ -146,6 +146,66 @@ AfterAll {
     }
 }
 Describe 'Active PR read-only intake' {
+    It 'classifies a missing exact source ref as head-inconsistent' {
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                Resolve-ActivePrHeadSnapshot `
+                    -PullRequest ([ordered]@{
+                        pullRequestId = 1
+                        sourceRefName =
+                            'refs/heads/missing'
+                        targetRefName =
+                            'refs/heads/master'
+                        repository =
+                            [ordered]@{
+                                id = 'r'
+                                project =
+                                    [ordered]@{
+                                        id = 'p'
+                                    }
+                            }
+                        status = 'active'
+                        isDraft = $false
+                    }) `
+                    -Iterations @([ordered]@{
+                            id = 1
+                            sourceRefCommit =
+                                [ordered]@{
+                                    commitId = 'a' * 40
+                                }
+                            targetRefCommit =
+                                [ordered]@{
+                                    commitId = 'b' * 40
+                                }
+                        }) `
+                    -SourceRefs ([object[]]@())
+            }
+        } | Should -Throw 'head-inconsistent'
+    }
+
+    It 'retains head-inconsistent as the selected head reason' {
+        $case = New-IntakeCase `
+            -Count 1 -MaxHeads 1
+        $baseProvider = $case.provider
+        $provider = {
+            param($Operation, $Request)
+            if ($Operation -ceq 'Head') {
+                throw 'head-inconsistent'
+            }
+            return & $baseProvider `
+                $Operation $Request
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $case.config `
+            -Provider $provider `
+            -StateRoot $case.root `
+            -RepositoryRoot $repo -Run
+
+        $result.heads[0].reasonCode |
+            Should -BeExactly 'head-inconsistent'
+    }
+
     It 'uses originalPath only for a deletion whose item path is absent' {
         $path = & (Get-Module DevPilot.ActivePrIntake) {
             Resolve-ActivePrIterationChangePath `

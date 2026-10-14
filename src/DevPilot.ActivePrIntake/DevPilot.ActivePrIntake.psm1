@@ -1646,7 +1646,8 @@ function Invoke-ActivePrIntake {
                                 -Generation $envelope.generation `
                                 -Exception $failure
                             $reason = [string]$failure.Message
-                            if ($reason -cnotin @('invalid-head', 'head-drift', 'file-budget',
+                            if ($reason -cnotin @('invalid-head', 'head-drift',
+                                    'head-inconsistent', 'file-budget',
                                     'line-budget', 'line-count-unavailable',
                                     'change-list-truncated', 'change-page-budget', 'invalid-discussions',
                                     'mutable-discussions', 'comment-budget', 'invalid-evaluator',
@@ -1876,6 +1877,7 @@ function Resolve-ActivePrHeadSnapshot {
         [Parameter(Mandatory)]
         [object[]]$Iterations,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object[]]$SourceRefs
     )
     if ($Iterations.Count -eq 0 -or
