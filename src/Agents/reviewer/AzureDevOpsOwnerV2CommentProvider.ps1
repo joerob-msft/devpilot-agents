@@ -524,12 +524,14 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                     -Id ([string]$reviewer.id) `
                     -Descriptor ([string]$reviewer.descriptor) `
                     -UniqueName ([string]$reviewer.uniqueName)
+                $pageConverter =
+                    $convertDiscussionPageCommand
                 $providerHandler = {
                     param($Operation, $ProviderArguments)
                     if ($Operation -cne 'GetDiscussionPage') {
                         throw "Unsupported discussion read '$Operation'."
                     }
-                    return & $convertDiscussionPageCommand `
+                    return & $pageConverter `
                         -Arguments $ProviderArguments `
                         -RawResponse $rawThreads `
                         -CurrentIteration ([ordered]@{
