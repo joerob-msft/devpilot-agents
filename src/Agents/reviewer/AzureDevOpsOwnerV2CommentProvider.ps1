@@ -262,6 +262,8 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
     }
     $invokeAzureCliJsonCommand =
         ${function:Invoke-ApprovedOwnerV2AzureCliJson}
+    $resolveLiveHeadCommand =
+        ${function:Resolve-ApprovedOwnerV2LiveHead}
 
     $invokeAzJson = {
         param(
@@ -480,7 +482,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                 )
                 $iterations = @(& $getIterations $pullRequestId)
                 $current = $iterations[-1]
-                $liveHead = Resolve-ApprovedOwnerV2LiveHead `
+                $liveHead = & $resolveLiveHeadCommand `
                     -PullRequest $pr -Iteration $current `
                     -SourceRefs @(& $getSourceRefs (
                         [string]$pr.sourceRefName))
