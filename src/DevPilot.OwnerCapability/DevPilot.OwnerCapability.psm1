@@ -2479,8 +2479,26 @@ function ConvertTo-OwnerV2Observation {
     foreach ($assessment in $outcomeAssessments) {
         $assessmentId = [string](Get-OwnerV2Member -Value $assessment -Name assessmentId)
         $outcome = Get-OwnerV2Member -Value $assessment -Name data
-        $outcomeState = [string](Get-OwnerV2Member -Value $outcome -Name state)
-        $outcomeReason = [string](Get-OwnerV2Member -Value $outcome -Name reason)
+        $rawOutcomeState =
+            [string](Get-OwnerV2Member `
+                -Value $outcome -Name state)
+        $outcomeState = if (
+            $namedAreEqual -and
+            $rawOutcomeState -ceq
+                'compliant') {
+            'notEligible'
+        }
+        else { $rawOutcomeState }
+        $outcomeReason =
+            [string](Get-OwnerV2Member `
+                -Value $outcome -Name reason)
+        if ($namedAreEqual -and
+            $rawOutcomeState -ceq 'compliant' -and
+            [string]::IsNullOrWhiteSpace(
+                $outcomeReason)) {
+            $outcomeReason =
+                'named-arguments-compliant'
+        }
         $constructRef = [string](Get-OwnerV2Member -Value $outcome -Name constructRef)
         $path = [string](Get-OwnerV2Member -Value $outcome -Name path)
         $startLine = Get-OwnerV2Member -Value $outcome -Name startLine

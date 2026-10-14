@@ -1,6 +1,7 @@
 BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1" -Force
+    Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1" -Force
     Import-Module "$PSScriptRoot\..\src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1" -Force
     . "$PSScriptRoot\..\src\Agents\reviewer\ApprovedOwnerV2Comments.ps1"
 
@@ -181,6 +182,41 @@ Describe 'Bound named Assert.AreEqual method capability' {
         $result.Observation.effects.providerWrites | Should -Be 0
     }
 
+    It 'serializes a compliant changed method as notEligible' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+[TestClass]
+class Checks {
+    [TestMethod]
+    void Verify() {
+        Assert.AreEqual(expected: 0, actual: 0);
+    }
+}
+'@
+        $result = Invoke-NamedTestReplay `
+            -Manifest (
+                New-NamedTestManifest `
+                    -Content $source `
+                    -First 6 -Last 6)
+
+        $result.Run.records[0].state |
+            Should -BeExactly 'completed' `
+            -Because (
+                $result.Observation.
+                    validationErrors -join '; ')
+        $result.Observation.findings |
+            Should -HaveCount 0
+        $result.Observation.outcomes |
+            Should -HaveCount 1
+        $result.Observation.outcomes[0].
+            state |
+            Should -BeExactly 'notEligible'
+        $result.Observation.outcomes[0].
+            reason |
+            Should -BeExactly (
+                'named-areequal-arguments')
+    }
+
     It 'refuses another cohort or policy identity' {
         $manifest = New-NamedTestManifest
         $manifest.kind = 'owner-v2-preview-cohort'
@@ -237,6 +273,131 @@ class Checks {
         $result.Observation.counts.unknown | Should -Be 1
         @($result.Observation.findings).Count | Should -Be 0
         $result.Observation.effects.providerWrites | Should -Be 0
+    }
+
+    It 'emits a schema-valid incomplete observation for unknown CSharp file evidence' {
+        $manifest = New-NamedTestManifest
+        $entry = $manifest.entries[0]
+        $contract =
+            New-NamedTestContract -Entry $entry
+        $bindingId =
+            $contract.Binding.BindingId
+        $acquisition =
+            New-OwnerPipelineAdapter `
+                -Stage acquisition `
+                -Name 'named-unknown-file' `
+                -Handler {
+                    param($context)
+                    return [ordered]@{
+                        schemaVersion = 1
+                        bindingId =
+                            $context.binding.
+                                BindingId
+                        state = 'unknown'
+                        evidenceUnits = @(
+                            [ordered]@{
+                                unitId = 'identity'
+                                state = 'complete'
+                                data =
+                                    [ordered]@{
+                                        repositoryId =
+                                            $entry.subject.
+                                                repositoryId
+                                        projectId =
+                                            $entry.subject.
+                                                projectId
+                                        pullRequestId =
+                                            $entry.subject.
+                                                pullRequestId
+                                        sourceCommit =
+                                            $entry.head.
+                                                sourceCommit
+                                        targetCommit =
+                                            $entry.target.
+                                                targetCommit
+                                        targetRef =
+                                            $entry.target.
+                                                targetRef
+                                        capabilityId =
+                                            $entry.capability.id
+                                        capabilityDigest =
+                                            $entry.capability.
+                                                digest
+                                    }
+                            }
+                            [ordered]@{
+                                unitId = 'rule'
+                                state = 'complete'
+                                data =
+                                    [ordered]@{
+                                        repositoryId =
+                                            $entry.rule.
+                                                repositoryId
+                                        path =
+                                            $entry.rule.path
+                                        commit =
+                                            $entry.rule.commit
+                                        section =
+                                            $entry.rule.section
+                                        hash =
+                                            $entry.rule.hash
+                                        content =
+                                            [IO.File]::ReadAllText(
+                                                (Join-Path $PSScriptRoot `
+                                                    '..\src\DevPilot.OwnerCapability\Policy\named-areequal-arguments.v1.txt'),
+                                                [Text.UTF8Encoding]::new($false))
+                                    }
+                            }
+                            @(
+                                0..3 | ForEach-Object {
+                                    [ordered]@{
+                                        unitId =
+                                            'file:{0:d6}' -f
+                                                $_
+                                        state = 'unknown'
+                                        data =
+                                            [ordered]@{
+                                                path =
+                                                    "tests/Unknown$_.cs"
+                                                content = $null
+                                                spans = @()
+                                            }
+                                    }
+                                }))
+                    }
+                }.GetNewClosure()
+        $capability =
+            New-NamedAreEqualCapabilityAdapter `
+                -CapabilityId (
+                    [string]$entry.capability.id) `
+                -CapabilityDigest (
+                    [string]$entry.capability.digest)
+        $pipeline = Invoke-OwnerReviewPipeline `
+            -Binding $contract.Binding `
+            -AcquisitionAdapter $acquisition `
+            -CapabilityAdapter $capability
+        $observation =
+            ConvertTo-OwnerV2Observation `
+                -PipelineResult $pipeline `
+                -ImplementationId `
+                    'named-areequal-arguments-v1-orchestrator' `
+                -ImplementationVersion '1.0.0'
+        $schemaPath = Join-Path (
+            Split-Path $PSScriptRoot -Parent) `
+            'src\OwnerObserver\schemas\owner-observation.v1.json'
+
+        $observation.lifecycle.status |
+            Should -BeExactly 'incomplete'
+        $observation.findingsComplete |
+            Should -BeFalse
+        $observation.findings |
+            Should -HaveCount 0
+        {
+            $observation |
+                ConvertTo-Json -Depth 64 -Compress |
+                Test-Json -SchemaFile `
+                    $schemaPath -ErrorAction Stop
+        } | Should -Not -Throw
     }
 
     It 'treats a current unmarked same-account human request as method coverage, not bot no-op' {
