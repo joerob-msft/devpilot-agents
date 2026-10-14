@@ -260,13 +260,15 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             digest = [string]$configuredAdapter.AzureDevOpsReviewerIdentityDigest
         }
     }
+    $invokeAzureCliJsonCommand =
+        ${function:Invoke-ApprovedOwnerV2AzureCliJson}
 
     $invokeAzJson = {
         param(
             [Parameter(Mandatory)][string[]]$Arguments,
             [string]$InputPath = ''
         )
-        return Invoke-ApprovedOwnerV2AzureCliJson `
+        return & $invokeAzureCliJsonCommand `
             -AzureCliPath $AzureCliPath `
             -Arguments $Arguments `
             -InputPath $InputPath
