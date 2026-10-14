@@ -298,6 +298,53 @@ function Get-AutomaticOwnerV2Diagnostic {
     return [ordered]@{ code = $Code; message = $clean }
 }
 
+function Get-AutomaticOwnerV2PreflightDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    $message = [string]$ErrorRecord.Exception.Message
+    $code = switch -Wildcard ($message) {
+        'Live pull request head, target, ref, status, or repository binding changed.' {
+            'live-pr-binding-drift'
+            break
+        }
+        'Live Azure DevOps provider configuration is stale or foreign.' {
+            'live-provider-binding-drift'
+            break
+        }
+        'Live Azure DevOps reviewer identity is missing, ambiguous, or foreign.' {
+            'live-reviewer-identity-drift'
+            break
+        }
+        'Live discussion snapshot changed; require a fresh scheduled observation and approval.' {
+            'live-discussion-drift'
+            break
+        }
+        "Anchor '*' is stale or ambiguous." {
+            'live-anchor-drift'
+            break
+        }
+        "Finding '*' has a foreign copied marker." {
+            'foreign-marker'
+            break
+        }
+        "Finding '*' has duplicate reviewer markers." {
+            'duplicate-marker'
+            break
+        }
+        'Current pull request iteration is missing.' {
+            'current-iteration-missing'
+            break
+        }
+        default {
+            'live-preflight-refused'
+        }
+    }
+    return Get-AutomaticOwnerV2Diagnostic `
+        -Code $code -Message $message
+}
+
 function Write-AutomaticOwnerV2Event {
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
@@ -601,6 +648,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 kind = 'owner-v2-automatic-delivery-result'
                 runId = $runId
                 health = 'refused'
+                effectState = 'known-zero-pre-intent'
                 providerWrites = 0
                 modelWrites = 0
                 remainingWouldCreate = @($Evidence.Observation.findings |
@@ -640,6 +688,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 kind = 'owner-v2-automatic-delivery-result'
                 runId = $runId
                 health = 'refused'
+                effectState = 'known-zero-pre-intent'
                 providerWrites = 0
                 modelWrites = 0
                 remainingWouldCreate = 0
@@ -657,6 +706,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 kind = 'owner-v2-automatic-delivery-result'
                 runId = $runId
                 health = 'refused'
+                effectState = 'known-zero-pre-intent'
                 providerWrites = 0
                 modelWrites = 0
                 remainingWouldCreate = 0
@@ -691,6 +741,7 @@ function Invoke-AutomaticOwnerV2Comments {
                 kind = 'owner-v2-automatic-delivery-result'
                 runId = $runId
                 health = $health
+                effectState = 'known-zero-pre-intent'
                 providerWrites = 0
                 modelWrites = 0
                 remainingWouldCreate = $candidates.Count
@@ -743,13 +794,14 @@ function Invoke-AutomaticOwnerV2Comments {
                 kind = 'owner-v2-automatic-delivery-result'
                 runId = $runId
                 health = 'refused'
+                effectState = 'known-zero-pre-intent'
                 providerWrites = 0
                 modelWrites = 0
                 remainingWouldCreate = $candidates.Count
                 events = @($repaired + $events.ToArray())
-                diagnostic = Get-AutomaticOwnerV2Diagnostic `
-                    -Code 'live-preflight-refused' `
-                    -Message 'Live PR, identity, anchor, source, or discussion drifted.'
+                diagnostic =
+                    Get-AutomaticOwnerV2PreflightDiagnostic `
+                        -ErrorRecord $_
             }
         }
 

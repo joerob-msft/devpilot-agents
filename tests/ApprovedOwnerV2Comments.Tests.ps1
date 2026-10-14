@@ -1098,11 +1098,14 @@ Describe 'Automatic Owner v2 create-only delivery' {
 
     It 'fails closed on live identity, head, and anchor drift' `
         -TestCases @(
-            @{ Name = 'identity'; Arguments = @{ ForeignIdentity = $true } }
-            @{ Name = 'head'; Arguments = @{ StaleHead = $true } }
-            @{ Name = 'anchor'; Arguments = @{ StaleAnchor = $true } }
+            @{ Name = 'identity'; Arguments = @{ ForeignIdentity = $true }
+                ExpectedCode = 'live-reviewer-identity-drift' }
+            @{ Name = 'head'; Arguments = @{ StaleHead = $true }
+                ExpectedCode = 'live-pr-binding-drift' }
+            @{ Name = 'anchor'; Arguments = @{ StaleAnchor = $true }
+                ExpectedCode = 'live-anchor-drift' }
         ) {
-        param($Name, $Arguments)
+        param($Name, $Arguments, $ExpectedCode)
         $context = New-TestAutomaticOwnerV2Context
         $provider = New-TestAutomaticOwnerV2Provider `
             -Evidence $context.Evidence @Arguments
@@ -1112,17 +1115,23 @@ Describe 'Automatic Owner v2 create-only delivery' {
             -Provider $provider.Handler
 
         $result.health | Should -BeExactly 'refused'
-        $result.diagnostic.code | Should -BeExactly 'live-preflight-refused'
+        $result.effectState |
+            Should -BeExactly 'known-zero-pre-intent'
+        $result.diagnostic.code |
+            Should -BeExactly $ExpectedCode
         $provider.State.writes | Should -Be 0
     }
 
     It 'refuses snapshot drift plus duplicate or foreign copied markers' `
         -TestCases @(
-            @{ Name = 'snapshot'; Mode = 'snapshot' }
-            @{ Name = 'duplicate'; Mode = 'duplicate' }
-            @{ Name = 'foreign'; Mode = 'foreign' }
+            @{ Name = 'snapshot'; Mode = 'snapshot'
+                ExpectedCode = 'live-discussion-drift' }
+            @{ Name = 'duplicate'; Mode = 'duplicate'
+                ExpectedCode = 'duplicate-marker' }
+            @{ Name = 'foreign'; Mode = 'foreign'
+                ExpectedCode = 'foreign-marker' }
         ) {
-        param($Name, $Mode)
+        param($Name, $Mode, $ExpectedCode)
         $context = New-TestAutomaticOwnerV2Context
         $provider = New-TestAutomaticOwnerV2Provider `
             -Evidence $context.Evidence
@@ -1157,6 +1166,10 @@ Describe 'Automatic Owner v2 create-only delivery' {
             -Provider $provider.Handler
 
         $result.health | Should -BeExactly 'refused'
+        $result.effectState |
+            Should -BeExactly 'known-zero-pre-intent'
+        $result.diagnostic.code |
+            Should -BeExactly $ExpectedCode
         $provider.State.writes | Should -Be 0
     }
 
