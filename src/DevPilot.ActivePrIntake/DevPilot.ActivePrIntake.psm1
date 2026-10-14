@@ -1666,6 +1666,15 @@ print(json.dumps({
         $argv = if ($Area -ceq '__account__') {
             @('account', 'show', '--only-show-errors', '-o', 'json')
         }
+        elseif ($Area -ceq '__token__') {
+            @(
+                'account', 'get-access-token',
+                '--resource',
+                '499b84ac-1321-427f-aa17-267ca6975798',
+                '--only-show-errors',
+                '-o', 'json'
+            )
+        }
         elseif ($Area -ceq '__connection__') {
             @('-I', '-c', $connectionDataCommand, $org)
         }
@@ -1932,20 +1941,140 @@ print(json.dumps({
             throw 'response-invalid'
         }
     }.GetNewClosure()
+    $tokenState = [pscustomobject]@{
+        AccessToken = $null
+    }
+    $getAccessToken = {
+        param([DateTime]$Deadline)
+        if (-not [string]::IsNullOrWhiteSpace(
+                [string]$tokenState.AccessToken)) {
+            return [string]$tokenState.AccessToken
+        }
+        $response = & $invoke '__token__' '' @() @() $Deadline
+        if ($response -isnot [Collections.IDictionary] -or
+            [string]$response.accessToken -cnotmatch '^\S{100,}$') {
+            throw 'identity-read-inaccessible'
+        }
+        $tokenState.AccessToken =
+            [string]$response.accessToken
+        return [string]$tokenState.AccessToken
+    }.GetNewClosure()
+    $invokeItemsGet = {
+        param(
+            [string]$Path,
+            [string]$Commit,
+            [DateTime]$Deadline,
+            [switch]$Directory
+        )
+        if ($transportReads.Count -ge $readCeiling) {
+            throw 'read-budget'
+        }
+        $token = & $getAccessToken $Deadline
+        $remainingSeconds = [int][Math]::Max(
+            1,
+            [Math]::Ceiling(
+                ($Deadline - [DateTime]::UtcNow).
+                    TotalSeconds))
+        $apiPath = if ($Path.StartsWith('/')) {
+            $Path
+        }
+        else { "/$Path" }
+        $query = [Collections.Generic.List[string]]::new()
+        $query.Add(
+            'api-version=7.1')
+        $query.Add(
+            'versionDescriptor.version=' +
+            [Uri]::EscapeDataString($Commit))
+        $query.Add(
+            'versionDescriptor.versionType=commit')
+        if ($Directory) {
+            $query.Add(
+                'scopePath=' +
+                [Uri]::EscapeDataString($apiPath))
+            $query.Add('recursionLevel=OneLevel')
+            $query.Add('includeContentMetadata=true')
+        }
+        else {
+            $query.Add(
+                'path=' +
+                [Uri]::EscapeDataString($apiPath))
+            $query.Add('includeContent=true')
+        }
+        $projectSegment =
+            [Uri]::EscapeDataString($project)
+        $repositorySegment =
+            [Uri]::EscapeDataString($repo)
+        $uri = (
+            $org.TrimEnd('/') + '/' +
+            $projectSegment +
+            '/_apis/git/repositories/' +
+            $repositorySegment +
+            '/items?' +
+            ($query -join '&'))
+        $transportReads.Count++
+        try {
+            $response = Invoke-WebRequest `
+                -Uri $uri -Method Get `
+                -Headers @{
+                    Authorization = "Bearer $token"
+                } `
+                -TimeoutSec $remainingSeconds `
+                -UseBasicParsing
+        }
+        catch {
+            $failure = [InvalidOperationException]::new(
+                'read-inaccessible')
+            $failure.Data['transportStage'] =
+                'http-response'
+            $failure.Data['underlyingExceptionType'] =
+                $_.Exception.GetType().Name
+            if ($null -ne $_.Exception.Response) {
+                $failure.Data['httpStatus'] =
+                    [int]$_.Exception.Response.StatusCode
+            }
+            throw $failure
+        }
+        if ([long]$response.RawContentLength -lt 0 -or
+            [long]$response.RawContentLength -gt
+                16777216) {
+            throw 'read-budget'
+        }
+        $content = ([string]$response.Content).
+            TrimStart([char]0xFEFF)
+        if ($Directory) {
+            try {
+                return $content |
+                    ConvertFrom-Json -AsHashtable `
+                        -Depth 32
+            }
+            catch {
+                throw 'response-invalid'
+            }
+        }
+        $contentType = @(
+            $response.Headers['Content-Type']
+        )[0]
+        if ([string]::IsNullOrWhiteSpace(
+                [string]$contentType)) {
+            $contentType = 'application/octet-stream'
+        }
+        return [ordered]@{
+            content = $content
+            contentMetadata = [ordered]@{
+                contentType = (
+                    [string]$contentType).
+                    Split(';')[0].Trim()
+            }
+        }
+    }.GetNewClosure()
     $getItem = {
         param(
             [string]$Path,
             [string]$Commit,
             [DateTime]$Deadline
         )
-        $apiPath = if ($Path.StartsWith('/')) { $Path } else { "/$Path" }
-        $response = & $invoke 'git' 'items' @(
-            "project=$project", "repositoryId=$repo") @(
-            "path=$apiPath",
-            "versionDescriptor.version=$Commit",
-            'versionDescriptor.versionType=commit',
-            'includeContent=true',
-            'includeContentMetadata=true') $Deadline
+        $response = & $invokeItemsGet `
+            $Path $Commit $Deadline
         if ($response -isnot [Collections.IDictionary] -or
             -not $response.Contains('content') -or
             $response.content -isnot [string] -or
@@ -1975,13 +2104,9 @@ print(json.dumps({
             }
             else { "/$directory" }
             try {
-                $response = & $invoke 'git' 'items' @(
-                    "project=$project", "repositoryId=$repo") @(
-                    "scopePath=$apiPath",
-                    'recursionLevel=OneLevel',
-                    "versionDescriptor.version=$Commit",
-                    'versionDescriptor.versionType=commit',
-                    'includeContentMetadata=true') $Deadline
+                $response = & $invokeItemsGet `
+                    $apiPath $Commit $Deadline `
+                    -Directory
             }
             catch {
                 return [ordered]@{
