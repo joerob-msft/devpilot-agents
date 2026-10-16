@@ -422,8 +422,7 @@ Describe 'Contextual convention analyzer' {
     It 'accepts only equivalence-preserving grouped representative deduplication' {
         $controls = @(
             'class C { IEnumerable<int> M(IEnumerable<int> values) { return values.GroupBy(value => value).Select(group => group.First()); } }',
-            'class C { object M(IEnumerable<string> paths) { return paths.Select(path => Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(path)).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }',
-            'class C { object M(IEnumerable<string> paths) { return RoslynCompilationTestHelper.CreateMetadataReferencesForExistingAssemblies(paths).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }'
+            'class C { object M(IEnumerable<string> paths) { return paths.Select(path => Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(path)).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }'
         )
         foreach ($source in $controls) {
             $outcome = Invoke-ConventionCase `
@@ -433,18 +432,24 @@ Describe 'Contextual convention analyzer' {
                 Should -BeExactly equivalent-group-representative-dedup
         }
 
-        $unsafe = @(
+        $unknown = @(
             'class C { object M(Item[] values) { return values.GroupBy(value => value.Id).Select(group => group.First()); } }',
-            'class C { object M(Item[] values) { return values.GroupBy(value => value.Id).Select(group => group.First().Payload); } }',
-            'class C { object M(Item[] values) { return values.GroupBy(value => value).Select(group => group.First()); } }',
-            'class C { int M(IEnumerable<int> values, IEqualityComparer<int> comparer) { return values.GroupBy(value => value, comparer).Select(group => group.First()).First(); } }'
+            'class C { object M(Item<int>[] values) { return values.GroupBy(value => value).Select(group => group.First()); } }',
+            'class C { IEnumerable<int> M(IEnumerable<int> values, IEqualityComparer<int> comparer) { return values.GroupBy(value => value, comparer).Select(group => group.First()); } }',
+            'class C { object M(IEnumerable<string> paths) { return RoslynCompilationTestHelper.CreateMetadataReferencesForExistingAssemblies(paths).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }'
         )
-        foreach ($source in $unsafe) {
-            (Invoke-ConventionCase `
-                -RuleId collection-cardinality `
-                -Content $source).state |
-                Should -BeExactly violation
+        foreach ($source in $unknown) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId collection-cardinality -Content $source
+            $outcome.state | Should -BeExactly unknown
+            $outcome.reason |
+                Should -BeExactly group-representative-equivalence-unproven
         }
+
+        $payload = 'class C { object M(Item[] values) { return values.GroupBy(value => value.Id).Select(group => group.First().Payload); } }'
+        (Invoke-ConventionCase `
+            -RuleId collection-cardinality -Content $payload).state |
+            Should -BeExactly violation
     }
 
     It 'withholds only synchronous assertion callbacks from file IO guidance' {

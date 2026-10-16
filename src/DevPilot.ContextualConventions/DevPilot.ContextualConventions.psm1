@@ -925,11 +925,16 @@ function Test-ContextualEquivalentGroupRepresentativeSelection {
         if ($sourceParameter.Count -eq 1 -and
             $null -ne $sourceParameter[0].Type) {
             $sourceType = [string]$sourceParameter[0].Type.ToString()
+            $scalar = '(?:bool|byte|sbyte|short|ushort|int|uint|long|' +
+                'ulong|char|decimal|double|float|string|Boolean|Byte|' +
+                'SByte|Int16|UInt16|Int32|UInt32|Int64|UInt64|Char|' +
+                'Decimal|Double|Single|String)'
             return $sourceType -match (
-                '(?:^|[<\[,])' +
-                '(?:bool|byte|sbyte|short|ushort|int|uint|long|ulong|' +
-                'char|decimal|double|float|string)' +
-                '(?:[>\],]|$)')
+                "^(?:System\.)?$scalar\[\]$") -or
+                $sourceType -match (
+                    '^(?:(?:System\.)?Collections\.Generic\.)?' +
+                    '(?:IEnumerable|IReadOnlyCollection|IReadOnlyList|' +
+                    "ICollection|IList|List|HashSet)<\s*$scalar\s*>$")
         }
         return $false
     }
@@ -943,13 +948,6 @@ function Test-ContextualEquivalentGroupRepresentativeSelection {
         return $false
     }
     $sourceSelect = $groupBy.Expression.Expression
-    if ($sourceSelect -is [
-            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
-        [string]$sourceSelect.Expression.ToString() -match
-            '(?:^|\.)RoslynCompilationTestHelper\.' +
-            'CreateMetadataReferencesForExistingAssemblies$') {
-        return $true
-    }
     if ($sourceSelect -isnot [
             Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -or
         $sourceSelect.Expression -isnot [
@@ -971,6 +969,34 @@ function Test-ContextualEquivalentGroupRepresentativeSelection {
         $factory.ArgumentList.Arguments.Count -eq 1 -and
         [string]$factory.ArgumentList.Arguments[0].Expression.ToString() -ceq
             [string]$sourceSelector.Parameter.Identifier.ValueText
+}
+
+function Test-ContextualGroupRepresentativeSelection {
+    param([Parameter(Mandatory)]$Invocation)
+
+    $lambda = $Invocation.Parent
+    if ($lambda -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax] -or
+        $lambda.Body -ne $Invocation) {
+        return $false
+    }
+    $groupParameter = [string]$lambda.Parameter.Identifier.ValueText
+    if ([string]$Invocation.Expression.Expression.ToString() -cne
+        $groupParameter) {
+        return $false
+    }
+    $select = $lambda.Parent.Parent.Parent
+    return $select -is [
+        Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+        $select.Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -and
+        [string]$select.Expression.Name.Identifier.ValueText -ceq 'Select' -and
+        $select.Expression.Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+        $select.Expression.Expression.Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -and
+        [string]$select.Expression.Expression.Expression.Name.
+            Identifier.ValueText -ceq 'GroupBy'
 }
 
 function Test-ContextualSynchronousAssertionCallback {
@@ -1706,6 +1732,22 @@ function Get-ContextualRoslynOutcomes {
                             -RuleId collection-cardinality `
                             -State compliant `
                             -Reason equivalent-group-representative-dedup `
+                            -Path $Path `
+                            -Line (Get-ContextualNodeLine $first) `
+                            -EndLine (Get-ContextualNodeLine $first) `
+                            -Symbol ([string]$method.Identifier.ValueText)
+                }
+                continue
+            }
+            if (-not $predicateSelection -and
+                (Test-ContextualGroupRepresentativeSelection `
+                    -Invocation $first)) {
+                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
+                    $results['collection-cardinality'] =
+                        New-ContextualOutcome `
+                            -RuleId collection-cardinality `
+                            -State unknown `
+                            -Reason group-representative-equivalence-unproven `
                             -Path $Path `
                             -Line (Get-ContextualNodeLine $first) `
                             -EndLine (Get-ContextualNodeLine $first) `

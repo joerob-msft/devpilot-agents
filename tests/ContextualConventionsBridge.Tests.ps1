@@ -110,7 +110,7 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    '6a74d7de1e57103fd95bbbec2c294d92738f5e965fd85d1b3684fbe1bc7769ea'
+                    'c45c5f1a34be73284c4a11bc58b5cabd3af853b9799a33d9a6660ee474395971'
             }
             sharedAcquisition = [ordered]@{
                 kind =
