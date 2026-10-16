@@ -917,6 +917,59 @@ Describe 'Named AreEqual automatic delivery' {
         $provider.State.operations | Should -Not -Contain CreateThread
     }
 
+    It 'delivers uncovered methods when another method is human covered' {
+        $context = New-NamedDeliveryContext -Count 2
+        $provider = New-NamedDeliveryProvider -Evidence $context.Evidence
+        $provider.State.threads = @([ordered]@{
+                threadId = 90
+                status = 'active'
+                isDeleted = $false
+                isOutdated = $false
+                sourceCommit = $context.Evidence.Declaration.head.sourceCommit
+                contextState = 'current'
+                anchor = [ordered]@{ path = 'tests/Check1.cs'; line = 21 }
+                comments = @([ordered]@{
+                        commentId = 91
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        reviewerIdentityState = 'matched'
+                        body = 'Fixture review: name expected and actual arguments in Assert.AreEqual.'
+                    })
+            })
+        $live = & $provider.Handler 'ReadCurrent' @{
+            evidence = $context.Evidence
+            selections = @([ordered]@{
+                    path = 'tests/Check1.cs'
+                    line = 21
+                    affectedCallLines = @(21)
+                })
+        }
+        $resolved = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $context.Evidence.Observation `
+            -Contract $context.Evidence.Contract -Snapshot $live.Snapshot
+        @($resolved.findings | Where-Object {
+                [string]$_.reconciliation.classification -ceq 'humanCovered'
+            }) | Should -HaveCount 1
+        @($resolved.findings | Where-Object {
+                [string]$_.reconciliation.classification -ceq 'wouldCreate'
+            }) | Should -HaveCount 1
+        $context.Evidence.Observation = $resolved
+        $context.Evidence.Record.resultDigest =
+            Get-ApprovedOwnerV2Digest $resolved
+
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider.Handler
+
+        $result.health | Should -BeExactly healthy
+        $result.providerWrites | Should -Be 1
+        @($provider.State.operations | Where-Object {
+                $_ -ceq 'CreateThread'
+            }) | Should -HaveCount 1
+    }
+
     It 'signs a historical-human refusal without reading or writing the provider' {
         $context = New-NamedDeliveryContext
         $provider = New-NamedDeliveryProvider -Evidence $context.Evidence

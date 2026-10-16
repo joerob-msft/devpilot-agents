@@ -1139,9 +1139,15 @@ function Invoke-AutomaticOwnerV2Comments {
                     -Message 'Observation contains an ineligible Owner finding.'
             }
         }
-        if ($namedAreEqual -and @($review.proposals | Where-Object {
-                    [string]$_.classification -ceq 'humanCovered'
-                }).Count -gt 0) {
+        $humanCoveredCount = @($review.proposals | Where-Object {
+                [string]$_.classification -ceq 'humanCovered'
+            }).Count
+        $wouldCreateCount = @($review.proposals | Where-Object {
+                [string]$_.classification -ceq 'wouldCreate'
+            }).Count
+        if ($namedAreEqual -and
+            $humanCoveredCount -gt 0 -and
+            $wouldCreateCount -eq 0) {
             return [pscustomobject][ordered]@{
                 schemaVersion = 1
                 kind = $resultKind
