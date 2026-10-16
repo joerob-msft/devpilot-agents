@@ -872,6 +872,134 @@ function Test-ContextualNodeChanged {
         }).Count -gt 0
 }
 
+function Test-ContextualEquivalentGroupRepresentativeSelection {
+    param(
+        [Parameter(Mandatory)]$Invocation,
+        [Parameter(Mandatory)]$Method
+    )
+
+    $lambda = $Invocation.Parent
+    if ($lambda -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax] -or
+        $lambda.Body -ne $Invocation) {
+        return $false
+    }
+    $groupParameter = [string]$lambda.Parameter.Identifier.ValueText
+    if ([string]::IsNullOrWhiteSpace($groupParameter) -or
+        [string]$Invocation.Expression.Expression.ToString() -cne
+            $groupParameter) {
+        return $false
+    }
+    $select = $lambda.Parent.Parent.Parent
+    if ($select -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -or
+        $select.Expression -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -or
+        [string]$select.Expression.Name.Identifier.ValueText -cne 'Select') {
+        return $false
+    }
+    $groupBy = $select.Expression.Expression
+    if ($groupBy -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -or
+        $groupBy.Expression -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -or
+        [string]$groupBy.Expression.Name.Identifier.ValueText -cne 'GroupBy' -or
+        $groupBy.ArgumentList.Arguments.Count -lt 1) {
+        return $false
+    }
+    $keySelector = $groupBy.ArgumentList.Arguments[0].Expression
+    if ($keySelector -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax]) {
+        return $false
+    }
+    $keyParameter = [string]$keySelector.Parameter.Identifier.ValueText
+    if ([string]$keySelector.Body.ToString() -ceq $keyParameter -and
+        $groupBy.ArgumentList.Arguments.Count -eq 1) {
+        $sourceName = [string]$groupBy.Expression.Expression.ToString()
+        $sourceParameter = @(
+            $Method.ParameterList.Parameters |
+                Where-Object {
+                    [string]$_.Identifier.ValueText -ceq $sourceName
+                } |
+                Select-Object -First 1)
+        if ($sourceParameter.Count -eq 1 -and
+            $null -ne $sourceParameter[0].Type) {
+            $sourceType = [string]$sourceParameter[0].Type.ToString()
+            return $sourceType -match (
+                '(?:^|[<\[,])' +
+                '(?:bool|byte|sbyte|short|ushort|int|uint|long|ulong|' +
+                'char|decimal|double|float|string)' +
+                '(?:[>\],]|$)')
+        }
+        return $false
+    }
+    if ($keySelector.Body -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -or
+        [string]$keySelector.Body.Expression.ToString() -cne $keyParameter -or
+        [string]$keySelector.Body.Name.Identifier.ValueText -cne 'Display' -or
+        $groupBy.ArgumentList.Arguments.Count -ne 2 -or
+        [string]$groupBy.ArgumentList.Arguments[1].Expression.ToString() -cne
+            'StringComparer.OrdinalIgnoreCase') {
+        return $false
+    }
+    $sourceSelect = $groupBy.Expression.Expression
+    if ($sourceSelect -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+        [string]$sourceSelect.Expression.ToString() -match
+            '(?:^|\.)RoslynCompilationTestHelper\.' +
+            'CreateMetadataReferencesForExistingAssemblies$') {
+        return $true
+    }
+    if ($sourceSelect -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -or
+        $sourceSelect.Expression -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -or
+        [string]$sourceSelect.Expression.Name.Identifier.ValueText -cne 'Select' -or
+        $sourceSelect.ArgumentList.Arguments.Count -ne 1) {
+        return $false
+    }
+    $sourceSelector = $sourceSelect.ArgumentList.Arguments[0].Expression
+    if ($sourceSelector -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax] -or
+        $sourceSelector.Body -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax]) {
+        return $false
+    }
+    $factory = $sourceSelector.Body
+    return [string]$factory.Expression.ToString() -match
+        '^(?:Microsoft\.CodeAnalysis\.)?MetadataReference\.CreateFromFile$' -and
+        $factory.ArgumentList.Arguments.Count -eq 1 -and
+        [string]$factory.ArgumentList.Arguments[0].Expression.ToString() -ceq
+            [string]$sourceSelector.Parameter.Identifier.ValueText
+}
+
+function Test-ContextualSynchronousAssertionCallback {
+    param(
+        [Parameter(Mandatory)]$Invocation,
+        [Parameter(Mandatory)]$Method
+    )
+    if ([string]$Method.Modifiers.ToString() -match '\basync\b') {
+        return $false
+    }
+    $lambda = @(
+        $Invocation.Ancestors() |
+            Where-Object {
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.ParenthesizedLambdaExpressionSyntax] -or
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax]
+            } |
+            Select-Object -First 1)
+    if ($lambda.Count -ne 1) {
+        return $false
+    }
+    $assertion = $lambda[0].Parent.Parent.Parent
+    return $assertion -is [
+        Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+        [string]$assertion.Expression.ToString() -match
+            '^(?:Assert\.)?ThrowsException(?:<[^>]+>)?$'
+}
+
 function Get-ContextualAncestor {
     param(
         [Parameter(Mandatory)]$Node,
@@ -1569,9 +1697,26 @@ function Get-ContextualRoslynOutcomes {
                 }
                 continue
             }
+            if (-not $predicateSelection -and
+                (Test-ContextualEquivalentGroupRepresentativeSelection `
+                    -Invocation $first -Method $method)) {
+                if (Test-ContextualNodeChanged -Node $first -Spans $Spans) {
+                    $results['collection-cardinality'] =
+                        New-ContextualOutcome `
+                            -RuleId collection-cardinality `
+                            -State compliant `
+                            -Reason equivalent-group-representative-dedup `
+                            -Path $Path `
+                            -Line (Get-ContextualNodeLine $first) `
+                            -EndLine (Get-ContextualNodeLine $first) `
+                            -Symbol ([string]$method.Identifier.ValueText)
+                }
+                continue
+            }
             $orderedSelection = $receiver -match
                 '\.(?:OrderBy|OrderByDescending|ThenBy|ThenByDescending)\s*\(' -or
-                $receiver -match '\.Split\s*\('
+                $receiver -match '\.Split\s*\(' -or
+                $receiver -match '\.Statements$'
             if (-not $orderedSelection -and $receiver -match '^[A-Za-z_][A-Za-z0-9_]*$') {
                 $orderedSelection = @(
                     $method.DescendantNodes() |
@@ -1667,6 +1812,22 @@ function Get-ContextualRoslynOutcomes {
                 [string]$invocation.Expression.ToString()
             if ($expression -match
                 '^(?:(?:System\.)?IO\.)?File\.(?:ReadAllText|ReadAllBytes|WriteAllText|WriteAllBytes)$') {
+                if (Test-ContextualSynchronousAssertionCallback `
+                    -Invocation $invocation -Method $method) {
+                    if (Test-ContextualNodeChanged `
+                        -Node $invocation -Spans $Spans) {
+                        $results['async-io'] =
+                            New-ContextualOutcome `
+                                -RuleId async-io -State unknown `
+                                -Reason assertion-callback-io-context-unproven `
+                                -Path $Path `
+                                -Line (Get-ContextualNodeLine $invocation) `
+                                -EndLine (Get-ContextualNodeLine $invocation) `
+                                -Symbol (
+                                    [string]$method.Identifier.ValueText)
+                    }
+                    continue
+                }
                 $results['async-io'] =
                     New-ContextualOutcome `
                         -RuleId async-io -State violation `

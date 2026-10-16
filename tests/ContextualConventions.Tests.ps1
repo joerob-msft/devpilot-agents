@@ -408,7 +408,8 @@ Describe 'Contextual convention analyzer' {
         $controls = @(
             'class C { int M(int[] values) { if (values.Count() != 1) throw new Exception(); return values.First(); } }',
             'class C { int M(int[] values) { var ordered = values.OrderBy(value => value); return ordered.FirstOrDefault(); } }',
-            'class C { string M(string header) { return header.Split(";").First(); } }'
+            'class C { string M(string header) { return header.Split(";").First(); } }',
+            'class C { object M(Method method) { return method.Body.Statements.First(); } }'
         )
         foreach ($source in $controls) {
             (Invoke-ConventionCase `
@@ -416,6 +417,53 @@ Describe 'Contextual convention analyzer' {
                 -Content $source).state |
                 Should -Not -BeExactly violation
         }
+    }
+
+    It 'accepts only equivalence-preserving grouped representative deduplication' {
+        $controls = @(
+            'class C { IEnumerable<int> M(IEnumerable<int> values) { return values.GroupBy(value => value).Select(group => group.First()); } }',
+            'class C { object M(IEnumerable<string> paths) { return paths.Select(path => Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(path)).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }',
+            'class C { object M(IEnumerable<string> paths) { return RoslynCompilationTestHelper.CreateMetadataReferencesForExistingAssemblies(paths).GroupBy(reference => reference.Display, StringComparer.OrdinalIgnoreCase).Select(group => group.First()); } }'
+        )
+        foreach ($source in $controls) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId collection-cardinality -Content $source
+            $outcome.state | Should -BeExactly compliant
+            $outcome.reason |
+                Should -BeExactly equivalent-group-representative-dedup
+        }
+
+        $unsafe = @(
+            'class C { object M(Item[] values) { return values.GroupBy(value => value.Id).Select(group => group.First()); } }',
+            'class C { object M(Item[] values) { return values.GroupBy(value => value.Id).Select(group => group.First().Payload); } }',
+            'class C { object M(Item[] values) { return values.GroupBy(value => value).Select(group => group.First()); } }',
+            'class C { int M(IEnumerable<int> values, IEqualityComparer<int> comparer) { return values.GroupBy(value => value, comparer).Select(group => group.First()).First(); } }'
+        )
+        foreach ($source in $unsafe) {
+            (Invoke-ConventionCase `
+                -RuleId collection-cardinality `
+                -Content $source).state |
+                Should -BeExactly violation
+        }
+    }
+
+    It 'withholds only synchronous assertion callbacks from file IO guidance' {
+        $sync = 'class C { byte[] M(string path) { return File.ReadAllBytes(path); } }'
+        (Invoke-ConventionCase `
+            -RuleId async-io -Content $sync).state |
+            Should -BeExactly violation
+
+        $assertion = 'class C { void M(string path) { Assert.ThrowsException<Exception>(() => File.ReadAllBytes(path)); } }'
+        $assertionOutcome = Invoke-ConventionCase `
+            -RuleId async-io -Content $assertion
+        $assertionOutcome.state | Should -BeExactly unknown
+        $assertionOutcome.reason |
+            Should -BeExactly assertion-callback-io-context-unproven
+
+        $async = 'class C { async Task<byte[]> M(string path) { await Task.Yield(); return File.ReadAllBytes(path); } }'
+        (Invoke-ConventionCase `
+            -RuleId async-io -Content $async).state |
+            Should -BeExactly violation
     }
 
     It 'binds cheap validation only to actual validation callback APIs' {

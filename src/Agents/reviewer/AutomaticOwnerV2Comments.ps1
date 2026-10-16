@@ -602,6 +602,74 @@ function Get-AutomaticOwnerV2Diagnostic {
     return [ordered]@{ code = $Code; message = $clean }
 }
 
+function Get-AutomaticOwnerV2PreflightDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    $message = [string]$ErrorRecord.Exception.Message
+    $code = switch -Regex ($message) {
+        '^Live pull request head, target, ref, status, or repository binding changed\.$' {
+            'live-pr-binding-drift'
+            break
+        }
+        '^Live Azure DevOps provider configuration is stale or foreign\.$' {
+            'live-provider-binding-drift'
+            break
+        }
+        '^Live Azure DevOps reviewer identity is missing, ambiguous, or foreign\.$' {
+            'live-reviewer-identity-drift'
+            break
+        }
+        '^Live discussion snapshot changed;' {
+            'live-discussion-drift'
+            break
+        }
+        '^Anchor .* is stale or ambiguous\.$' {
+            'live-anchor-drift'
+            break
+        }
+        '^Named AreEqual call .* is stale or ambiguous\.$' {
+            'live-named-call-drift'
+            break
+        }
+        '^Finding .* has a foreign copied marker\.$' {
+            'live-foreign-marker'
+            break
+        }
+        '^Finding .* has duplicate reviewer markers\.$' {
+            'live-duplicate-marker'
+            break
+        }
+        '^Named AreEqual live classification is not create-only eligible\.$' {
+            'live-classification-ineligible'
+            break
+        }
+        '^Current pull request iteration is missing\.$' {
+            'live-iteration-missing'
+            break
+        }
+        '^Live pull request source ref or iteration is inconsistent\.$' {
+            'live-source-ref-inconsistent'
+            break
+        }
+        default { 'live-preflight-exception' }
+    }
+    if ($code -cne 'live-preflight-exception') {
+        return Get-AutomaticOwnerV2Diagnostic `
+            -Code $code -Message $message
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($message)
+    $digest = ([Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($bytes))).
+        ToLowerInvariant()
+    return Get-AutomaticOwnerV2Diagnostic `
+        -Code $code `
+        -Message (
+            "Preflight threw $($ErrorRecord.Exception.GetType().Name); " +
+            "messageSha256=$digest")
+}
+
 function Write-AutomaticOwnerV2Event {
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
@@ -1421,9 +1489,9 @@ function Invoke-AutomaticOwnerV2Comments {
                 modelWrites = 0
                 remainingWouldCreate = $candidates.Count
                 events = @($repaired + $events.ToArray())
-                diagnostic = Get-AutomaticOwnerV2Diagnostic `
-                    -Code 'live-preflight-refused' `
-                    -Message 'Live PR, identity, anchor, source, or discussion drifted.'
+                diagnostic =
+                    Get-AutomaticOwnerV2PreflightDiagnostic `
+                        -ErrorRecord $_
             }
         }
 
