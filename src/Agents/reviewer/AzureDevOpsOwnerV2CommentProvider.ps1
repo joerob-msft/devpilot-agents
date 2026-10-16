@@ -318,13 +318,39 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             digest = [string]$configuredAdapter.AzureDevOpsReviewerIdentityDigest
         }
     }
+    $invokeAzureCliJsonCommand =
+        ${function:Invoke-ApprovedOwnerV2AzureCliJson}
+    $resolveLiveHeadCommand =
+        ${function:Resolve-ApprovedOwnerV2LiveHead}
+    $getChangedSpansCommand =
+        ${function:Get-ApprovedOwnerV2ChangedSpans}
+    $newReviewerIdentityCommand =
+        (Get-Command `
+            New-OwnerAzureDevOpsReviewerIdentity `
+            -CommandType Function).ScriptBlock
+    $convertDiscussionPageCommand =
+        (Get-Command `
+            ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -CommandType Function).ScriptBlock
+    $newReadOnlyAdapterCommand =
+        (Get-Command `
+            New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -CommandType Function).ScriptBlock
+    $getDiscussionSnapshotCommand =
+        (Get-Command `
+            Get-OwnerDiscussionSnapshot `
+            -CommandType Function).ScriptBlock
+    $newDiscussionLimitsCommand =
+        (Get-Command `
+            New-OwnerDiscussionLimits `
+            -CommandType Function).ScriptBlock
 
     $invokeAzJson = {
         param(
             [Parameter(Mandatory)][string[]]$Arguments,
             [string]$InputPath = ''
         )
-        return Invoke-ApprovedOwnerV2AzureCliJson `
+        return & $invokeAzureCliJsonCommand `
             -AzureCliPath $AzureCliPath `
             -Arguments $Arguments `
             -InputPath $InputPath
@@ -472,7 +498,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         else {
             & $getItemContent $Path $TargetCommit
         }
-        return Get-ApprovedOwnerV2ChangedSpans `
+        return & $getChangedSpansCommand `
             -Path $Path -ChangeType $ChangeType `
             -SourceContent $source -TargetContent $target -GitPath $GitPath
     }.GetNewClosure()
@@ -532,7 +558,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                 )
                 $iterations = @(& $getIterations $pullRequestId)
                 $current = $iterations[-1]
-                $liveHead = Resolve-ApprovedOwnerV2LiveHead `
+                $liveHead = & $resolveLiveHeadCommand `
                     -PullRequest $pr -Iteration $current `
                     -SourceRefs @(& $getSourceRefs (
                         [string]$pr.sourceRefName))
@@ -550,16 +576,18 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                     '-o', 'json',
                     '--only-show-errors'
                 )
-                $reviewerIdentity = New-OwnerAzureDevOpsReviewerIdentity `
+                $reviewerIdentity = & $newReviewerIdentityCommand `
                     -Id ([string]$reviewer.id) `
                     -Descriptor ([string]$reviewer.descriptor) `
                     -UniqueName ([string]$reviewer.uniqueName)
+                $pageConverter =
+                    $convertDiscussionPageCommand
                 $providerHandler = {
                     param($Operation, $ProviderArguments)
                     if ($Operation -cne 'GetDiscussionPage') {
                         throw "Unsupported discussion read '$Operation'."
                     }
-                    return ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                    return & $pageConverter `
                         -Arguments $ProviderArguments `
                         -RawResponse $rawThreads `
                         -CurrentIteration ([ordered]@{
@@ -569,12 +597,14 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                         }) `
                         -ReviewerIdentity $reviewerIdentity
                 }.GetNewClosure()
-                $adapter = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                $adapter = & $newReadOnlyAdapterCommand `
                     -Name 'approved-owner-v2-direct-ado-rest' `
                     -ReviewerIdentity $reviewerIdentity -Handler $providerHandler
-                $snapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+                $snapshot = & $getDiscussionSnapshotCommand `
+                    -Contract $evidence.Contract `
                     -Provider $adapter `
-                    -Limits (New-OwnerDiscussionLimits -MaximumPages 20 `
+                    -Limits (& $newDiscussionLimitsCommand `
+                        -MaximumPages 20 `
                         -PageSize $pageSize -MaximumThreads 1000 `
                         -MaximumComments 5000 -MaximumBytes 4194304) `
                     -RequireAzureDevOpsProvenance

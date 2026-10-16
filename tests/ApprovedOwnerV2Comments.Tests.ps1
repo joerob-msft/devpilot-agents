@@ -1111,11 +1111,23 @@ Describe 'Automatic Owner v2 create-only delivery' {
 
     It 'fails closed on live identity, head, and anchor drift' `
         -TestCases @(
-            @{ Name = 'identity'; Arguments = @{ ForeignIdentity = $true } }
-            @{ Name = 'head'; Arguments = @{ StaleHead = $true } }
-            @{ Name = 'anchor'; Arguments = @{ StaleAnchor = $true } }
+            @{
+                Name = 'identity'
+                Arguments = @{ ForeignIdentity = $true }
+                Code = 'live-reviewer-identity-drift'
+            }
+            @{
+                Name = 'head'
+                Arguments = @{ StaleHead = $true }
+                Code = 'live-pr-binding-drift'
+            }
+            @{
+                Name = 'anchor'
+                Arguments = @{ StaleAnchor = $true }
+                Code = 'live-anchor-drift'
+            }
         ) {
-        param($Name, $Arguments)
+        param($Name, $Arguments, $Code)
         $context = New-TestAutomaticOwnerV2Context
         $provider = New-TestAutomaticOwnerV2Provider `
             -Evidence $context.Evidence @Arguments
@@ -1125,8 +1137,26 @@ Describe 'Automatic Owner v2 create-only delivery' {
             -Provider $provider.Handler
 
         $result.health | Should -BeExactly 'refused'
-        $result.diagnostic.code | Should -BeExactly 'live-preflight-refused'
+        $result.diagnostic.code | Should -BeExactly $Code
         $provider.State.writes | Should -Be 0
+    }
+
+    It 'reports a typed digest for an unexpected preflight exception' {
+        $context = New-TestAutomaticOwnerV2Context
+        $provider = {
+            param([string]$Action, [hashtable]$Arguments)
+            throw 'simulated provider transport failure'
+        }
+        $result = Invoke-AutomaticOwnerV2Comments `
+            -Evidence $context.Evidence -Policy $context.Policy `
+            -DeliveryRoot $context.Root -Key $context.Key `
+            -Provider $provider
+
+        $result.health | Should -BeExactly 'refused'
+        $result.diagnostic.code |
+            Should -BeExactly 'live-preflight-exception'
+        $result.diagnostic.message |
+            Should -Match '^Preflight threw RuntimeException; messageSha256=[0-9a-f]{64}$'
     }
 
     It 'refuses snapshot drift plus duplicate or foreign copied markers' `
