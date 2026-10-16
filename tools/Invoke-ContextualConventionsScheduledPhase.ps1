@@ -28,6 +28,61 @@ $WarningPreference = 'SilentlyContinue'
 [Console]::OutputEncoding =
     [Text.UTF8Encoding]::new($false)
 
+function Get-ContextualScheduledObservationDisposition {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][string[]]$AllowedRuleIds
+    )
+
+    $unexpectedValidationErrors = @(
+        $Observation.validationErrors |
+            Where-Object {
+                [string]$_ -cnotmatch
+                    '^file-evidence-unknown: '
+            })
+    if ([string]$Observation.lifecycle.status -cne
+            'completed' -or
+        $unexpectedValidationErrors.Count -ne 0 -or
+        [int]$Observation.effects.providerWrites -ne 0 -or
+        [int]$Observation.execution.modelStarts -ne 0 -or
+        @($Observation.findings |
+            Where-Object {
+                [string]$_.ruleId -cnotin
+                    $AllowedRuleIds
+            }).Count -ne 0) {
+        throw 'contextual-phase-observation-unsafe'
+    }
+    $semanticUnknown = [int]$Observation.counts.unknown
+    $reconciliationUnknown =
+        [int]$Observation.effects.dedupe.unknown
+    if (-not [bool]$Observation.findingsComplete -or
+        $semanticUnknown -gt 0 -or
+        $reconciliationUnknown -gt 0) {
+        return [ordered]@{
+            deliverable = $false
+            reason = $(if ($reconciliationUnknown -gt 0) {
+                    'discussion-reconciliation-unknown'
+                }
+                elseif ($semanticUnknown -gt 0) {
+                    'semantic-or-evidence-unknown'
+                }
+                else {
+                    'findings-incomplete'
+                })
+            semanticUnknown = $semanticUnknown
+            reconciliationUnknown =
+                $reconciliationUnknown
+        }
+    }
+    return [ordered]@{
+        deliverable = $true
+        reason = 'complete'
+        semanticUnknown = 0
+        reconciliationUnknown = 0
+    }
+}
+
 $head = (& $GitPath --no-optional-locks `
     -c core.longpaths=true `
     -C $ContextualToolkitRoot `
@@ -170,6 +225,8 @@ $identities =
     [Collections.Generic.List[string]]::new()
 $observations =
     [Collections.Generic.List[object]]::new()
+$withheldObservations =
+    [Collections.Generic.List[object]]::new()
 foreach ($record in $completed) {
     $identity = [string]$record.identity
     $matches = @(
@@ -186,25 +243,24 @@ foreach ($record in $completed) {
     $observation = Get-Content `
         -LiteralPath $matches[0].FullName -Raw |
         ConvertFrom-Json -AsHashtable -Depth 64
-    $unexpectedValidationErrors = @(
-        $observation.validationErrors |
-            Where-Object {
-                [string]$_ -cnotmatch
-                    '^file-evidence-unknown: '
+    $disposition =
+        Get-ContextualScheduledObservationDisposition `
+            -Observation $observation `
+            -AllowedRuleIds $allowedRuleIds
+    if (-not [bool]$disposition.deliverable) {
+        [void]$withheldObservations.Add([ordered]@{
+                identity = $identity
+                pullRequestId =
+                    [long]$observation.subject.pullRequestId
+                reason = [string]$disposition.reason
+                semanticUnknown =
+                    [int]$disposition.semanticUnknown
+                reconciliationUnknown =
+                    [int]$disposition.reconciliationUnknown
+                findingCount =
+                    @($observation.findings).Count
             })
-    if ([string]$observation.lifecycle.status -cne
-            'completed' -or
-        -not [bool]$observation.findingsComplete -or
-        [int]$observation.counts.unknown -ne 0 -or
-        $unexpectedValidationErrors.Count -ne 0 -or
-        [int]$observation.effects.providerWrites -ne 0 -or
-        [int]$observation.execution.modelStarts -ne 0 -or
-        @($observation.findings |
-            Where-Object {
-                [string]$_.ruleId -cnotin
-                    $allowedRuleIds
-            }).Count -ne 0) {
-        throw 'contextual-phase-observation-unsafe'
+        continue
     }
     [void]$identities.Add($identity)
     [void]$observations.Add([ordered]@{
@@ -292,6 +348,9 @@ if ([int]$delivery.providerWrites -lt 0 -or
     }
     evaluation = $evaluation
     observations = $observations.ToArray()
+    withheldObservations =
+        $withheldObservations.ToArray()
+    withheldCount = $withheldObservations.Count
     delivery = $delivery
     deliveryEnvelope = $deliveryEnvelope
     deliveryEnabled = $deliveryEnabled

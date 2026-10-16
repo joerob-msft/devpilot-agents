@@ -4,6 +4,86 @@ BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $producer = Join-Path $repoRoot `
         'tools\Invoke-ContextualDeliveryBatchJson.ps1'
+    $phase = Join-Path $repoRoot `
+        'tools\Invoke-ContextualConventionsScheduledPhase.ps1'
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile(
+        $phase, [ref]$tokens, [ref]$errors)
+    $errors | Should -HaveCount 0
+    $function = @($ast.FindAll({
+                param($node)
+                $node -is [
+                    Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq
+                    'Get-ContextualScheduledObservationDisposition'
+            }, $true))[0]
+    Invoke-Expression $function.Extent.Text
+}
+
+Describe 'Contextual scheduled observation disposition' {
+    BeforeEach {
+        $observation = [ordered]@{
+            lifecycle = [ordered]@{
+                status = 'completed'
+            }
+            findingsComplete = $true
+            counts = [ordered]@{
+                unknown = 0
+            }
+            effects = [ordered]@{
+                providerWrites = 0
+                dedupe = [ordered]@{
+                    unknown = 0
+                }
+            }
+            execution = [ordered]@{
+                modelStarts = 0
+            }
+            validationErrors = @()
+            findings = @([ordered]@{
+                    ruleId = 'explicit-string-comparison'
+                })
+        }
+    }
+
+    It 'keeps a complete observation deliverable' {
+        $result =
+            Get-ContextualScheduledObservationDisposition `
+                -Observation $observation `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison')
+
+        $result.deliverable | Should -BeTrue
+        $result.reason | Should -BeExactly complete
+    }
+
+    It 'withholds an ambiguous discussion without treating it as unsafe' {
+        $observation.findingsComplete = $false
+        $observation.effects.dedupe.unknown = 1
+
+        $result =
+            Get-ContextualScheduledObservationDisposition `
+                -Observation $observation `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison')
+
+        $result.deliverable | Should -BeFalse
+        $result.reason |
+            Should -BeExactly discussion-reconciliation-unknown
+        $result.reconciliationUnknown | Should -Be 1
+    }
+
+    It 'still rejects observations that report provider writes' {
+        $observation.effects.providerWrites = 1
+
+        {
+            Get-ContextualScheduledObservationDisposition `
+                -Observation $observation `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison')
+        } | Should -Throw contextual-phase-observation-unsafe
+    }
 }
 
 Describe 'Contextual delivery producer' {
