@@ -75,6 +75,46 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         $result.endLine | Should -Be 5
     }
 
+    It 'uses the first changed argument line as the anchor for a fully named call' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+[TestClass]
+class Checks {
+    [TestMethod]
+    void Verify() {
+        Assert.AreEqual(
+            expected: 1,
+            actual: GetValue());
+    }
+}
+'@
+        $result = (Parse-NamedAreEqual $source 8)[0]
+        $result.recognized | Should -BeTrue
+        $result.hasPositional | Should -BeFalse
+        $result.startLine | Should -Be 8
+        $result.affectedCallLines | Should -Be @(8)
+    }
+
+    It 'keeps a positional call actionable when only a continuation line changed' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+[TestClass]
+class Checks {
+    [TestMethod]
+    void Verify() {
+        Assert.AreEqual(
+            1,
+            GetValue());
+    }
+}
+'@
+        $result = (Parse-NamedAreEqual $source 8)[0]
+        $result.recognized | Should -BeTrue
+        $result.hasPositional | Should -BeTrue
+        $result.startLine | Should -Be 8
+        $result.affectedCallLines | Should -Be @(8)
+    }
+
     It 'marks same-line changed calls unknown rather than exposing duplicate anchors' {
         $source = @'
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -266,7 +306,7 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         (Parse-NamedAreEqual $missingClass 3)[0].recognized | Should -BeFalse
     }
 
-    It 'ignores comments and strings, and refuses changes without an exact opening anchor' {
+    It 'ignores comments and strings, and anchors a split call on its changed continuation' {
         $source = @'
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 [TestClass] class Checks {
@@ -281,9 +321,9 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
         (Parse-NamedAreEqual $source 4 5).Count | Should -Be 0
         $result = Parse-NamedAreEqual $source 7
         $result.Count | Should -Be 1
-        $result[0].recognized | Should -BeFalse
-        $result[0].hasPositional | Should -BeFalse
-        $result[0].startLine | Should -Be 6
+        $result[0].recognized | Should -BeTrue
+        $result[0].hasPositional | Should -BeTrue
+        $result[0].startLine | Should -Be 7
     }
 
     It 'treats literal arguments as supplied positional arguments without inspecting their text' {

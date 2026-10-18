@@ -217,6 +217,40 @@ class Checks {
                 'named-areequal-arguments')
     }
 
+    It 'completes a fully named call when only its continuation line changed' {
+        $source = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+[TestClass]
+class Checks {
+    [TestMethod]
+    void Verify() {
+        Assert.AreEqual(
+            expected: 0,
+            actual: items.Count);
+    }
+}
+'@
+        $result = Invoke-NamedTestReplay `
+            -Manifest (
+                New-NamedTestManifest `
+                    -Content $source `
+                    -First 8 -Last 8)
+
+        $result.Run.records[0].state |
+            Should -BeExactly completed
+        $result.Observation.lifecycle.status |
+            Should -BeExactly completed
+        $result.Observation.counts.checked |
+            Should -Be 1
+        $result.Observation.counts.unknown |
+            Should -Be 0
+        $result.Observation.findings |
+            Should -HaveCount 0
+        $result.Observation.outcomes[0].
+            state |
+            Should -BeExactly notEligible
+    }
+
     It 'refuses another cohort or policy identity' {
         $manifest = New-NamedTestManifest
         $manifest.kind = 'owner-v2-preview-cohort'

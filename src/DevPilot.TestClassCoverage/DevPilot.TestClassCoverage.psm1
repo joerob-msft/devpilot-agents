@@ -18,6 +18,30 @@ function Test-CoverageChanged {
     return $false
 }
 
+function Get-CoverageChangedAnchor {
+    param(
+        [int]$First,
+        [int]$Last,
+        [object[]]$Ranges
+    )
+    $anchors = @(
+        foreach ($range in $Ranges) {
+            if ($First -le $range.end -and
+                $Last -ge $range.start) {
+                [Math]::Max(
+                    $First,
+                    [int]$range.start)
+            }
+        })
+    if ($anchors.Count -eq 0) {
+        return 0
+    }
+    return [int](
+        $anchors |
+            Measure-Object -Minimum).
+        Minimum
+}
+
 function Get-CoverageTokens {
     param([string]$Text, [switch]$IncludeLiteralTokens)
     $tokens = [Collections.Generic.List[object]]::new()
@@ -405,6 +429,10 @@ function Get-NamedAreEqualConstructs {
             $pairs.ContainsKey($openParen)
         $end = if ($callValid) { [int]$tokens[$pairs[$openParen]].line } else { [int]$tokens[$i].line }
         if (-not (Test-CoverageChanged $start $end $ranges)) { continue }
+        $changedAnchor =
+            Get-CoverageChangedAnchor `
+                -First $start -Last $end `
+                -Ranges $ranges
         $contexts = @($location[$i])
         $method = @($contexts | Where-Object kind -eq 'method' | Select-Object -Last 1)
         $symbolParts = [Collections.Generic.List[string]]::new()
@@ -418,9 +446,9 @@ function Get-NamedAreEqualConstructs {
         $exactSpelling = $receiver -ceq 'Assert' -and
             ($receiverStart -eq 0 -or $tokens[$receiverStart - 1].text -notin @('.', '::', '?', '!'))
         $testClass = @($contexts | Where-Object { $_.kind -eq 'type' -and $_.isTestClass })
-        $exactAnchor = Test-CoverageChanged $start $start $ranges
         $known = $exactSpelling -and -not $assertShadowed -and
-            -not $malformed -and $callValid -and $exactAnchor -and
+            -not $malformed -and $callValid -and
+            $changedAnchor -ge 1 -and
             $method.Count -eq 1 -and $method[0].isTestMethod -and
             $testClass.Count -eq 1 -and $method[0].declarationLine -ge 1 -and
             $symbol.Length -gt 0 -and $symbol.Length -le 256 -and
@@ -476,14 +504,18 @@ function Get-NamedAreEqualConstructs {
         }
         $key = if ($method.Count -eq 1 -and $symbol.Length -le 256) {
             "$symbol`:$($method[0].declarationLine)"
-        } else { "unknown:$start" }
+        } else { "unknown:$changedAnchor" }
         if (-not $groups.ContainsKey($key)) {
             $groups[$key] = [Collections.Generic.List[object]]::new()
         }
         [void]$groups[$key].Add(@{ name = $(if ($symbol.Length -gt 0 -and
                     $symbol.Length -le 256) { $symbol } else { 'unrecognized' })
             declarationLine = $(if ($method.Count -eq 1) { [int]$method[0].declarationLine } else { 0 })
-            start = $start; end = $end; known = [bool]$known; positional = [bool]$positional })
+            start = $changedAnchor
+            callStart = $start
+            end = $end
+            known = [bool]$known
+            positional = [bool]$positional })
     }
     foreach ($key in @($groups.Keys | Sort-Object)) {
         $calls = @($groups[$key] | Sort-Object start, end)

@@ -20,7 +20,8 @@ The 653-byte local policy is pinned independently at SHA-256
 the declaration and capability both reject a changed local policy.
 
 Only a confidently parsed C# test-method call spelled `Assert.AreEqual` with
-at least two supplied arguments, an exact changed call opening line, and at
+at least two supplied arguments, an exact changed line within the complete
+invocation, and at
 least one positional argument is actionable. Ordinary namespace imports alone
 do not change its call-site spelling or the named-argument style requirement;
 the rule does not claim the receiver's resolved type is MSTest. Aliases,
@@ -30,11 +31,21 @@ conventional MSTest call these include `expected:` and `actual:`, but a
 different overload may use other names.
 There is **one finding/comment per affected test method**, not one per
 assertion. It anchors the first changed violating call and records up to 256
-exact changed call lines with a bounded 12-line display sample. Unknown syntax,
+exact changed invocation lines with a bounded 12-line display sample. When an
+invocation starts outside the changed span, its first changed argument or
+continuation line is the anchor; the complete call must still parse
+confidently. Unknown syntax,
 receiver shape, containment, or changed-line provenance is not actionable. The rule
 does not reorder arguments or change assertion values.
 
 The current-PR bridge accepts `devpilot-current-line-derivation-v1` evidence from the shared intake. It derives that evidence from already-fetched source/target content and the existing changed-span invocation, without another fetch or diff pass. Only same-path modified C# with complete, byte-identical source/target proof and zero current spans, or a complete whole-file C# deletion, can be filtered as known-empty for Named. Proof validation binds the head, actual UTF-8 content SHA-256 and length, path, change type, and exact inventory/span counts before filtering. Missing or inconsistent proof, derivation-unknown, pure renames, retained-file deletion-only changes, and malformed or unavailable relevant evidence remain UNKNOWN; zero spans alone are not proof of compliance. Derivation metadata participates in the snapshot digest and acquisition identity, so old observations cannot qualify a new binding. The frozen Owner runtime can consume a separately derived view that omits only proven identical C#; relation and other consumers retain the immutable full shared snapshot. This contract does not authorize delivery or change Owner body-coverage semantics.
+
+Fresh PR metadata remains uncached across head checks. Within one check, the
+shared intake acquires one bounded ADO token and reuses the existing
+authenticated in-process GET path for the PR, its iterations, and its exact
+source ref. Status, draft state, latest iteration, and exact live ref are still
+read and validated every time; only repeated Azure CLI process startup is
+removed.
 
 Preview accepts a separate `named-areequal-v2-preview-cohort`, signed source
 and target generation, complete changed spans, pinned policy, and
