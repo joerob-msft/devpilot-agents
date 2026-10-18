@@ -519,6 +519,136 @@ else {
         }
     }
 
+    It 'reads freshness metadata in-process with one cached token acquisition' {
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force |
+            Out-Null
+        $stub = Join-Path $c.root 'az-head-metadata.ps1'
+        $log = Join-Path $c.root 'az-head-metadata.log'
+        $env:ACTIVE_PR_HEAD_LOG = $log
+        @'
+Add-Content -LiteralPath $env:ACTIVE_PR_HEAD_LOG -Value ($args -join ' ')
+if ($args -contains 'get-access-token') {
+    @{ accessToken = 'x' * 128 } |
+        ConvertTo-Json -Compress
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $headUris = [Collections.Generic.List[string]]::new()
+$httpGet = {
+    param(
+        $Uri,
+        $Method,
+        $Headers,
+        $TimeoutSec,
+        $UseBasicParsing
+    )
+    $headUris.Add([string]$Uri) |
+        Out-Null
+            if ([string]$Headers.Authorization -cne
+                ('Bearer ' + ('x' * 128))) {
+                throw 'unexpected-authorization'
+            }
+            $content = if (
+                [string]$Uri -match
+                    '/pullRequests/17\?') {
+                [ordered]@{
+                    pullRequestId = 17
+                    repository = [ordered]@{
+                        id = $c.config.repositoryId
+                        project = [ordered]@{
+                            id = $c.config.projectId
+                        }
+                    }
+                    status = 'active'
+                    isDraft = $false
+                    sourceRefName =
+                        'refs/heads/feature/test'
+                    targetRefName =
+                        'refs/heads/master'
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/pullRequests/17/iterations\?') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            id = 4
+                            sourceRefCommit =
+                                @{ commitId = ('a' * 40) }
+                            targetRefCommit =
+                                @{ commitId = ('b' * 40) }
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/refs\?filter=heads%2Ffeature%2Ftest') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            name =
+                                'refs/heads/feature/test'
+                            objectId = ('a' * 40)
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            else {
+                throw "unexpected-uri:$Uri"
+            }
+            [pscustomobject]@{
+                RawContentLength =
+                    [Text.Encoding]::UTF8.
+                        GetByteCount($content)
+                Content = $content
+                Headers = @{
+                    'Content-Type' =
+                        'application/json'
+                }
+            }
+        }.GetNewClosure()
+        try {
+            $provider =
+                New-ActivePrAzureDevOpsProvider `
+                    -Config $c.config `
+                    -AzureCliPath $stub `
+                    -HttpGetInvoker $httpGet
+            $head = & $provider Head @{
+                pullRequestId = 17
+                timeoutMilliseconds = 15000
+            }
+
+            $head.pullRequestId | Should -Be 17
+            $head.iterationId | Should -Be 4
+            $head.sourceCommit |
+                Should -BeExactly ('a' * 40)
+            $head.targetCommit |
+                Should -BeExactly ('b' * 40)
+            $headUris | Should -HaveCount 3
+            @($headUris | Where-Object {
+                    $_ -notmatch (
+                        [regex]::Escape(
+                            $c.config.projectName) +
+                        '/_apis/git/repositories/' +
+                        [regex]::Escape(
+                            $c.config.repositoryId))
+                }) |
+                Should -HaveCount 0
+            $cliCalls = @(Get-Content `
+                    -LiteralPath $log)
+            $cliCalls | Should -HaveCount 1
+            $cliCalls[0] |
+                Should -Match 'account get-access-token'
+            $cliCalls[0] |
+                Should -Not -Match 'devops invoke'
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_HEAD_LOG `
+                -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }
