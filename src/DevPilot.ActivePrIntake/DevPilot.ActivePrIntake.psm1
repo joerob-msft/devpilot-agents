@@ -1606,10 +1606,10 @@ function Invoke-ActivePrIntake {
                                                     evidencePlanDigest
                                             totalFiles =
                                                 [int]$progressRecord.
-                                                    totalInventoryFiles
-                                            evidenceFiles =
-                                                [int]$progressRecord.
                                                     totalFiles
+                                            inventoryFiles =
+                                                [int]$progressRecord.
+                                                    totalInventoryFiles
                                             processedFiles =
                                                 [int]$progressRecord.
                                                     nextOrdinal
@@ -2017,29 +2017,35 @@ function Get-ActivePrSharedEvidencePlan {
         $paths = @($path, $originalPath | Where-Object {
                 -not [string]::IsNullOrWhiteSpace($_)
             })
-        $generated = @($paths | Where-Object {
+        $csharpPaths = @($paths | Where-Object {
+                [IO.Path]::GetExtension($_) -ieq '.cs'
+            })
+        $nonGeneratedCSharp = @($csharpPaths | Where-Object {
+                $_ -inotmatch (
+                    '(^|/)(?:obj|generated|' +
+                    'Ignore-AddedForReferenceOnly)(/|$)|' +
+                    '(?:\.g|\.designer)\.cs$')
+            })
+        $generatedCSharp = @($csharpPaths | Where-Object {
                 $_ -imatch (
                     '(^|/)(?:obj|generated|' +
                     'Ignore-AddedForReferenceOnly)(/|$)|' +
                     '(?:\.g|\.designer)\.cs$')
-            }).Count -gt 0
-        $csharp = @($paths | Where-Object {
-                [IO.Path]::GetExtension($_) -ieq '.cs'
-            }).Count -gt 0
+            })
         $metadata = @($paths | Where-Object {
                 $_ -imatch (
-                    '(?:\.csproj|\.props|\.targets|' +
+                    '(?:\.csproj|\.props|' +
                     'packages\.config)$')
             }).Count -gt 0
-        $required = ($csharp -and -not $generated) -or
+        $required = $nonGeneratedCSharp.Count -gt 0 -or
             $metadata
-        $reason = if ($csharp -and -not $generated) {
+        $reason = if ($nonGeneratedCSharp.Count -gt 0) {
             'non-generated-csharp'
         }
         elseif ($metadata) {
             'contextual-project-metadata'
         }
-        elseif ($generated) {
+        elseif ($generatedCSharp.Count -gt 0) {
             'generated-source-not-applicable'
         }
         else {
@@ -2074,6 +2080,18 @@ function Get-ActivePrSharedEvidencePlan {
         inventoryCount = $plannedInventory.Count
         evidenceCount = $evidenceEntries.Count
     }
+}
+
+function Test-ActivePrEvidenceTextPath {
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $normalized = $Path.Replace('\', '/')
+    return [IO.Path]::GetExtension($normalized) -ieq '.cs' -or
+        $normalized -imatch (
+            '(?:\.csproj|\.props|' +
+            'packages\.config)$')
 }
 
 function New-ActivePrAzureDevOpsProvider {
@@ -2652,6 +2670,8 @@ print(json.dumps({
         ${function:Resolve-ActivePrIterationChangePath}
     $getSharedEvidencePlan =
         ${function:Get-ActivePrSharedEvidencePlan}
+    $testEvidenceTextPath =
+        ${function:Test-ActivePrEvidenceTextPath}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -3036,10 +3056,19 @@ print(json.dumps({
                     else { [string]$sourceItem.contentMetadata.contentType }
                     $isCSharp = [IO.Path]::GetExtension(
                         [string]$entry.path) -ieq '.cs'
+                    $evidenceTextPath =
+                        & $testEvidenceTextPath `
+                            -Path ([string]$entry.path)
+                    if (-not $evidenceTextPath -and
+                        $entry.originalPath) {
+                        $evidenceTextPath =
+                            & $testEvidenceTextPath `
+                                -Path ([string]$entry.originalPath)
+                    }
                     $isText = $deleted -or
                         $contentType.StartsWith(
                             'text/', [StringComparison]::OrdinalIgnoreCase) -or
-                        $isCSharp
+                        $evidenceTextPath
                     if (-not $isText) {
                         $binaryChange = [ordered]@{
                                 changeTrackingId =

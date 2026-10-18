@@ -265,7 +265,7 @@ Describe 'Active PR read-only intake' {
             },
             [ordered]@{
                 changeTrackingId = 5
-                path = 'Directory.Build.targets'
+                path = 'Directory.Build.props'
                 changeType = 'edit'
                 originalPath = $null
             },
@@ -301,6 +301,46 @@ Describe 'Active PR read-only intake' {
             Should -BeExactly 'non-generated-csharp'
     }
 
+    It 'keeps either non-generated side of a rename relevant' {
+        $inventory = @(
+            [ordered]@{
+                changeTrackingId = 1
+                path = 'src/Product.cs'
+                changeType = 'rename'
+                originalPath = 'src/obj/Product.g.cs'
+            },
+            [ordered]@{
+                changeTrackingId = 2
+                path = 'src/obj/Old.g.cs'
+                changeType = 'rename'
+                originalPath = 'src/Old.cs'
+            },
+            [ordered]@{
+                changeTrackingId = 3
+                path = 'src/obj/New.g.cs'
+                changeType = 'rename'
+                originalPath = 'src/generated/Old.g.cs'
+            },
+            [ordered]@{
+                changeTrackingId = 4
+                path = 'Directory.Build.targets'
+                changeType = 'edit'
+                originalPath = $null
+            }
+        )
+        $plan = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Value)
+            Get-ActivePrSharedEvidencePlan -Inventory $Value
+        } $inventory
+
+        @($plan.evidenceEntries.changeTrackingId) |
+            Should -Be @(1, 2)
+        [string]$plan.inventory[2].evidenceReason |
+            Should -BeExactly 'generated-source-not-applicable'
+        [string]$plan.inventory[3].evidenceReason |
+            Should -BeExactly 'no-enabled-lane-requires-content'
+    }
+
     It 'keeps missing relevant C# in the evidence plan and skips only proven unrelated paths' {
         $inventory = @(
             [ordered]@{
@@ -326,6 +366,157 @@ Describe 'Active PR read-only intake' {
             Should -BeExactly 'src/Missing.cs'
         [string]$plan.inventory[1].evidenceDisposition |
             Should -BeExactly 'not-applicable'
+    }
+
+    It 'keeps planned <Mode> evidence textual under non-text MIME' `
+        -TestCases @(
+            @{
+                Mode = 'metadata'
+                Path = '/src/App.csproj'
+                OriginalPath = $null
+                ChangeType = 'edit'
+                ContentType = 'application/xml'
+            },
+            @{
+                Mode = 'rename'
+                Path = '/src/obj/New.g.cs'
+                OriginalPath = '/src/Old.cs'
+                ChangeType = 'rename'
+                ContentType = 'application/octet-stream'
+            }
+        ) {
+        param(
+            $Mode,
+            $Path,
+            $OriginalPath,
+            $ChangeType,
+            $ContentType
+        )
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force |
+            Out-Null
+        $stub = Join-Path $c.root 'az-evidence-plan.ps1'
+        $env:ACTIVE_PR_EVIDENCE_MODE = $Mode
+        $env:ACTIVE_PR_EVIDENCE_PATH = $Path
+        $env:ACTIVE_PR_EVIDENCE_ORIGINAL =
+            [string]$OriginalPath
+        $env:ACTIVE_PR_EVIDENCE_CHANGE =
+            $ChangeType
+        @'
+if ($args -contains 'get-access-token') {
+    @{
+        accessToken = 'x' * 128
+    } | ConvertTo-Json -Compress
+}
+elseif ($args -contains 'pullRequestIterationChanges') {
+    if ($args -contains '$skip=1') {
+        '{"changeEntries":[],"count":0}'
+    }
+    else {
+        @{
+            changeEntries = @([ordered]@{
+                    changeTrackingId = 1
+                    changeType =
+                        $env:ACTIVE_PR_EVIDENCE_CHANGE
+                    originalPath = $(if (
+                        $env:ACTIVE_PR_EVIDENCE_ORIGINAL
+                    ) {
+                        $env:ACTIVE_PR_EVIDENCE_ORIGINAL
+                    }
+                    else { $null })
+                    item = @{
+                        path =
+                            $env:ACTIVE_PR_EVIDENCE_PATH
+                    }
+                })
+            count = 1
+            nextSkip = 1
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        Mock Invoke-WebRequest `
+            -ModuleName DevPilot.ActivePrIntake {
+            param($Uri)
+            if ([string]$Uri -match
+                'scopePath=') {
+                $content = '[]'
+                return [pscustomobject]@{
+                    RawContentLength =
+                        $content.Length
+                    Content = $content
+                    Headers = @{
+                        'Content-Type' =
+                            'application/json'
+                    }
+                }
+            }
+            $source = [string]$Uri -match
+                ('versionDescriptor\.version=' +
+                    ('a' * 40))
+            $content = if (
+                $env:ACTIVE_PR_EVIDENCE_MODE -ceq
+                    'metadata'
+            ) {
+                if ($source) {
+                    '<Project><PropertyGroup /></Project>'
+                }
+                else {
+                    '<Project />'
+                }
+            }
+            elseif ($source) {
+                'namespace Generated { class NewName {} }'
+            }
+            else {
+                'namespace Product { class OldName {} }'
+            }
+            return [pscustomobject]@{
+                RawContentLength =
+                    $content.Length
+                Content = $content
+                Headers = @{
+                    'Content-Type' = $ContentType
+                }
+            }
+        }
+        try {
+            $provider =
+                New-ActivePrAzureDevOpsProvider `
+                    -Config $c.config `
+                    -AzureCliPath $stub
+            $changes = & $provider Changes @{
+                pullRequestId = 1
+                iterationId = 1
+                sourceCommit = 'a' * 40
+                targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+
+            $changes.changedFiles | Should -Be 1
+            $changes.fileProgress.totalFiles |
+                Should -Be 1
+            $changes.fileProgress.
+                totalInventoryFiles |
+                Should -Be 1
+            [string]$changes.entries[0].state |
+                Should -BeExactly complete
+            [string]$changes.entries[0].content |
+                Should -Not -BeNullOrEmpty
+            [string]$changes.entries[0].
+                unavailableReason |
+                Should -BeNullOrEmpty
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_EVIDENCE_MODE,
+                Env:\ACTIVE_PR_EVIDENCE_PATH,
+                Env:\ACTIVE_PR_EVIDENCE_ORIGINAL,
+                Env:\ACTIVE_PR_EVIDENCE_CHANGE `
+                -ErrorAction SilentlyContinue
+        }
     }
 
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
