@@ -235,6 +235,24 @@ function Test-ApprovedContextualActionablePartial {
     )
 
     $findings = @($Observation.findings)
+    foreach ($finding in $findings) {
+        if ($finding -isnot
+            [Collections.IDictionary]) {
+            return $false
+        }
+        $reconciliation =
+            Get-ApprovedOwnerV2Value `
+                -Value $finding `
+                -Name reconciliation
+        if ($reconciliation -isnot
+                [Collections.IDictionary] -or
+            -not $reconciliation.Contains(
+                'classification') -or
+            -not $reconciliation.Contains(
+                'reason')) {
+            return $false
+        }
+    }
     $unknown = @($findings | Where-Object {
             [string]$_.reconciliation.classification -ceq
                 'unknown'
