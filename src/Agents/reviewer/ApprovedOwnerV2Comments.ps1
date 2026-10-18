@@ -228,6 +228,41 @@ function Get-ApprovedOwnerV2SourceArtifacts {
     return @($values | Sort-Object)
 }
 
+function Test-ApprovedContextualActionablePartial {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Observation
+    )
+
+    $findings = @($Observation.findings)
+    $unknown = @($findings | Where-Object {
+            [string]$_.reconciliation.classification -ceq
+                'unknown'
+        })
+    $actionable = @($findings | Where-Object {
+            [string]$_.reconciliation.classification -ceq
+                'wouldCreate'
+        })
+    return (
+        -not [bool]$Observation.findingsComplete -and
+        [int]$Observation.counts.unknown -eq 0 -and
+        [int]$Observation.counts.uncovered -eq 0 -and
+        @($Observation.validationErrors).Count -eq 0 -and
+        $unknown.Count -gt 0 -and
+        $actionable.Count -gt 0 -and
+        [int]$Observation.effects.dedupe.unknown -eq
+            $unknown.Count -and
+        @($unknown | Where-Object {
+                [string]$_.reconciliation.reason -cne
+                    'other-review-at-anchor'
+            }).Count -eq 0 -and
+        @($findings | Where-Object {
+                [string]$_.reconciliation.classification -cnotin @(
+                    'wouldCreate', 'noOp', 'humanCovered', 'unknown')
+            }).Count -eq 0
+    )
+}
+
 function Read-ApprovedOwnerV2Evidence {
     [CmdletBinding()]
     param(
@@ -331,11 +366,17 @@ function Read-ApprovedOwnerV2Evidence {
         [string]$declaration.acquisitionPayloadDigest) {
         throw 'Owner v2 declaration or evidence pin is stale, unsupported, or foreign.'
     }
+    $contextualActionablePartial =
+        [string]$observation.capability -ceq
+            $script:ApprovedContextualCapability -and
+        (Test-ApprovedContextualActionablePartial `
+            -Observation $observation)
     if ([int]$observation.schemaVersion -ne 2 -or
         [string]$observation.kind -cne 'owner-observation' -or
         [string]$observation.capability -cne $expectedCapability -or
         [string]$observation.lifecycle.status -cne 'completed' -or
-        -not [bool]$observation.findingsComplete -or
+        (-not [bool]$observation.findingsComplete -and
+            -not $contextualActionablePartial) -or
         [int]$observation.counts.unknown -ne 0 -or
         [int]$observation.counts.uncovered -ne 0 -or
         [int]$observation.effects.providerWrites -ne 0 -or

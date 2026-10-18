@@ -724,6 +724,52 @@ BeforeAll {
 }
 
 Describe 'Approved Owner v2 review and approval packages' {
+    It 'allows only isolated contextual discussion unknowns beside actionable findings' {
+        $observation = [ordered]@{
+            findingsComplete = $false
+            counts = [ordered]@{
+                unknown = 0
+                uncovered = 0
+            }
+            validationErrors = @()
+            effects = [ordered]@{
+                dedupe = [ordered]@{
+                    unknown = 1
+                }
+            }
+            findings = @(
+                [ordered]@{
+                    reconciliation = [ordered]@{
+                        classification = 'unknown'
+                        reason = 'other-review-at-anchor'
+                    }
+                },
+                [ordered]@{
+                    reconciliation = [ordered]@{
+                        classification = 'wouldCreate'
+                        reason = 'no-current-review-at-anchor'
+                    }
+                })
+        }
+
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeTrue
+        $observation.findings[0].
+            reconciliation.reason =
+            'duplicate-reviewer-markers'
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+        $observation.findings[0].
+            reconciliation.reason =
+            'other-review-at-anchor'
+        $observation.counts.unknown = 1
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+    }
+
     It 'exports the exact V1-compatible marker, body, anchor, and body digest' {
         $evidence = New-TestOwnerV2Evidence
         $package = New-ApprovedOwnerV2ReviewPackage -Evidence $evidence
