@@ -237,6 +237,97 @@ Describe 'Active PR read-only intake' {
         } | Should -Throw 'change-list-truncated'
     }
 
+    It 'plans the fixed union of enabled reviewer evidence before content reads' {
+        $inventory = @(
+            [ordered]@{
+                changeTrackingId = 1
+                path = 'src/Product.cs'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 2
+                path = 'src/obj/Generated.g.cs'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 3
+                path = 'tests/Fixture.json'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 4
+                path = 'src/App.csproj'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 5
+                path = 'Directory.Build.targets'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 6
+                path = 'src/NewName.json'
+                changeType = 'rename'
+                originalPath = 'src/OldName.cs'
+            },
+            [ordered]@{
+                changeTrackingId = 7
+                path = 'docs/Deleted.md'
+                changeType = 'delete'
+                originalPath = 'docs/Deleted.md'
+            }
+        )
+        $plan = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Value)
+            Get-ActivePrSharedEvidencePlan -Inventory $Value
+        } $inventory
+
+        $plan.inventoryCount | Should -Be 7
+        $plan.evidenceCount | Should -Be 4
+        @($plan.evidenceEntries.changeTrackingId) |
+            Should -Be @(1, 4, 5, 6)
+        [string]$plan.inventory[1].evidenceDisposition |
+            Should -BeExactly 'not-applicable'
+        [string]$plan.inventory[1].evidenceReason |
+            Should -BeExactly 'generated-source-not-applicable'
+        [string]$plan.inventory[2].evidenceReason |
+            Should -BeExactly 'no-enabled-lane-requires-content'
+        [string]$plan.inventory[5].evidenceReason |
+            Should -BeExactly 'non-generated-csharp'
+    }
+
+    It 'keeps missing relevant C# in the evidence plan and skips only proven unrelated paths' {
+        $inventory = @(
+            [ordered]@{
+                changeTrackingId = 1
+                path = 'src/Missing.cs'
+                changeType = 'edit'
+                originalPath = $null
+            },
+            [ordered]@{
+                changeTrackingId = 2
+                path = 'fixtures/Only.json'
+                changeType = 'edit'
+                originalPath = $null
+            }
+        )
+        $plan = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Value)
+            Get-ActivePrSharedEvidencePlan -Inventory $Value
+        } $inventory
+
+        $plan.evidenceCount | Should -Be 1
+        [string]$plan.evidenceEntries[0].path |
+            Should -BeExactly 'src/Missing.cs'
+        [string]$plan.inventory[1].evidenceDisposition |
+            Should -BeExactly 'not-applicable'
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }
@@ -674,6 +765,17 @@ $response | ConvertTo-Json -Depth 8 -Compress
             $changes.changedLines | Should -Be 0
             @($changes.entries) | Should -HaveCount 16
             $changes.fileProgress.totalFiles | Should -Be 110
+            $changes.fileProgress.totalInventoryFiles |
+                Should -Be 110
+            $changes.fileProgress.evidencePlanDigest |
+                Should -Match '^[0-9a-f]{64}$'
+            @($changes.inventory) | Should -HaveCount 110
+            @($changes.inventory | Where-Object {
+                    [string]$_.evidenceDisposition -cne
+                        'required' -or
+                    [string]$_.evidenceReason -cne
+                        'non-generated-csharp'
+                }) | Should -HaveCount 0
             $changes.fileProgress.startOrdinal | Should -Be 0
             $changes.fileProgress.nextOrdinal | Should -Be 16
             $changes.fileProgress.complete | Should -BeFalse
@@ -702,6 +804,14 @@ $response | ConvertTo-Json -Depth 8 -Compress
                     $next.fileProgress.inventoryDigest |
                         Should -BeExactly (
                             $changes.fileProgress.inventoryDigest)
+                    $next.fileProgress.evidencePlanDigest |
+                        Should -BeExactly (
+                            $changes.fileProgress.evidencePlanDigest)
+                    ($next.inventory |
+                        ConvertTo-Json -Depth 16 -Compress) |
+                        Should -BeExactly (
+                            $changes.inventory |
+                                ConvertTo-Json -Depth 16 -Compress)
                     @($changes.entries.path | Where-Object {
                             $_ -in @($next.entries.path)
                         }) | Should -HaveCount 0

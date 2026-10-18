@@ -1244,7 +1244,7 @@ function Invoke-ActivePrIntake {
                                             -Depth 64
                                     if (
                                         [int]$priorProgress.
-                                            schemaVersion -ne 1 -or
+                                            schemaVersion -ne 2 -or
                                         [string]$priorProgress.kind -cne
                                             'active-pr-file-progress' -or
                                         [long]$priorProgress.
@@ -1262,6 +1262,13 @@ function Invoke-ActivePrIntake {
                                             nextOrdinal -lt 1 -or
                                         [int]$priorProgress.
                                             nextOrdinal -gt 1999 -or
+                                        [string]$priorProgress.
+                                            evidencePlanDigest -cnotmatch
+                                            '^[0-9a-f]{64}$' -or
+                                        [int]$priorProgress.
+                                            totalInventoryFiles -lt 1 -or
+                                        $priorProgress.inventory -isnot
+                                            [array] -or
                                         $priorProgress.entries -isnot
                                             [array]) {
                                         $priorProgress = $null
@@ -1316,10 +1323,22 @@ function Invoke-ActivePrIntake {
                                         [string]$fileProgress.
                                             inventoryDigest -cnotmatch
                                             '^[0-9a-f]{64}$' -or
+                                        [string]$fileProgress.
+                                            evidencePlanDigest -cnotmatch
+                                            '^[0-9a-f]{64}$' -or
                                         [int]$fileProgress.
-                                            totalFiles -lt 1 -or
+                                            totalFiles -lt 0 -or
                                         [int]$fileProgress.
                                             totalFiles -gt 2000 -or
+                                        [int]$fileProgress.
+                                            totalInventoryFiles -lt 1 -or
+                                        [int]$fileProgress.
+                                            totalInventoryFiles -gt 2000 -or
+                                        $changes.inventory -isnot
+                                            [array] -or
+                                        @($changes.inventory).Count -ne
+                                            [int]$fileProgress.
+                                                totalInventoryFiles -or
                                         [int]$fileProgress.
                                             startOrdinal -ne
                                             $fileStartOrdinal -or
@@ -1344,10 +1363,18 @@ function Invoke-ActivePrIntake {
                                                 inventoryDigest -cne
                                                 [string]$fileProgress.
                                                     inventoryDigest -or
+                                            [string]$priorProgress.
+                                                evidencePlanDigest -cne
+                                                [string]$fileProgress.
+                                                    evidencePlanDigest -or
                                             [int]$priorProgress.
                                                 totalFiles -ne
                                                 [int]$fileProgress.
-                                                    totalFiles
+                                                    totalFiles -or
+                                            [int]$priorProgress.
+                                                totalInventoryFiles -ne
+                                                [int]$fileProgress.
+                                                    totalInventoryFiles
                                         )) {
                                         throw 'file-progress-invalid'
                                     }
@@ -1407,7 +1434,7 @@ function Invoke-ActivePrIntake {
                                     }
                                     $progressRecord =
                                         [ordered]@{
-                                            schemaVersion = 1
+                                            schemaVersion = 2
                                             kind =
                                                 'active-pr-file-progress'
                                             pullRequestId = $id
@@ -1421,9 +1448,15 @@ function Invoke-ActivePrIntake {
                                             inventoryDigest =
                                                 [string]$fileProgress.
                                                     inventoryDigest
+                                            evidencePlanDigest =
+                                                [string]$fileProgress.
+                                                    evidencePlanDigest
                                             totalFiles =
                                                 [int]$fileProgress.
                                                     totalFiles
+                                            totalInventoryFiles =
+                                                [int]$fileProgress.
+                                                    totalInventoryFiles
                                             nextOrdinal =
                                                 [int]$fileProgress.
                                                     nextOrdinal
@@ -1437,6 +1470,8 @@ function Invoke-ActivePrIntake {
                                             projectContexts =
                                                 @($contextByDigest.
                                                     Values)
+                                            inventory =
+                                                @($changes.inventory)
                                         }
                                     if (-not $progressComplete) {
                                         $progressPending = $true
@@ -1461,6 +1496,9 @@ function Invoke-ActivePrIntake {
                                                 projectContexts =
                                                     @($contextByDigest.
                                                         Values)
+                                                inventory =
+                                                    @($progressRecord.
+                                                        inventory)
                                             }
                                         $lines =
                                             [int]$progressRecord.
@@ -1563,7 +1601,13 @@ function Invoke-ActivePrIntake {
                                             inventoryDigest =
                                                 [string]$progressRecord.
                                                     inventoryDigest
+                                            evidencePlanDigest =
+                                                [string]$progressRecord.
+                                                    evidencePlanDigest
                                             totalFiles =
+                                                [int]$progressRecord.
+                                                    totalInventoryFiles
+                                            evidenceFiles =
                                                 [int]$progressRecord.
                                                     totalFiles
                                             processedFiles =
@@ -1946,6 +1990,90 @@ function Resolve-ActivePrIterationChangePath {
         return $originalPath.TrimStart('/')
     }
     throw 'change-list-truncated'
+}
+
+function Get-ActivePrSharedEvidencePlan {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Inventory
+    )
+
+    $plannedInventory =
+        [Collections.Generic.List[object]]::new()
+    $evidenceEntries =
+        [Collections.Generic.List[object]]::new()
+    foreach ($entry in $Inventory) {
+        if ($entry -isnot [Collections.IDictionary] -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$entry.path)) {
+            throw 'change-list-truncated'
+        }
+        $path = ([string]$entry.path).Replace('\', '/')
+        $originalPath = if (
+            $null -ne $entry['originalPath']) {
+            ([string]$entry.originalPath).Replace('\', '/')
+        }
+        else { '' }
+        $paths = @($path, $originalPath | Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            })
+        $generated = @($paths | Where-Object {
+                $_ -imatch (
+                    '(^|/)(?:obj|generated|' +
+                    'Ignore-AddedForReferenceOnly)(/|$)|' +
+                    '(?:\.g|\.designer)\.cs$')
+            }).Count -gt 0
+        $csharp = @($paths | Where-Object {
+                [IO.Path]::GetExtension($_) -ieq '.cs'
+            }).Count -gt 0
+        $metadata = @($paths | Where-Object {
+                $_ -imatch (
+                    '(?:\.csproj|\.props|\.targets|' +
+                    'packages\.config)$')
+            }).Count -gt 0
+        $required = ($csharp -and -not $generated) -or
+            $metadata
+        $reason = if ($csharp -and -not $generated) {
+            'non-generated-csharp'
+        }
+        elseif ($metadata) {
+            'contextual-project-metadata'
+        }
+        elseif ($generated) {
+            'generated-source-not-applicable'
+        }
+        else {
+            'no-enabled-lane-requires-content'
+        }
+        $planned = [ordered]@{
+            changeTrackingId =
+                [int]$entry.changeTrackingId
+            path = $path
+            changeType =
+                [string]$entry.changeType
+            originalPath = $(if ($originalPath) {
+                    $originalPath
+                }
+                else { $null })
+            evidenceDisposition = $(if ($required) {
+                    'required'
+                }
+                else { 'not-applicable' })
+            evidenceReason = $reason
+        }
+        [void]$plannedInventory.Add($planned)
+        if ($required) {
+            [void]$evidenceEntries.Add($entry)
+        }
+    }
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'shared-review-evidence-plan'
+        inventory = $plannedInventory.ToArray()
+        evidenceEntries = $evidenceEntries.ToArray()
+        inventoryCount = $plannedInventory.Count
+        evidenceCount = $evidenceEntries.Count
+    }
 }
 
 function New-ActivePrAzureDevOpsProvider {
@@ -2522,6 +2650,8 @@ print(json.dumps({
         ${function:Resolve-ActivePrHeadSnapshot}
     $resolveChangePath =
         ${function:Resolve-ActivePrIterationChangePath}
+    $getSharedEvidencePlan =
+        ${function:Get-ActivePrSharedEvidencePlan}
     $handler = {
         param([string]$Operation, [Collections.IDictionary]$Request)
         $budget = if ($null -ne $Request['timeoutMilliseconds']) {
@@ -2769,15 +2899,24 @@ print(json.dumps({
                 $orderedChangeEntries = @(
                     $changeEntries |
                         Sort-Object path, changeTrackingId)
-                if ($orderedChangeEntries.Count -gt 0 -and
+                $evidencePlan =
+                    & $getSharedEvidencePlan `
+                        -Inventory $orderedChangeEntries
+                $evidenceChangeEntries =
+                    @($evidencePlan.evidenceEntries)
+                if ($evidenceChangeEntries.Count -gt 0 -and
                     $fileStartOrdinal -ge
-                        $orderedChangeEntries.Count) {
+                        $evidenceChangeEntries.Count) {
+                    throw 'file-progress-invalid'
+                }
+                if ($evidenceChangeEntries.Count -eq 0 -and
+                    $fileStartOrdinal -ne 0) {
                     throw 'file-progress-invalid'
                 }
                 $chunkFileLimit =
                     [Math]::Min($maxFiles, 16)
                 $selectedChangeEntries = @(
-                    $orderedChangeEntries |
+                    $evidenceChangeEntries |
                         Select-Object `
                             -Skip $fileStartOrdinal `
                             -First $chunkFileLimit)
@@ -2793,6 +2932,24 @@ print(json.dumps({
                                         [string]$_.changeType
                                     originalPath =
                                         $_.originalPath
+                                }
+                            })
+                $evidencePlanDigest =
+                    & $digestCommand @(
+                        $evidencePlan.inventory |
+                            ForEach-Object {
+                                [ordered]@{
+                                    changeTrackingId =
+                                        [int]$_.changeTrackingId
+                                    path = [string]$_.path
+                                    changeType =
+                                        [string]$_.changeType
+                                    originalPath =
+                                        $_.originalPath
+                                    evidenceDisposition =
+                                        [string]$_.evidenceDisposition
+                                    evidenceReason =
+                                        [string]$_.evidenceReason
                                 }
                             })
                 $normalized = [Collections.Generic.List[object]]::new()
@@ -3154,10 +3311,16 @@ print(json.dumps({
                         $lineBudgetConsumed
                     entries = $normalized.ToArray()
                     projectContexts = @($projectContexts.Values)
+                    inventory =
+                        @($evidencePlan.inventory)
                     fileProgress = [ordered]@{
                         inventoryDigest =
                             $inventoryDigest
+                        evidencePlanDigest =
+                            $evidencePlanDigest
                         totalFiles =
+                            $evidenceChangeEntries.Count
+                        totalInventoryFiles =
                             $orderedChangeEntries.Count
                         startOrdinal =
                             $fileStartOrdinal
@@ -3165,7 +3328,7 @@ print(json.dumps({
                             $nextFileOrdinal
                         complete =
                             $nextFileOrdinal -ge
-                                $orderedChangeEntries.Count
+                                $evidenceChangeEntries.Count
                         cumulativeChangedLines =
                             $changedLines
                     }
