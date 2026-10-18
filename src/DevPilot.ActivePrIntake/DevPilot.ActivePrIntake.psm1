@@ -2099,7 +2099,8 @@ function New-ActivePrAzureDevOpsProvider {
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$Config,
         [string]$AzureCliPath = 'az',
-        [Parameter(DontShow)][string]$ConnectionDataToolPath = ''
+        [Parameter(DontShow)][string]$ConnectionDataToolPath = '',
+        [Parameter(DontShow)][scriptblock]$HttpGetInvoker
     )
     Assert-IntakeConfig $Config
     $org = [string]$Config.organization
@@ -2445,6 +2446,73 @@ print(json.dumps({
         $tokenState.AccessToken =
             [string]$response.accessToken
         return [string]$tokenState.AccessToken
+    }.GetNewClosure()
+    $invokeGitJsonGet = {
+        param(
+            [string]$PathAndQuery,
+            [DateTime]$Deadline
+        )
+        if ($transportReads.Count -ge $readCeiling) {
+            throw 'read-budget'
+        }
+        $token = & $getAccessToken $Deadline
+        $remainingSeconds = [int][Math]::Max(
+            1,
+            [Math]::Ceiling(
+                ($Deadline - [DateTime]::UtcNow).
+                    TotalSeconds))
+        $uri = (
+            $org.TrimEnd('/') + '/' +
+            [Uri]::EscapeDataString($project) +
+            '/_apis/git/repositories/' +
+            [Uri]::EscapeDataString($repo) +
+            '/' + $PathAndQuery)
+        $transportReads.Count++
+        try {
+            $request = @{
+                Uri = $uri
+                Method = 'Get'
+                Headers = @{
+                    Authorization = ('Bearer ' + $token)
+                }
+                TimeoutSec = $remainingSeconds
+                UseBasicParsing = $true
+            }
+            $response = if ($null -eq $HttpGetInvoker) {
+                Invoke-WebRequest @request
+            }
+            else {
+                & $HttpGetInvoker @request
+            }
+        }
+        catch {
+            $failure = [InvalidOperationException]::new(
+                'read-inaccessible')
+            $failure.Data['transportStage'] =
+                'http-response'
+            $failure.Data['underlyingExceptionType'] =
+                $_.Exception.GetType().Name
+            if ($null -ne $_.Exception.Response) {
+                $failure.Data['httpStatus'] =
+                    [int]$_.Exception.Response.StatusCode
+            }
+            throw $failure
+        }
+        if ([long]$response.RawContentLength -lt 0 -or
+            [long]$response.RawContentLength -gt
+                16777216) {
+            throw 'read-budget'
+        }
+        try {
+            $content = ([string]$response.Content).
+                TrimStart([char]0xFEFF)
+            return ConvertFrom-Json `
+                -InputObject $content `
+                -AsHashtable -Depth 32
+        }
+        catch {
+            throw 'response-invalid'
+        }
     }.GetNewClosure()
     $invokeItemsGet = {
         param(
@@ -2792,22 +2860,29 @@ print(json.dumps({
             }
             Head {
                 $id = [int]$Request.pullRequestId
-                $r = & $invoke 'git' 'pullRequests' @(
-                    "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
-                $iterations = & $invoke 'git' 'pullRequestIterations' @(
-                    "project=$project", "repositoryId=$repo", "pullRequestId=$id") @() $deadline
+                $r = & $invokeGitJsonGet (
+                    'pullRequests/' +
+                    [Uri]::EscapeDataString(
+                        [string]$id) +
+                    '?api-version=7.1') $deadline
+                $iterations = & $invokeGitJsonGet (
+                    'pullRequests/' +
+                    [Uri]::EscapeDataString(
+                        [string]$id) +
+                    '/iterations?api-version=7.1') $deadline
                 $list = @($iterations.value)
                 $sourceRefName = [string]$r.sourceRefName
                 if ($sourceRefName -cnotmatch
                     '^refs/heads/(?<filter>.+)$') {
                     throw 'head-inconsistent'
                 }
-                $refs = & $invoke 'git' 'refs' @(
-                    "project=$project",
-                    "repositoryId=$repo") @(
-                    "filter=heads/$($Matches.filter)",
-                    'includeStatuses=false',
-                    'peelTags=false') $deadline
+                $refs = & $invokeGitJsonGet (
+                    'refs?filter=' +
+                    [Uri]::EscapeDataString(
+                        "heads/$($Matches.filter)") +
+                    '&includeStatuses=false' +
+                    '&peelTags=false' +
+                    '&api-version=7.1') $deadline
                 return & $resolveHeadSnapshot `
                     -PullRequest $r `
                     -Iterations $list `
