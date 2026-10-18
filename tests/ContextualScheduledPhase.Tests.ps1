@@ -2,6 +2,8 @@
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $repoRoot `
+        'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
     $producer = Join-Path $repoRoot `
         'tools\Invoke-ContextualDeliveryBatchJson.ps1'
     $phase = Join-Path $repoRoot `
@@ -30,6 +32,7 @@ Describe 'Contextual scheduled observation disposition' {
             findingsComplete = $true
             counts = [ordered]@{
                 unknown = 0
+                uncovered = 0
             }
             effects = [ordered]@{
                 providerWrites = 0
@@ -61,6 +64,18 @@ Describe 'Contextual scheduled observation disposition' {
     It 'withholds an ambiguous discussion without treating it as unsafe' {
         $observation.findingsComplete = $false
         $observation.effects.dedupe.unknown = 1
+        $observation.findings = @([ordered]@{
+                anchor = [ordered]@{
+                    path = 'src/Test.cs'
+                    line = 10
+                }
+                constructRef = 'construct:unknown'
+                ruleId = 'explicit-string-comparison'
+                reconciliation = [ordered]@{
+                    classification = 'unknown'
+                    reason = 'other-review-at-anchor'
+                }
+            })
 
         $result =
             Get-ContextualScheduledObservationDisposition `
@@ -72,6 +87,47 @@ Describe 'Contextual scheduled observation disposition' {
         $result.reason |
             Should -BeExactly discussion-reconciliation-unknown
         $result.reconciliationUnknown | Should -Be 1
+    }
+
+    It 'delivers known findings beside disjoint discussion unknowns' {
+        $observation.findingsComplete = $false
+        $observation.effects.dedupe.unknown = 1
+        $observation.findings = @(
+            [ordered]@{
+                anchor = [ordered]@{
+                    path = 'src/Test.cs'
+                    line = 10
+                }
+                constructRef = 'construct:unknown'
+                ruleId = 'explicit-string-comparison'
+                reconciliation = [ordered]@{
+                    classification = 'unknown'
+                    reason = 'other-review-at-anchor'
+                }
+            },
+            [ordered]@{
+                anchor = [ordered]@{
+                    path = 'src/Test.cs'
+                    line = 20
+                }
+                constructRef = 'construct:actionable'
+                ruleId = 'http-client-lifetime'
+                reconciliation = [ordered]@{
+                    classification = 'wouldCreate'
+                    reason = 'no-current-review-at-anchor'
+                }
+            })
+
+        $result =
+            Get-ContextualScheduledObservationDisposition `
+                -Observation $observation `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison',
+                    'http-client-lifetime')
+
+        $result.deliverable | Should -BeTrue
+        $result.reason |
+            Should -BeExactly actionable-with-isolated-discussion-unknown
     }
 
     It 'still rejects observations that report provider writes' {

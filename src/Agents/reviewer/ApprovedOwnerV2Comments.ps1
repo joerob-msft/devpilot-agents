@@ -243,6 +243,27 @@ function Test-ApprovedContextualActionablePartial {
             [string]$_.reconciliation.classification -ceq
                 'wouldCreate'
         })
+    $unknownAnchors = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $unknownConstructs = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($finding in $unknown) {
+        [void]$unknownAnchors.Add(
+            "$([string]$finding.anchor.path)|$([int]$finding.anchor.line)")
+        if (-not [string]::IsNullOrWhiteSpace(
+                [string]$finding.constructRef)) {
+            [void]$unknownConstructs.Add(
+                [string]$finding.constructRef)
+        }
+    }
+    $overlap = @($actionable | Where-Object {
+            $unknownAnchors.Contains(
+                "$([string]$_.anchor.path)|$([int]$_.anchor.line)") -or
+            (-not [string]::IsNullOrWhiteSpace(
+                    [string]$_.constructRef) -and
+                $unknownConstructs.Contains(
+                    [string]$_.constructRef))
+        }).Count -gt 0
     return (
         -not [bool]$Observation.findingsComplete -and
         [int]$Observation.counts.unknown -eq 0 -and
@@ -250,6 +271,7 @@ function Test-ApprovedContextualActionablePartial {
         @($Observation.validationErrors).Count -eq 0 -and
         $unknown.Count -gt 0 -and
         $actionable.Count -gt 0 -and
+        -not $overlap -and
         [int]$Observation.effects.dedupe.unknown -eq
             $unknown.Count -and
         @($unknown | Where-Object {

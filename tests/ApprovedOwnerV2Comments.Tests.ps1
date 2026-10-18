@@ -739,12 +739,22 @@ Describe 'Approved Owner v2 review and approval packages' {
             }
             findings = @(
                 [ordered]@{
+                    anchor = [ordered]@{
+                        path = 'src/Test.cs'
+                        line = 10
+                    }
+                    constructRef = 'construct:unknown'
                     reconciliation = [ordered]@{
                         classification = 'unknown'
                         reason = 'other-review-at-anchor'
                     }
                 },
                 [ordered]@{
+                    anchor = [ordered]@{
+                        path = 'src/Test.cs'
+                        line = 20
+                    }
+                    constructRef = 'construct:actionable'
                     reconciliation = [ordered]@{
                         classification = 'wouldCreate'
                         reason = 'no-current-review-at-anchor'
@@ -764,6 +774,18 @@ Describe 'Approved Owner v2 review and approval packages' {
         $observation.findings[0].
             reconciliation.reason =
             'other-review-at-anchor'
+        $observation.findings[1].anchor.line = 10
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+        $observation.findings[1].anchor.line = 20
+        $observation.findings[1].constructRef =
+            'construct:unknown'
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+        $observation.findings[1].constructRef =
+            'construct:actionable'
         $observation.counts.unknown = 1
         Test-ApprovedContextualActionablePartial `
             -Observation $observation |

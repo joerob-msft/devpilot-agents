@@ -28,6 +28,14 @@ $WarningPreference = 'SilentlyContinue'
 [Console]::OutputEncoding =
     [Text.UTF8Encoding]::new($false)
 
+$approvedCommentsTool = Join-Path $ContextualToolkitRoot `
+    'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1'
+if (-not (Test-Path -LiteralPath $approvedCommentsTool `
+        -PathType Leaf)) {
+    throw 'contextual-phase-approved-comments-missing'
+}
+. $approvedCommentsTool
+
 function Get-ContextualScheduledObservationDisposition {
     param(
         [Parameter(Mandatory)]
@@ -56,9 +64,22 @@ function Get-ContextualScheduledObservationDisposition {
     $semanticUnknown = [int]$Observation.counts.unknown
     $reconciliationUnknown =
         [int]$Observation.effects.dedupe.unknown
+    $actionablePartial =
+        Test-ApprovedContextualActionablePartial `
+            -Observation $Observation
     if (-not [bool]$Observation.findingsComplete -or
         $semanticUnknown -gt 0 -or
         $reconciliationUnknown -gt 0) {
+        if ($actionablePartial) {
+            return [ordered]@{
+                deliverable = $true
+                reason =
+                    'actionable-with-isolated-discussion-unknown'
+                semanticUnknown = 0
+                reconciliationUnknown =
+                    $reconciliationUnknown
+            }
+        }
         return [ordered]@{
             deliverable = $false
             reason = $(if ($reconciliationUnknown -gt 0) {
