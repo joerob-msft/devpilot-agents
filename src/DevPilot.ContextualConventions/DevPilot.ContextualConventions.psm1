@@ -2103,35 +2103,59 @@ function Get-ContextualRoslynOutcomes {
             [string]$_.Identifier.ValueText -ceq
                 'HttpClient'
         }).Count -gt 0
-    $usingDirectives = @($nodes | Where-Object {
-            $_ -is [
-                Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax]
-        })
-    $usingSystemHttp = @($usingDirectives |
-        Where-Object {
-            $null -eq $_.Alias -and
-            ([string]$_.Name.ToString()) -replace
-                '^global::', '' -ceq
-                'System.Net.Http'
-        }).Count -gt 0
-    $httpAliases = @{}
-    foreach ($using in @($usingDirectives |
-            Where-Object { $null -ne $_.Alias })) {
-        $httpAliases[
-            [string]$using.Alias.Name.Identifier.ValueText
-        ] = ([string]$using.Name.ToString()) -replace
-            '^global::', ''
-    }
+    $getHttpUsingContext = {
+        param([Parameter(Mandatory)]$Node)
+        $applicable = [Collections.Generic.List[object]]::new()
+        foreach ($using in @($root.Usings)) {
+            [void]$applicable.Add($using)
+        }
+        foreach ($namespace in @($Node.Ancestors() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]
+                })) {
+            foreach ($using in @($namespace.Usings)) {
+                [void]$applicable.Add($using)
+            }
+        }
+        $aliases = @{}
+        foreach ($using in @($applicable |
+                Where-Object {
+                    $null -ne $_.Alias
+                })) {
+            $aliases[
+                [string]$using.Alias.Name.Identifier.ValueText
+            ] = ([string]$using.Name.ToString()) -replace
+                '^global::', ''
+        }
+        return [ordered]@{
+            usingSystemHttp = @($applicable |
+                Where-Object {
+                    $null -eq $_.Alias -and
+                    (([string]$_.Name.ToString()) -replace
+                        '^global::', '') -ceq
+                        'System.Net.Http'
+                }).Count -gt 0
+            aliases = $aliases
+        }
+    }.GetNewClosure()
     $resolveHttpClientType = {
-        param([Parameter(Mandatory)][string]$TypeText)
+        param(
+            [Parameter(Mandatory)][string]$TypeText,
+            [Parameter(Mandatory)]$Node
+        )
         $normalized = $TypeText -replace '^global::', ''
+        $usingContext =
+            & $getHttpUsingContext $Node
         if ($normalized -ceq
             'System.Net.Http.HttpClient') {
             return 'system'
         }
-        if ($httpAliases.ContainsKey($normalized)) {
+        if ($usingContext.aliases.ContainsKey(
+                $normalized)) {
             return $(if (
-                [string]$httpAliases[$normalized] -ceq
+                [string]$usingContext.aliases[
+                    $normalized] -ceq
                     'System.Net.Http.HttpClient'
             ) {
                 'system'
@@ -2142,40 +2166,47 @@ function Get-ContextualRoslynOutcomes {
             if ($localHttpClient) {
                 return 'shadowed'
             }
-            if ($usingSystemHttp) {
+            if ([bool]$usingContext.usingSystemHttp) {
                 return 'system'
             }
+            return 'unknown'
         }
-        return 'unknown'
+        if ($normalized -match
+            '(?:^|\.)HttpClient$') {
+            return 'unknown'
+        }
+        return 'not-http-client'
     }.GetNewClosure()
-    $staticReadonlyHttpClients = @(
-        $nodes | Where-Object {
-            $_ -is [
-                Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
-            [string]$_.Modifiers.ToString() -match '\bstatic\b' -and
-            [string]$_.Modifiers.ToString() -match '\breadonly\b' -and
-            (& $resolveHttpClientType (
-                [string]$_.Declaration.Type.ToString())) -ceq
-                'system'
-        } | ForEach-Object {
-            $_.Declaration.Variables |
-                ForEach-Object {
-                    [string]$_.Identifier.ValueText
-                }
-        })
-    foreach ($creation in @($nodes | Where-Object {
+    $getCreationType = {
+        param([Parameter(Mandatory)]$Creation)
+        if ($Creation -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax]) {
+            return [string]$Creation.Type.ToString()
+        }
+        $declaration = @($Creation.Ancestors() |
+            Where-Object {
                 $_ -is [
-                    Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax] -and
+                    Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclarationSyntax]
+            } | Select-Object -First 1)
+        if ($declaration.Count -eq 1) {
+            return [string]$declaration[0].Type.ToString()
+        }
+        return ''
+    }.GetNewClosure()
+    foreach ($creation in @($nodes | Where-Object {
+                ($_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax] -or
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.ImplicitObjectCreationExpressionSyntax]) -and
                 (Test-ContextualNodeChanged `
-                    -Node $_ -Spans $Spans) -and
-                (
-                    [string]$_.Type.ToString() -match
-                        '(?:^|\.)HttpClient$' -or
-                    $httpAliases.ContainsKey(
-                        [string]$_.Type.ToString())
-                )
+                    -Node $_ -Spans $Spans)
             })) {
-        $fullType = [string]$creation.Type.ToString()
+        $fullType =
+            & $getCreationType $creation
+        if ([string]::IsNullOrWhiteSpace(
+                $fullType)) {
+            continue
+        }
         $httpMethod = @($creation.Ancestors() |
             Where-Object {
                 $_ -is [
@@ -2194,7 +2225,11 @@ function Get-ContextualRoslynOutcomes {
         }
         else { 'file' }
         $typeState =
-            & $resolveHttpClientType $fullType
+            & $resolveHttpClientType $fullType $creation
+        if ($typeState -ceq
+            'not-http-client') {
+            continue
+        }
         if ($typeState -ceq 'shadowed') {
             $results['http-client-lifetime'] =
                 New-ContextualOutcome `
@@ -2231,11 +2266,43 @@ function Get-ContextualRoslynOutcomes {
             [string]$field[0].Modifiers.ToString() -match
                 '\bstatic\b' -and
             [string]$field[0].Modifiers.ToString() -match
-                '\breadonly\b'
+                '\breadonly\b' -and
+            (& $resolveHttpClientType (
+                [string]$field[0].Declaration.Type.ToString()
+            ) $field[0]) -ceq 'system'
         $staticConstructorAssignment = $false
         if ($constructor.Count -eq 1 -and
             [string]$constructor[0].Modifiers.ToString() -match
                 '\bstatic\b') {
+            $containingType = @(
+                $constructor[0].Ancestors() |
+                    Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                    } |
+                    Select-Object -First 1)
+            $sameTypeStaticReadonlyClients = if (
+                $containingType.Count -eq 1
+            ) {
+                @($containingType[0].Members |
+                    Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                        [string]$_.Modifiers.ToString() -match
+                            '\bstatic\b' -and
+                        [string]$_.Modifiers.ToString() -match
+                            '\breadonly\b' -and
+                        (& $resolveHttpClientType (
+                            [string]$_.Declaration.Type.ToString()
+                        ) $_) -ceq 'system'
+                    } | ForEach-Object {
+                        $_.Declaration.Variables |
+                            ForEach-Object {
+                                [string]$_.Identifier.ValueText
+                            }
+                    })
+            }
+            else { @() }
             $assignment = @($creation.Ancestors() |
                 Where-Object {
                     $_ -is [
@@ -2246,7 +2313,7 @@ function Get-ContextualRoslynOutcomes {
                     Split('.')[-1]
                 $staticConstructorAssignment =
                     $target -cin
-                        $staticReadonlyHttpClients
+                        $sameTypeStaticReadonlyClients
             }
         }
         if ($sharedField -or

@@ -343,6 +343,43 @@ Describe 'Contextual convention analyzer' {
             Should -BeExactly unknown
     }
 
+    It 'does not leak namespace imports or aliases across sibling namespaces' {
+        $usingLeak = 'namespace A { using System.Net.Http; class Imported { } } namespace B { using Foreign; class C { void M() { var c = new HttpClient(); } } }'
+        $aliasLeak = 'namespace A { using Client = Foreign.HttpClient; class Imported { } } namespace B { using Client = System.Net.Http.HttpClient; class C { void M() { var c = new Client(); } } }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $usingLeak).state |
+            Should -BeExactly unknown
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $aliasLeak).state |
+            Should -BeExactly violation
+    }
+
+    It 'flags target-typed System HttpClient construction' {
+        $content = 'using System.Net.Http; class C { void M() { HttpClient client = new(); } }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content).state |
+            Should -BeExactly violation
+    }
+
+    It 'does not mistake a readonly client factory delegate for a singleton' {
+        $content = 'using System; using System.Net.Http; class C { private static readonly Func<HttpClient> Factory = () => new HttpClient(); }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content).state |
+            Should -BeExactly violation
+    }
+
+    It 'binds static-constructor singleton proof to the same containing type' {
+        $content = 'using System.Net.Http; class A { private static readonly HttpClient Client = new HttpClient(); } class B { static B() { HttpClient Client; Client = new HttpClient(); } }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content).state |
+            Should -BeExactly violation
+    }
+
     It 'does not flag factory-managed client acquisition' {
         $content = 'using System.Net.Http; class C { private readonly IHttpClientFactory factory; C(IHttpClientFactory factory) { this.factory = factory; } HttpClient M() { return this.factory.CreateClient("managed"); } }'
         (Invoke-ConventionCase `
