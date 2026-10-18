@@ -28,14 +28,6 @@ $WarningPreference = 'SilentlyContinue'
 [Console]::OutputEncoding =
     [Text.UTF8Encoding]::new($false)
 
-$approvedCommentsTool = Join-Path $ContextualToolkitRoot `
-    'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1'
-if (-not (Test-Path -LiteralPath $approvedCommentsTool `
-        -PathType Leaf)) {
-    throw 'contextual-phase-approved-comments-missing'
-}
-. $approvedCommentsTool
-
 function Get-ContextualScheduledObservationDisposition {
     param(
         [Parameter(Mandatory)]
@@ -124,6 +116,13 @@ if ($LASTEXITCODE -ne 0 -or
         }).Count -ne 0) {
     throw 'contextual-phase-toolkit-mismatch'
 }
+$approvedCommentsTool = Join-Path $ContextualToolkitRoot `
+    'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1'
+if (-not (Test-Path -LiteralPath $approvedCommentsTool `
+        -PathType Leaf)) {
+    throw 'contextual-phase-approved-comments-missing'
+}
+. $approvedCommentsTool
 foreach ($path in @(
         $ContextualConfigPath,
         $SharedAcquisitionPath,
