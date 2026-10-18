@@ -2103,22 +2103,99 @@ function Get-ContextualRoslynOutcomes {
             [string]$_.Identifier.ValueText -ceq
                 'HttpClient'
         }).Count -gt 0
-    $usingSystemHttp = @($root.Usings |
+    $usingDirectives = @($nodes | Where-Object {
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax]
+        })
+    $usingSystemHttp = @($usingDirectives |
         Where-Object {
-            [string]$_.Name.ToString() -ceq
+            $null -eq $_.Alias -and
+            ([string]$_.Name.ToString()) -replace
+                '^global::', '' -ceq
                 'System.Net.Http'
         }).Count -gt 0
+    $httpAliases = @{}
+    foreach ($using in @($usingDirectives |
+            Where-Object { $null -ne $_.Alias })) {
+        $httpAliases[
+            [string]$using.Alias.Name.Identifier.ValueText
+        ] = ([string]$using.Name.ToString()) -replace
+            '^global::', ''
+    }
+    $resolveHttpClientType = {
+        param([Parameter(Mandatory)][string]$TypeText)
+        $normalized = $TypeText -replace '^global::', ''
+        if ($normalized -ceq
+            'System.Net.Http.HttpClient') {
+            return 'system'
+        }
+        if ($httpAliases.ContainsKey($normalized)) {
+            return $(if (
+                [string]$httpAliases[$normalized] -ceq
+                    'System.Net.Http.HttpClient'
+            ) {
+                'system'
+            }
+            else { 'unknown' })
+        }
+        if ($normalized -ceq 'HttpClient') {
+            if ($localHttpClient) {
+                return 'shadowed'
+            }
+            if ($usingSystemHttp) {
+                return 'system'
+            }
+        }
+        return 'unknown'
+    }.GetNewClosure()
+    $staticReadonlyHttpClients = @(
+        $nodes | Where-Object {
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+            [string]$_.Modifiers.ToString() -match '\bstatic\b' -and
+            [string]$_.Modifiers.ToString() -match '\breadonly\b' -and
+            (& $resolveHttpClientType (
+                [string]$_.Declaration.Type.ToString())) -ceq
+                'system'
+        } | ForEach-Object {
+            $_.Declaration.Variables |
+                ForEach-Object {
+                    [string]$_.Identifier.ValueText
+                }
+        })
     foreach ($creation in @($nodes | Where-Object {
                 $_ -is [
                     Microsoft.CodeAnalysis.CSharp.Syntax.ObjectCreationExpressionSyntax] -and
                 (Test-ContextualNodeChanged `
                     -Node $_ -Spans $Spans) -and
-                [string]$_.Type.ToString() -match
-                    '(?:^|\.)HttpClient$'
+                (
+                    [string]$_.Type.ToString() -match
+                        '(?:^|\.)HttpClient$' -or
+                    $httpAliases.ContainsKey(
+                        [string]$_.Type.ToString())
+                )
             })) {
         $fullType = [string]$creation.Type.ToString()
-        if ($localHttpClient -and
-            $fullType -ceq 'HttpClient') {
+        $httpMethod = @($creation.Ancestors() |
+            Where-Object {
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax]
+            } | Select-Object -First 1)
+        $httpConstructor = @($creation.Ancestors() |
+            Where-Object {
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
+            } | Select-Object -First 1)
+        $httpSymbol = if ($httpMethod.Count -eq 1) {
+            [string]$httpMethod[0].Identifier.ValueText
+        }
+        elseif ($httpConstructor.Count -eq 1) {
+            [string]$httpConstructor[0].Identifier.ValueText
+        }
+        else { 'file' }
+        $typeState =
+            & $resolveHttpClientType $fullType
+        if ($typeState -ceq 'shadowed') {
             $results['http-client-lifetime'] =
                 New-ContextualOutcome `
                     -RuleId http-client-lifetime `
@@ -2126,12 +2203,11 @@ function Get-ContextualRoslynOutcomes {
                     -Reason http-client-type-shadowed `
                     -Path $Path `
                     -Line (Get-ContextualNodeLine $creation) `
-                    -EndLine (Get-ContextualNodeLine $creation)
+                    -EndLine (Get-ContextualNodeLine $creation) `
+                    -Symbol $httpSymbol
             continue
         }
-        if ($fullType -cne
-                'System.Net.Http.HttpClient' -and
-            -not $usingSystemHttp) {
+        if ($typeState -cne 'system') {
             $results['http-client-lifetime'] =
                 New-ContextualOutcome `
                     -RuleId http-client-lifetime `
@@ -2139,7 +2215,8 @@ function Get-ContextualRoslynOutcomes {
                     -Reason http-client-type-unproven `
                     -Path $Path `
                     -Line (Get-ContextualNodeLine $creation) `
-                    -EndLine (Get-ContextualNodeLine $creation)
+                    -EndLine (Get-ContextualNodeLine $creation) `
+                    -Symbol $httpSymbol
             continue
         }
         $field = @($creation.Ancestors() |
@@ -2147,26 +2224,67 @@ function Get-ContextualRoslynOutcomes {
                 $_ -is [
                     Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax]
             } | Select-Object -First 1)
-        $constructor = @($creation.Ancestors() |
-            Where-Object {
-                $_ -is [
-                    Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
-            } | Select-Object -First 1)
-        $factory = $Content -match '\bIHttpClientFactory\b'
-        if ($field.Count -eq 0 -and
-            $constructor.Count -eq 0 -and
-            -not $factory) {
+        $constructor = $httpConstructor
+        $customHandler =
+            $creation.ArgumentList.Arguments.Count -gt 0
+        $sharedField = $field.Count -eq 1 -and
+            [string]$field[0].Modifiers.ToString() -match
+                '\bstatic\b' -and
+            [string]$field[0].Modifiers.ToString() -match
+                '\breadonly\b'
+        $staticConstructorAssignment = $false
+        if ($constructor.Count -eq 1 -and
+            [string]$constructor[0].Modifiers.ToString() -match
+                '\bstatic\b') {
+            $assignment = @($creation.Ancestors() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.AssignmentExpressionSyntax]
+                } | Select-Object -First 1)
+            if ($assignment.Count -eq 1) {
+                $target = ([string]$assignment[0].Left.ToString()).
+                    Split('.')[-1]
+                $staticConstructorAssignment =
+                    $target -cin
+                        $staticReadonlyHttpClients
+            }
+        }
+        if ($sharedField -or
+            $staticConstructorAssignment) {
             $results['http-client-lifetime'] =
                 New-ContextualOutcome `
                     -RuleId http-client-lifetime `
-                    -State violation `
-                    -Reason request-path-http-client-construction `
+                    -State compliant `
+                    -Reason shared-http-client-singleton `
                     -Path $Path `
                     -Line (Get-ContextualNodeLine $creation) `
                     -EndLine (Get-ContextualNodeLine $creation) `
-                    -Evidence (
-                        'Reuse System.Net.Http.HttpClient or use IHttpClientFactory.')
+                    -Symbol $httpSymbol
+            continue
         }
+        if ($customHandler) {
+            $results['http-client-lifetime'] =
+                New-ContextualOutcome `
+                    -RuleId http-client-lifetime `
+                    -State unknown `
+                    -Reason custom-handler-lifetime-unproven `
+                    -Path $Path `
+                    -Line (Get-ContextualNodeLine $creation) `
+                    -EndLine (Get-ContextualNodeLine $creation) `
+                    -Symbol $httpSymbol
+            continue
+        }
+        $results['http-client-lifetime'] =
+            New-ContextualOutcome `
+                -RuleId http-client-lifetime `
+                -State violation `
+                -Reason request-path-http-client-construction `
+                -Path $Path `
+                -Line (Get-ContextualNodeLine $creation) `
+                -EndLine (Get-ContextualNodeLine $creation) `
+                -Symbol $httpSymbol `
+                -Evidence (
+                    'Reuse System.Net.Http.HttpClient or use IHttpClientFactory.')
     }
 
     $staticFields = @($nodes | Where-Object {
@@ -2392,7 +2510,16 @@ function Get-ContextualRoslynOutcomes {
                     }).Count -gt 0
             })
         if ($changedCandidates.Count -gt 0) {
-            $results[$rule] = $changedCandidates[-1]
+            $results[$rule] = if ($rule -ceq
+                'http-client-lifetime') {
+                @($changedCandidates |
+                    Sort-Object {
+                        [int]$_.line
+                    })[0]
+            }
+            else {
+                $changedCandidates[-1]
+            }
             continue
         }
         $outcome = $results[$rule]

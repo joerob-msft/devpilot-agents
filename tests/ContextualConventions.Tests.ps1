@@ -238,6 +238,119 @@ Describe 'Contextual convention analyzer' {
             Should -BeExactly unknown
     }
 
+    It 'flags default HttpClient construction with a namespace-scoped using' {
+        $content = @(
+            'namespace Fixture'
+            '{'
+            '    using System.Net.Http;'
+            '    class C'
+            '    {'
+            '        void M()'
+            '        {'
+            '            using (var client = new HttpClient())'
+            '            {'
+            '            }'
+            '        }'
+            '    }'
+            '}'
+        ) -join "`n"
+        $outcome = Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content
+        $outcome.state | Should -BeExactly violation
+        $outcome.reason |
+            Should -BeExactly request-path-http-client-construction
+        $outcome.line | Should -Be 8
+        $outcome.symbol | Should -BeExactly M
+    }
+
+    It 'selects the first default construction after custom-handler test clients' {
+        $content = @(
+            'namespace Fixture'
+            '{'
+            '    using System.Net.Http;'
+            '    class C'
+            '    {'
+            '        void M(HttpMessageHandler handler)'
+            '        {'
+            '            using (var configured = new HttpClient(handler))'
+            '            {'
+            '            }'
+            '            using (var backendClient = new HttpClient())'
+            '            {'
+            '            }'
+            '            using (var gatewayClient = new HttpClient())'
+            '            {'
+            '            }'
+            '        }'
+            '    }'
+            '}'
+        ) -join "`n"
+        $outcome = Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 11
+        $outcome.symbol | Should -BeExactly M
+    }
+
+    It 'withholds custom-handler lifetime without exempting default construction' {
+        $content = 'using System.Net.Http; class C { void M(HttpMessageHandler handler) { using var client = new HttpClient(handler); } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content
+        $outcome.state | Should -BeExactly unknown
+        $outcome.reason |
+            Should -BeExactly custom-handler-lifetime-unproven
+    }
+
+    It 'accepts static readonly and static-constructor singletons' {
+        $controls = @(
+            'using System.Net.Http; class C { private static readonly HttpClient Client = new HttpClient(); }',
+            'using System.Net.Http; class C { private static readonly HttpClient Client; static C() { C.Client = new HttpClient(); } }'
+        )
+        foreach ($content in $controls) {
+            (Invoke-ConventionCase `
+                -RuleId http-client-lifetime `
+                -Content $content).state |
+                Should -Not -BeExactly violation
+        }
+    }
+
+    It 'flags instance-owned default HttpClient construction' {
+        $controls = @(
+            'using System.Net.Http; class C { private readonly HttpClient client = new HttpClient(); }',
+            'using System.Net.Http; class C { private readonly HttpClient client; C() { this.client = new HttpClient(); } }'
+        )
+        foreach ($content in $controls) {
+            (Invoke-ConventionCase `
+                -RuleId http-client-lifetime `
+                -Content $content).state |
+                Should -BeExactly violation
+        }
+    }
+
+    It 'resolves System HttpClient aliases and withholds foreign aliases' {
+        $system = 'using Client = System.Net.Http.HttpClient; class C { void M() { using var client = new Client(); } }'
+        $foreign = 'using HttpClient = Custom.HttpClient; class C { void M() { var client = new HttpClient(); } }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $system).state |
+            Should -BeExactly violation
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $foreign).state |
+            Should -BeExactly unknown
+    }
+
+    It 'does not flag factory-managed client acquisition' {
+        $content = 'using System.Net.Http; class C { private readonly IHttpClientFactory factory; C(IHttpClientFactory factory) { this.factory = factory; } HttpClient M() { return this.factory.CreateClient("managed"); } }'
+        (Invoke-ConventionCase `
+            -RuleId http-client-lifetime `
+            -Content $content).state |
+            Should -Not -BeExactly violation
+    }
+
     It 'does not treat a successful HttpResponseMessage as an API error' {
         $content = 'class CController { [HttpGet] HttpResponseMessage M() { return new HttpResponseMessage(HttpStatusCode.OK); } }'
         (Invoke-ConventionCase `
