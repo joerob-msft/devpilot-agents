@@ -350,6 +350,43 @@ function Format-ContextualConventionComment {
     ) -join "`n"
 }
 
+function Test-ContextualRuleBindingShape {
+    param([AllowNull()][object]$Value)
+    if ($Value -isnot
+        [Collections.IDictionary]) {
+        return $false
+    }
+    $keys = @($Value.Keys |
+        ForEach-Object { [string]$_ } |
+        Sort-Object -CaseSensitive)
+    return (
+        ($keys -join "`n") -ceq
+            "hash`nlength" -and
+        [string]$Value.hash -cmatch
+            '^v1:sha256:[0-9a-f]{64}$' -and
+        [long]$Value.length -gt 0)
+}
+
+function Test-ContextualRuleIdSet {
+    param([AllowNull()][object]$Values)
+    $ids = @($Values)
+    $registered = @(
+        Get-ContextualConventionRuleIds)
+    return (
+        $ids.Count -ge 1 -and
+        $ids.Count -le 64 -and
+        @($ids |
+            Sort-Object -Unique `
+                -CaseSensitive).Count -eq
+            $ids.Count -and
+        @($ids | Where-Object {
+                [string]$_ -cnotmatch
+                    '^[a-z][a-z0-9-]{0,127}$' -or
+                [string]$_ -cnotin
+                    $registered
+            }).Count -eq 0)
+}
+
 function Test-ContextualPriorRuleCompatibility {
     param(
         [AllowNull()][object]$Compatibility,
@@ -362,33 +399,50 @@ function Test-ContextualPriorRuleCompatibility {
             [Collections.IDictionary]) {
         return $false
     }
-    if ($Compatibility.currentRule -isnot
-        [Collections.IDictionary] -or
+    $schema = [int]$Compatibility.
+        schemaVersion
+    $expectedKeys = if ($schema -eq 1) {
+        @(
+            'currentRule',
+            'kind',
+            'previousRule',
+            'schemaVersion',
+            'unchangedRuleIds')
+    }
+    elseif ($schema -eq 2) {
+        @(
+            'currentRule',
+            'kind',
+            'previousRules',
+            'schemaVersion')
+    }
+    else { @() }
+    $actualKeys = @($Compatibility.Keys |
+        ForEach-Object { [string]$_ } |
+        Sort-Object -CaseSensitive)
+    if ($expectedKeys.Count -eq 0 -or
+        ($actualKeys -join "`n") -cne
+            ($expectedKeys -join "`n") -or
         [string]$Compatibility.kind -cne
-            'contextual-additive-rule-history-compatibility') {
-        return $false
-    }
-    foreach ($binding in @(
-            $Compatibility.currentRule)) {
-        $bindingKeys = @($binding.Keys |
-            ForEach-Object { [string]$_ } |
-            Sort-Object -CaseSensitive)
-        if (($bindingKeys -join "`n") -cne
-            "hash`nlength" -or
-            [string]$binding.hash -cnotmatch
-                '^v1:sha256:[0-9a-f]{64}$' -or
-            [long]$binding.length -lt 1) {
-            return $false
-        }
-    }
-    if ([string]$Compatibility.currentRule.hash -cne
+            'contextual-additive-rule-history-compatibility' -or
+        -not (Test-ContextualRuleBindingShape `
+            $Compatibility.currentRule) -or
+        [string]$Compatibility.currentRule.hash -cne
             [string]$Request.RuleHash -or
         [long]$Compatibility.currentRule.length -ne
             [long]$Request.RuleLength) {
         return $false
     }
     $previousEntries = if (
-        [int]$Compatibility.schemaVersion -eq 1) {
+        $schema -eq 1) {
+        if (-not (
+                Test-ContextualRuleBindingShape `
+                    $Compatibility.previousRule) -or
+            -not (
+                Test-ContextualRuleIdSet `
+                    $Compatibility.unchangedRuleIds)) {
+            return $false
+        }
         @([ordered]@{
                 rule =
                     $Compatibility.previousRule
@@ -396,40 +450,60 @@ function Test-ContextualPriorRuleCompatibility {
                     $Compatibility.unchangedRuleIds
             })
     }
-    elseif ([int]$Compatibility.schemaVersion -eq 2) {
-        @($Compatibility.previousRules)
-    }
-    else { @() }
-    foreach ($entry in $previousEntries) {
-        if ($entry -isnot
-                [Collections.IDictionary] -or
-            $entry.rule -isnot
-                [Collections.IDictionary]) {
-            continue
+    else {
+        $values = @(
+            $Compatibility.previousRules)
+        if ($values.Count -lt 1 -or
+            $values.Count -gt 8) {
+            return $false
         }
-        $bindingKeys = @($entry.rule.Keys |
-            ForEach-Object { [string]$_ } |
-            Sort-Object -CaseSensitive)
+        $bindings =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
+        foreach ($entry in $values) {
+            if ($entry -isnot
+                    [Collections.IDictionary]) {
+                return $false
+            }
+            $entryKeys = @($entry.Keys |
+                ForEach-Object {
+                    [string]$_
+                } |
+                Sort-Object -CaseSensitive)
+            if (($entryKeys -join "`n") -cne
+                    "rule`nunchangedRuleIds" -or
+                -not (
+                    Test-ContextualRuleBindingShape `
+                        $entry.rule) -or
+                -not (
+                    Test-ContextualRuleIdSet `
+                        $entry.unchangedRuleIds)) {
+                return $false
+            }
+            $key = [string]$entry.rule.hash +
+                '|' +
+                [string][long]$entry.rule.length
+            if (-not $bindings.Add($key) -or
+                ([string]$entry.rule.hash -ceq
+                        [string]$Compatibility.
+                            currentRule.hash -and
+                    [long]$entry.rule.length -eq
+                        [long]$Compatibility.
+                            currentRule.length)) {
+                return $false
+            }
+        }
+        $values
+    }
+    foreach ($entry in $previousEntries) {
         $unchanged = @(
             $entry.unchangedRuleIds)
-        if (($bindingKeys -join "`n") -ceq
-                "hash`nlength" -and
-            [string]$entry.rule.hash -ceq
+        if ([string]$entry.rule.hash -ceq
                 [string]$PriorRule.hash -and
             [long]$entry.rule.length -eq
                 [long]$PriorRule.length -and
             [string]$RuleId -cin
-                $unchanged -and
-            $unchanged.Count -ge 1 -and
-            $unchanged.Count -le 64 -and
-            @($unchanged |
-                Sort-Object -Unique `
-                    -CaseSensitive).Count -eq
-                $unchanged.Count -and
-            @($unchanged | Where-Object {
-                    [string]$_ -cnotmatch
-                        '^[a-z][a-z0-9-]{0,127}$'
-                }).Count -eq 0) {
+                $unchanged) {
             return $true
         }
     }

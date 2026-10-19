@@ -1358,9 +1358,8 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     -Compatibility $RuleCompatibility `
                     -CurrentRule (
                         $RuleCompatibility.currentRule) `
-                    -AllowedRuleIds @(
-                        $RuleCompatibility.
-                            unchangedRuleIds)
+                    -AllowedRuleIds `
+                        $script:ApprovedContextualRuleIds
         }
         [void]$proofs.Add($proof)
     }

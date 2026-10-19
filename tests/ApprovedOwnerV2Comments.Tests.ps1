@@ -965,6 +965,56 @@ Describe 'Approved Owner v2 review and approval packages' {
         } | Should -Throw '*is invalid*'
     }
 
+    It 'reads authenticated history with schema-v2 compatibility under StrictMode' {
+        $history =
+            New-TestAuthenticatedContextualHistory
+        $compatibility = [ordered]@{
+            schemaVersion = 2
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRules = @(
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:' +
+                            ('8' * 64)
+                        length = 4815
+                    }
+                    unchangedRuleIds = @(
+                        'explicit-string-comparison')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+                        length = 5205
+                    }
+                    unchangedRuleIds = @(
+                        'http-client-lifetime')
+                })
+            currentRule = [ordered]@{
+                hash =
+                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                length = 5399
+            }
+        }
+
+        $proofs =
+            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key $history.Key `
+                -Delivery contextual-conventions `
+                -RuleCompatibility $compatibility)
+
+        $proofs | Should -HaveCount 1
+        [int]$proofs[0].
+            ruleCompatibility.schemaVersion |
+            Should -Be 2
+        @($proofs[0].
+                ruleCompatibility.previousRules) |
+            Should -HaveCount 2
+    }
+
     It 'binds additive history compatibility into the signed contextual policy' {
         $evidence =
             New-TestOwnerV2Evidence
