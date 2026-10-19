@@ -106,6 +106,74 @@ function Assert-ApprovedOwnerV2ExactKeys {
     }
 }
 
+function Assert-ApprovedOwnerV2RuleCompatibility {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Compatibility,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$CurrentRule,
+        [Parameter(Mandatory)][string[]]$AllowedRuleIds
+    )
+    Assert-ApprovedOwnerV2ExactKeys `
+        -Value $Compatibility `
+        -Name ruleCompatibility `
+        -Expected @(
+            'schemaVersion',
+            'kind',
+            'previousRule',
+            'currentRule',
+            'unchangedRuleIds')
+    foreach ($entry in @(
+            [pscustomobject]@{
+                Name = 'ruleCompatibility.previousRule'
+                Value = $Compatibility.previousRule
+            },
+            [pscustomobject]@{
+                Name = 'ruleCompatibility.currentRule'
+                Value = $Compatibility.currentRule
+            })) {
+        if ($entry.Value -isnot
+                [Collections.IDictionary]) {
+            throw "$($entry.Name) must be an exact rule binding."
+        }
+        Assert-ApprovedOwnerV2ExactKeys `
+            -Value $entry.Value `
+            -Name $entry.Name `
+            -Expected @('hash', 'length')
+        if ([string]$entry.Value.hash -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            [long]$entry.Value.length -lt 1) {
+            throw "$($entry.Name) is invalid."
+        }
+    }
+    $ids = @($Compatibility.unchangedRuleIds)
+    if ([int]$Compatibility.schemaVersion -ne 1 -or
+        [string]$Compatibility.kind -cne
+            'contextual-additive-rule-history-compatibility' -or
+        $ids.Count -lt 1 -or
+        $ids.Count -gt 64 -or
+        @($ids | Sort-Object -Unique -CaseSensitive).Count -ne
+            $ids.Count -or
+        @($ids | Where-Object {
+                [string]$_ -cnotmatch
+                    '^[a-z][a-z0-9-]{0,127}$' -or
+                [string]$_ -cnotin $AllowedRuleIds
+            }).Count -ne 0 -or
+        [string]$Compatibility.currentRule.hash -cne
+            [string]$CurrentRule.hash -or
+        [long]$Compatibility.currentRule.length -ne
+            [long]$CurrentRule.length -or
+        ([string]$Compatibility.previousRule.hash -ceq
+                [string]$Compatibility.currentRule.hash -and
+            [long]$Compatibility.previousRule.length -eq
+                [long]$Compatibility.currentRule.length)) {
+        throw 'Rule compatibility is not an exact additive rule binding.'
+    }
+    return ConvertTo-ApprovedOwnerV2CanonicalJson `
+        $Compatibility |
+        ConvertFrom-Json -AsHashtable -Depth 32
+}
+
 function Get-ApprovedOwnerV2CapabilityRoot {
     param(
         [Parameter(Mandatory)][string]$StateRoot,
@@ -1051,7 +1119,9 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
             'owner',
             'named-areequal',
             'contextual-conventions')]
-        [string]$Delivery = 'owner'
+        [string]$Delivery = 'owner',
+        [AllowNull()]
+        [Collections.IDictionary]$RuleCompatibility
     )
     if (-not [IO.Path]::IsPathFullyQualified($DeliveryRoot) -or
         -not (Test-Path -LiteralPath $DeliveryRoot -PathType Container) -or
@@ -1174,7 +1244,7 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
             (Get-ApprovedOwnerV2Digest $event.subject)) {
             continue
         }
-        [void]$proofs.Add([ordered]@{
+        $proof = [ordered]@{
                 schemaVersion = 1
                 kind =
                     'owner-v2-authenticated-prior-comment'
@@ -1212,7 +1282,22 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     threadId = [long]$event.threadId
                     commentId = [long]$event.commentId
                 }
-            })
+            }
+        if ($null -ne $RuleCompatibility) {
+            if ($Delivery -cne
+                'contextual-conventions') {
+                throw 'Rule compatibility is contextual-only.'
+            }
+            $proof['ruleCompatibility'] =
+                Assert-ApprovedOwnerV2RuleCompatibility `
+                    -Compatibility $RuleCompatibility `
+                    -CurrentRule (
+                        $RuleCompatibility.currentRule) `
+                    -AllowedRuleIds @(
+                        $RuleCompatibility.
+                            unchangedRuleIds)
+        }
+        [void]$proofs.Add($proof)
     }
     return $proofs.ToArray()
 }

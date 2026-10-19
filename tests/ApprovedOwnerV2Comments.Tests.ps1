@@ -917,6 +917,153 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -Be 100
     }
 
+    It 'attaches only an exact validated additive rule compatibility proof' {
+        $history =
+            New-TestAuthenticatedContextualHistory
+        $compatibility = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRule = [ordered]@{
+                hash =
+                    'v1:sha256:' + ('8' * 64)
+                length = 4815
+            }
+            currentRule = [ordered]@{
+                hash =
+                    'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+                length = 5205
+            }
+            unchangedRuleIds = @(
+                'explicit-string-comparison')
+        }
+        $proofs =
+            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key $history.Key `
+                -Delivery contextual-conventions `
+                -RuleCompatibility $compatibility)
+
+        $proofs | Should -HaveCount 1
+        (Get-ApprovedOwnerV2Digest `
+                $proofs[0].ruleCompatibility) |
+            Should -BeExactly (
+                Get-ApprovedOwnerV2Digest `
+                    $compatibility)
+
+        $invalid = $compatibility |
+            ConvertTo-Json -Depth 16 |
+            ConvertFrom-Json -AsHashtable -Depth 16
+        $invalid.unchangedRuleIds =
+            @('not-in-current-roster')
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $invalid `
+                -CurrentRule $compatibility.currentRule `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison')
+        } | Should -Throw '*exact additive rule binding*'
+    }
+
+    It 'binds additive history compatibility into the signed contextual policy' {
+        $evidence =
+            New-TestOwnerV2Evidence
+        $evidence.Declaration.capability.id =
+            'bpm-contextual-conventions@1'
+        $evidence.Declaration.rule.path =
+            'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+        $evidence.Declaration.rule.section =
+            'bpm-contextual-conventions@1'
+        $evidence.Declaration.rule.hash =
+            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+        $evidence.Declaration.rule.length = 5205
+        $implementationPaths = [ordered]@{
+            parser = Join-Path $repoRoot `
+                'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
+            parserManifest = Join-Path $repoRoot `
+                'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1'
+            activePrIntake = Join-Path $repoRoot `
+                'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1'
+            contextualBridge = Join-Path $repoRoot `
+                'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1'
+            sharedAcquisitionTool = Join-Path $repoRoot `
+                'tools\Invoke-SharedReviewAcquisition.ps1'
+        }
+        foreach ($name in $implementationPaths.Keys) {
+            $evidence.Paths[$name] =
+                [string]$implementationPaths[$name]
+        }
+        $evidence.Toolkit.analyzerSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.parser
+        $evidence.Toolkit.analyzerManifestSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.parserManifest
+        $evidence.Toolkit.activePrIntakeSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.activePrIntake
+        $evidence.Toolkit.contextualBridgeSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.contextualBridge
+        $evidence.Toolkit.sharedAcquisitionToolSha256 =
+            Get-ApprovedOwnerV2FileSha256 `
+                $evidence.Paths.sharedAcquisitionTool
+        $evidence.Toolkit.activePrIntakeManifestSha256 =
+            'c' * 64
+        $evidence.Toolkit.contextualBridgeManifestSha256 =
+            'd' * 64
+        $evidence.Toolkit.contextualCurrentPrToolSha256 =
+            'e' * 64
+        $compatibility = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRule = [ordered]@{
+                hash =
+                    'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+                length = 3706
+            }
+            currentRule = [ordered]@{
+                hash =
+                    $evidence.Declaration.
+                        rule.hash
+                length =
+                    $evidence.Declaration.
+                        rule.length
+            }
+            unchangedRuleIds = @(
+                'explicit-string-comparison')
+        }
+
+        $policy =
+            New-AutomaticOwnerV2ServicePolicy `
+                -Evidence $evidence `
+                -PolicyId contextual-test-policy `
+                -MaxCreatesPerRun 2 `
+                -MaxCreatesPerPullRequest 5 `
+                -HistoryCompatibility `
+                    $compatibility `
+                -CreatedUtc '20261019T000000Z'
+
+        $policy.historyCompatibility.
+            previousRule.hash |
+            Should -BeExactly (
+                $compatibility.previousRule.hash)
+        $policy.historyCompatibility.
+            unchangedRuleIds |
+            Should -BeExactly @(
+                'explicit-string-comparison')
+        $policy.limits.maxCreatesPerRun |
+            Should -Be 2
+        $policy.limits.maxCreatesPerPullRequest |
+            Should -Be 5
+        {
+            Assert-AutomaticOwnerV2ServicePolicy `
+                -Evidence $evidence `
+                -Policy $policy
+        } | Should -Not -Throw
+    }
+
     It 'refuses prior history signed by a foreign key' {
         $history =
             New-TestAuthenticatedContextualHistory

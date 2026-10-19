@@ -350,6 +350,78 @@ function Format-ContextualConventionComment {
     ) -join "`n"
 }
 
+function Test-ContextualPriorRuleCompatibility {
+    param(
+        [AllowNull()][object]$Compatibility,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$PriorRule,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$RuleId
+    )
+    if ($Compatibility -isnot
+            [Collections.IDictionary]) {
+        return $false
+    }
+    $keys = @($Compatibility.Keys |
+        ForEach-Object { [string]$_ } |
+        Sort-Object -CaseSensitive)
+    if (($keys -join "`n") -cne (
+            @(
+                'currentRule',
+                'kind',
+                'previousRule',
+                'schemaVersion',
+                'unchangedRuleIds') -join "`n") -or
+        $Compatibility.previousRule -isnot
+            [Collections.IDictionary] -or
+        $Compatibility.currentRule -isnot
+            [Collections.IDictionary]) {
+        return $false
+    }
+    foreach ($binding in @(
+            $Compatibility.previousRule,
+            $Compatibility.currentRule)) {
+        $bindingKeys = @($binding.Keys |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -CaseSensitive)
+        if (($bindingKeys -join "`n") -cne
+            "hash`nlength" -or
+            [string]$binding.hash -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            [long]$binding.length -lt 1) {
+            return $false
+        }
+    }
+    $unchanged = @(
+        $Compatibility.unchangedRuleIds)
+    return (
+        [int]$Compatibility.schemaVersion -eq 1 -and
+        [string]$Compatibility.kind -ceq
+            'contextual-additive-rule-history-compatibility' -and
+        $unchanged.Count -ge 1 -and
+        $unchanged.Count -le 64 -and
+        @($unchanged |
+            Sort-Object -Unique -CaseSensitive).Count -eq
+                $unchanged.Count -and
+        @($unchanged | Where-Object {
+                [string]$_ -cnotmatch
+                    '^[a-z][a-z0-9-]{0,127}$'
+            }).Count -eq 0 -and
+        [string]$RuleId -cin $unchanged -and
+        [string]$Compatibility.previousRule.hash -ceq
+            [string]$PriorRule.hash -and
+        [long]$Compatibility.previousRule.length -eq
+            [long]$PriorRule.length -and
+        [string]$Compatibility.currentRule.hash -ceq
+            [string]$Request.RuleHash -and
+        [long]$Compatibility.currentRule.length -eq
+            [long]$Request.RuleLength -and
+        ([string]$Compatibility.previousRule.hash -cne
+                [string]$Compatibility.currentRule.hash -or
+            [long]$Compatibility.previousRule.length -ne
+                [long]$Compatibility.currentRule.length))
+}
+
 function Resolve-ContextualConventionDiscussionReconciliation {
     param(
         [Parameter(Mandatory)]
@@ -424,6 +496,30 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             $false
         foreach ($proof in @(
                 $AuthenticatedPriorComments)) {
+            $ruleBindingMatches = $false
+            if ($proof -is
+                    [Collections.IDictionary] -and
+                $proof.Contains('rule') -and
+                $proof.rule -is
+                    [Collections.IDictionary]) {
+                $ruleBindingMatches =
+                    [string]$proof.rule.hash -ceq
+                        [string]$Contract.Request.RuleHash -and
+                    [long]$proof.rule.length -eq
+                        [long]$Contract.Request.RuleLength
+                if (-not $ruleBindingMatches -and
+                    $proof.Contains(
+                        'ruleCompatibility')) {
+                    $ruleBindingMatches =
+                        Test-ContextualPriorRuleCompatibility `
+                            -Compatibility (
+                                $proof.ruleCompatibility) `
+                            -PriorRule $proof.rule `
+                            -Request $Contract.Request `
+                            -RuleId (
+                                [string]$finding.ruleId)
+                }
+            }
             if ($proof -isnot
                     [Collections.IDictionary] -or
                 [string]$proof.kind -cne
@@ -450,10 +546,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     [string]$Contract.Request.RulePath -or
                 [string]$proof.rule.section -cne
                     [string]$Contract.Request.RuleSection -or
-                [string]$proof.rule.hash -cne
-                    [string]$Contract.Request.RuleHash -or
-                [long]$proof.rule.length -ne
-                    [long]$Contract.Request.RuleLength -or
+                -not $ruleBindingMatches -or
                 [string]$proof.reviewerIdentityDigest -cne
                     [string]$Snapshot.
                         ReviewerIdentityDigest -or

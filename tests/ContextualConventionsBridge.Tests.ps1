@@ -500,6 +500,117 @@ Describe 'Contextual convention current PR bridge' {
         }
     }
 
+    It 'recognizes only explicitly unchanged rules across an additive bundle update' {
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $case.Proof.rule.hash =
+            'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+        $case.Proof.rule.length = 3706
+        $case.Proof['ruleCompatibility'] =
+            [ordered]@{
+                schemaVersion = 1
+                kind =
+                    'contextual-additive-rule-history-compatibility'
+                previousRule = [ordered]@{
+                    hash = $case.Proof.rule.hash
+                    length = $case.Proof.rule.length
+                }
+                currentRule = [ordered]@{
+                    hash =
+                        $case.Config.
+                            contextualRule.hash
+                    length =
+                        $case.Config.
+                            contextualRule.length
+                }
+                unchangedRuleIds = @(
+                    'explicit-string-comparison')
+            }
+
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments @(
+                    $case.Proof)
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        $result.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                authenticated-prior-reviewer-comment
+        $result.effects.dedupe.noOp |
+            Should -Be 1
+        $result.effects.dedupe.unknown |
+            Should -Be 0
+    }
+
+    It 'keeps incompatible additive history unknown for <Mode>' -TestCases @(
+        @{ Mode = 'changed-rule' }
+        @{ Mode = 'edited-previous-bundle' }
+        @{ Mode = 'edited-current-bundle' }
+    ) {
+        param($Mode)
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $case.Proof.rule.hash =
+            'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+        $case.Proof.rule.length = 3706
+        $case.Proof['ruleCompatibility'] =
+            [ordered]@{
+                schemaVersion = 1
+                kind =
+                    'contextual-additive-rule-history-compatibility'
+                previousRule = [ordered]@{
+                    hash = $case.Proof.rule.hash
+                    length = $case.Proof.rule.length
+                }
+                currentRule = [ordered]@{
+                    hash =
+                        $case.Config.
+                            contextualRule.hash
+                    length =
+                        $case.Config.
+                            contextualRule.length
+                }
+                unchangedRuleIds = @(
+                    'explicit-string-comparison')
+            }
+        switch ($Mode) {
+            changed-rule {
+                $case.Proof.ruleCompatibility.
+                    unchangedRuleIds =
+                    @('collection-cardinality')
+            }
+            edited-previous-bundle {
+                $case.Proof.ruleCompatibility.
+                    previousRule.hash =
+                    'v1:sha256:' + ('a' * 64)
+            }
+            edited-current-bundle {
+                $case.Proof.ruleCompatibility.
+                    currentRule.length++
+            }
+        }
+
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments @(
+                    $case.Proof)
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.findingsComplete |
+            Should -BeFalse
+    }
+
     It 'keeps unsafe prior-review variants unknown for <Mode>' -TestCases @(
         @{ Mode = 'copied' }
         @{ Mode = 'edited' }

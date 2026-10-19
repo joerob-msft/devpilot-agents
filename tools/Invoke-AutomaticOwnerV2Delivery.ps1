@@ -19,6 +19,10 @@ param(
     [string]$PolicyId = '',
     [ValidateRange(1, 5)][int]$MaxCreatesPerRun = 5,
     [ValidateRange(1, 50)][int]$MaxCreatesPerPullRequest = 25,
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$PreviousRuleHash = '',
+    [long]$PreviousRuleLength = 0,
+    [string[]]$UnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -194,9 +198,52 @@ if ($Command -ceq 'authorize-policy') {
             -Root (Join-Path $context.Root 'policies'))) {
         throw 'PolicyPath must be absolute and inside the private policies root.'
     }
-    $policy = New-AutomaticOwnerV2ServicePolicy -Evidence $evidence `
-        -PolicyId $PolicyId -MaxCreatesPerRun $MaxCreatesPerRun `
-        -MaxCreatesPerPullRequest $MaxCreatesPerPullRequest
+    $compatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace(
+            $PreviousRuleHash) -or
+        $PreviousRuleLength -ne 0 -or
+        $UnchangedRuleId.Count -ne 0
+    if ($compatibilitySpecified -and (
+            $Delivery -cne
+                'contextual-conventions' -or
+            [string]::IsNullOrWhiteSpace(
+                $PreviousRuleHash) -or
+            $PreviousRuleLength -lt 1 -or
+            $UnchangedRuleId.Count -lt 1)) {
+        throw 'Additive rule history compatibility requires one exact prior contextual rule and unchanged rule IDs.'
+    }
+    $policyArguments = @{
+        Evidence = $evidence
+        PolicyId = $PolicyId
+        MaxCreatesPerRun = $MaxCreatesPerRun
+        MaxCreatesPerPullRequest =
+            $MaxCreatesPerPullRequest
+    }
+    if ($compatibilitySpecified) {
+        $policyArguments.HistoryCompatibility =
+            [ordered]@{
+                schemaVersion = 1
+                kind =
+                    'contextual-additive-rule-history-compatibility'
+                previousRule = [ordered]@{
+                    hash = $PreviousRuleHash
+                    length = $PreviousRuleLength
+                }
+                currentRule = [ordered]@{
+                    hash =
+                        [string]$evidence.
+                            Declaration.rule.hash
+                    length =
+                        [long]$evidence.
+                            Declaration.rule.length
+                }
+                unchangedRuleIds =
+                    @($UnchangedRuleId)
+            }
+    }
+    $policy =
+        New-AutomaticOwnerV2ServicePolicy `
+            @policyArguments
     [void](Write-AutomaticOwnerV2ServicePolicy -Path $PolicyPath `
             -Policy $policy -Key $key)
     [pscustomobject][ordered]@{

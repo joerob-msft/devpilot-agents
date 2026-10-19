@@ -29,6 +29,9 @@ Describe 'Contextual scheduled observation disposition' {
         $historyIndex = $text.IndexOf(
             'Get-ApprovedOwnerV2AuthenticatedPriorComments',
             [StringComparison]::Ordinal)
+        $policyIndex = $text.IndexOf(
+            'Read-ApprovedOwnerV2SignedRecord',
+            [StringComparison]::Ordinal)
         $harnessIndex = $text.IndexOf(
             'Import-Module $agentHarnessModule',
             [StringComparison]::Ordinal)
@@ -37,15 +40,20 @@ Describe 'Contextual scheduled observation disposition' {
             [StringComparison]::Ordinal)
 
         $harnessIndex | Should -BeGreaterThan -1
+        $policyIndex | Should -BeGreaterThan -1
         $historyIndex | Should -BeGreaterThan -1
-        $historyIndex |
+        $policyIndex |
             Should -BeGreaterThan $harnessIndex
+        $historyIndex |
+            Should -BeGreaterThan $policyIndex
         $evaluationIndex |
             Should -BeGreaterThan $historyIndex
         $text | Should -Match (
             '-AuthenticatedHistoryPath\s+\$historyPath')
         $text | Should -Match (
             '-AuthenticatedHistorySha256\s+`?\s*\$historySha256')
+        $text | Should -Match (
+            '-RuleCompatibility\s+\$ruleCompatibility')
     }
 
     It 'wires authenticated history through evaluation and live preflight' {

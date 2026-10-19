@@ -227,6 +227,8 @@ function New-AutomaticOwnerV2ServicePolicy {
         [string]$PolicyId,
         [ValidateRange(1, 5)][int]$MaxCreatesPerRun = 5,
         [ValidateRange(1, 50)][int]$MaxCreatesPerPullRequest = 25,
+        [AllowNull()]
+        [Collections.IDictionary]$HistoryCompatibility,
         [string]$CreatedUtc = ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
     )
     $namedAreEqual =
@@ -336,7 +338,19 @@ function New-AutomaticOwnerV2ServicePolicy {
                 [string]$Evidence.Toolkit[$name]
         }
     }
-    return [ordered]@{
+    $compatibility = $null
+    if ($null -ne $HistoryCompatibility) {
+        if (-not $contextual) {
+            throw 'Rule history compatibility is contextual-only.'
+        }
+        $compatibility =
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $HistoryCompatibility `
+                -CurrentRule $Evidence.Declaration.rule `
+                -AllowedRuleIds `
+                    $script:ApprovedContextualRuleIds
+    }
+    $policy = [ordered]@{
         schemaVersion = 1
         kind = $(if ($namedAreEqual) {
                 'named-areequal-v1-service-authorization-policy'
@@ -353,11 +367,16 @@ function New-AutomaticOwnerV2ServicePolicy {
         rule = & $copy $Evidence.Declaration.rule
         reviewerIdentity = & $copy $Evidence.Provider.reviewerIdentity
         implementation = $implementation
-        limits = [ordered]@{
+    }
+    if ($null -ne $compatibility) {
+        $policy['historyCompatibility'] =
+            $compatibility
+    }
+    $policy['limits'] = [ordered]@{
             maxCreatesPerRun = $MaxCreatesPerRun
             maxCreatesPerPullRequest = $MaxCreatesPerPullRequest
         }
-        authority = [ordered]@{
+    $policy['authority'] = [ordered]@{
             action = 'create'
             classification = 'wouldCreate'
             construct = $(if ($namedAreEqual) {
@@ -371,8 +390,8 @@ function New-AutomaticOwnerV2ServicePolicy {
             relationCapability = $false
             modelAuthorization = $false
         }
-        createdUtc = $CreatedUtc
-    }
+    $policy['createdUtc'] = $CreatedUtc
+    return $policy
 }
 
 function Write-AutomaticOwnerV2ServicePolicy {
@@ -390,7 +409,7 @@ function Assert-AutomaticOwnerV2ServicePolicy {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)][Collections.IDictionary]$Policy
     )
-    Assert-ApprovedOwnerV2ExactKeys -Value $Policy -Name policy -Expected @(
+    $expectedKeys = @(
         'schemaVersion', 'kind', 'enabled', 'policyId', 'repository', 'capability',
         'rule', 'reviewerIdentity', 'implementation', 'limits', 'authority',
         'createdUtc'
@@ -401,6 +420,17 @@ function Assert-AutomaticOwnerV2ServicePolicy {
     $contextual =
         [string]$Evidence.Declaration.capability.id -ceq
             $script:AutomaticContextualCapability
+    if ($Policy.Contains(
+            'historyCompatibility')) {
+        if (-not $contextual) {
+            throw 'Rule history compatibility is contextual-only.'
+        }
+        $expectedKeys +=
+            'historyCompatibility'
+    }
+    Assert-ApprovedOwnerV2ExactKeys `
+        -Value $Policy -Name policy `
+        -Expected $expectedKeys
     $expectedKind = if ($namedAreEqual) {
         'named-areequal-v1-service-authorization-policy'
     } elseif ($contextual) {
@@ -574,14 +604,36 @@ function Assert-AutomaticOwnerV2ServicePolicy {
         [bool]$authority.modelAuthorization) {
         throw 'Automatic Owner service policy exceeds create-only authority.'
     }
-    $expected = New-AutomaticOwnerV2ServicePolicy -Evidence $Evidence `
-        -PolicyId ([string]$Policy.policyId) `
-        -MaxCreatesPerRun $runLimit -MaxCreatesPerPullRequest $prLimit `
-        -CreatedUtc ([string]$Policy.createdUtc)
-    foreach ($name in @(
+    $expectedArguments = @{
+        Evidence = $Evidence
+        PolicyId = [string]$Policy.policyId
+        MaxCreatesPerRun = $runLimit
+        MaxCreatesPerPullRequest = $prLimit
+        CreatedUtc = [string]$Policy.createdUtc
+    }
+    if ($Policy.Contains(
+            'historyCompatibility')) {
+        $expectedArguments.HistoryCompatibility =
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility (
+                    $Policy.historyCompatibility) `
+                -CurrentRule $Evidence.Declaration.rule `
+                -AllowedRuleIds `
+                    $script:ApprovedContextualRuleIds
+    }
+    $expected =
+        New-AutomaticOwnerV2ServicePolicy `
+            @expectedArguments
+    $bindingNames = @(
             'repository', 'capability', 'rule', 'reviewerIdentity',
             'implementation', 'limits', 'authority'
-        )) {
+        )
+    if ($Policy.Contains(
+            'historyCompatibility')) {
+        $bindingNames +=
+            'historyCompatibility'
+    }
+    foreach ($name in $bindingNames) {
         if ((Get-ApprovedOwnerV2Digest $Policy[$name]) -cne
             (Get-ApprovedOwnerV2Digest $expected[$name])) {
             throw "Automatic Owner service policy binding '$name' is stale or foreign."
@@ -1251,7 +1303,12 @@ function Invoke-AutomaticOwnerV2Comments {
             $contextual) {
             @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
                 -DeliveryRoot $DeliveryRoot -Key $Key `
-                -Delivery contextual-conventions)
+                -Delivery contextual-conventions `
+                -RuleCompatibility $(if ($Policy.Contains(
+                            'historyCompatibility')) {
+                        $Policy.historyCompatibility
+                    }
+                    else { $null }))
         }
         else { @() }
         $history = Get-AutomaticOwnerV2DeliveryHistory `

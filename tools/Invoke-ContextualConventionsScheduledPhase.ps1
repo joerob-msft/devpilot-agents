@@ -233,11 +233,58 @@ try {
     if ($historyKey.Length -ne 32) {
         throw 'contextual-phase-history-key-invalid'
     }
+    $ruleCompatibility = $null
+    if ($deliveryEnabled) {
+        [void](Assert-AgentTrustedFile `
+                -Path ([string]$automatic.policyPath) `
+                -AllowedRoot (
+                    Join-Path $contextualDeliveryRoot `
+                        'policies') `
+                -Private)
+        if ((Get-ApprovedOwnerV2FileSha256 `
+                    ([string]$automatic.policyPath)) -cne
+                [string]$automatic.policySha256) {
+            throw 'contextual-phase-delivery-policy-digest-changed'
+        }
+        $servicePolicy =
+            Read-ApprovedOwnerV2SignedRecord `
+                -Path (
+                    [string]$automatic.policyPath) `
+                -Key $historyKey
+        if ([string]$servicePolicy.kind -cne
+                'contextual-conventions-v1-service-authorization-policy' -or
+            -not [bool]$servicePolicy.enabled -or
+            [string]$servicePolicy.capability.id -cne
+                [string]$evaluationConfig.capability.id -or
+            [string]$servicePolicy.rule.path -cne
+                [string]$evaluationConfig.contextualRule.path -or
+            [string]$servicePolicy.rule.section -cne
+                [string]$evaluationConfig.contextualRule.section -or
+            [string]$servicePolicy.rule.hash -cne
+                [string]$evaluationConfig.contextualRule.hash -or
+            [long]$servicePolicy.rule.length -ne
+                [long]$evaluationConfig.contextualRule.length) {
+            throw 'contextual-phase-delivery-policy-binding-invalid'
+        }
+        if ($servicePolicy.Contains(
+                'historyCompatibility')) {
+            $ruleCompatibility =
+                Assert-ApprovedOwnerV2RuleCompatibility `
+                    -Compatibility (
+                        $servicePolicy.
+                            historyCompatibility) `
+                    -CurrentRule (
+                        $evaluationConfig.
+                            contextualRule) `
+                    -AllowedRuleIds $allowedRuleIds
+        }
+    }
     $authenticatedPriorComments =
         @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
             -DeliveryRoot $contextualDeliveryRoot `
             -Key $historyKey `
-            -Delivery contextual-conventions)
+            -Delivery contextual-conventions `
+            -RuleCompatibility $ruleCompatibility)
 }
 finally {
     if ($null -ne $historyKey) {
