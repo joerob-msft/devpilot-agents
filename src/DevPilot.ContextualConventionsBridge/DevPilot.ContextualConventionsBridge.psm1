@@ -14,7 +14,7 @@ Import-Module (Join-Path $PSScriptRoot `
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:58d3c0ec2205d6c52f3e3f882a922730508096f307bed07bc58080456b57f6f8'
+    'v1:sha256:f7fcd3fed2db2e39215050fab806a1a65ff4e402c46faeb6ec7fe4ffefd061b6'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =

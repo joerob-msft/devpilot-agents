@@ -1066,26 +1066,114 @@ function Get-ContextualMethodTypeMap {
 }
 
 function Get-ContextualNormalizedTypeName {
-    param([Parameter(Mandatory)][string]$TypeName)
+    param(
+        [Parameter(Mandatory)][string]$TypeName,
+        [AllowNull()]$ContextNode
+    )
     $value = ($TypeName -replace '\s+', '') -replace '^global::', ''
+    if ($value.EndsWith('?')) {
+        return 'System.Nullable<' +
+            (Get-ContextualNormalizedTypeName `
+                -TypeName $value.Substring(
+                    0, $value.Length - 1) `
+                -ContextNode $ContextNode) + '>'
+    }
+    if ($value -match '^(?:System\.)?Nullable<(?<inner>.+)>$') {
+        return 'System.Nullable<' +
+            (Get-ContextualNormalizedTypeName `
+                -TypeName $Matches.inner `
+                -ContextNode $ContextNode) + '>'
+    }
     switch -CaseSensitive ($value) {
         'string' { return 'System.String' }
+        'System.String' { return 'System.String' }
         'bool' { return 'System.Boolean' }
+        'System.Boolean' { return 'System.Boolean' }
         'byte' { return 'System.Byte' }
+        'System.Byte' { return 'System.Byte' }
         'sbyte' { return 'System.SByte' }
+        'System.SByte' { return 'System.SByte' }
         'short' { return 'System.Int16' }
+        'System.Int16' { return 'System.Int16' }
         'ushort' { return 'System.UInt16' }
+        'System.UInt16' { return 'System.UInt16' }
         'int' { return 'System.Int32' }
+        'System.Int32' { return 'System.Int32' }
         'uint' { return 'System.UInt32' }
+        'System.UInt32' { return 'System.UInt32' }
         'long' { return 'System.Int64' }
+        'System.Int64' { return 'System.Int64' }
         'ulong' { return 'System.UInt64' }
+        'System.UInt64' { return 'System.UInt64' }
         'char' { return 'System.Char' }
+        'System.Char' { return 'System.Char' }
         'decimal' { return 'System.Decimal' }
+        'System.Decimal' { return 'System.Decimal' }
         'double' { return 'System.Double' }
+        'System.Double' { return 'System.Double' }
         'float' { return 'System.Single' }
+        'System.Single' { return 'System.Single' }
         'object' { return 'System.Object' }
-        default { return $value }
+        'System.Object' { return 'System.Object' }
+        'System.Uri' { return 'System.Uri' }
+        'System.StringComparison' {
+            return 'System.StringComparison'
+        }
     }
+    $systemNames = @{
+        String = 'System.String'
+        Boolean = 'System.Boolean'
+        Byte = 'System.Byte'
+        SByte = 'System.SByte'
+        Int16 = 'System.Int16'
+        UInt16 = 'System.UInt16'
+        Int32 = 'System.Int32'
+        UInt32 = 'System.UInt32'
+        Int64 = 'System.Int64'
+        UInt64 = 'System.UInt64'
+        Char = 'System.Char'
+        Decimal = 'System.Decimal'
+        Double = 'System.Double'
+        Single = 'System.Single'
+        Object = 'System.Object'
+        Uri = 'System.Uri'
+        StringComparison = 'System.StringComparison'
+    }
+    if ($systemNames.ContainsKey($value) -and
+        $null -ne $ContextNode) {
+        $root = $ContextNode.GetLocation().
+            SourceTree.GetRoot()
+        $usings = @($root.Usings)
+        foreach ($ancestor in $ContextNode.Ancestors()) {
+            if ($ancestor -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]) {
+                $usings += @($ancestor.Usings)
+            }
+        }
+        $systemImported = @($usings | Where-Object {
+                $null -eq $_.Alias -and
+                [string]$_.Name.ToString() -ceq
+                    'System'
+            }).Count -gt 0
+        $shadowed = @($root.DescendantNodes() |
+            Where-Object {
+                (($_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]) -or
+                    ($_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.EnumDeclarationSyntax])) -and
+                [string]$_.Identifier.ValueText -ceq
+                    $value
+            }).Count -gt 0 -or
+            @($usings | Where-Object {
+                    $null -ne $_.Alias -and
+                    [string]$_.Alias.Name.Identifier.ValueText -ceq
+                        $value
+                }).Count -gt 0
+        if ($systemImported -and -not $shadowed) {
+            return [string]$systemNames[$value]
+        }
+    }
+    return $value
 }
 
 function Get-ContextualNamedCallLanguageState {
@@ -1210,6 +1298,11 @@ function Get-ContextualNamedCallSignatures {
                     $_ -is [
                         Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
                 })) {
+            if ($node -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax] -and
+                $null -ne $node.ExplicitInterfaceSpecifier) {
+                continue
+            }
             $type = @($node.Ancestors() | Where-Object {
                     $_ -is [
                         Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
@@ -1224,7 +1317,8 @@ function Get-ContextualNamedCallSignatures {
                         name =
                             [string]$parameter.Identifier.ValueText
                         type = Get-ContextualNormalizedTypeName `
-                            -TypeName ([string]$parameter.Type)
+                            -TypeName ([string]$parameter.Type) `
+                            -ContextNode $parameter
                         modifier =
                             [string]$parameter.Modifiers.ToString()
                         optional =
@@ -1235,6 +1329,43 @@ function Get-ContextualNamedCallSignatures {
                                 }).Count -gt 0
                     }
                 })
+            $namespace = @($type[0].Ancestors() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]
+                } |
+                Select-Object -First 1)
+            $namespaceName = if ($namespace.Count -eq 1) {
+                [string]$namespace[0].Name.ToString()
+            }
+            else { '' }
+            $genericParameters =
+                [Collections.Generic.List[string]]::new()
+            if ($null -ne
+                $type[0].TypeParameterList) {
+                foreach ($parameter in @(
+                        $type[0].TypeParameterList.
+                            Parameters)) {
+                    [void]$genericParameters.Add(
+                        [string]$parameter.
+                            Identifier.ValueText)
+                }
+            }
+            if ($node -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax] -and
+                $null -ne $node.TypeParameterList) {
+                foreach ($parameter in @(
+                        $node.TypeParameterList.
+                            Parameters)) {
+                    [void]$genericParameters.Add(
+                        [string]$parameter.
+                            Identifier.ValueText)
+                }
+            }
+            $requiredCount = @($parameters | Where-Object {
+                    -not [bool]$_['optional'] -and
+                    -not [bool]$_['params']
+                }).Count
             [void]$signatures.Add([pscustomobject]@{
                     Kind = $(if ($node -is [
                             Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]) {
@@ -1243,6 +1374,29 @@ function Get-ContextualNamedCallSignatures {
                     Name = [string]$node.Identifier.ValueText
                     Container =
                         [string]$type[0].Identifier.ValueText
+                    Namespace = $namespaceName
+                    FullContainer = $(if (
+                        [string]::IsNullOrWhiteSpace(
+                            $namespaceName)) {
+                            [string]$type[0].Identifier.ValueText
+                        }
+                        else {
+                            "$namespaceName.$(
+                                [string]$type[0].Identifier.ValueText)"
+                        })
+                    IsStatic = @($node.Modifiers |
+                        Where-Object {
+                            [string]$_.Text -ceq 'static'
+                        }).Count -gt 0
+                    GenericParameters = @(
+                        $genericParameters |
+                            Sort-Object -Unique)
+                    RequiredCount = $requiredCount
+                    MaximumCount = $parameters.Count
+                    HasParams = @($parameters |
+                        Where-Object {
+                            [bool]$_['params']
+                        }).Count -gt 0
                     Parameters = $parameters
                     Path = [string]$file.path
                 })
@@ -1259,6 +1413,11 @@ function Get-ContextualNamedCallSignature {
         [AllowEmptyCollection()]
         [object[]]$Signatures
     )
+    if ($null -eq $Node.ArgumentList) {
+        return [pscustomobject]@{
+            State = 'not-applicable'
+        }
+    }
     $arguments = @($Node.ArgumentList.Arguments)
     if ($arguments.Count -lt 1) {
         return [pscustomobject]@{
@@ -1268,64 +1427,20 @@ function Get-ContextualNamedCallSignature {
     $kind = 'method'
     $name = ''
     $container = ''
+    $receiverKind = 'none'
     if ($Node -is [
             Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax]) {
         $expression = $Node.Expression
-        if ($expression -is [
-                Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
-            $name = [string]$expression.Name.Identifier.ValueText
-            $receiver = [string]$expression.Expression.ToString()
-            if ($receiver -ceq 'this') {
-                $owner = @($Node.Ancestors() | Where-Object {
-                        $_ -is [
-                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
-                    } | Select-Object -First 1)
-                if ($owner.Count -eq 1) {
-                    $container =
-                        [string]$owner[0].Identifier.ValueText
-                }
-            }
-            elseif ($receiver -ceq 'base') {
-                $owner = @($Node.Ancestors() | Where-Object {
-                        $_ -is [
-                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
-                    } | Select-Object -First 1)
-                if ($owner.Count -eq 1 -and
-                    $null -ne $owner[0].BaseList -and
-                    $owner[0].BaseList.Types.Count -eq 1) {
-                    $container = (
-                        [string]$owner[0].BaseList.Types[0].Type.ToString() `
-                            -split '\.')[-1]
-                }
-            }
-            else {
-                $container = ($receiver -split '\.')[-1]
-            }
-        }
-        elseif ($expression -is [
-                Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax] -or
-            $expression -is [
-                Microsoft.CodeAnalysis.CSharp.Syntax.GenericNameSyntax]) {
-            $name = [string]$expression.Identifier.ValueText
-            $owner = @($Node.Ancestors() | Where-Object {
-                    $_ -is [
-                        Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
-                } | Select-Object -First 1)
-            if ($owner.Count -eq 1) {
-                $container =
-                    [string]$owner[0].Identifier.ValueText
-            }
-        }
-        if ($name -ceq 'AreEqual' -and
-            [string]$expression.ToString() -match
-                '(?:^|\.)Assert\.AreEqual$') {
-            return [pscustomobject]@{
-                State = 'excluded'
-                Reason = 'mstest-areequal-owned-by-named-rule'
-            }
-        }
-        if ([string]$expression.ToString() -ceq
-                'string.Equals' -and
+        $expressionText =
+            ([string]$expression.ToString()) -replace '^global::', ''
+        $knownStringReceiver = $expressionText -match
+                '^(?:string|System\.String)\.Equals$' -or
+            ($expressionText -ceq 'String.Equals' -and
+                (Get-ContextualNormalizedTypeName `
+                    -TypeName String `
+                    -ContextNode $Node) -ceq
+                    'System.String')
+        if ($knownStringReceiver -and
             $arguments.Count -in @(2, 3)) {
             $parameters = @(
                 [ordered]@{
@@ -1357,9 +1472,145 @@ function Get-ContextualNamedCallSignature {
                     Kind = 'method'
                     Name = 'Equals'
                     Container = 'String'
+                    GenericParameters = @()
                     Parameters = $parameters
                     Path = 'known-bcl'
                 }
+            }
+        }
+        if ($expression -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
+            $name = [string]$expression.Name.Identifier.ValueText
+            $receiver = [string]$expression.Expression.ToString()
+            if ($receiver -ceq 'this') {
+                $receiverKind = 'instance'
+                $owner = @($Node.Ancestors() | Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                    } | Select-Object -First 1)
+                if ($owner.Count -eq 1) {
+                    $container =
+                        [string]$owner[0].Identifier.ValueText
+                }
+            }
+            elseif ($receiver -ceq 'base') {
+                $receiverKind = 'instance'
+                $owner = @($Node.Ancestors() | Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                    } | Select-Object -First 1)
+                if ($owner.Count -ne 1 -or
+                    $null -eq $owner[0].BaseList -or
+                    $owner[0].BaseList.Types.Count -ne 1) {
+                    return [pscustomobject]@{
+                        State = 'unknown'
+                        Reason = 'call-receiver-type-unproven'
+                    }
+                }
+                else {
+                    $container = (
+                        [string]$owner[0].BaseList.Types[0].Type.ToString() `
+                            -split '\.')[-1]
+                }
+            }
+            else {
+                $receiverKind = 'static'
+                if ($expression.Expression -isnot [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax] -and
+                    $expression.Expression -isnot [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -and
+                    $expression.Expression -isnot [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.AliasQualifiedNameSyntax]) {
+                    return [pscustomobject]@{
+                        State = 'unknown'
+                        Reason = 'call-receiver-type-unproven'
+                    }
+                }
+                $receiver = $receiver -replace '^global::', ''
+                $container = ($receiver -split '\.')[-1]
+                $method = @($Node.Ancestors() | Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax] -or
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
+                    } | Select-Object -First 1)
+                $shadowed = $false
+                if ($method.Count -eq 1) {
+                    $shadowed =
+                        @($method[0].ParameterList.Parameters |
+                            Where-Object {
+                                [string]$_.Identifier.ValueText -ceq
+                                    $container
+                            }).Count -gt 0 -or
+                        @($method[0].DescendantNodes() |
+                            Where-Object {
+                                $_ -is [
+                                    Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax] -and
+                                [string]$_.Identifier.ValueText -ceq
+                                    $container
+                            }).Count -gt 0
+                }
+                $owner = @($Node.Ancestors() | Where-Object {
+                        $_ -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                    } | Select-Object -First 1)
+                if ($owner.Count -eq 1) {
+                    $shadowed = $shadowed -or
+                        @($owner[0].Members | Where-Object {
+                                ($_ -is [
+                                        Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                                    @($_.Declaration.Variables |
+                                        Where-Object {
+                                            [string]$_.Identifier.ValueText -ceq
+                                                $container
+                                        }).Count -gt 0) -or
+                                ($_ -is [
+                                        Microsoft.CodeAnalysis.CSharp.Syntax.PropertyDeclarationSyntax] -and
+                                    [string]$_.Identifier.ValueText -ceq
+                                        $container)
+                            }).Count -gt 0
+                }
+                $usings = @($Root.Usings)
+                foreach ($ancestor in $Node.Ancestors()) {
+                    if ($ancestor -is [
+                            Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]) {
+                        $usings += @($ancestor.Usings)
+                    }
+                }
+                $shadowed = $shadowed -or
+                    @($usings | Where-Object {
+                            $null -ne $_.Alias -and
+                            [string]$_.Alias.Name.Identifier.ValueText -ceq
+                                $container
+                        }).Count -gt 0
+                if ($shadowed) {
+                    return [pscustomobject]@{
+                        State = 'unknown'
+                        Reason = 'call-receiver-type-unproven'
+                    }
+                }
+            }
+        }
+        elseif ($expression -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax] -or
+            $expression -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.GenericNameSyntax]) {
+            $name = [string]$expression.Identifier.ValueText
+            $owner = @($Node.Ancestors() | Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                } | Select-Object -First 1)
+            if ($owner.Count -eq 1) {
+                $container =
+                    [string]$owner[0].Identifier.ValueText
+            }
+        }
+        if ($name -ceq 'AreEqual' -and
+            [string]$expression.ToString() -match
+                '(?:^|\.)Assert\.AreEqual$') {
+            return [pscustomobject]@{
+                State = 'excluded'
+                Reason = 'mstest-areequal-owned-by-named-rule'
             }
         }
     }
@@ -1388,6 +1639,12 @@ function Get-ContextualNamedCallSignature {
                 [string]$owner[0].Identifier.ValueText
         }
         else {
+            if ($null -eq $owner[0].BaseList) {
+                return [pscustomobject]@{
+                    State = 'unknown'
+                    Reason = 'base-constructor-type-unproven'
+                }
+            }
             $bases = @($owner[0].BaseList.Types)
             if ($bases.Count -ne 1) {
                 return [pscustomobject]@{
@@ -1414,12 +1671,50 @@ function Get-ContextualNamedCallSignature {
     $candidates = @($Signatures | Where-Object {
             [string]$_.Kind -ceq $kind -and
             [string]$_.Name -ceq $name -and
-            @($_.Parameters).Count -eq $arguments.Count
+            [int]$_.RequiredCount -le $arguments.Count -and
+            ([bool]$_.HasParams -or
+                [int]$_.MaximumCount -ge $arguments.Count)
         })
     if (-not [string]::IsNullOrWhiteSpace($container)) {
         $contained = @($candidates | Where-Object {
-                [string]$_.Container -ceq $container
+                [string]$_.Container -ceq $container -and
+                ($(if ($receiverKind -ceq 'static') {
+                        [bool]$_.IsStatic
+                    }
+                    elseif ($receiverKind -ceq 'instance') {
+                        -not [bool]$_.IsStatic
+                    }
+                    else { $true }))
             })
+        if ($receiverKind -ceq 'static' -and
+            $contained.Count -gt 0) {
+            $receiverText = (
+                [string]$Node.Expression.Expression.ToString()) `
+                -replace '^global::', ''
+            $exact = @($contained | Where-Object {
+                    [string]$_.FullContainer -ceq
+                        $receiverText
+                })
+            if ($exact.Count -eq 1) {
+                $contained = $exact
+            }
+            elseif ($receiverText -ceq $container) {
+                $namespaces = @($contained.Namespace |
+                    Sort-Object -Unique)
+                if ($namespaces.Count -gt 1) {
+                    return [pscustomobject]@{
+                        State = 'unknown'
+                        Reason = 'call-receiver-type-unproven'
+                    }
+                }
+            }
+            else {
+                return [pscustomobject]@{
+                    State = 'unknown'
+                    Reason = 'call-receiver-type-unproven'
+                }
+            }
+        }
         if ($contained.Count -gt 0) {
             $candidates = $contained
         }
@@ -1438,9 +1733,7 @@ function Get-ContextualNamedCallSignature {
                 } else { 'selected-overload-unavailable' })
         }
     }
-    if (@($candidates[0].Parameters | Where-Object {
-                [bool]$_.params
-            }).Count -gt 0) {
+    if ([bool]$candidates[0].HasParams) {
         return [pscustomobject]@{
             State = 'unknown'
             Reason = 'expanded-params-binding-unproven'
@@ -1452,12 +1745,11 @@ function Get-ContextualNamedCallSignature {
     }
 }
 
-function Test-ContextualCompileTimeConstantArgument {
+function Test-ContextualConstantSyntax {
     param(
         [Parameter(Mandatory)]$Expression,
-        [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [Collections.Generic.HashSet[string]]$ConstNames
+        [string[]]$KnownNames = @()
     )
     if ($Expression -is [
             Microsoft.CodeAnalysis.CSharp.Syntax.LiteralExpressionSyntax] -or
@@ -1466,12 +1758,286 @@ function Test-ContextualCompileTimeConstantArgument {
         return $true
     }
     if ($Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.ParenthesizedExpressionSyntax]) {
+        return Test-ContextualConstantSyntax `
+            -Expression $Expression.Expression `
+            -KnownNames $KnownNames
+    }
+    if ($Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.PrefixUnaryExpressionSyntax] -and
+        [string]$Expression.OperatorToken.Text -in @(
+            '+', '-', '~', '!')) {
+        return Test-ContextualConstantSyntax `
+            -Expression $Expression.Operand `
+            -KnownNames $KnownNames
+    }
+    if ($Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.BinaryExpressionSyntax]) {
+        return (Test-ContextualConstantSyntax `
+                -Expression $Expression.Left `
+                -KnownNames $KnownNames) -and
+            (Test-ContextualConstantSyntax `
+                -Expression $Expression.Right `
+                -KnownNames $KnownNames)
+    }
+    if ($Expression -is [
             Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
         [string]$Expression.Expression.ToString() -ceq 'nameof') {
         return $true
     }
     $text = [string]$Expression.ToString()
-    return $ConstNames.Contains($text)
+    return $text -cin $KnownNames
+}
+
+function Get-ContextualNamedCallConstants {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $constants = [Collections.Generic.List[object]]::new()
+    $files = [Collections.Generic.List[object]]::new()
+    [void]$files.Add([pscustomobject]@{
+            path = $Path
+            root = $Root
+            current = $true
+        })
+    foreach ($file in $SnapshotFiles) {
+        if ($file -isnot [Collections.IDictionary] -or
+            [string]$file.state -cne 'complete' -or
+            [string]$file.path -inotmatch '\.cs$' -or
+            $file.content -isnot [string] -or
+            [string]$file.path -ieq $Path) {
+            continue
+        }
+        $tree = [
+            Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+                [string]$file.content)
+        if (@($tree.GetDiagnostics() | Where-Object {
+                    $_.Severity -eq [
+                        Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            continue
+        }
+        [void]$files.Add([pscustomobject]@{
+                path = [string]$file.path
+                root = $tree.GetRoot()
+                current = $false
+            })
+    }
+    foreach ($file in $files) {
+        $known = [Collections.Generic.List[string]]::new()
+        foreach ($enum in @($file.root.DescendantNodes() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.EnumDeclarationSyntax]
+                })) {
+            foreach ($member in @($enum.Members)) {
+                $qualified =
+                    [string]$enum.Identifier.ValueText +
+                    '.' +
+                    [string]$member.Identifier.ValueText
+                [void]$known.Add($qualified)
+                [void]$constants.Add([pscustomobject]@{
+                        Kind = 'enum'
+                        Name =
+                            [string]$member.Identifier.ValueText
+                        QualifiedName = $qualified
+                        Container =
+                            [string]$enum.Identifier.ValueText
+                        Path = [string]$file.path
+                        Current = [bool]$file.current
+                        Declaration = $member
+                    })
+            }
+        }
+        foreach ($field in @($file.root.DescendantNodes() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                    @($_.Modifiers | Where-Object {
+                            [string]$_.Text -ceq 'const'
+                        }).Count -gt 0
+                })) {
+            $owner = @($field.Ancestors() | Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                } | Select-Object -First 1)
+            if ($owner.Count -ne 1) {
+                continue
+            }
+            foreach ($variable in @(
+                    $field.Declaration.Variables)) {
+                if ($null -eq $variable.Initializer -or
+                    -not (Test-ContextualConstantSyntax `
+                        -Expression $variable.Initializer.Value `
+                        -KnownNames $known.ToArray())) {
+                    continue
+                }
+                $qualified =
+                    [string]$owner[0].Identifier.ValueText +
+                    '.' +
+                    [string]$variable.Identifier.ValueText
+                [void]$known.Add(
+                    [string]$variable.Identifier.ValueText)
+                [void]$known.Add($qualified)
+                [void]$constants.Add([pscustomobject]@{
+                        Kind = 'field'
+                        Name =
+                            [string]$variable.Identifier.ValueText
+                        QualifiedName = $qualified
+                        Container =
+                            [string]$owner[0].Identifier.ValueText
+                        Path = [string]$file.path
+                        Current = [bool]$file.current
+                        Declaration = $variable
+                    })
+            }
+        }
+        if (-not [bool]$file.current) {
+            continue
+        }
+        foreach ($local in @($file.root.DescendantNodes() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.LocalDeclarationStatementSyntax] -and
+                    @($_.Modifiers | Where-Object {
+                            [string]$_.Text -ceq 'const'
+                        }).Count -gt 0
+                })) {
+            $method = @($local.Ancestors() | Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax] -or
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
+                } | Select-Object -First 1)
+            if ($method.Count -ne 1) {
+                continue
+            }
+            foreach ($variable in @(
+                    $local.Declaration.Variables)) {
+                if ($null -eq $variable.Initializer -or
+                    -not (Test-ContextualConstantSyntax `
+                        -Expression $variable.Initializer.Value `
+                        -KnownNames $known.ToArray())) {
+                    continue
+                }
+                [void]$known.Add(
+                    [string]$variable.Identifier.ValueText)
+                [void]$constants.Add([pscustomobject]@{
+                        Kind = 'local'
+                        Name =
+                            [string]$variable.Identifier.ValueText
+                        QualifiedName = ''
+                        Container = ''
+                        Path = [string]$file.path
+                        Current = $true
+                        MethodStart =
+                            [int]$method[0].SpanStart
+                        ScopeStart =
+                            [int]$local.Parent.SpanStart
+                        ScopeEnd =
+                            [int]$local.Parent.Span.End
+                        Declaration = $variable
+                    })
+            }
+        }
+    }
+    return $constants.ToArray()
+}
+
+function Test-ContextualCompileTimeConstantArgument {
+    param(
+        [Parameter(Mandatory)]$Expression,
+        [Parameter(Mandatory)]$CallNode,
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Constants
+    )
+    if (Test-ContextualConstantSyntax `
+            -Expression $Expression) {
+        return $true
+    }
+    $text = [string]$Expression.ToString()
+    if ($Expression -is [
+            Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
+        return @($Constants | Where-Object {
+                [string]$_.QualifiedName -ceq $text
+            }).Count -eq 1
+    }
+    if ($Expression -isnot [
+            Microsoft.CodeAnalysis.CSharp.Syntax.IdentifierNameSyntax]) {
+        return $false
+    }
+    $name = [string]$Expression.Identifier.ValueText
+    $method = @($CallNode.Ancestors() | Where-Object {
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax] -or
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax]
+        } | Select-Object -First 1)
+    if ($method.Count -eq 1) {
+        if (@($method[0].ParameterList.Parameters |
+                Where-Object {
+                    [string]$_.Identifier.ValueText -ceq
+                        $name
+                }).Count -gt 0) {
+            return $false
+        }
+        $locals = @($method[0].DescendantNodes() |
+            Where-Object {
+                $_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax] -and
+                [string]$_.Identifier.ValueText -ceq
+                    $name -and
+                [int]$_.SpanStart -lt
+                    [int]$CallNode.SpanStart
+            } | Sort-Object {
+                -[int]$_.SpanStart
+            })
+        if ($locals.Count -gt 0) {
+            return @($Constants | Where-Object {
+                    [string]$_.Kind -ceq 'local' -and
+                    [string]$_.Name -ceq $name -and
+                    [int]$_.MethodStart -eq
+                        [int]$method[0].SpanStart -and
+                    [int]$_.Declaration.SpanStart -eq
+                        [int]$locals[0].SpanStart -and
+                    [int]$_.ScopeStart -le
+                        [int]$CallNode.SpanStart -and
+                    [int]$_.ScopeEnd -ge
+                        [int]$CallNode.Span.End
+                }).Count -eq 1
+        }
+    }
+    $owner = @($CallNode.Ancestors() | Where-Object {
+            $_ -is [
+                Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+        } | Select-Object -First 1)
+    if ($owner.Count -ne 1) {
+        return $false
+    }
+    $members = @($owner[0].Members | Where-Object {
+            ($_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                @($_.Declaration.Variables | Where-Object {
+                        [string]$_.Identifier.ValueText -ceq $name
+                    }).Count -gt 0) -or
+            ($_ -is [
+                    Microsoft.CodeAnalysis.CSharp.Syntax.PropertyDeclarationSyntax] -and
+                [string]$_.Identifier.ValueText -ceq $name)
+        })
+    if ($members.Count -ne 1) {
+        return $false
+    }
+    return @($Constants | Where-Object {
+            [string]$_.Kind -ceq 'field' -and
+            [bool]$_.Current -and
+            [string]$_.Container -ceq
+                [string]$owner[0].Identifier.ValueText -and
+            [string]$_.Name -ceq $name
+        }).Count -eq 1
 }
 
 function Test-ContextualNamedCallExpressionTree {
@@ -1506,10 +2072,13 @@ function Get-ContextualNamedCallOutcome {
         [Parameter(Mandatory)]$Language,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [Collections.Generic.HashSet[string]]$ConstNames
+        [object[]]$Constants
     )
     if (-not (Test-ContextualNodeChanged `
             -Node $Node -Spans $Spans)) {
+        return $null
+    }
+    if ($null -eq $Node.ArgumentList) {
         return $null
     }
     $arguments = @($Node.ArgumentList.Arguments)
@@ -1531,18 +2100,17 @@ function Get-ContextualNamedCallOutcome {
     }
     $anchor = [int](
         $anchors | Measure-Object -Minimum).Minimum
-    $signatureResult =
-        Get-ContextualNamedCallSignature `
-            -Node $Node -Root $Root `
-            -Signatures $Signatures
-    if ([string]$signatureResult.State -ceq 'excluded' -or
-        [string]$signatureResult.State -ceq 'not-applicable') {
+    $allNamed = @($arguments | Where-Object {
+            $null -ne $_.NameColon
+        }).Count -eq $arguments.Count
+    if ($allNamed) {
         return $null
     }
     $literalTrigger = @($arguments | Where-Object {
             Test-ContextualCompileTimeConstantArgument `
                 -Expression $_.Expression `
-                -ConstNames $ConstNames
+                -CallNode $Node -Root $Root `
+                -Constants $Constants
         }).Count -gt 0
     $argumentLines = @($arguments | ForEach-Object {
             [int]$_.GetLocation().GetLineSpan().
@@ -1551,9 +2119,38 @@ function Get-ContextualNamedCallOutcome {
     $multilineTrigger = $arguments.Count -gt 1 -and
         @($argumentLines | Sort-Object -Unique).Count -eq
             $arguments.Count
+    if ([string]$Language.State -cne 'supported' -and
+        ($literalTrigger -or $multilineTrigger -or
+            $arguments.Count -ge 2)) {
+        return New-ContextualOutcome `
+            -RuleId named-call-arguments `
+            -State unknown `
+            -Reason $(if ($Language.Reason) {
+                    [string]$Language.Reason
+                } else {
+                    'project-language-version-unknown'
+                }) `
+            -Path $Path -Line $anchor `
+            -EndLine $anchor `
+            -Symbol 'unresolved-call'
+    }
+    $signatureResult =
+        Get-ContextualNamedCallSignature `
+            -Node $Node -Root $Root `
+            -Signatures $Signatures
+    if ([string]$signatureResult.State -ceq 'excluded' -or
+        [string]$signatureResult.State -ceq 'not-applicable') {
+        return $null
+    }
     if ([string]$signatureResult.State -cne 'resolved') {
         if (-not $literalTrigger -and
-            -not $multilineTrigger) {
+            -not $multilineTrigger -and
+            -not ($arguments.Count -ge 2 -and
+                [string]$signatureResult.Reason -cin @(
+                    'selected-overload-ambiguous',
+                    'expanded-params-binding-unproven',
+                    'generic-type-parameter-binding-unproven',
+                    'call-receiver-type-unproven'))) {
             return $null
         }
         return New-ContextualOutcome `
@@ -1566,6 +2163,25 @@ function Get-ContextualNamedCallOutcome {
     }
     $signature = $signatureResult.Signature
     $parameters = @($signature.Parameters)
+    if ($arguments.Count -ge 2 -and
+        @($parameters | Where-Object {
+                $parameterType = [string]$_['type']
+                @($signature.GenericParameters |
+                    Where-Object {
+                        $parameterType -match (
+                            '(?:^|[^A-Za-z0-9_])' +
+                            [regex]::Escape([string]$_) +
+                            '(?:$|[^A-Za-z0-9_])')
+                    }).Count -gt 0
+            }).Count -gt 0) {
+        return New-ContextualOutcome `
+            -RuleId named-call-arguments `
+            -State unknown `
+            -Reason generic-type-parameter-binding-unproven `
+            -Path $Path -Line $anchor `
+            -EndLine $anchor `
+            -Symbol ([string]$signature.Name)
+    }
     $mapped = [Collections.Generic.HashSet[int]]::new()
     foreach ($argument in $arguments) {
         $parameterIndex = -1
@@ -1652,19 +2268,6 @@ function Get-ContextualNamedCallOutcome {
         -not $repeatedTypeTrigger) {
         return $null
     }
-    if ([string]$Language.State -cne 'supported') {
-        return New-ContextualOutcome `
-            -RuleId named-call-arguments `
-            -State unknown `
-            -Reason $(if ($Language.Reason) {
-                    [string]$Language.Reason
-                } else {
-                    'project-language-version-unknown'
-                }) `
-            -Path $Path -Line $anchor `
-            -EndLine $anchor `
-            -Symbol ([string]$signature.Name)
-    }
     if (Test-ContextualNamedCallExpressionTree `
             -Node $Node) {
         return New-ContextualOutcome `
@@ -1702,9 +2305,6 @@ function Get-ContextualNamedCallOutcome {
                 -Symbol ([string]$signature.Name)
         }
     }
-    $allNamed = @($arguments | Where-Object {
-            $null -ne $_.NameColon
-        }).Count -eq $arguments.Count
     $triggers = [Collections.Generic.List[string]]::new()
     if ($repeatedTypeTrigger) {
         [void]$triggers.Add('repeated-formal-type')
@@ -2125,68 +2725,10 @@ function Get-ContextualRoslynOutcomes {
         @(Get-ContextualNamedCallSignatures `
             -Root $root -Path $Path `
             -SnapshotFiles $SnapshotFiles)
-    $constNames =
-        [Collections.Generic.HashSet[string]]::new(
-            [StringComparer]::Ordinal)
-    foreach ($field in @($nodes | Where-Object {
-                $_ -is [
-                    Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
-                @($_.Modifiers | Where-Object {
-                        [string]$_.Text -ceq 'const'
-                    }).Count -gt 0
-            })) {
-        foreach ($variable in @(
-                $field.Declaration.Variables)) {
-            if ($null -eq $variable.Initializer -or
-                -not (Test-ContextualCompileTimeConstantArgument `
-                    -Expression $variable.Initializer.Value `
-                    -ConstNames $constNames)) {
-                continue
-            }
-            [void]$constNames.Add(
-                [string]$variable.Identifier.ValueText)
-            $owner = @($field.Ancestors() | Where-Object {
-                    $_ -is [
-                        Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
-                } | Select-Object -First 1)
-            if ($owner.Count -eq 1) {
-                [void]$constNames.Add(
-                    [string]$owner[0].Identifier.ValueText +
-                    '.' +
-                    [string]$variable.Identifier.ValueText)
-            }
-        }
-    }
-    foreach ($local in @($nodes | Where-Object {
-                $_ -is [
-                    Microsoft.CodeAnalysis.CSharp.Syntax.LocalDeclarationStatementSyntax] -and
-                @($_.Modifiers | Where-Object {
-                        [string]$_.Text -ceq 'const'
-                    }).Count -gt 0
-            })) {
-        foreach ($variable in @(
-                $local.Declaration.Variables)) {
-            if ($null -eq $variable.Initializer -or
-                -not (Test-ContextualCompileTimeConstantArgument `
-                    -Expression $variable.Initializer.Value `
-                    -ConstNames $constNames)) {
-                continue
-            }
-            [void]$constNames.Add(
-                [string]$variable.Identifier.ValueText)
-        }
-    }
-    foreach ($enum in @($nodes | Where-Object {
-                $_ -is [
-                    Microsoft.CodeAnalysis.CSharp.Syntax.EnumDeclarationSyntax]
-            })) {
-        foreach ($member in @($enum.Members)) {
-            [void]$constNames.Add(
-                [string]$enum.Identifier.ValueText +
-                '.' +
-                [string]$member.Identifier.ValueText)
-        }
-    }
+    $namedCallConstants =
+        @(Get-ContextualNamedCallConstants `
+            -Root $root -Path $Path `
+            -SnapshotFiles $SnapshotFiles)
     $callNodes = @(
         $nodes | Where-Object {
             $_ -is [
@@ -2202,7 +2744,7 @@ function Get-ContextualRoslynOutcomes {
             -Path $Path -Spans $Spans `
             -Signatures $namedCallSignatures `
             -Language $namedCallLanguage `
-            -ConstNames $constNames
+            -Constants $namedCallConstants
         if ($null -eq $outcome) {
             continue
         }

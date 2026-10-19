@@ -54,7 +54,7 @@
   },
   "capability": {
     "id": "bpm-contextual-conventions@1",
-    "implementationSha256": "58d3c0ec2205d6c52f3e3f882a922730508096f307bed07bc58080456b57f6f8"
+    "implementationSha256": "f7fcd3fed2db2e39215050fab806a1a65ff4e402c46faeb6ec7fe4ffefd061b6"
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",

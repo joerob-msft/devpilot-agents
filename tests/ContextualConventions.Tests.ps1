@@ -472,6 +472,138 @@ class C : B { C() : base("a", "b") {} }
             Should -BeExactly documented-trigger-positional-arguments
     }
 
+    It 'does not crash on omitted object-creation parentheses or unproven base lists' {
+        $objectInitializer =
+            'class C { int P { get; set; } void M() { var x = new C { P = 1 }; } }'
+        $partialBase =
+            'partial class C { C() : base(0) {} }'
+        foreach ($content in @(
+                $objectInitializer,
+                $partialBase)) {
+            $outcomes = @(
+                Get-ContextualConventionOutcomes `
+                    -Content $content `
+                    -Path 'src/Changed.cs' `
+                    -Spans @([ordered]@{
+                            startLine = 1
+                            endLine = 1
+                        }) `
+                    -SnapshotFiles @([ordered]@{
+                            path = 'src/Changed.cs'
+                            content = $content
+                            state = 'complete'
+                            projectContext = [ordered]@{
+                                state = 'complete'
+                                content = '<Project><PropertyGroup><LangVersion>7.2</LangVersion></PropertyGroup></Project>'
+                            }
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                })
+                        }))
+            $outcomes | Should -HaveCount 19
+            @($outcomes | Where-Object {
+                    [string]$_.ruleId -cne
+                        'named-call-arguments'
+                }) | Should -HaveCount 18
+        }
+    }
+
+    It 'withholds unproven receiver and container bindings' {
+        $controls = @(
+            'class Unrelated { void Target(string a, string b) {} } class C : Base, System.IDisposable { void M(string x, string y) { base.Target(x, y); } }',
+            'class Service { void Target(int x) {} } class C { IOther Service { get; } void M() { this.Service.Target(0); } }',
+            'class Service { static void Target(int x) {} } class C { void M(IOther Service) { Service.Target(0); } }',
+            'class Service { void Target(int x) {} } class C { void M() { Service.Target(0); } }')
+        foreach ($content in $controls) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content
+            $outcome.state | Should -BeExactly unknown
+            $outcome.reason |
+                Should -BeExactly call-receiver-type-unproven
+        }
+    }
+
+    It 'matches optional arity and withholds competing overloads and params' {
+        $optional = 'class C { void Target(string a, string b, int timeout = 0) {} void M(string x, string y) { Target(x, y); } }'
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $optional).state |
+            Should -BeExactly violation
+
+        $ambiguous = @(
+            'class C { void Target(string a, string b) {} void Target(int a, int b) {} void M(string x, string y) { Target(x, y); } }',
+            'class C { void Target(string a, string b) {} void Target(int a, string b, bool f = false) {} void M(int x, string y) { Target(x, y); } }')
+        foreach ($content in $ambiguous) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content
+            $outcome.state | Should -BeExactly unknown
+            $outcome.reason |
+                Should -BeExactly selected-overload-ambiguous
+        }
+
+        $params = 'class C { void Target(params string[] values) {} void M(string x, string y) { Target(x, y); } }'
+        $paramsOutcome = Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $params
+        $paramsOutcome.state | Should -BeExactly unknown
+        $paramsOutcome.reason |
+            Should -BeExactly expanded-params-binding-unproven
+    }
+
+    It 'normalizes proven BCL type names and withholds generic instantiations' {
+        $sameType = 'using System; class C { void Target(String a, string b) {} void M(string x, string y) { Target(x, y); } }'
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $sameType).state |
+            Should -BeExactly violation
+
+        foreach ($receiver in @(
+                'String.Equals',
+                'System.String.Equals',
+                'global::System.String.Equals')) {
+            $content =
+                "using System; class C { bool M(string a, string b) { return $receiver(a, b, StringComparison.Ordinal); } }"
+            (Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content).state |
+                Should -BeExactly violation
+        }
+
+        $generic = 'class C { void Target<T1, T2>(T1 a, T2 b) {} void M(string x, string y) { Target(x, y); } }'
+        $genericOutcome = Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $generic
+        $genericOutcome.state | Should -BeExactly unknown
+        $genericOutcome.reason |
+            Should -BeExactly generic-type-parameter-binding-unproven
+    }
+
+    It 'scopes constants and recognizes unary and parenthesized constants' {
+        $shadowed =
+            'class C { void Target(int x) {} void A() { const int value = 1; } void B(int value) { Target(value); } }'
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $shadowed).state |
+            Should -BeExactly compliant
+
+        foreach ($expression in @(
+                '-1',
+                '(0)',
+                '~0',
+                '!false',
+                '1 + 2')) {
+            $content =
+                "class C { void Target(int x) {} void M() { Target($expression); } }"
+            (Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content).state |
+                Should -BeExactly violation
+        }
+    }
+
     It 'flags default HttpClient construction with a namespace-scoped using' {
         $content = @(
             'namespace Fixture'
