@@ -801,7 +801,7 @@ BeforeAll {
                     'bpm-contextual-conventions@1'
                 hash =
                     'v1:sha256:' + ('8' * 64)
-                length = 4297
+                length = 4815
             }
             capability = [ordered]@{
                 id =

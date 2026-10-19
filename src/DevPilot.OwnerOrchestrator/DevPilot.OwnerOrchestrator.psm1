@@ -53,11 +53,11 @@ $script:NamedAreEqualPolicyDigest =
 $script:ContextualCapabilityId =
     'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:f7fcd3fed2db2e39215050fab806a1a65ff4e402c46faeb6ec7fe4ffefd061b6'
+    'v1:sha256:c04c3dac3bd86ef1943a816dee3a1e97dc9b904ba04b5207e6f1469eec272901'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
-    'v1:sha256:cdddfdbe2823d7ac7e07012a27862935ab829c14b777111f00522d96c75074f9'
+    'v1:sha256:ed8d84176ecfebbc014e2cc6fc52eb92842af05f87b743623a69f0d31ad8b318'
 $script:NamedAreEqualParserPath = Join-Path $PSScriptRoot `
     '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
 $script:NamedAreEqualParserManifestPath = Join-Path $PSScriptRoot `

@@ -14,6 +14,13 @@
         "Use named parameters if one passed parameter values is a constant."
       ]
     },
+    "xmlSummaryLayout": {
+      "authorityState": "user-directed proposed documentation",
+      "pullRequestId": 17578758,
+      "commit": "23affb18db51b88c33bd1d96aff987b0386e2612",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "lines": [980, 1007]
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -41,6 +48,11 @@
       "id": "named-call-arguments",
       "name": "Name arguments at documented ambiguous call sites",
       "sourceSection": "Named parameters / Name constant parameters"
+    },
+    {
+      "id": "xml-summary-layout",
+      "name": "Format XML documentation summary tags on standalone lines",
+      "sourceSection": "Proposed: Format XML documentation summaries on separate lines"
     },
     {
       "id": "collection-cardinality",
