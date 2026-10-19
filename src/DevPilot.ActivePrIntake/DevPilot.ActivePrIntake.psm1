@@ -3060,10 +3060,10 @@ print(json.dumps({
                         Sort-Object -CaseSensitive `
                             @{ Expression = {
                                     [string]$_['path']
-                                }; Ascending = $true },
+                                } },
                             @{ Expression = {
                                     [int]$_['changeTrackingId']
-                                }; Ascending = $true })
+                                } })
                 $evidencePlan =
                     & $getSharedEvidencePlan `
                         -Inventory $orderedChangeEntries
