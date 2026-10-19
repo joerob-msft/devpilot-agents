@@ -831,6 +831,132 @@ $response | ConvertTo-Json -Depth 8 -Compress
                 -ErrorAction SilentlyContinue
         }
     }
+    It 'stabilizes ADO hashtable change ordering and completed progress revalidation' {
+        $c = New-IntakeCase -Count 1 -MaxHeads 1
+        New-Item -ItemType Directory -Path $c.root -Force |
+            Out-Null
+        $stub = Join-Path $c.root 'az-reordered-changes.ps1'
+        $counter = Join-Path $c.root 'change-order-count.txt'
+        $env:ACTIVE_PR_INTAKE_CHANGE_ORDER_COUNT =
+            $counter
+        @'
+$arguments = $args
+if ($arguments -contains 'pullRequestIterationChanges') {
+    if ($arguments -contains '$skip=4') {
+        '{"changeEntries":[],"count":0}'
+    }
+    else {
+        $counter = $env:ACTIVE_PR_INTAKE_CHANGE_ORDER_COUNT
+        $call = if (Test-Path -LiteralPath $counter) {
+            [int](Get-Content -LiteralPath $counter -Raw)
+        }
+        else { 0 }
+        $call++
+        Set-Content -LiteralPath $counter -Value $call
+        $entries = @(
+            @{
+                changeTrackingId = 10
+                changeType = 'delete'
+                item = @{ path = '/src/Same.cs' }
+            },
+            @{
+                changeTrackingId = 2
+                changeType = 'delete'
+                item = @{ path = '/src/Same.cs' }
+            },
+            @{
+                changeTrackingId = 3
+                changeType = 'delete'
+                item = @{ path = '/src/A.cs' }
+            },
+            @{
+                changeTrackingId = 4
+                changeType = 'delete'
+                item = @{ path = '/src/a.cs' }
+            })
+        if ($call % 2 -eq 0) {
+            [array]::Reverse($entries)
+        }
+        @{
+            changeEntries = $entries
+            count = $entries.Count
+            nextSkip = $entries.Count
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        try {
+            $transport = New-ActivePrAzureDevOpsProvider `
+                -Config $c.config -AzureCliPath $stub
+            $request = @{
+                pullRequestId = 1
+                iterationId = 1
+                sourceCommit = 'a' * 40
+                targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+            $first = & $transport 'Changes' $request
+            $second = & $transport 'Changes' $request
+
+            @($first.inventory.path) |
+                Should -Be @($second.inventory.path)
+            @($first.inventory.changeTrackingId) |
+                Should -Be @($second.inventory.changeTrackingId)
+            $first.fileProgress.inventoryDigest |
+                Should -BeExactly `
+                    $second.fileProgress.inventoryDigest
+            $first.fileProgress.evidencePlanDigest |
+                Should -BeExactly `
+                    $second.fileProgress.evidencePlanDigest
+            @($first.inventory |
+                    Where-Object path -CEQ 'src/Same.cs' |
+                    ForEach-Object changeTrackingId) |
+                Should -Be @(2, 10)
+
+            $baseProvider = $c.provider
+            $provider = {
+                param($operation, $providerRequest)
+                if ($operation -ceq 'Changes') {
+                    return & $transport `
+                        $operation $providerRequest
+                }
+                return & $baseProvider `
+                    $operation $providerRequest
+            }.GetNewClosure()
+            $firstRun = Invoke-ActivePrIntake `
+                -Config $c.config -Provider $provider `
+                -StateRoot $c.root `
+                -RepositoryRoot $repo -Run
+            $secondRun = Invoke-ActivePrIntake `
+                -Config $c.config -Provider $provider `
+                -StateRoot $c.root `
+                -RepositoryRoot $repo -Run
+
+            $firstRun.heads[0].reasonCode |
+                Should -BeExactly 'rules-incomplete'
+            $secondRun.heads[0].reasonCode |
+                Should -BeExactly 'rules-incomplete'
+            $progress = Get-Content (
+                Join-Path $c.root `
+                    'active-pr-intake-v1\file-progress\1.json'
+                ) -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            $progress.inventoryDigest |
+                Should -BeExactly `
+                    $first.fileProgress.inventoryDigest
+            $progress.evidencePlanDigest |
+                Should -BeExactly `
+                    $first.fileProgress.evidencePlanDigest
+        }
+        finally {
+            Remove-Item `
+                Env:\ACTIVE_PR_INTAKE_CHANGE_ORDER_COUNT `
+                -ErrorAction SilentlyContinue
+        }
+    }
     It 'keeps a modified file unknown when required <Side> Item content is <Shape>' `
         -TestCases @(
             @{ Side = 'source'; Shape = 'missing' }
