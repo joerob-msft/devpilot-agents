@@ -52,7 +52,7 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:fc312d515ec9b52389f79ea353ab6a4bc8d690cf81a1505766a0ffe7f59f710a'
+$script:ContextualDigest = 'v1:sha256:a8d368a37fc41310a412bca16ca9b843b03fe16e7993a2ebaacdc0b0c8b45dad'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
 $script:ContextualPolicyDigest = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
 $script:OwnerV2AttributePattern = (
@@ -422,6 +422,40 @@ function Test-ContextualPriorRuleCompatibility {
                 [long]$Compatibility.currentRule.length))
 }
 
+function Test-ContextualDuplicateConstantHumanCoverage {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][string]$Evidence
+    )
+    if ($Body -cnotmatch
+        '(?i)\b(?:duplicat\w*|consolidat\w*|reconcil\w*|common\s+declar\w*|shared\s+constant\w*)\b') {
+        return $false
+    }
+    $tokens =
+        [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+    foreach ($match in [regex]::Matches(
+            $Evidence,
+            '(?<name>[A-Za-z_][A-Za-z0-9_]*)="(?<value>[^"]{1,256})"')) {
+        [void]$tokens.Add(
+            [string]$match.Groups[
+                'name'].Value)
+        [void]$tokens.Add(
+            [string]$match.Groups[
+                'value'].Value)
+    }
+    foreach ($token in $tokens) {
+        if ([regex]::IsMatch(
+                $Body,
+                '(?i)(?<![A-Za-z0-9_])' +
+                [regex]::Escape($token) +
+                '(?![A-Za-z0-9_])')) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Resolve-ContextualConventionDiscussionReconciliation {
     param(
         [Parameter(Mandatory)]
@@ -739,6 +773,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         $ambiguous = $false
         $humanCurrent = $false
         $crossRule = $false
+        $rangedHumanUnknown = $false
         foreach ($thread in @($Snapshot.Threads)) {
             $sameAnchor = $null -ne $thread.anchor -and
                 [string]$thread.anchor.path -ieq
@@ -813,6 +848,18 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             'ambiguous') {
                         $ambiguous = $true
                     }
+                    elseif (-not $sameAnchor -and
+                        [string]$finding.ruleId -ceq
+                            'duplicate-constant-declarations' -and
+                        -not (
+                            Test-ContextualDuplicateConstantHumanCoverage `
+                                -Body (
+                                    [string]$comment.body) `
+                                -Evidence (
+                                    [string]$finding.evidence))) {
+                        $rangedHumanUnknown =
+                            $true
+                    }
                     else {
                         $humanCurrent = $true
                     }
@@ -820,6 +867,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             }
         }
         if ($ambiguous -or $foreign -or
+            $rangedHumanUnknown -or
             $matches.Count -gt 1 -or
             ($matches.Count -eq 1 -and
                 [int]$matches[0].Count -ne 1)) {
@@ -830,7 +878,16 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             $finding.reconciliation =
                 New-OwnerV2DiscussionReconciliation `
                     -Classification unknown `
-                    -Reason duplicate-or-foreign-reviewer-marker `
+                    -Reason $(if (
+                            $rangedHumanUnknown -and
+                            -not $ambiguous -and
+                            -not $foreign -and
+                            $matches.Count -eq 0) {
+                            'ambiguous-ranged-human-review'
+                        }
+                        else {
+                            'duplicate-or-foreign-reviewer-marker'
+                        }) `
                     -DiscussionDigest $discussionDigest `
                     -BodyDigest $bodyDigest `
                     -ThreadAvailability ambiguous
@@ -3149,8 +3206,9 @@ function Invoke-ContextualConventionsCapabilityResponse {
         [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::OrdinalIgnoreCase)
     foreach ($file in $files) {
-        [void]$snapshotFiles.Add(
-            [ordered]@{
+        $context = Get-OwnerV2Member `
+            -Value $file.data -Name projectContext
+        $snapshotFile = [ordered]@{
                 path = [string]$file.data.path
                 content = $(if (
                     [string]$file.state -ceq 'complete' -and
@@ -3160,11 +3218,15 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 state = [string]$file.state
                 spans = @($file.data.spans)
             }
-        )
+        if ($context -is
+                [Collections.IDictionary]) {
+            $snapshotFile['projectContext'] =
+                $context
+        }
+        [void]$snapshotFiles.Add(
+            $snapshotFile)
         [void]$snapshotPaths.Add(
             [string]$file.data.path)
-        $context = Get-OwnerV2Member `
-            -Value $file.data -Name projectContext
         if ($context -is
                 [Collections.IDictionary] -and
             [string]$context.state -ceq 'complete' -and
@@ -3265,6 +3327,8 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 anchor = [ordered]@{
                     path = $path
                     line = [int]$outcome.line
+                    endLine =
+                        [int]$outcome.endLine
                     symbol =
                         [string]$outcome.symbol
                 }
@@ -3479,7 +3543,19 @@ function ConvertTo-OwnerV2Observation {
         $binding = New-OwnerCanonicalAnchor `
             -Path ([string](Get-OwnerV2Member -Value $anchor -Name path)) `
             -StartLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
-            -EndLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
+            -EndLine $(if ($null -ne (
+                        Get-OwnerV2Member `
+                            -Value $anchor `
+                            -Name endLine)) {
+                    [int](Get-OwnerV2Member `
+                        -Value $anchor `
+                        -Name endLine)
+                }
+                else {
+                    [int](Get-OwnerV2Member `
+                        -Value $anchor `
+                        -Name line)
+                }) `
             -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
             -ConstructIdentity $constructRef
         $normalizedFinding = [ordered]@{

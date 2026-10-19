@@ -114,7 +114,7 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    'fc312d515ec9b52389f79ea353ab6a4bc8d690cf81a1505766a0ffe7f59f710a'
+                    'a8d368a37fc41310a412bca16ca9b843b03fe16e7993a2ebaacdc0b0c8b45dad'
             }
             sharedAcquisition = [ordered]@{
                 kind =
@@ -746,6 +746,8 @@ Describe 'Contextual convention current PR bridge' {
         $finding.ruleId =
             'duplicate-constant-declarations'
         $finding.anchor.line = 16
+        $finding.evidence =
+            'Consolidate duplicated constants ApiVersionHeaderName="x-adc-api-version", AuthorizationHeaderName="Authorization", SupportedProtocol="http", SupportedScheme="https" for shared contract adc.egress.hook/v1.'
         $finding.binding['span'] =
             [ordered]@{
                 startLine = 16
@@ -778,6 +780,220 @@ Describe 'Contextual convention current PR bridge' {
             Should -Be 1
         $result.effects.dedupe.wouldCreate |
             Should -Be 0
+    }
+
+    It 'withholds an unrelated human review inside a duplicate-constant range' {
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $finding =
+            $case.Observation.findings[0]
+        $finding.ruleId =
+            'duplicate-constant-declarations'
+        $finding.anchor.line = 16
+        $finding.evidence =
+            'Consolidate duplicated constants ApiVersionHeaderName="x-adc-api-version", SupportedProtocol="http" for shared contract adc.egress.hook/v1.'
+        $finding.binding['span'] =
+            [ordered]@{
+                startLine = 16
+                endLine = 45
+            }
+        $case.Thread.anchor.line = 37
+        $case.Thread.comments[0].body =
+            'Typo in XML documentation summary.'
+        $case.Thread.comments[0].
+            reviewerOwned = $false
+        $case.Thread.comments[0].
+            reviewerIdentityState = 'foreign'
+
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                ambiguous-ranged-human-review
+        $result.effects.dedupe.humanCovered |
+            Should -Be 0
+        $result.effects.dedupe.wouldCreate |
+            Should -Be 0
+    }
+
+    It 'preserves project context and the grouped span through the capability adapter' {
+        $config =
+            New-ContextualTestConfig
+        $candidate = @'
+namespace N {
+/// <summary>Wire <c>contract/v1</c>.</summary>
+internal static class Candidate {
+internal const string Header = "x-header";
+internal const string Protocol = "http";
+} }
+'@
+        $comparison = @'
+namespace N {
+/// <summary>Wire <c>contract/v1</c>.</summary>
+internal static class Existing {
+internal const string Header = "x-header";
+internal const string Protocol = "http";
+} }
+'@
+        $project = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            sourceDigest =
+                'v1:sha256:' + ('1' * 64)
+            content =
+                '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+        }
+        $bindingId =
+            'v1:sha256:' + ('2' * 64)
+        $policyPath = Join-Path $repoRoot `
+            'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json'
+        $policyText = [IO.File]::ReadAllText(
+            $policyPath,
+            [Text.UTF8Encoding]::new($false))
+        $capabilityDigest =
+            'v1:sha256:' +
+            $config.capability.
+                implementationSha256
+        $context = [ordered]@{
+            binding = [ordered]@{
+                BindingId = $bindingId
+            }
+            evidence = [ordered]@{
+                bindingId = $bindingId
+                evidenceDigest =
+                    'v1:sha256:' + ('3' * 64)
+                evidenceUnits = @(
+                    [ordered]@{
+                        unitId = 'identity'
+                        state = 'complete'
+                        data = [ordered]@{
+                            capabilityId =
+                                $config.capability.id
+                            capabilityDigest =
+                                $capabilityDigest
+                            repositoryId =
+                                $config.repositoryId
+                            projectId =
+                                $config.projectId
+                            pullRequestId = 42
+                            sourceCommit = 'a' * 40
+                            targetCommit = 'b' * 40
+                            targetRef =
+                                'refs/heads/main'
+                        }
+                    },
+                    [ordered]@{
+                        unitId = 'rule'
+                        state = 'complete'
+                        data = [ordered]@{
+                            repositoryId =
+                                $config.contextualRule.
+                                    repositoryId
+                            path =
+                                $config.contextualRule.path
+                            commit = 'c' * 40
+                            section =
+                                $config.contextualRule.
+                                    section
+                            hash =
+                                $config.contextualRule.hash
+                            content = $policyText
+                        }
+                    },
+                    [ordered]@{
+                        unitId = 'file:000000'
+                        state = 'complete'
+                        data = [ordered]@{
+                            path = 'src/Candidate.cs'
+                            content = $candidate
+                            spans = @([ordered]@{
+                                    startLine = 4
+                                    endLine = 5
+                                })
+                            projectContext =
+                                $project
+                        }
+                    },
+                    [ordered]@{
+                        unitId = 'file:000001'
+                        state = 'complete'
+                        data = [ordered]@{
+                            path = 'src/Existing.cs'
+                            content = $comparison
+                            spans = @([ordered]@{
+                                    startLine = 4
+                                    endLine = 5
+                                })
+                            projectContext =
+                                $project
+                        }
+                    })
+            }
+        }
+        $module =
+            Get-Module DevPilot.OwnerCapability
+        $response = & $module {
+            param($Context, $Digest)
+            Invoke-ContextualConventionsCapabilityResponse `
+                -Context $Context `
+                -CapabilityDigest $Digest `
+                -Limits (
+                    New-OwnerV2CapabilityLimits)
+        } $context $capabilityDigest
+        $previewFindings = @(
+            $response.assessments |
+                ForEach-Object {
+                    @($_.findings)
+                } |
+                Where-Object {
+                    [string]$_.data.ruleId -ceq
+                        'duplicate-constant-declarations'
+                })
+        $candidateFinding = @(
+            $previewFindings |
+                Where-Object {
+                    [string]$_.data.anchor.path -ceq
+                        'src/Candidate.cs'
+                })
+
+        $candidateFinding | Should -HaveCount 1
+        $candidateFinding[0].data.anchor.line |
+            Should -Be 4
+        $candidateFinding[0].data.anchor.endLine |
+            Should -Be 5
+
+        $observation =
+            ConvertTo-OwnerV2Observation `
+                -PipelineResult ([ordered]@{
+                    evidence = $context.evidence
+                    validation = $response
+                    preview = [ordered]@{
+                        findings =
+                            $previewFindings
+                    }
+                })
+        $normalized = @(
+            $observation.findings |
+                Where-Object {
+                    [string]$_.ruleId -ceq
+                        'duplicate-constant-declarations' -and
+                    [string]$_.anchor.path -ceq
+                        'src/Candidate.cs'
+                })
+
+        $normalized | Should -HaveCount 1
+        $normalized[0].binding.span.startLine |
+            Should -Be 4
+        $normalized[0].binding.span.endLine |
+            Should -Be 5
     }
 
     It 'excludes generated C# from the contextual line denominator' {

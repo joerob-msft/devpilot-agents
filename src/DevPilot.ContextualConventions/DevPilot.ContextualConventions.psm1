@@ -2935,6 +2935,9 @@ function Get-ContextualDuplicateConstantDeclarations {
             Path = $Path
             Root = $Root
             Current = $true
+            Conditional = [regex]::IsMatch(
+                $Root.ToFullString(),
+                '(?m)^[ \t]*#(?:if|elif|else|endif)\b')
             Project = $(if ($currentFile.Count -eq 1) {
                     Get-ContextualConstantProjectBinding `
                         -File $currentFile[0]
@@ -2971,6 +2974,9 @@ function Get-ContextualDuplicateConstantDeclarations {
                 Path = [string]$file.path
                 Root = $tree.GetRoot()
                 Current = $false
+                Conditional = [regex]::IsMatch(
+                    [string]$file.content,
+                    '(?m)^[ \t]*#(?:if|elif|else|endif)\b')
                 Project =
                     Get-ContextualConstantProjectBinding `
                         -File $file
@@ -3002,13 +3008,45 @@ function Get-ContextualDuplicateConstantDeclarations {
             $typeDocs =
                 [string]$type.GetLeadingTrivia().
                     ToFullString()
+            $nested = @($type.Ancestors() |
+                Where-Object {
+                    $_ -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                }).Count -gt 0
             $contractTokens = @(
                 [regex]::Matches(
                     $typeDocs,
                     '(?is)<c>\s*(?<token>[^<]{1,256})\s*</c>') |
                     ForEach-Object {
-                        $_.Groups['token'].Value.Trim()
-                    } | Sort-Object -Unique)
+                        $windowStart =
+                            [Math]::Max(
+                                0,
+                                $_.Index - 160)
+                        $windowLength =
+                            [Math]::Min(
+                                $typeDocs.Length -
+                                    $windowStart,
+                                $_.Length + 320)
+                        $window =
+                            $typeDocs.Substring(
+                                $windowStart,
+                                $windowLength)
+                        if ($window -match
+                            '(?i)\bcontract\b') {
+                            $_.Groups[
+                                'token'].Value.Trim()
+                        }
+                    } |
+                    Where-Object {
+                        [string]$_ -cmatch
+                            '^[A-Za-z0-9][A-Za-z0-9._/-]{1,254}[A-Za-z0-9]$' -and
+                        [string]$_ -cmatch '[./-]' -and
+                        [string]$_ -cnotin @(
+                            'true',
+                            'false',
+                            'null')
+                    } |
+                    Sort-Object -Unique)
             foreach ($field in @(
                     $type.Members | Where-Object {
                         $_ -is [
@@ -3029,8 +3067,10 @@ function Get-ContextualDuplicateConstantDeclarations {
                 foreach ($variable in @(
                         $field.Declaration.Variables)) {
                     if ($null -eq $variable.Initializer -or
-                        $variable.Initializer.Value -isnot [
-                            Microsoft.CodeAnalysis.CSharp.Syntax.LiteralExpressionSyntax] -or
+                        [int]$variable.Initializer.Value.RawKind -ne
+                            [int][
+                                Microsoft.CodeAnalysis.CSharp.SyntaxKind]::
+                                    StringLiteralExpression -or
                         [string]$variable.Initializer.Value.Token.ValueText -ceq
                             '') {
                         continue
@@ -3058,6 +3098,9 @@ function Get-ContextualDuplicateConstantDeclarations {
                                     $variable
                             ContractTokens =
                                 $contractTokens
+                            Unsupported =
+                                [bool]$file.Conditional -or
+                                $nested
                         })
                 }
             }
@@ -3102,6 +3145,23 @@ function Get-ContextualDuplicateConstantOutcome {
             -Reason no-changed-eligible-constant `
             -Path $Path
     }
+    if (@($changed | Where-Object {
+                [bool]$_.Unsupported
+            }).Count -gt 0) {
+        $firstUnsupported = @($changed |
+            Where-Object {
+                [bool]$_.Unsupported
+            } |
+            Sort-Object Line)[0]
+        return New-ContextualOutcome `
+            -RuleId duplicate-constant-declarations `
+            -State unknown `
+            -Reason duplicate-constant-scope-unproven `
+            -Path $Path `
+            -Line ([int]$firstUnsupported.Line) `
+            -EndLine ([int]$firstUnsupported.Line) `
+            -Symbol ([string]$firstUnsupported.TypeName)
+    }
     $violations =
         [Collections.Generic.List[object]]::new()
     $unknowns =
@@ -3109,7 +3169,11 @@ function Get-ContextualDuplicateConstantOutcome {
     foreach ($candidate in $changed) {
         foreach ($comparison in @(
                 $declarations | Where-Object {
-                    -not [bool]$_.Current -and
+                    (-not (
+                        [string]$_.Path -ieq
+                            [string]$candidate.Path -and
+                        [string]$_.TypeName -ceq
+                            [string]$candidate.TypeName)) -and
                     [string]$_.Name -ceq
                         [string]$candidate.Name -and
                     [string]$_.ConstantType -ceq
@@ -3137,7 +3201,8 @@ function Get-ContextualDuplicateConstantOutcome {
                     })
             if ($projectProven -and
                 $sameNamespace -and
-                $sharedContract.Count -gt 0) {
+                $sharedContract.Count -eq 1 -and
+                -not [bool]$comparison.Unsupported) {
                 [void]$violations.Add([pscustomobject]@{
                         Candidate = $candidate
                         Comparison = $comparison
@@ -3153,6 +3218,27 @@ function Get-ContextualDuplicateConstantOutcome {
             }
         }
     }
+    $contracts = @($violations |
+        ForEach-Object {
+            [string]$_.Contract
+        } |
+        Sort-Object -Unique)
+    if ($unknowns.Count -gt 0 -or
+        $contracts.Count -gt 1) {
+        $first = @(
+            @($unknowns) + @($violations) |
+                Sort-Object {
+                    [int]$_.Candidate.Line
+                })[0]
+        return New-ContextualOutcome `
+            -RuleId duplicate-constant-declarations `
+            -State unknown `
+            -Reason duplicate-constant-relation-unproven `
+            -Path $Path `
+            -Line ([int]$first.Candidate.Line) `
+            -EndLine ([int]$first.Candidate.Line) `
+            -Symbol ([string]$first.Candidate.TypeName)
+    }
     if ($violations.Count -gt 0) {
         $ordered = @($violations | Sort-Object {
                 [int]$_.Candidate.Line
@@ -3161,8 +3247,12 @@ function Get-ContextualDuplicateConstantOutcome {
         $lastLine = [int](
             $ordered.Candidate.Line |
                 Measure-Object -Maximum).Maximum
-        $names = @($ordered.Candidate.Name |
-            Sort-Object -Unique)
+        $pairs = @($ordered | ForEach-Object {
+                [string]$_.Candidate.Name +
+                '="' +
+                [string]$_.Candidate.Value +
+                '"'
+            } | Sort-Object -Unique)
         return New-ContextualOutcome `
             -RuleId duplicate-constant-declarations `
             -State violation `
@@ -3173,22 +3263,9 @@ function Get-ContextualDuplicateConstantOutcome {
             -Symbol ([string]$first.Candidate.TypeName) `
             -Evidence (
                 'Consolidate duplicated constants ' +
-                ($names -join ', ') +
+                ($pairs -join ', ') +
                 ' for shared contract ' +
                 [string]$first.Contract + '.')
-    }
-    if ($unknowns.Count -gt 0) {
-        $first = @($unknowns | Sort-Object {
-                [int]$_.Candidate.Line
-            })[0]
-        return New-ContextualOutcome `
-            -RuleId duplicate-constant-declarations `
-            -State unknown `
-            -Reason duplicate-constant-relation-unproven `
-            -Path $Path `
-            -Line ([int]$first.Candidate.Line) `
-            -EndLine ([int]$first.Candidate.Line) `
-            -Symbol ([string]$first.Candidate.TypeName)
     }
     return New-ContextualOutcome `
         -RuleId duplicate-constant-declarations `
