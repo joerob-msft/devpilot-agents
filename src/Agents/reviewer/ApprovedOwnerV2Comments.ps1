@@ -16,6 +16,7 @@ $script:ApprovedContextualRuleIds = @(
     'exception-propagation',
     'type-based-decisions',
     'explicit-string-comparison',
+    'named-call-arguments',
     'collection-cardinality',
     'cheap-validation',
     'async-all-the-way',

@@ -5,6 +5,15 @@
   "sourceAuthority": {
     "codingPatterns": "documentation/EngineeringProcesses/Conventions/CodingPatterns.md",
     "codingStyle": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+    "codingStyleCommit": "33bc630a76a60b5ec3435355d30ddc5cf1b883e4",
+    "namedCallArguments": {
+      "lines": [550, 593, 620],
+      "clauses": [
+        "Name each parameter when two or more parameters are of the same type.",
+        "Name each parameter if you linefeed between each parameter.",
+        "Use named parameters if one passed parameter values is a constant."
+      ]
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -27,6 +36,11 @@
       "id": "explicit-string-comparison",
       "name": "Make string comparison explicit",
       "sourceSection": "Compare strings the correct way"
+    },
+    {
+      "id": "named-call-arguments",
+      "name": "Name arguments at documented ambiguous call sites",
+      "sourceSection": "Named parameters / Name constant parameters"
     },
     {
       "id": "collection-cardinality",

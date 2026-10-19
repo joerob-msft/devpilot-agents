@@ -23,6 +23,11 @@ BeforeDiscovery {
             Exemption = 'class C { bool M(string a, string b) { return string.Equals(a, b, StringComparison.Ordinal); } }'
         },
         @{
+            Rule = 'named-call-arguments'
+            Violation = 'class C { void Target(string left, string right) {} void M() { Target("a", "b"); } }'
+            Exemption = 'class C { void Target(string left, string right) {} void M() { Target(left: "a", right: "b"); } }'
+        },
+        @{
             Rule = 'collection-cardinality'
             Violation = 'class C { object M(IEnumerable<object> values) { var matches = values.Where(x => x != null).ToList(); return matches.First(); } }'
             Exemption = 'class C { object M(IEnumerable<object> values) { var matches = values.Where(x => x != null).ToList(); if (matches.Count != 1) throw new Exception(); return matches.Single(); } }'
@@ -106,6 +111,11 @@ BeforeAll {
                     path = $Path
                     content = $Content
                     state = 'complete'
+                    projectContext = [ordered]@{
+                        state = 'complete'
+                        path = 'src/App.csproj'
+                        content = '<Project><PropertyGroup><LangVersion>7.2</LangVersion></PropertyGroup></Project>'
+                    }
                     spans = @([ordered]@{
                             startLine = 1
                             endLine = $lines
@@ -126,9 +136,9 @@ BeforeAll {
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed eighteen-rule allow set' {
+    It 'exports the fixed nineteen-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 18
+            Should -HaveCount 19
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -236,6 +246,230 @@ Describe 'Contextual convention analyzer' {
             -RuleId http-client-lifetime `
             -Content $content).state |
             Should -BeExactly unknown
+    }
+
+    It 'enforces all three named-call triggers with one rule' {
+        $cases = @(
+            @{
+                reason = 'repeated formal types'
+                source = 'class C { void Target(string left, string right, System.Uri endpoint) {} void M(string a, string b, System.Uri u) { Target(a, b, u); } }'
+            },
+            @{
+                reason = 'one argument per line'
+                source = @'
+class C {
+    void Target(int first, string second, bool third) {}
+    void M(int a, string b, bool c) {
+        Target(
+            a,
+            b,
+            c);
+    }
+}
+'@
+            },
+            @{
+                reason = 'literal constant'
+                source = 'class C { void Target(int count) {} void M() { Target(0); } }'
+            },
+            @{
+                reason = 'declared compile-time constant'
+                source = 'class C { const int Count = 1; void Target(int count) {} void M() { Target(Count); } }'
+            })
+        foreach ($case in $cases) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $case.source
+            $outcome.state |
+                Should -BeExactly violation `
+                -Because $case.reason
+            $outcome.reason |
+                Should -BeExactly `
+                    documented-trigger-positional-arguments
+        }
+    }
+
+    It 'accepts all-named calls for every documented trigger' {
+        $controls = @(
+            'class C { void Target(string left, string right) {} void M() { Target(left: "a", right: "b"); } }',
+            @'
+class C {
+    void Target(int first, string second) {}
+    void M(int a, string b) {
+        Target(
+            first: a,
+            second: b);
+    }
+}
+'@,
+            'class C { void Target(int count) {} void M() { Target(count: 0); } }')
+        foreach ($content in $controls) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content
+            $outcome.state |
+                Should -Not -BeExactly violation
+        }
+    }
+
+    It 'does not duplicate the Assert AreEqual named-argument rule' {
+        $content = @'
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+class C {
+    void M() {
+        Assert.AreEqual(0, 1);
+    }
+}
+'@
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content).state |
+            Should -BeExactly compliant
+    }
+
+    It 'does not infer constants from capitalized identifiers' {
+        $content = 'class C { void Target(int count) {} void M(int Count) { Target(Count); } }'
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content).state |
+            Should -BeExactly compliant
+    }
+
+    It 'requires syntactic proof for declared constants' {
+        $content = 'class C { const int Count = Get(); static int Get() => 1; void Target(int count) {} void M() { Target(Count); } }'
+        (Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content).state |
+            Should -BeExactly compliant
+    }
+
+    It 'does not treat a newline inside one expression as argument-per-line formatting' {
+        $content = @'
+class C {
+    void Target(int first, int second) {}
+    int Get(
+        int value) => value;
+    void M(int a, int b) {
+        Target(Get(
+            a), b);
+    }
+}
+'@
+        $outcome = Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content
+        $outcome.reason |
+            Should -Not -BeExactly one-argument-per-line
+    }
+
+    It 'supports object construction and this/base constructor initializers with proven signatures' {
+        $object = 'class Item { Item(string left, string right) {} } class C { void M() { var value = new Item("a", "b"); } }'
+        $thisInitializer = @'
+class C {
+    C(int first, string second) : this(
+        first,
+        second,
+        true) {}
+    C(int first, string second, bool third) {}
+}
+'@
+        $baseInitializer = @'
+class B { public B(string left, string right) {} }
+class C : B { C() : base("a", "b") {} }
+'@
+        foreach ($content in @(
+                $object,
+                $thisInitializer,
+                $baseInitializer)) {
+            (Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content $content).state |
+                Should -BeExactly violation
+        }
+    }
+
+    It 'withholds ambiguous dynamic params expression-tree and unknown-language calls' {
+        $controls = @(
+            @{
+                reason = 'selected-overload-ambiguous'
+                source = 'class C { void Target(int value) {} void Target(string value) {} void M() { Target(0); } }'
+                files = @()
+            },
+            @{
+                reason = 'dynamic-argument-binding-unproven'
+                source = 'class C { void Target(int first, int second) {} void M(dynamic value) { Target(value, 0); } }'
+                files = @()
+            },
+            @{
+                reason = 'expanded-params-binding-unproven'
+                source = 'class C { void Target(params int[] values) {} void M() { Target(0); } }'
+                files = @()
+            },
+            @{
+                reason = 'expression-tree-named-arguments-unproven'
+                source = 'class C { void Target(int value) {} void Setup(System.Action f) {} void M() { Setup(() => Target(0)); } }'
+                files = @()
+            },
+            @{
+                reason = 'project-language-version-unknown'
+                source = 'class C { void Target(int value) {} void M() { Target(0); } }'
+                files = @([ordered]@{
+                        path = 'src/Changed.cs'
+                        state = 'complete'
+                        content = 'class C { void Target(int value) {} void M() { Target(0); } }'
+                        spans = @([ordered]@{
+                                startLine = 1
+                                endLine = 1
+                            })
+                    })
+            },
+            @{
+                reason = 'call-receiver-type-unproven'
+                source = 'class Service { void Target(int value) {} } class C { void M(Service service) { service.Target(0); } }'
+                files = @()
+            },
+            @{
+                reason = 'argument-modifier-binding-unproven'
+                source = 'class C { void Target(ref int first, ref int second) {} void M(int a, int b) { Target(a, b); } }'
+                files = @()
+            })
+        foreach ($case in $controls) {
+            $outcome = if ($case.files.Count) {
+                Invoke-ConventionCase `
+                    -RuleId named-call-arguments `
+                    -Content $case.source `
+                    -SnapshotFiles $case.files
+            }
+            else {
+                Invoke-ConventionCase `
+                    -RuleId named-call-arguments `
+                    -Content $case.source
+            }
+            $outcome.state |
+                Should -BeExactly unknown `
+                -Because $case.reason
+            $outcome.reason |
+                Should -BeExactly $case.reason
+        }
+    }
+
+    It 'resolves the pinned BCL string Equals signature without overlapping comparison semantics' {
+        $content = 'class C { bool M(string a, string b) { return string.Equals(a, b, System.StringComparison.Ordinal); } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content
+        $outcome.state | Should -BeExactly violation
+        $outcome.symbol | Should -BeExactly Equals
+    }
+
+    It 'preserves ref out and in argument binding' {
+        $content = 'class C { void Target(ref int first, ref int second) {} void M(int a, int b) { Target(ref a, ref b); } }'
+        $outcome = Invoke-ConventionCase `
+            -RuleId named-call-arguments `
+            -Content $content
+        $outcome.state | Should -BeExactly violation
+        $outcome.reason |
+            Should -BeExactly documented-trigger-positional-arguments
     }
 
     It 'flags default HttpClient construction with a namespace-scoped using' {

@@ -60,6 +60,17 @@ hash and construct remain identical. Copied, edited, deleted, moved, duplicate,
 foreign-identity, stale-head, or changed-rule evidence remains unknown and
 cannot authorize a create, update, or rewrite.
 
+The contextual bundle also enforces EngHub's general named-call convention as
+one rule group. A changed invocation, object construction, or `this`/`base`
+initializer requires every supplied argument to be named when selected formal
+parameters repeat a semantic type, each argument starts on its own line, or a
+supplied value is a proven literal/compile-time constant. The implementation
+uses a unique same-file/snapshot signature or a pinned known BCL signature and
+never guesses parameter names. It excludes `Assert.AreEqual`, which remains
+owned by the separate MSTest rule. Ambiguous overloads, dynamic calls, expanded
+`params`, unsupported expression-tree syntax, or unknown language-version
+evidence remain unknown and cannot reach delivery.
+
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
 different local key, policy kind, intent kind, outcome kind, directories, and
