@@ -116,12 +116,18 @@ if ($LASTEXITCODE -ne 0 -or
         }).Count -ne 0) {
     throw 'contextual-phase-toolkit-mismatch'
 }
+$agentHarnessModule = Join-Path `
+    $ContextualToolkitRoot `
+    'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
 $approvedCommentsTool = Join-Path $ContextualToolkitRoot `
     'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1'
-if (-not (Test-Path -LiteralPath $approvedCommentsTool `
+if (-not (Test-Path -LiteralPath $agentHarnessModule `
+        -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $approvedCommentsTool `
         -PathType Leaf)) {
     throw 'contextual-phase-approved-comments-missing'
 }
+Import-Module $agentHarnessModule -Force
 . $approvedCommentsTool
 foreach ($path in @(
         $ContextualConfigPath,

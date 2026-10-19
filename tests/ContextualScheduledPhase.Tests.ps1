@@ -29,11 +29,17 @@ Describe 'Contextual scheduled observation disposition' {
         $historyIndex = $text.IndexOf(
             'Get-ApprovedOwnerV2AuthenticatedPriorComments',
             [StringComparison]::Ordinal)
+        $harnessIndex = $text.IndexOf(
+            'Import-Module $agentHarnessModule',
+            [StringComparison]::Ordinal)
         $evaluationIndex = $text.IndexOf(
             '& $currentPrTool',
             [StringComparison]::Ordinal)
 
+        $harnessIndex | Should -BeGreaterThan -1
         $historyIndex | Should -BeGreaterThan -1
+        $historyIndex |
+            Should -BeGreaterThan $harnessIndex
         $evaluationIndex |
             Should -BeGreaterThan $historyIndex
         $text | Should -Match (
