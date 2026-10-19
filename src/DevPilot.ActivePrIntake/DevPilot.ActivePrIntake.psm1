@@ -201,11 +201,13 @@ function Write-IntakePrivateFailure {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$Generation,
-        [Parameter(Mandatory)][Exception]$Exception
+        [Parameter(Mandatory)][Exception]$Exception,
+        [long]$PullRequestId = 0
     )
     $allowedKeys = @(
         'identityStage', 'transportStage', 'underlyingExceptionType',
         'providerOperation', 'providerReason',
+        'intakeStage', 'pullRequestId',
         'nativeExitCode', 'hResult', 'nativeErrorCode',
         'httpStatus', 'stderrCategory', 'externalErrorCode',
         'stderrSha256', 'stderrByteCount'
@@ -230,6 +232,8 @@ function Write-IntakePrivateFailure {
             $Exception.Data['underlyingExceptionType']
         providerOperation = $Exception.Data['providerOperation']
         providerReason = $Exception.Data['providerReason']
+        intakeStage = $Exception.Data['intakeStage']
+        pullRequestId = $Exception.Data['pullRequestId']
         hResult = $Exception.Data['hResult']
         nativeErrorCode = $Exception.Data['nativeErrorCode']
         identityStage = $Exception.Data['identityStage']
@@ -240,7 +244,12 @@ function Write-IntakePrivateFailure {
         stderrSha256 = $Exception.Data['stderrSha256']
         stderrByteCount = $Exception.Data['stderrByteCount']
     }
-    $path = Join-Path $diagnostics "$Generation.json"
+    $suffix = if ($PullRequestId -gt 0) {
+        "-pr$PullRequestId"
+    }
+    else { '' }
+    $path = Join-Path $diagnostics (
+        "$Generation$suffix.json")
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
         (ConvertTo-Json -InputObject $record -Depth 8) + "`n")
     if ($bytes.Length -gt 4096) {
@@ -272,12 +281,14 @@ function Save-IntakePrivateFailure {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$Generation,
-        [Parameter(Mandatory)][Exception]$Exception
+        [Parameter(Mandatory)][Exception]$Exception,
+        [long]$PullRequestId = 0
     )
     try {
         Write-IntakePrivateFailure `
             -Root $Root -RepositoryRoot $RepositoryRoot `
-            -Generation $Generation -Exception $Exception
+            -Generation $Generation -Exception $Exception `
+            -PullRequestId $PullRequestId
     }
     catch {
         # Private diagnostics must never mask or alter the original
@@ -1178,6 +1189,7 @@ function Invoke-ActivePrIntake {
                                     $remainingStageMilliseconds /
                                     $remainingSelected))
                         $selectedOrdinal++
+                        $intakeStage = 'head-before'
                         try {
                             $before = Assert-IntakeHead (
                                 Invoke-IntakeRead $Provider Head @{
@@ -1214,6 +1226,8 @@ function Invoke-ActivePrIntake {
                                 }
                                 $progressPath = Join-Path `
                                     $fileProgressRoot "$id.json"
+                                $intakeStage =
+                                    'progress-read'
                                 $priorProgress = $null
                                 if (Test-Path -LiteralPath `
                                         $progressPath `
@@ -1288,8 +1302,9 @@ function Invoke-ActivePrIntake {
                                 else { 0 }
                                 $progressPending = $false
                                 $progressRecord = $null
-                                $removeProgress = $false
                                 try {
+                                $intakeStage =
+                                    'changes-read'
                                 $changes = Invoke-IntakeRead $Provider Changes @{
                                     pullRequestId = $id
                                     iterationId = $before.iterationId
@@ -1317,6 +1332,8 @@ function Invoke-ActivePrIntake {
                                         'fileProgress') -and
                                     $changes.fileProgress -is
                                         [Collections.IDictionary]) {
+                                    $intakeStage =
+                                        'progress-validate'
                                     $fileProgress =
                                         $changes.fileProgress
                                     if (
@@ -1378,13 +1395,24 @@ function Invoke-ActivePrIntake {
                                         )) {
                                         throw 'file-progress-invalid'
                                     }
-                                    $accumulatedEntries = @(
-                                        $(if ($null -ne
-                                            $priorProgress) {
-                                            @($priorProgress.entries)
-                                        }) +
-                                        @($changes.entries)
-                                    )
+                                    $entryList =
+                                        [Collections.Generic.List[object]]::new()
+                                    if ($null -ne
+                                        $priorProgress) {
+                                        foreach ($priorEntry in @(
+                                                $priorProgress.
+                                                    entries)) {
+                                            [void]$entryList.Add(
+                                                $priorEntry)
+                                        }
+                                    }
+                                    foreach ($currentEntry in @(
+                                            $changes.entries)) {
+                                        [void]$entryList.Add(
+                                            $currentEntry)
+                                    }
+                                    $accumulatedEntries =
+                                        $entryList.ToArray()
                                     $progressTrackingIds =
                                         [Collections.Generic.HashSet[int]]::new()
                                     foreach ($progressEntry in
@@ -1405,15 +1433,22 @@ function Invoke-ActivePrIntake {
                                     }
                                     $contextByDigest =
                                         [ordered]@{}
+                                    if ($null -ne
+                                        $priorProgress) {
+                                        foreach ($context in @(
+                                                $priorProgress.
+                                                    projectContexts)) {
+                                            $contextDigest =
+                                                Get-IntakeDigest `
+                                                    $context
+                                            $contextByDigest[
+                                                $contextDigest] =
+                                                $context
+                                        }
+                                    }
                                     foreach ($context in @(
-                                        $(if ($null -ne
-                                            $priorProgress) {
-                                            @($priorProgress.
-                                                projectContexts)
-                                        }) +
-                                        @($changes.
-                                            projectContexts)
-                                    )) {
+                                            $changes.
+                                                projectContexts)) {
                                         $contextDigest =
                                             Get-IntakeDigest `
                                                 $context
@@ -1503,10 +1538,11 @@ function Invoke-ActivePrIntake {
                                         $lines =
                                             [int]$progressRecord.
                                                 changedLines
-                                        $removeProgress = $true
                                     }
                                 }
                                 if (-not $progressPending) {
+                                    $intakeStage =
+                                        'discussion-read'
                                     $discussion = Invoke-IntakeRead $Provider Discussions @{
                                         pullRequestId = $id; iterationId = $before.iterationId
                                     } $readConfig ([ref]$reads) $clock `
@@ -1546,7 +1582,19 @@ function Invoke-ActivePrIntake {
                                     }
                                 }
                                 }
+                                catch {
+                                    if (-not $_.Exception.
+                                            Data.Contains(
+                                                'intakeStage')) {
+                                        $_.Exception.Data[
+                                            'intakeStage'] =
+                                            $intakeStage
+                                    }
+                                    throw
+                                }
                                 finally {
+                                    $intakeStage =
+                                        'head-after'
                                     $after = Assert-IntakeHead (
                                         Invoke-IntakeRead $Provider Head @{
                                             pullRequestId = $id
@@ -1557,7 +1605,10 @@ function Invoke-ActivePrIntake {
                                         throw 'head-drift'
                                     }
                                 }
-                                if ($progressPending) {
+                                if ($null -ne
+                                    $progressRecord) {
+                                    $intakeStage =
+                                        'progress-write'
                                     $progressBytes =
                                         [Text.UTF8Encoding]::new(
                                             $false).GetBytes(
@@ -1596,6 +1647,8 @@ function Invoke-ActivePrIntake {
                                             -AllowedRoot `
                                                 $fileProgressRoot `
                                             -Private)
+                                }
+                                if ($progressPending) {
                                     $entry.fileProgress =
                                         [ordered]@{
                                             inventoryDigest =
@@ -1637,12 +1690,8 @@ function Invoke-ActivePrIntake {
                                         $Config.rules.Count
                                 }
                                 if (-not $progressPending) {
-                                    if ($removeProgress -and
-                                        (Test-Path -LiteralPath `
-                                            $progressPath)) {
-                                        Remove-Item -LiteralPath `
-                                            $progressPath -Force
-                                    }
+                                    $intakeStage =
+                                        'snapshot-finalize'
                                     if ($IncludeTransientSnapshots) {
                                         $transientSnapshots[[string]$id] =
                                             [ordered]@{
@@ -1684,11 +1733,26 @@ function Invoke-ActivePrIntake {
                         }
                         catch {
                             $failure = $_.Exception
+                            if (-not $failure.Data.Contains(
+                                    'intakeStage')) {
+                                $failure.Data[
+                                    'intakeStage'] =
+                                    $intakeStage
+                            }
+                            $failure.Data[
+                                'pullRequestId'] = $id
+                            if (-not $failure.Data.Contains(
+                                    'underlyingExceptionType')) {
+                                $failure.Data[
+                                    'underlyingExceptionType'] =
+                                    $failure.GetType().Name
+                            }
                             Save-IntakePrivateFailure `
                                 -Root $root `
                                 -RepositoryRoot $RepositoryRoot `
                                 -Generation $envelope.generation `
-                                -Exception $failure
+                                -Exception $failure `
+                                -PullRequestId $id
                             $reason = [string]$failure.Message
                             if ($reason -cnotin @('invalid-head', 'head-drift',
                                     'head-inconsistent', 'file-budget',
@@ -3000,7 +3064,7 @@ print(json.dumps({
                 $evidenceChangeEntries =
                     @($evidencePlan.evidenceEntries)
                 if ($evidenceChangeEntries.Count -gt 0 -and
-                    $fileStartOrdinal -ge
+                    $fileStartOrdinal -gt
                         $evidenceChangeEntries.Count) {
                     throw 'file-progress-invalid'
                 }
