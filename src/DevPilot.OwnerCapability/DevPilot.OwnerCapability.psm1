@@ -531,6 +531,36 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             }
         }
         if ($authenticatedMatches.Count -eq 1) {
+            $currentMarkerCount = 0
+            foreach ($thread in @(
+                    $Snapshot.Threads)) {
+                foreach ($comment in @(
+                        $thread.comments)) {
+                    $currentMarkerCount += @(
+                        [regex]::Matches(
+                            [string]$comment.body,
+                            $targetPattern) |
+                            Where-Object {
+                                $_.Groups[1].Value -ceq
+                                    $marker
+                            }).Count
+                }
+            }
+            if ($currentMarkerCount -gt 0) {
+                $finding.providerMarker =
+                    New-OwnerProviderMarker `
+                        -Value $marker `
+                        -Integrity invalid
+                $finding.reconciliation =
+                    New-OwnerV2DiscussionReconciliation `
+                        -Classification unknown `
+                        -Reason authenticated-prior-comment-conflict `
+                        -DiscussionDigest $discussionDigest `
+                        -BodyDigest $bodyDigest `
+                        -ThreadAvailability ambiguous
+                $counts.unknown++
+                continue
+            }
             $entry = $authenticatedMatches[0]
             $finding.providerMarker =
                 New-OwnerProviderMarker `

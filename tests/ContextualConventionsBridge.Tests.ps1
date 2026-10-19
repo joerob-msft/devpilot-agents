@@ -502,6 +502,7 @@ Describe 'Contextual convention current PR bridge' {
         @{ Mode = 'edited' }
         @{ Mode = 'foreign-identity' }
         @{ Mode = 'ambiguous' }
+        @{ Mode = 'current-marker-conflict' }
         @{ Mode = 'semantic-changed' }
         @{ Mode = 'head-changed' }
         @{ Mode = 'moved' }
@@ -536,6 +537,31 @@ Describe 'Contextual convention current PR bridge' {
                         -AsHashtable -Depth 8
                 $proofs =
                     @($case.Proof, $duplicateProof)
+            }
+            current-marker-conflict {
+                $currentMarker = & (
+                    Get-Module `
+                        DevPilot.OwnerCapability) {
+                    param($Contract, $Finding)
+                    Get-ContextualConventionMarkerKey `
+                        -Contract $Contract `
+                        -Finding $Finding
+                } $case.Contract `
+                    $case.Observation.findings[0]
+                $case.Thread.comments +=
+                    [ordered]@{
+                        commentId = 104
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        reviewerIdentityState =
+                            'matched'
+                        body = (
+                            'Current marker conflict.' +
+                            "`n`n<!-- " +
+                            'devpilot-contextual-convention:v1:' +
+                            "$currentMarker -->")
+                    }
             }
             semantic-changed {
                 $case.Proof.selection.
