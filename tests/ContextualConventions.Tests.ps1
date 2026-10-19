@@ -153,9 +153,9 @@ BeforeAll {
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed twenty-rule allow set' {
+    It 'exports the fixed twenty-one-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 20
+            Should -HaveCount 21
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -607,6 +607,266 @@ class C
         $outcome.state | Should -BeExactly compliant
     }
 
+    It 'detects a proven duplicate constant cluster for one shared contract' {
+        $candidate = @'
+namespace N {
+/// <summary>Wire contract <c>adc.egress.hook/v1</c>.</summary>
+internal static class Candidate {
+internal const string ApiVersionHeaderName = "x-adc-api-version";
+internal const string SupportedApiVersion = "adc.egress.hook/v1";
+internal const string SupportedProtocol = "http";
+internal const string SupportedScheme = "https";
+internal const string AuthorizationHeaderName = "Authorization";
+internal const string DenyReason = "candidate reason";
+} }
+'@
+        $comparison = @'
+namespace N {
+/// <summary>Shared <c>adc.egress.hook/v1</c> wire contract.</summary>
+internal static class Existing {
+internal const string ApiVersionHeaderName = "x-adc-api-version";
+internal const string SupportedApiVersion = "adc.egress.hook/v1";
+internal const string SupportedProtocol = "http";
+internal const string SupportedScheme = "https";
+internal const string AuthorizationHeaderName = "Authorization";
+internal const string DenyReason = "existing reason";
+} }
+'@
+        $project = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            sourceDigest =
+                'v1:sha256:' + ('1' * 64)
+            content = '<Project />'
+        }
+        $files = @(
+            [ordered]@{
+                path = 'src/Candidate.cs'
+                content = $candidate
+                state = 'complete'
+                projectContext = $project
+                spans = @([ordered]@{
+                        startLine = 4
+                        endLine = 9
+                    })
+            },
+            [ordered]@{
+                path = 'src/Existing.cs'
+                content = $comparison
+                state = 'complete'
+                projectContext = $project
+                spans = @()
+            })
+        $outcome = Invoke-ConventionCase `
+            -RuleId duplicate-constant-declarations `
+            -Content $candidate `
+            -Path 'src/Candidate.cs' `
+            -SnapshotFiles $files
+
+        $outcome.state | Should -BeExactly violation
+        $outcome.reason |
+            Should -BeExactly duplicate-shared-contract-constants
+        $outcome.line | Should -Be 4
+        $outcome.endLine | Should -Be 8
+        $outcome.evidence |
+            Should -Match 'ApiVersionHeaderName'
+        $outcome.evidence |
+            Should -Not -Match 'DenyReason'
+    }
+
+    It 'withholds or excludes unproved duplicate constant relations' {
+        $baseCandidate = @'
+namespace N {
+/// <summary>Wire contract <c>contract/a</c>.</summary>
+internal static class Candidate {
+internal const string Value = "same";
+} }
+'@
+        $sameProject = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            sourceDigest =
+                'v1:sha256:' + ('2' * 64)
+            content = '<Project />'
+        }
+        $cases = @(
+            [ordered]@{
+                reason =
+                    'duplicate-constant-relation-unproven'
+                comparison = @'
+namespace N {
+/// <summary>Different <c>contract/b</c>.</summary>
+internal static class Existing {
+internal const string Value = "same";
+} }
+'@
+                candidateProject = $sameProject
+                comparisonProject = $sameProject
+            },
+            [ordered]@{
+                reason =
+                    'duplicate-constant-relation-unproven'
+                comparison = @'
+namespace Other {
+/// <summary>Wire contract <c>contract/a</c>.</summary>
+internal static class Existing {
+internal const string Value = "same";
+} }
+'@
+                candidateProject = $sameProject
+                comparisonProject = $sameProject
+            },
+            [ordered]@{
+                reason =
+                    'duplicate-constant-relation-unproven'
+                comparison = @'
+namespace N {
+/// <summary>Wire contract <c>contract/a</c>.</summary>
+internal static class Existing {
+internal const string Value = "same";
+} }
+'@
+                candidateProject = [ordered]@{
+                    state = 'complete'
+                    path = 'src/App.csproj'
+                    content =
+                        '<Project><PropertyGroup Condition="x"><LangVersion>7.2</LangVersion></PropertyGroup></Project>'
+                }
+                comparisonProject = $sameProject
+            })
+        foreach ($case in $cases) {
+            $files = @(
+                [ordered]@{
+                    path = 'src/Candidate.cs'
+                    content = $baseCandidate
+                    state = 'complete'
+                    projectContext =
+                        $case.candidateProject
+                    spans = @([ordered]@{
+                            startLine = 4
+                            endLine = 4
+                        })
+                },
+                [ordered]@{
+                    path = 'src/Existing.cs'
+                    content = $case.comparison
+                    state = 'complete'
+                    projectContext =
+                        $case.comparisonProject
+                    spans = @()
+                })
+            $outcome = Invoke-ConventionCase `
+                -RuleId duplicate-constant-declarations `
+                -Content $baseCandidate `
+                -Path 'src/Candidate.cs' `
+                -SnapshotFiles $files
+            $outcome.state | Should -BeExactly unknown
+            $outcome.reason |
+                Should -BeExactly $case.reason
+        }
+    }
+
+    It 'does not flag different values private enum test generated or unchanged constants' {
+        $project = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            content = '<Project />'
+        }
+        $testProject = [ordered]@{
+            state = 'complete'
+            path = 'tests/Tests.csproj'
+            content =
+                '<Project><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>'
+        }
+        $controls = @(
+            [ordered]@{
+                candidate = 'namespace N { /// <summary><c>x</c></summary> internal static class A { internal const string Value = "one"; } }'
+                comparison = 'namespace N { /// <summary><c>x</c></summary> internal static class B { internal const string Value = "two"; } }'
+                project = $project
+                comparisonPath = 'src/B.cs'
+                changed = $true
+            },
+            [ordered]@{
+                candidate = 'namespace N { /// <summary><c>x</c></summary> internal static class A { private const string Value = "same"; } }'
+                comparison = 'namespace N { /// <summary><c>x</c></summary> internal static class B { internal const string Value = "same"; } }'
+                project = $project
+                comparisonPath = 'src/B.cs'
+                changed = $true
+            },
+            [ordered]@{
+                candidate = 'namespace N { internal enum A { Value } }'
+                comparison = 'namespace N { internal enum B { Value } }'
+                project = $project
+                comparisonPath = 'src/B.cs'
+                changed = $true
+            },
+            [ordered]@{
+                candidate = 'namespace N { /// <summary><c>x</c></summary> internal static class A { internal const string Value = "same"; } }'
+                comparison = 'namespace N { /// <summary><c>x</c></summary> internal static class B { internal const string Value = "same"; } }'
+                project = $testProject
+                comparisonPath = 'tests/B.cs'
+                changed = $true
+            },
+            [ordered]@{
+                candidate = 'namespace N { /// <summary><c>x</c></summary> internal static class A { internal const string Value = "same"; } }'
+                comparison = 'namespace N { /// <summary><c>x</c></summary> internal static class B { internal const string Value = "same"; } }'
+                project = $project
+                comparisonPath = 'src/Generated.g.cs'
+                changed = $true
+            },
+            [ordered]@{
+                candidate = 'namespace N { /// <summary><c>x</c></summary> internal static class A { internal const string Value = "same"; } }'
+                comparison = 'namespace N { /// <summary><c>x</c></summary> internal static class B { internal const string Value = "same"; } }'
+                project = $project
+                comparisonPath = 'src/B.cs'
+                changed = $false
+            })
+        foreach ($control in $controls) {
+            $candidateLines = [Math]::Max(
+                1,
+                ($control.candidate -split "`r?`n").Count)
+            $spans = if ($control.changed) {
+                @([ordered]@{
+                        startLine = 1
+                        endLine = $candidateLines
+                    })
+            }
+            else {
+                @([ordered]@{
+                        startLine = $candidateLines + 1
+                        endLine = $candidateLines + 1
+                    })
+            }
+            $files = @(
+                [ordered]@{
+                    path = 'src/A.cs'
+                    content = $control.candidate
+                    state = 'complete'
+                    projectContext = $control.project
+                    spans = $spans
+                },
+                [ordered]@{
+                    path = $control.comparisonPath
+                    content = $control.comparison
+                    state = 'complete'
+                    projectContext = $control.project
+                    spans = @()
+                })
+            $outcome = @(
+                Get-ContextualConventionOutcomes `
+                    -Content $control.candidate `
+                    -Path 'src/A.cs' `
+                    -Spans $spans `
+                    -SnapshotFiles $files |
+                    Where-Object {
+                        [string]$_.ruleId -ceq
+                            'duplicate-constant-declarations'
+                    })[0]
+            $outcome.state |
+                Should -Not -BeExactly violation
+        }
+    }
+
     It 'does not crash on omitted object-creation parentheses or unproven base lists' {
         $objectInitializer =
             'class C { int P { get; set; } void M() { var x = new C { P = 1 }; } }'
@@ -636,11 +896,11 @@ class C
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 20
+            $outcomes | Should -HaveCount 21
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 19
+                }) | Should -HaveCount 20
         }
     }
 

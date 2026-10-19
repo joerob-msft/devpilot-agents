@@ -18,6 +18,7 @@ $script:ApprovedContextualRuleIds = @(
     'explicit-string-comparison',
     'named-call-arguments',
     'xml-summary-layout',
+    'duplicate-constant-declarations',
     'collection-cardinality',
     'cheap-validation',
     'async-all-the-way',

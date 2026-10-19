@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:c04c3dac3bd86ef1943a816dee3a1e97dc9b904ba04b5207e6f1469eec272901'
+$script:ContextualDigest = 'v1:sha256:37555621202e5d220e1121a85acb98e6d56113fe023f32c729a7243f694d7f90'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:ed8d84176ecfebbc014e2cc6fc52eb92842af05f87b743623a69f0d31ad8b318'
+$script:ContextualPolicyDigest = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -652,6 +652,20 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     [string]$finding.anchor.path -and
                 [int]$thread.anchor.line -eq
                     [int]$finding.anchor.line
+            $sameFindingRange = $sameAnchor -or (
+                [string]$finding.ruleId -ceq
+                    'duplicate-constant-declarations' -and
+                $null -ne $thread.anchor -and
+                [string]$thread.anchor.path -ieq
+                    [string]$finding.anchor.path -and
+                $finding.binding -is
+                    [Collections.IDictionary] -and
+                $finding.binding.span -is
+                    [Collections.IDictionary] -and
+                [int]$thread.anchor.line -ge
+                    [int]$finding.binding.span.startLine -and
+                [int]$thread.anchor.line -le
+                    [int]$finding.binding.span.endLine)
             foreach ($comment in @($thread.comments)) {
                 if ([string]$comment.commentType -cne
                         'text' -or
@@ -686,7 +700,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     }
                     continue
                 }
-                if ($sameAnchor -and
+                if ($sameFindingRange -and
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq

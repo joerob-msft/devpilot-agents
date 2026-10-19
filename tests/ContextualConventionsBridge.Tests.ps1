@@ -68,8 +68,8 @@ BeforeAll {
                 section =
                     'bpm-contextual-conventions@1'
                 hash =
-                    'v1:sha256:ed8d84176ecfebbc014e2cc6fc52eb92842af05f87b743623a69f0d31ad8b318'
-                length = 4815
+                    'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+                length = 5205
             }
             toolkit = [ordered]@{
                 ref =
@@ -114,7 +114,7 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    'c04c3dac3bd86ef1943a816dee3a1e97dc9b904ba04b5207e6f1469eec272901'
+                    '37555621202e5d220e1121a85acb98e6d56113fe023f32c729a7243f694d7f90'
             }
             sharedAcquisition = [ordered]@{
                 kind =
@@ -625,6 +625,48 @@ Describe 'Contextual convention current PR bridge' {
             Should -BeExactly unknown
         $result.findingsComplete |
             Should -BeFalse
+    }
+
+    It 'treats the existing ranged duplicate-constant human review as coverage' {
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $finding =
+            $case.Observation.findings[0]
+        $finding.ruleId =
+            'duplicate-constant-declarations'
+        $finding.anchor.line = 16
+        $finding.binding['span'] =
+            [ordered]@{
+                startLine = 16
+                endLine = 45
+            }
+        $finding.binding.span.startLine = 16
+        $finding.binding.span.endLine = 45
+        $case.Thread.anchor.line = 24
+        $case.Thread.comments[0].body =
+            'Duplicated constants http, https, Authorization, x-adc-api-version, possibly more. Reconcile to one common declaration.'
+        $case.Thread.comments[0].
+            reviewerOwned = $false
+        $case.Thread.comments[0].
+            reviewerIdentityState = 'foreign'
+
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly humanCovered
+        $result.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                current-human-review-at-anchor
+        $result.effects.dedupe.humanCovered |
+            Should -Be 1
+        $result.effects.dedupe.wouldCreate |
+            Should -Be 0
     }
 
     It 'excludes generated C# from the contextual line denominator' {

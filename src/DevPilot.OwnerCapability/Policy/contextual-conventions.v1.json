@@ -21,6 +21,11 @@
       "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
       "lines": [980, 1007]
     },
+    "duplicateConstantDeclarations": {
+      "authorityState": "user-directed Azure DevOps review comment",
+      "pullRequestId": 17562908,
+      "threadId": 266816420
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -53,6 +58,11 @@
       "id": "xml-summary-layout",
       "name": "Format XML documentation summary tags on standalone lines",
       "sourceSection": "Proposed: Format XML documentation summaries on separate lines"
+    },
+    {
+      "id": "duplicate-constant-declarations",
+      "name": "Consolidate duplicated constants for one proven shared contract",
+      "sourceSection": "User-directed review thread 266816420"
     },
     {
       "id": "collection-cardinality",
