@@ -1183,6 +1183,74 @@ $response | ConvertTo-Json -Depth 8 -Compress
                 -ErrorAction SilentlyContinue
         }
     }
+    It 'orders ADO change hashtables deterministically across provider page order' {
+        $c = New-IntakeCase -Count 1
+        New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+        $stub = Join-Path $c.root 'az-reordered-changes.ps1'
+        @'
+$skipArgument = @($args | Where-Object { $_.StartsWith('$skip=') })
+if ($skipArgument.Count -ne 1) { exit 5 }
+$skip = [int]$skipArgument[0].Substring(6)
+$entries = @(
+    @{ changeTrackingId = 9; changeType = 'delete'
+        item = @{ path = '/src/a.cs' } }
+    @{ changeTrackingId = 12; changeType = 'delete'
+        item = @{ path = '/src/A.cs' } }
+    @{ changeTrackingId = 2; changeType = 'delete'
+        item = @{ path = '/src/A.cs' } }
+    @{ changeTrackingId = 4; changeType = 'delete'
+        item = @{ path = '/src/b.cs' } }
+)
+if ($env:ACTIVE_PR_INTAKE_CHANGE_ORDER -eq 'reverse') {
+    [array]::Reverse($entries)
+}
+if ($skip -eq 0) {
+    @{
+        changeEntries = $entries
+        count = $entries.Count
+        nextSkip = $entries.Count
+    } | ConvertTo-Json -Depth 8 -Compress
+}
+elseif ($skip -eq $entries.Count) {
+    '{"changeEntries":[],"count":0}'
+}
+else {
+    exit 6
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        try {
+            $provider = New-ActivePrAzureDevOpsProvider -Config $c.config `
+                -AzureCliPath $stub
+            $first = & $provider 'Changes' @{
+                pullRequestId = 1; iterationId = 1
+                sourceCommit = 'a' * 40; targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+            $env:ACTIVE_PR_INTAKE_CHANGE_ORDER = 'reverse'
+            $reversed = & $provider 'Changes' @{
+                pullRequestId = 1; iterationId = 1
+                sourceCommit = 'a' * 40; targetCommit = 'b' * 40
+                timeoutMilliseconds = 15000
+            }
+
+            @($first.inventory.path) |
+                Should -Be @('src/a.cs', 'src/A.cs', 'src/A.cs', 'src/b.cs')
+            @($first.inventory.changeTrackingId) |
+                Should -Be @(9, 2, 12, 4)
+            ($reversed.inventory | ConvertTo-Json -Depth 16 -Compress) |
+                Should -BeExactly (
+                    $first.inventory |
+                        ConvertTo-Json -Depth 16 -Compress)
+            $reversed.fileProgress.inventoryDigest |
+                Should -BeExactly $first.fileProgress.inventoryDigest
+            $reversed.fileProgress.evidencePlanDigest |
+                Should -BeExactly $first.fileProgress.evidencePlanDigest
+        }
+        finally {
+            Remove-Item Env:\ACTIVE_PR_INTAKE_CHANGE_ORDER `
+                -ErrorAction SilentlyContinue
+        }
+    }
     It 'keeps a modified file unknown when required <Side> Item content is <Shape>' `
         -TestCases @(
             @{ Side = 'source'; Shape = 'missing' }

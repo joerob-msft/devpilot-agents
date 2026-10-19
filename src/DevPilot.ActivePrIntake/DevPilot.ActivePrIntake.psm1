@@ -3057,7 +3057,13 @@ print(json.dumps({
                 if (-not $complete) { throw 'change-page-budget' }
                 $orderedChangeEntries = @(
                     $changeEntries |
-                        Sort-Object path, changeTrackingId)
+                        Sort-Object -CaseSensitive `
+                            @{ Expression = {
+                                    [string]$_['path']
+                                }; Ascending = $true },
+                            @{ Expression = {
+                                    [int]$_['changeTrackingId']
+                                }; Ascending = $true })
                 $evidencePlan =
                     & $getSharedEvidencePlan `
                         -Inventory $orderedChangeEntries
