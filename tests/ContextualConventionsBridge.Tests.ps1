@@ -492,6 +492,9 @@ Describe 'Contextual convention current PR bridge' {
                 Should -Be 1
             $result.effects.dedupe.unknown |
                 Should -Be 0
+            $result.findings[0].
+                providerMarker.integrity |
+                Should -BeExactly verified
             $result.findingsComplete |
                 Should -BeTrue
         }

@@ -607,7 +607,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             }
             $finding.providerMarker =
                 New-OwnerProviderMarker `
-                    -Value $marker
+                    -Value $marker `
+                    -Integrity verified
             $finding.reconciliation =
                 New-OwnerV2DiscussionReconciliation `
                     -Classification noOp `
