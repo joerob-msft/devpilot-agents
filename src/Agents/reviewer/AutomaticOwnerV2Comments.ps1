@@ -1247,6 +1247,13 @@ function Invoke-AutomaticOwnerV2Comments {
         $repaired = @(Repair-AutomaticOwnerV2Intents `
                 -DeliveryRoot $DeliveryRoot -Key $Key -Provider $Provider `
                 -Evidence $Evidence)
+        $authenticatedPriorComments = if (
+            $contextual) {
+            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $DeliveryRoot -Key $Key `
+                -Delivery contextual-conventions)
+        }
+        else { @() }
         $history = Get-AutomaticOwnerV2DeliveryHistory `
             -DeliveryRoot $DeliveryRoot -Key $Key -Evidence $Evidence
         if ($deterministic) {
@@ -1462,6 +1469,8 @@ function Invoke-AutomaticOwnerV2Comments {
             $liveState = Assert-ApprovedOwnerV2LiveRead `
                 -Evidence $Evidence -Approval $authorization -Live $initial `
                 -Selections $selections -ExpectedSnapshotSha256 $snapshot `
+                -AuthenticatedPriorComments `
+                    $authenticatedPriorComments `
                 -Delivery $(if ($namedAreEqual) {
                     'named-areequal'
                 } elseif ($contextual) {
@@ -1590,6 +1599,8 @@ function Invoke-AutomaticOwnerV2Comments {
                     -Evidence $Evidence -Approval $authorization -Live $fresh `
                     -Selections @($selection) `
                     -ExpectedSnapshotSha256 $expectedSnapshot `
+                    -AuthenticatedPriorComments `
+                        $authenticatedPriorComments `
                     -Delivery $(if ($namedAreEqual) {
                         'named-areequal'
                     } elseif ($contextual) {

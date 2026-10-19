@@ -531,6 +531,8 @@ function Invoke-ContextualConventionsCurrentPrBridge {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
         [AllowNull()][Collections.IDictionary]$PreparedIntake = $null,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @(),
         [switch]$Run
     )
 
@@ -793,7 +795,8 @@ function Invoke-ContextualConventionsCurrentPrBridge {
     }
     $runResult = Invoke-OwnerV2PreviewRun `
         -StateRoot $StateRoot -ManifestPath $ManifestPath `
-        -EnableLiveModel -LiveAcquisitionProvider $acquisition
+        -EnableLiveModel -LiveAcquisitionProvider $acquisition `
+        -AuthenticatedPriorComments $AuthenticatedPriorComments
     $postHeadFailures = [Collections.Generic.HashSet[long]]::new()
     foreach ($head in @($heads.Values | Where-Object {
                 $packageAccepted.Contains(

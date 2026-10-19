@@ -8,6 +8,10 @@ BeforeAll {
         'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
+    . (Join-Path $repoRoot `
+        'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
 
     function Get-ContextualTestTextDigest {
         param([Parameter(Mandatory)][string]$Text)
@@ -229,9 +233,340 @@ BeforeAll {
             Head = $head
         }
     }
+
+    function New-ContextualUpgradeRecognitionCase {
+        $config = New-ContextualTestConfig
+        $head = [ordered]@{
+            repositoryId = $config.repositoryId
+            projectId = $config.projectId
+            pullRequestId = 42
+            sourceCommit = 'c' * 40
+            targetCommit = 'd' * 40
+            targetRef = 'refs/heads/master'
+        }
+        $contract = New-OwnerAcquisitionContract `
+            -RepositoryId $head.repositoryId `
+            -ProjectId $head.projectId `
+            -PullRequestId $head.pullRequestId `
+            -SourceCommit $head.sourceCommit `
+            -TargetCommit $head.targetCommit `
+            -TargetRef $head.targetRef `
+            -RuleRepositoryId (
+                $config.contextualRule.repositoryId) `
+            -RulePath $config.contextualRule.path `
+            -RuleCommit ('f' * 40) `
+            -RuleSection (
+                $config.contextualRule.section) `
+            -RuleHash $config.contextualRule.hash `
+            -RuleLength (
+                $config.contextualRule.length) `
+            -ConfigId contextual-test `
+            -ConfigDigest (
+                'v1:sha256:' + ('1' * 64)) `
+            -CapabilityId (
+                $config.capability.id) `
+            -CapabilityDigest (
+                'v1:sha256:' +
+                $config.capability.
+                    implementationSha256) `
+            -Limits (
+                New-OwnerAdapterLimits `
+                    -MaximumFiles 64 `
+                    -MaximumBytes 16777216 `
+                    -MaximumReads 128)
+        $finding = [ordered]@{
+            identity =
+                'contextual-v1:' + ('2' * 64)
+            semanticKey =
+                'v1:sha256:' + ('3' * 64)
+            disposition = 'violation'
+            reason =
+                'string-comparison-not-explicit'
+            evidence =
+                'Use explicit StringComparison semantics.'
+            ruleId =
+                'explicit-string-comparison'
+            ruleRef =
+                'rule:' + ('4' * 64)
+            constructRef =
+                'construct:' + ('5' * 64)
+            anchor = [ordered]@{
+                path = 'src/Checks.cs'
+                line = 32
+                symbol = 'FilterByTag'
+            }
+            binding = [ordered]@{
+                constructIdentity =
+                    'v1:sha256:' + ('6' * 64)
+            }
+        }
+        $observation = [ordered]@{
+            capability =
+                'bpm-contextual-conventions@1'
+            lifecycle =
+                [ordered]@{ status = 'completed' }
+            findings = @($finding)
+            findingsComplete = $false
+            counts = [ordered]@{
+                checked = 1
+                violations = 1
+                unknown = 0
+            }
+            effects = [ordered]@{
+                providerWrites = 0
+                writeToolInvocations = 0
+                dedupe = [ordered]@{}
+            }
+            sourceArtifacts = @()
+        }
+        $marker = '7' * 64
+        $body = "Prior contextual review.`n`n" +
+            "<!-- devpilot-contextual-convention:v1:$marker -->"
+        $reviewer = [ordered]@{
+            id = [string]$config.expectedAccount.id
+            descriptor =
+                [string]$config.expectedAccount.descriptor
+            uniqueName =
+                [string]$config.expectedAccount.uniqueName
+        }
+        $proof = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'owner-v2-authenticated-prior-comment'
+            delivery =
+                'contextual-conventions'
+            capabilityId =
+                'bpm-contextual-conventions@1'
+            subject = $head
+            rule = [ordered]@{
+                repositoryId =
+                    $config.contextualRule.repositoryId
+                path =
+                    $config.contextualRule.path
+                commit = '8' * 40
+                section =
+                    $config.contextualRule.section
+                hash =
+                    $config.contextualRule.hash
+                length =
+                    $config.contextualRule.length
+            }
+            reviewerIdentity = $reviewer
+            reviewerIdentityDigest =
+                $config.discussionProvider.
+                    reviewerIdentity.digest
+            selection = [ordered]@{
+                findingId =
+                    'contextual-v1:' + ('9' * 64)
+                marker = $marker
+                body = $body
+                bodySha256 =
+                    [Convert]::ToHexString(
+                        [Security.Cryptography.SHA256]::
+                            HashData(
+                                [Text.Encoding]::UTF8.
+                                    GetBytes($body))).
+                        ToLowerInvariant()
+                constructIdentity =
+                    $finding.binding.
+                        constructIdentity
+                constructRef =
+                    'construct:' + ('a' * 64)
+                semanticKey =
+                    'v1:sha256:' + ('b' * 64)
+                ruleId = $finding.ruleId
+                path = $finding.anchor.path
+                line = $finding.anchor.line
+                symbol = $finding.anchor.symbol
+            }
+            event = [ordered]@{
+                eventId = 'c' * 32
+                runId = 'd' * 32
+                stateIdentity = 'e' * 64
+                threadId = 100
+                commentId = 101
+            }
+        }
+        $thread = [ordered]@{
+            threadId = 100
+            status = 'active'
+            isDeleted = $false
+            isOutdated = $false
+            sourceCommit = $head.sourceCommit
+            contextState = 'current'
+            anchor = [ordered]@{
+                path = $finding.anchor.path
+                line = $finding.anchor.line
+            }
+            comments = @([ordered]@{
+                    commentId = 101
+                    commentType = 'text'
+                    isDeleted = $false
+                    reviewerOwned = $true
+                    reviewerIdentityState =
+                        'matched'
+                    body = $body
+                })
+        }
+        $snapshot =
+            [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+                'complete',
+                'unknown',
+                1,
+                1,
+                1,
+                0,
+                'v1:sha256:' + ('f' * 64),
+                [string[]]@(
+                    'v1:sha256:' + ('0' * 64)),
+                [object[]]@($thread))
+        $snapshot |
+            Add-Member -NotePropertyName `
+                RawProvenanceDigests `
+                -NotePropertyValue ([string[]]@(
+                    'v1:sha256:' + ('1' * 64)))
+        $snapshot |
+            Add-Member -NotePropertyName `
+                MappingDigest `
+                -NotePropertyValue (
+                    $config.discussionProvider.
+                        mappingDigest)
+        $snapshot |
+            Add-Member -NotePropertyName `
+                ReviewerIdentityDigest `
+                -NotePropertyValue (
+                    $config.discussionProvider.
+                        reviewerIdentity.digest)
+        $snapshot |
+            Add-Member -NotePropertyName `
+                CurrentIterationId `
+                -NotePropertyValue 3
+        return [pscustomobject]@{
+            Config = $config
+            Contract = $contract
+            Observation = $observation
+            Proof = $proof
+            Snapshot = $snapshot
+            Thread = $thread
+            Head = $head
+        }
+    }
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'recognizes an exact signed prior reviewer comment across an upgrade and on restart' {
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $first =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation (
+                    $case.Observation |
+                        ConvertTo-Json -Depth 32 |
+                        ConvertFrom-Json `
+                            -AsHashtable -Depth 32) `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments @(
+                    $case.Proof)
+        $second =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation (
+                    $case.Observation |
+                        ConvertTo-Json -Depth 32 |
+                        ConvertFrom-Json `
+                            -AsHashtable -Depth 32) `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments @(
+                    $case.Proof)
+
+        foreach ($result in @($first, $second)) {
+            $result.findings[0].
+                reconciliation.classification |
+                Should -BeExactly noOp
+            $result.findings[0].
+                reconciliation.reason |
+                Should -BeExactly `
+                    authenticated-prior-reviewer-comment
+            $result.effects.dedupe.noOp |
+                Should -Be 1
+            $result.effects.dedupe.unknown |
+                Should -Be 0
+            $result.findingsComplete |
+                Should -BeTrue
+        }
+    }
+
+    It 'keeps unsafe prior-review variants unknown for <Mode>' -TestCases @(
+        @{ Mode = 'copied' }
+        @{ Mode = 'edited' }
+        @{ Mode = 'foreign-identity' }
+        @{ Mode = 'ambiguous' }
+        @{ Mode = 'semantic-changed' }
+        @{ Mode = 'head-changed' }
+        @{ Mode = 'moved' }
+        @{ Mode = 'deleted' }
+    ) {
+        param($Mode)
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $proofs = @($case.Proof)
+        switch ($Mode) {
+            copied {
+                $case.Thread.comments[0].
+                    reviewerOwned = $false
+                $case.Thread.comments[0].
+                    reviewerIdentityState =
+                    'foreign'
+            }
+            edited {
+                $case.Thread.comments[0].body +=
+                    ' edited'
+            }
+            foreign-identity {
+                $case.Proof.
+                    reviewerIdentityDigest =
+                    'v1:sha256:' + ('9' * 64)
+            }
+            ambiguous {
+                $duplicateProof =
+                    $case.Proof |
+                    ConvertTo-Json -Depth 8 |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 8
+                $proofs =
+                    @($case.Proof, $duplicateProof)
+            }
+            semantic-changed {
+                $case.Proof.selection.
+                    constructIdentity =
+                    'v1:sha256:' + ('8' * 64)
+            }
+            head-changed {
+                $case.Proof.subject.
+                    sourceCommit = '9' * 40
+            }
+            moved {
+                $case.Thread.anchor.line = 33
+            }
+            deleted {
+                $case.Thread.isDeleted = $true
+            }
+        }
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments $proofs
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.findingsComplete |
+            Should -BeFalse
+    }
+
     It 'excludes generated C# from the contextual line denominator' {
         $changes = [ordered]@{
             changedFiles = 2

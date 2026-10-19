@@ -721,9 +721,234 @@ BeforeAll {
         $Context.Evidence.Record.resultDigest =
             Get-ApprovedOwnerV2Digest $Context.Evidence.Observation
     }
+
+    function New-TestAuthenticatedContextualHistory {
+        $root = Join-Path $TestDrive (
+            'prior-history-' +
+            [guid]::NewGuid().ToString('N'))
+        $identity = 'a' * 64
+        foreach ($leaf in @(
+                'events',
+                "intents\$identity",
+                "outcomes\$identity")) {
+            New-Item -ItemType Directory `
+                -Path (Join-Path $root $leaf) `
+                -Force | Out-Null
+        }
+        $key = [byte[]](1..32)
+        $runId = 'b' * 32
+        $eventId = 'c' * 32
+        $marker = 'd' * 64
+        $body =
+            "Prior contextual review.`n`n" +
+            "<!-- devpilot-contextual-convention:v1:$marker -->"
+        $bodySha =
+            Get-ApprovedOwnerV2TextSha256 $body
+        $subject = [ordered]@{
+            projectId =
+                '22222222-2222-2222-2222-222222222222'
+            repositoryId =
+                '11111111-1111-1111-1111-111111111111'
+            pullRequestId = 42
+            sourceCommit = 'e' * 40
+            targetCommit = 'f' * 40
+            targetRef = 'refs/heads/master'
+        }
+        $selection = [ordered]@{
+            body = $body
+            bodySha256 = $bodySha
+            classification = 'wouldCreate'
+            constructIdentity =
+                'v1:sha256:' + ('1' * 64)
+            constructRef =
+                'construct:' + ('2' * 64)
+            findingId =
+                'contextual-v1:' + ('3' * 64)
+            line = 32
+            marker = $marker
+            markerComment =
+                "<!-- devpilot-contextual-convention:v1:$marker -->"
+            path = 'src/Checks.cs'
+            rationale =
+                'no-current-review-at-anchor'
+            ruleId =
+                'explicit-string-comparison'
+            semanticKey =
+                'v1:sha256:' + ('4' * 64)
+            symbol = 'FilterByTag'
+        }
+        $intent = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'contextual-conventions-v1-service-create-intent'
+            runId = $runId
+            policyDigest =
+                'v1:sha256:' + ('5' * 64)
+            state = [ordered]@{
+                identity = $identity
+            }
+            subject = $subject
+            currentIterationId = 3
+            discussionSnapshotSha256 =
+                '6' * 64
+            rule = [ordered]@{
+                repositoryId =
+                    'devpilot-agents'
+                path =
+                    'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+                commit = '7' * 40
+                section =
+                    'bpm-contextual-conventions@1'
+                hash =
+                    'v1:sha256:' + ('8' * 64)
+                length = 3706
+            }
+            capability = [ordered]@{
+                id =
+                    'bpm-contextual-conventions@1'
+                digest =
+                    'v1:sha256:' + ('9' * 64)
+            }
+            reviewerIdentity = [ordered]@{
+                id =
+                    '33333333-3333-3333-3333-333333333333'
+                descriptor =
+                    'aad.synthetic-service-account'
+                uniqueName =
+                    'service@example.invalid'
+            }
+            implementation = [ordered]@{}
+            selections = @($selection)
+            createdUtc = '20261018T000000Z'
+        }
+        $event = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'contextual-conventions-v1-delivery-event'
+            eventId = $eventId
+            runId = $runId
+            occurredUtc = '20261018T000100Z'
+            runHealth = 'healthy'
+            capabilityId =
+                'bpm-contextual-conventions@1'
+            subject = $subject
+            finding = [ordered]@{
+                stateIdentity = $identity
+                findingId =
+                    $selection.findingId
+                marker = $marker
+                bodySha256 = $bodySha
+                path = $selection.path
+                line = $selection.line
+                symbol = $selection.symbol
+                ruleId = $selection.ruleId
+            }
+            action = 'create'
+            outcome = 'created'
+            threadId = 100
+            commentId = 101
+            url = 'https://example.invalid'
+            modelWriteCount = 0
+            providerWriteCount = 1
+            providerWriteState = 'confirmed'
+            diagnostic = $null
+        }
+        $outcome = [ordered]@{
+            schemaVersion = 1
+            kind =
+                'contextual-conventions-v1-service-create-outcome'
+            runId = $runId
+            stateIdentity = $identity
+            status = 'completed'
+            providerWrites = 1
+            providerWritesConservative = 1
+            modelWrites = 0
+            eventIds = @($eventId)
+            remainingWouldCreate = 0
+            diagnostic = $null
+            createdUtc = '20261018T000100Z'
+        }
+        [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $root `
+                    "intents\$identity\$runId.json") `
+                -Payload $intent -Key $key)
+        [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $root `
+                    "outcomes\$identity\$runId.json") `
+                -Payload $outcome -Key $key)
+        $eventPath = Join-Path $root `
+            "events\$eventId.json"
+        [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path $eventPath `
+                -Payload $event -Key $key)
+        return [pscustomobject]@{
+            Root = $root
+            Key = $key
+            EventPath = $eventPath
+            Event = $event
+        }
+    }
 }
 
 Describe 'Approved Owner v2 review and approval packages' {
+    It 'reconstructs exact authenticated prior comments after restart' {
+        $history =
+            New-TestAuthenticatedContextualHistory
+        $first =
+            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key $history.Key `
+                -Delivery contextual-conventions)
+        $second =
+            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key $history.Key `
+                -Delivery contextual-conventions)
+
+        $first | Should -HaveCount 1
+        ($first | ConvertTo-Json -Depth 16 -Compress) |
+            Should -BeExactly (
+                $second |
+                    ConvertTo-Json -Depth 16 -Compress)
+        $first[0].selection.bodySha256 |
+            Should -BeExactly (
+                $history.Event.finding.bodySha256)
+        $first[0].event.threadId |
+            Should -Be 100
+    }
+
+    It 'refuses prior history signed by a foreign key' {
+        $history =
+            New-TestAuthenticatedContextualHistory
+        {
+            Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key ([byte[]](33..64)) `
+                -Delivery contextual-conventions
+        } | Should -Throw '*signature did not verify*'
+    }
+
+    It 'refuses a signed foreign event kind in contextual history' {
+        $history =
+            New-TestAuthenticatedContextualHistory
+        $foreign = [ordered]@{} +
+            $history.Event
+        $foreign.kind =
+            'owner-v2-delivery-event'
+        [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $history.Root `
+                    'events\ffffffffffffffffffffffffffffffff.json') `
+                -Payload $foreign `
+                -Key $history.Key)
+
+        {
+            Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $history.Root `
+                -Key $history.Key `
+                -Delivery contextual-conventions
+        } | Should -Throw '*is foreign*'
+    }
+
     It 'allows only isolated contextual discussion unknowns beside actionable findings' {
         $observation = [ordered]@{
             findingsComplete = $false

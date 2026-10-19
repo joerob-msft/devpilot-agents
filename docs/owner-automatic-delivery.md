@@ -48,6 +48,18 @@ changed anchor, pagination failure, identity mismatch, or any other drift is a
 refusal. The model runner remains `effectiveTools: []` and cannot see, request,
 or authorize this phase.
 
+When a deterministic reviewer upgrade changes its current marker or formatter,
+an earlier contextual comment can remain `noOp` only through authenticated
+delivery history. The reader verifies the lane key on the signed create event,
+intent, and outcome, links their run/event/state identities, requires the same
+immutable PR source and target, rule content hash, construct identity, path,
+line, and symbol, and then requires the exact live reviewer-owned comment,
+thread ID, comment ID, body hash, active status, current context, and anchor.
+The rule commit and implementation may advance while the authoritative rule
+hash and construct remain identical. Copied, edited, deleted, moved, duplicate,
+foreign-identity, stale-head, or changed-rule evidence remains unknown and
+cannot authorize a create, update, or rewrite.
+
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
 different local key, policy kind, intent kind, outcome kind, directories, and

@@ -211,6 +211,62 @@ else {
     throw 'contextual-phase-delivery-policy-invalid'
 }
 
+$contextualDeliveryRoot =
+    Join-Path $AutomaticDeliveryRoot `
+        'contextual-conventions-v1'
+$historyKeyPath =
+    Join-Path $contextualDeliveryRoot `
+        'keys\contextual-conventions-service-authorization.hmac'
+if (-not (Test-Path -LiteralPath $historyKeyPath `
+        -PathType Leaf)) {
+    throw 'contextual-phase-history-key-missing'
+}
+$historyKey = [IO.File]::ReadAllBytes(
+    $historyKeyPath)
+try {
+    if ($historyKey.Length -ne 32) {
+        throw 'contextual-phase-history-key-invalid'
+    }
+    $authenticatedPriorComments =
+        @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+            -DeliveryRoot $contextualDeliveryRoot `
+            -Key $historyKey `
+            -Delivery contextual-conventions)
+}
+finally {
+    if ($null -ne $historyKey) {
+        [Array]::Clear(
+            $historyKey, 0, $historyKey.Length)
+    }
+}
+$historyRoot = Join-Path $ContextualStateRoot `
+    'authenticated-history'
+[IO.Directory]::CreateDirectory($historyRoot) |
+    Out-Null
+$historyPath = Join-Path $historyRoot `
+    'contextual-prior-comments.json'
+$historyPayload = [ordered]@{
+    schemaVersion = 1
+    kind =
+        'owner-v2-authenticated-prior-comment-history'
+    comments = $authenticatedPriorComments
+}
+$historyJson =
+    ConvertTo-ApprovedOwnerV2CanonicalJson `
+        $historyPayload
+$historyTempPath =
+    "$historyPath.$([guid]::NewGuid().ToString('N')).tmp"
+[IO.File]::WriteAllText(
+    $historyTempPath,
+    $historyJson,
+    [Text.UTF8Encoding]::new($false))
+[IO.File]::Move(
+    $historyTempPath, $historyPath, $true)
+$historySha256 =
+    (Get-FileHash -LiteralPath $historyPath `
+        -Algorithm SHA256).Hash.
+        ToLowerInvariant()
+
 $evaluationOutput = @(
     & $currentPrTool `
         -ConfigPath $ContextualConfigPath `
@@ -219,6 +275,9 @@ $evaluationOutput = @(
         -AcquisitionPath $SharedAcquisitionPath `
         -AcquisitionSha256 `
             $SharedAcquisitionSha256 `
+        -AuthenticatedHistoryPath $historyPath `
+        -AuthenticatedHistorySha256 `
+            $historySha256 `
         -AzureCliPath $AzureCliPath `
         -MaximumHeadsThisRun 4 `
         -RepoRoot $ContextualToolkitRoot -Run)

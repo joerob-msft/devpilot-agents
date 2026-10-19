@@ -2114,7 +2114,9 @@ function Invoke-ContextualConventionsLive {
     param(
         [Parameter(Mandatory)][object]$Entry,
         [Parameter(Mandatory)][bool]$Enabled,
-        [AllowNull()][object]$AcquisitionProvider
+        [AllowNull()][object]$AcquisitionProvider,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @()
     )
     if (-not $Enabled) {
         return New-OwnerV2LiveOutcome `
@@ -2185,6 +2187,8 @@ function Invoke-ContextualConventionsLive {
                     -Observation $observation `
                     -Contract $Entry.Contract `
                     -Snapshot $snapshot `
+                    -AuthenticatedPriorComments `
+                        $AuthenticatedPriorComments `
                     -FailureReason $(if ($failure) {
                         $failure
                     }
@@ -2198,6 +2202,8 @@ function Invoke-ContextualConventionsLive {
                     -Observation $observation `
                     -Contract $Entry.Contract `
                     -Snapshot $null `
+                    -AuthenticatedPriorComments `
+                        $AuthenticatedPriorComments `
                     -FailureReason (
                         'discussion-reconciliation-failed')
         }
@@ -2630,7 +2636,9 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
     param(
         [Parameter(Mandatory)][object]$Entry,
         [Parameter(Mandatory)][Collections.IDictionary]$Observation,
-        [Parameter(Mandatory)][object]$AcquisitionProvider
+        [Parameter(Mandatory)][object]$AcquisitionProvider,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @()
     )
 
     if (@($Observation.findings).Count -eq 0) {
@@ -2656,6 +2664,7 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
     try {
         $observation = Resolve-OwnerV2DiscussionReconciliation `
             -Observation $observation -Contract $Entry.Contract -Snapshot $snapshot `
+            -AuthenticatedPriorComments $AuthenticatedPriorComments `
             -FailureReason $(if ($failureReason) {
                     $failureReason
                 }
@@ -2667,6 +2676,7 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
         $failureReason = 'discussion-reconciliation-failed'
         $observation = Resolve-OwnerV2DiscussionReconciliation `
             -Observation $observation -Contract $Entry.Contract -Snapshot $null `
+            -AuthenticatedPriorComments $AuthenticatedPriorComments `
             -FailureReason $failureReason
     }
     $reconciledJson = $observation | ConvertTo-Json -Depth 64 -Compress
@@ -2757,6 +2767,8 @@ function Invoke-OwnerV2PreviewRun {
         [int]$LeaseSeconds = 300,
         [switch]$EnableLiveModel,
         [AllowNull()][object]$LiveAcquisitionProvider,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @(),
         [AllowNull()][object]$LiveModelProvider,
         [AllowNull()][string]$LiveModel,
         [ValidateSet('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')]
@@ -2817,7 +2829,9 @@ function Invoke-OwnerV2PreviewRun {
                     $lock = $null
                     $refresh = Resolve-OwnerV2CompletedDiscussionRefresh `
                         -Entry $entry -Observation $refreshObservation `
-                        -AcquisitionProvider $LiveAcquisitionProvider
+                        -AcquisitionProvider $LiveAcquisitionProvider `
+                        -AuthenticatedPriorComments `
+                            $AuthenticatedPriorComments
 
                     $lock = Enter-AgentLock -Path (
                         Join-Path $capabilityRoot 'owner-v2-preview.lock'
@@ -3016,7 +3030,9 @@ function Invoke-OwnerV2PreviewRun {
                     Invoke-ContextualConventionsLive `
                         -Entry $entry `
                         -Enabled ([bool]$EnableLiveModel) `
-                        -AcquisitionProvider $LiveAcquisitionProvider
+                        -AcquisitionProvider $LiveAcquisitionProvider `
+                        -AuthenticatedPriorComments `
+                            $AuthenticatedPriorComments
                 }
                 else {
                     Invoke-OwnerV2Live -Entry $entry `

@@ -24,6 +24,59 @@ BeforeAll {
 }
 
 Describe 'Contextual scheduled observation disposition' {
+    It 'authenticates prior history before ordinary evaluation and passes its digest' {
+        $text = Get-Content -LiteralPath $phase -Raw
+        $historyIndex = $text.IndexOf(
+            'Get-ApprovedOwnerV2AuthenticatedPriorComments',
+            [StringComparison]::Ordinal)
+        $evaluationIndex = $text.IndexOf(
+            '& $currentPrTool',
+            [StringComparison]::Ordinal)
+
+        $historyIndex | Should -BeGreaterThan -1
+        $evaluationIndex |
+            Should -BeGreaterThan $historyIndex
+        $text | Should -Match (
+            '-AuthenticatedHistoryPath\s+\$historyPath')
+        $text | Should -Match (
+            '-AuthenticatedHistorySha256\s+`?\s*\$historySha256')
+    }
+
+    It 'wires authenticated history through evaluation and live preflight' {
+        $currentTool = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'tools\Invoke-ContextualConventionsCurrentPr.ps1') -Raw
+        $bridge = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1') -Raw
+        $orchestrator = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psm1') -Raw
+        $approved = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1') -Raw
+        $automatic = Get-Content -LiteralPath (
+            Join-Path $repoRoot `
+                'src\Agents\reviewer\AutomaticOwnerV2Comments.ps1') -Raw
+
+        $currentTool | Should -Match (
+            '-AuthenticatedPriorComments\s+`?\s*\$authenticatedPriorComments')
+        $bridge | Should -Match (
+            'Invoke-OwnerV2PreviewRun[\s\S]{0,400}' +
+            '-AuthenticatedPriorComments')
+        $orchestrator | Should -Match (
+            'Invoke-ContextualConventionsLive[\s\S]{0,400}' +
+            '-AuthenticatedPriorComments')
+        $approved | Should -Match (
+            '\[object\[\]\]\$AuthenticatedPriorComments')
+        $approved | Should -Match (
+            'Resolve-OwnerV2DiscussionReconciliation[\s\S]{0,500}' +
+            '-AuthenticatedPriorComments')
+        $automatic | Should -Match (
+            'Assert-ApprovedOwnerV2LiveRead[\s\S]{0,500}' +
+            '-AuthenticatedPriorComments')
+    }
+
     BeforeEach {
         $observation = [ordered]@{
             lifecycle = [ordered]@{

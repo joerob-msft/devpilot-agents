@@ -1039,6 +1039,181 @@ function Read-ApprovedOwnerV2SignedRecord {
     return $payload
 }
 
+function Get-ApprovedOwnerV2AuthenticatedPriorComments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [ValidateSet(
+            'owner',
+            'named-areequal',
+            'contextual-conventions')]
+        [string]$Delivery = 'owner'
+    )
+    if (-not [IO.Path]::IsPathFullyQualified($DeliveryRoot) -or
+        -not (Test-Path -LiteralPath $DeliveryRoot -PathType Container) -or
+        $Key.Length -ne 32) {
+        throw 'Authenticated prior-comment history requires a bounded delivery root and key.'
+    }
+    $eventKind = if ($Delivery -ceq 'named-areequal') {
+        'named-areequal-v2-delivery-event'
+    }
+    elseif ($Delivery -ceq 'contextual-conventions') {
+        'contextual-conventions-v1-delivery-event'
+    }
+    else { 'owner-v2-delivery-event' }
+    $intentKind = if ($Delivery -ceq 'named-areequal') {
+        'named-areequal-v2-service-create-intent'
+    }
+    elseif ($Delivery -ceq 'contextual-conventions') {
+        'contextual-conventions-v1-service-create-intent'
+    }
+    else { 'owner-v2-service-create-intent' }
+    $outcomeKind = if ($Delivery -ceq 'named-areequal') {
+        'named-areequal-v2-service-create-outcome'
+    }
+    elseif ($Delivery -ceq 'contextual-conventions') {
+        'contextual-conventions-v1-service-create-outcome'
+    }
+    else { 'owner-v2-service-create-outcome' }
+    $proofs = [Collections.Generic.List[object]]::new()
+    $eventFiles = @(Get-ChildItem -LiteralPath (
+                Join-Path $DeliveryRoot 'events') `
+            -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Sort-Object FullName)
+    if ($eventFiles.Count -gt 5000) {
+        throw 'Authenticated prior-comment history exceeds the bounded event limit.'
+    }
+    foreach ($file in $eventFiles) {
+        $event = Read-ApprovedOwnerV2SignedRecord `
+            -Path $file.FullName -Key $Key
+        if ([string]$event.kind -cne $eventKind) {
+            throw "Prior-comment event '$($file.FullName)' is foreign."
+        }
+        if ([string]$event.action -cne 'create' -or
+            [string]$event.outcome -cnotin @(
+                'created',
+                'created-confirmed-after-error',
+                'recovered-confirmed') -or
+            [int]$event.providerWriteCount -ne 1 -or
+            [int]$event.modelWriteCount -ne 0 -or
+            [string]$event.providerWriteState -cne 'confirmed') {
+            continue
+        }
+        $runId = [string]$event.runId
+        $stateIdentity = [string]$event.finding.stateIdentity
+        if ($runId -cnotmatch '^[0-9a-f]{32}$' -or
+            $stateIdentity -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$event.eventId -cnotmatch '^[0-9a-f]{32}$' -or
+            [long]$event.threadId -lt 1 -or
+            [long]$event.commentId -lt 1) {
+            continue
+        }
+        $intentPath = Join-Path $DeliveryRoot (
+            "intents\$stateIdentity\$runId.json")
+        $outcomePath = Join-Path $DeliveryRoot (
+            "outcomes\$stateIdentity\$runId.json")
+        if (-not (Test-Path -LiteralPath $intentPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $outcomePath -PathType Leaf)) {
+            continue
+        }
+        $intent = Read-ApprovedOwnerV2SignedRecord `
+            -Path $intentPath -Key $Key
+        $outcome = Read-ApprovedOwnerV2SignedRecord `
+            -Path $outcomePath -Key $Key
+        if ([string]$intent.kind -cne $intentKind -or
+            [string]$outcome.kind -cne $outcomeKind -or
+            [string]$intent.runId -cne $runId -or
+            [string]$outcome.runId -cne $runId -or
+            [string]$intent.state.identity -cne $stateIdentity -or
+            [string]$outcome.stateIdentity -cne $stateIdentity -or
+            [string]$outcome.status -cnotin @(
+                'completed',
+                'partial',
+                'operator-review-required') -or
+            [int]$outcome.modelWrites -ne 0 -or
+            [int]$outcome.providerWritesConservative -lt 1 -or
+            @($outcome.eventIds | Where-Object {
+                    [string]$_ -ceq [string]$event.eventId
+                }).Count -ne 1) {
+            continue
+        }
+        $selection = @($intent.selections | Where-Object {
+                [string]$_.findingId -ceq
+                    [string]$event.finding.findingId -and
+                [string]$_.marker -ceq
+                    [string]$event.finding.marker
+            })
+        if ($selection.Count -ne 1) {
+            continue
+        }
+        $selection = $selection[0]
+        $bodySha256 =
+            Get-ApprovedOwnerV2TextSha256 `
+                -Text ([string]$selection.body)
+        if ([Text.Encoding]::UTF8.GetByteCount(
+                [string]$selection.body) -gt 65536 -or
+            $bodySha256 -cne
+                [string]$selection.bodySha256 -or
+            $bodySha256 -cne
+                [string]$event.finding.bodySha256 -or
+            [string]$selection.path -ine
+                [string]$event.finding.path -or
+            [int]$selection.line -ne
+                [int]$event.finding.line -or
+            [string]$selection.symbol -cne
+                [string]$event.finding.symbol -or
+            [string]$selection.ruleId -cne
+                [string]$event.finding.ruleId) {
+            continue
+        }
+        if ((Get-ApprovedOwnerV2Digest $intent.subject) -cne
+            (Get-ApprovedOwnerV2Digest $event.subject)) {
+            continue
+        }
+        [void]$proofs.Add([ordered]@{
+                schemaVersion = 1
+                kind =
+                    'owner-v2-authenticated-prior-comment'
+                delivery = $Delivery
+                capabilityId =
+                    [string]$intent.capability.id
+                subject = $intent.subject
+                rule = $intent.rule
+                reviewerIdentity =
+                    $intent.reviewerIdentity
+                reviewerIdentityDigest =
+                    Get-ApprovedOwnerV2Digest `
+                        $intent.reviewerIdentity
+                selection = [ordered]@{
+                    findingId =
+                        [string]$selection.findingId
+                    marker = [string]$selection.marker
+                    body = [string]$selection.body
+                    bodySha256 = $bodySha256
+                    constructIdentity =
+                        [string]$selection.constructIdentity
+                    constructRef =
+                        [string]$selection.constructRef
+                    semanticKey =
+                        [string]$selection.semanticKey
+                    ruleId = [string]$selection.ruleId
+                    path = [string]$selection.path
+                    line = [int]$selection.line
+                    symbol = [string]$selection.symbol
+                }
+                event = [ordered]@{
+                    eventId = [string]$event.eventId
+                    runId = $runId
+                    stateIdentity = $stateIdentity
+                    threadId = [long]$event.threadId
+                    commentId = [long]$event.commentId
+                }
+            })
+    }
+    return $proofs.ToArray()
+}
+
 function Approve-OwnerV2ReviewPackage {
     [CmdletBinding()]
     param(
@@ -1219,6 +1394,8 @@ function Assert-ApprovedOwnerV2LiveRead {
         [Parameter(Mandatory)]$Live,
         [Parameter(Mandatory)][object[]]$Selections,
         [Parameter(Mandatory)][string]$ExpectedSnapshotSha256,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @(),
         [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
         [string]$Delivery = 'owner'
     )
@@ -1311,7 +1488,8 @@ function Assert-ApprovedOwnerV2LiveRead {
         sourceArtifacts = @()
     }
     $resolved = Resolve-OwnerV2DiscussionReconciliation -Observation $mini `
-        -Contract $Evidence.Contract -Snapshot $Live.Snapshot
+        -Contract $Evidence.Contract -Snapshot $Live.Snapshot `
+        -AuthenticatedPriorComments $AuthenticatedPriorComments
     $classifications = [ordered]@{}
     foreach ($finding in @($resolved.findings)) {
         $classifications[[string]$finding.identity] =

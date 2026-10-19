@@ -357,7 +357,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         [Parameter(Mandatory)][object]$Contract,
         [AllowNull()]
         [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]$Snapshot,
-        [Parameter(Mandatory)][string]$FailureReason
+        [Parameter(Mandatory)][string]$FailureReason,
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @()
     )
     $counts = [ordered]@{
         created = 0
@@ -413,6 +415,154 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     -Reason $FailureReason `
                     -DiscussionDigest unknown `
                     -BodyDigest $bodyDigest
+            $counts.unknown++
+            continue
+        }
+        $authenticatedMatches =
+            [Collections.Generic.List[object]]::new()
+        $authenticatedPriorMarkerSeen =
+            $false
+        foreach ($proof in @(
+                $AuthenticatedPriorComments)) {
+            if ($proof -isnot
+                    [Collections.IDictionary] -or
+                [string]$proof.kind -cne
+                    'owner-v2-authenticated-prior-comment' -or
+                [string]$proof.delivery -cne
+                    'contextual-conventions' -or
+                [string]$proof.capabilityId -cne
+                    $script:ContextualCapability -or
+                [string]$proof.subject.projectId -cne
+                    [string]$Contract.Request.ProjectId -or
+                [string]$proof.subject.repositoryId -cne
+                    [string]$Contract.Request.RepositoryId -or
+                [long]$proof.subject.pullRequestId -ne
+                    [long]$Contract.Request.PullRequestId -or
+                [string]$proof.subject.sourceCommit -cne
+                    [string]$Contract.Request.SourceCommit -or
+                [string]$proof.subject.targetCommit -cne
+                    [string]$Contract.Request.TargetCommit -or
+                [string]$proof.subject.targetRef -cne
+                    [string]$Contract.Request.TargetRef -or
+                [string]$proof.rule.repositoryId -cne
+                    [string]$Contract.Request.RuleRepositoryId -or
+                [string]$proof.rule.path -cne
+                    [string]$Contract.Request.RulePath -or
+                [string]$proof.rule.section -cne
+                    [string]$Contract.Request.RuleSection -or
+                [string]$proof.rule.hash -cne
+                    [string]$Contract.Request.RuleHash -or
+                [long]$proof.rule.length -ne
+                    [long]$Contract.Request.RuleLength -or
+                [string]$proof.reviewerIdentityDigest -cne
+                    [string]$Snapshot.
+                        ReviewerIdentityDigest -or
+                [string]$proof.selection.ruleId -cne
+                    [string]$finding.ruleId -or
+                [string]$proof.selection.path -ine
+                    [string]$finding.anchor.path -or
+                [int]$proof.selection.line -ne
+                    [int]$finding.anchor.line -or
+                [string]$proof.selection.symbol -cne
+                    [string]$finding.anchor.symbol -or
+                [string]$proof.selection.constructIdentity -cne
+                    [string]$finding.binding.constructIdentity) {
+                continue
+            }
+            $priorEntries =
+                [Collections.Generic.List[object]]::new()
+            foreach ($thread in @($Snapshot.Threads)) {
+                foreach ($comment in @(
+                        $thread.comments)) {
+                    $priorMarkers = @(
+                        [regex]::Matches(
+                            [string]$comment.body,
+                            $targetPattern) |
+                            Where-Object {
+                                $_.Groups[1].Value -ceq
+                                    [string]$proof.selection.marker
+                            })
+                    if ($priorMarkers.Count -eq 0) {
+                        continue
+                    }
+                    $authenticatedPriorMarkerSeen =
+                        $true
+                    if ($priorMarkers.Count -eq 1 -and
+                        [string]$comment.commentType -ceq
+                            'text' -and
+                        -not [bool]$comment.isDeleted -and
+                        [bool]$comment.reviewerOwned -and
+                        [string]$comment.reviewerIdentityState -ceq
+                            'matched' -and
+                        [long]$thread.threadId -eq
+                            [long]$proof.event.threadId -and
+                        [long]$comment.commentId -eq
+                            [long]$proof.event.commentId -and
+                        -not [bool]$thread.isDeleted -and
+                        -not [bool]$thread.isOutdated -and
+                        [string]$thread.status -ceq
+                            'active' -and
+                        [string]$thread.contextState -ceq
+                            'current' -and
+                        [string]$thread.sourceCommit -ceq
+                            [string]$Contract.Request.SourceCommit -and
+                        $null -ne $thread.anchor -and
+                        [string]$thread.anchor.path -ieq
+                            [string]$finding.anchor.path -and
+                        [int]$thread.anchor.line -eq
+                            [int]$finding.anchor.line -and
+                        [string]$comment.body -ceq
+                            [string]$proof.selection.body -and
+                        (Get-OwnerV1WriterSha256 -Text (
+                            [string]$comment.body)) -ceq
+                            [string]$proof.selection.bodySha256) {
+                        [void]$priorEntries.Add(
+                            [pscustomobject]@{
+                                Thread = $thread
+                                Comment = $comment
+                                Proof = $proof
+                            })
+                    }
+                }
+            }
+            if ($priorEntries.Count -eq 1) {
+                [void]$authenticatedMatches.Add(
+                    $priorEntries[0])
+            }
+        }
+        if ($authenticatedMatches.Count -eq 1) {
+            $entry = $authenticatedMatches[0]
+            $finding.providerMarker =
+                New-OwnerProviderMarker `
+                    -Value $marker
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification noOp `
+                    -Reason authenticated-prior-reviewer-comment `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest $bodyDigest `
+                    -ThreadAvailability available `
+                    -ThreadId (
+                        [long]$entry.Thread.threadId) `
+                    -CommentId (
+                        [long]$entry.Comment.commentId) `
+                    -ThreadStatus (
+                        [string]$entry.Thread.status)
+            $counts.noOp++
+            continue
+        }
+        if ($authenticatedPriorMarkerSeen) {
+            $finding.providerMarker =
+                New-OwnerProviderMarker `
+                    -Value $marker `
+                    -Integrity invalid
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification unknown `
+                    -Reason authenticated-prior-comment-mismatch `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest $bodyDigest `
+                    -ThreadAvailability ambiguous
             $counts.unknown++
             continue
         }
@@ -968,7 +1118,9 @@ function Resolve-OwnerV2DiscussionReconciliation {
         [Parameter(Mandatory)][object]$Contract,
         [AllowNull()][DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]$Snapshot,
         [ValidatePattern('^[a-z][a-z0-9-]{0,127}$')]
-        [string]$FailureReason = 'discussion-acquisition-unavailable'
+        [string]$FailureReason = 'discussion-acquisition-unavailable',
+        [AllowEmptyCollection()]
+        [object[]]$AuthenticatedPriorComments = @()
     )
 
     if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
@@ -981,7 +1133,8 @@ function Resolve-OwnerV2DiscussionReconciliation {
         $script:ContextualCapability) {
         return Resolve-ContextualConventionDiscussionReconciliation `
             -Observation $Observation -Contract $Contract `
-            -Snapshot $Snapshot -FailureReason $FailureReason
+            -Snapshot $Snapshot -FailureReason $FailureReason `
+            -AuthenticatedPriorComments $AuthenticatedPriorComments
     }
 
     $findings = @($Observation.findings)
