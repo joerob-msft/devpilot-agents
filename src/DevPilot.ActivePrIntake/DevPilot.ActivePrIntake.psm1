@@ -3438,6 +3438,76 @@ print(json.dumps({
                     }
                 }
             }
+            ReferenceFiles {
+                $sourceCommit =
+                    [string]$Request.sourceCommit
+                $paths = @($Request.paths)
+                if ($sourceCommit -cnotmatch
+                        '^[a-fA-F0-9]{40}$' -or
+                    $paths.Count -lt 1 -or
+                    $paths.Count -gt 8 -or
+                    @($paths | Sort-Object -Unique).
+                        Count -ne $paths.Count) {
+                    throw 'reference-file-request-invalid'
+                }
+                $references =
+                    [Collections.Generic.List[object]]::new()
+                $totalBytes = 0L
+                foreach ($requestedPath in $paths) {
+                    $path = ([string]$requestedPath).
+                        Replace('\', '/').
+                        TrimStart('/')
+                    if ($path -cnotmatch
+                            '^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.cs$' -or
+                        $path -imatch
+                            '(^|/)(?:obj|generated|Ignore-AddedForReferenceOnly)(/|$)|(?:\.g|\.designer)\.cs$') {
+                        throw 'reference-file-path-invalid'
+                    }
+                    $item = & $getItem `
+                        $path $sourceCommit $deadline
+                    $content = [string]$item.content
+                    $bytes =
+                        [Text.Encoding]::UTF8.
+                            GetByteCount($content)
+                    $totalBytes += $bytes
+                    if ($totalBytes -gt 2097152) {
+                        throw 'reference-file-budget'
+                    }
+                    $context =
+                        & $getProjectContext `
+                            $path $sourceCommit $deadline
+                    [void]$references.Add(
+                        [ordered]@{
+                            changeTrackingId =
+                                2000000000 +
+                                $references.Count
+                            path = $path
+                            changeType = 'Edit'
+                            state = 'complete'
+                            spans = @()
+                            unavailableReason =
+                                $null
+                            content = $content
+                            byteLength = $bytes
+                            sourceDigest =
+                                'v1:sha256:' +
+                                [Convert]::ToHexString(
+                                    [Security.Cryptography.SHA256]::HashData(
+                                        [Text.Encoding]::UTF8.GetBytes(
+                                            $content))).
+                                    ToLowerInvariant()
+                            projectContext =
+                                $context
+                            contextOnly = $true
+                        })
+                }
+                return [ordered]@{
+                    schemaVersion = 1
+                    sourceCommit = $sourceCommit
+                    entries =
+                        $references.ToArray()
+                }
+            }
             Discussions {
                 $id = [int]$Request.pullRequestId
                 $r = & $invoke 'git' 'pullRequestThreads' @(

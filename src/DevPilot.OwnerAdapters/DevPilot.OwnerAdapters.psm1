@@ -2051,6 +2051,15 @@ function ConvertTo-OwnerAcquisitionResponse {
         Assert-OwnerAdapterDigest -Value $changeDigest -Name change.sourceDigest
         $spanValues = @(Get-OwnerAdapterMember -Value $change -Name spans -Required)
         $spans = ConvertTo-OwnerSpanData -Spans $spanValues
+        $contextOnly = Get-OwnerAdapterMember `
+            -Value $change -Name contextOnly
+        if ($null -ne $contextOnly) {
+            $contextOnly =
+                Get-OwnerAdapterBoolean `
+                    -Value $contextOnly `
+                    -Name change.contextOnly
+        }
+        else { $contextOnly = $false }
         $projectContext = Get-OwnerAdapterMember `
             -Value $change -Name projectContext
         if ($null -ne $projectContext) {
@@ -2111,7 +2120,7 @@ function ConvertTo-OwnerAcquisitionResponse {
                 }
             }
         }
-        [void]$normalizedChanges.Add([ordered]@{
+        $normalizedChange = [ordered]@{
                 path = $path
                 oldPath = $oldPath
                 changeType = $changeType
@@ -2120,7 +2129,13 @@ function ConvertTo-OwnerAcquisitionResponse {
                 sourceDigest = $changeDigest
                 spans = $spans
                 projectContext = $projectContext
-            })
+            }
+        if ($contextOnly) {
+            $normalizedChange['contextOnly'] =
+                $true
+        }
+        [void]$normalizedChanges.Add(
+            $normalizedChange)
     }
     $changeArray = @($normalizedChanges)
     [Array]::Sort($changeArray, [Collections.Generic.Comparer[object]]::Create({
@@ -2238,6 +2253,9 @@ function ConvertTo-OwnerAcquisitionResponse {
             throw 'File package exceeded the configured byte cap.'
         }
         $spanStates = @($change['spans'] | ForEach-Object { $_['state'] })
+        $contextOnly =
+            $change.Contains('contextOnly') -and
+            [bool]$change['contextOnly']
         $providerReasonValue = Get-OwnerAdapterMember -Value $file -Name unavailableReason
         $providerReason = if ($null -eq $providerReasonValue) { $null } else { [string]$providerReasonValue }
         if ($null -ne $providerReason -and $providerReason -cnotin $script:OwnerUnknownReasons -and
@@ -2251,7 +2269,10 @@ function ConvertTo-OwnerAcquisitionResponse {
             $fileState -cne 'complete' -or
             $truncated -or
             [bool]$change['isBinary'] -or
-            $change['spans'].Count -eq 0 -and $change['changeType'] -cne 'deleted' -or
+            $change['spans'].Count -eq 0 -and
+                $change['changeType'] -cne
+                    'deleted' -and
+                -not $contextOnly -or
             $spanStates -contains 'incomplete' -or
             $spanStates -contains 'unknown') {
             'unknown'
@@ -2271,7 +2292,8 @@ function ConvertTo-OwnerAcquisitionResponse {
         elseif ($null -ne $providerReason -and $providerReason -cne 'deleted') {
             $providerReason
         }
-        elseif ($change['spans'].Count -eq 0) {
+        elseif ($change['spans'].Count -eq 0 -and
+            -not $contextOnly) {
             'spans-missing'
         }
         elseif ($spanStates -contains 'incomplete' -or $spanStates -contains 'unknown') {
@@ -2289,7 +2311,7 @@ function ConvertTo-OwnerAcquisitionResponse {
         }
         [void]$artifactDigests.Add([ordered]@{ artifact = "change:$ordinal"; digest = $change['sourceDigest'] })
         [void]$artifactDigests.Add([ordered]@{ artifact = "file:$ordinal"; digest = $fileDigest })
-        [void]$units.Add([ordered]@{
+        $unit = [ordered]@{
                 unitId = ('file:{0:D6}' -f $ordinal)
                 state = $evidenceState
                 data = [ordered]@{
@@ -2307,7 +2329,12 @@ function ConvertTo-OwnerAcquisitionResponse {
                     projectContext =
                         $change['projectContext']
                 }
-            })
+            }
+        if ($contextOnly) {
+            $unit.data['contextOnly'] =
+                $true
+        }
+        [void]$units.Add($unit)
         $ordinal++
     }
     if ($filesByPath.Count -ne $changeArray.Count) {

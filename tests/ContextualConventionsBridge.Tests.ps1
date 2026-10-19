@@ -1057,6 +1057,191 @@ internal const string Protocol = "http";
             Should -BeFalse
     }
 
+    It 'acquires a cited unchanged constant peer as context-only evidence' {
+        $config =
+            New-ContextualTestConfig
+        $config.enabled = $true
+        $candidate = @'
+namespace N {
+/// <summary>Shared <c>contract/v1</c> contract.</summary>
+internal static class Candidate {
+internal const string Value = "wire-value";
+} }
+'@
+        $peer = @'
+namespace N {
+/// <summary>Shared <c>contract/v1</c> contract.</summary>
+internal static class Existing {
+internal const string Value = "wire-value";
+} }
+'@
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content $candidate
+        $entry =
+            $prepared.Intake.
+                transientSnapshots['42'].
+                changes.entries[0]
+        $entry.path = 'src/Candidate.cs'
+        $entry.spans[0].startLine = 4
+        $entry.spans[0].endLine = 4
+        $entry.sourceDigest =
+            Get-ContextualTestTextDigest `
+                $candidate
+        $entry.byteLength =
+            [Text.Encoding]::UTF8.
+                GetByteCount($candidate)
+        $projectContent =
+            '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+        $projectContext = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            content = $projectContent
+            byteLength =
+                [Text.Encoding]::UTF8.
+                    GetByteCount($projectContent)
+            sourceDigest =
+                Get-ContextualTestTextDigest `
+                    $projectContent
+        }
+        $entry['projectContext'] =
+            $projectContext
+        $prepared.Intake.
+            transientSnapshots['42'].
+            discussions = [ordered]@{
+                count = 1
+                threads = @([ordered]@{
+                        id = 100
+                        status = 'active'
+                        isDeleted = $false
+                        threadContext = [ordered]@{
+                            filePath =
+                                '/src/Candidate.cs'
+                            rightFileStart =
+                                [ordered]@{
+                                    line = 4
+                                    offset = 1
+                                }
+                            rightFileEnd =
+                                [ordered]@{
+                                    line = 4
+                                    offset = 10
+                                }
+                        }
+                        pullRequestThreadContext =
+                            [ordered]@{
+                                changeTrackingId = 7
+                                iterationContext =
+                                    [ordered]@{
+                                        firstComparingIteration = 3
+                                        secondComparingIteration = 3
+                                    }
+                            }
+                        comments = @([ordered]@{
+                                id = 1
+                                commentType = 'text'
+                                content =
+                                    'Duplicated constant wire-value. Reconcile to src/Existing.cs.'
+                                author = [ordered]@{
+                                    id =
+                                        '44444444-4444-4444-4444-444444444444'
+                                    descriptor =
+                                        'aad.human'
+                                    uniqueName =
+                                        'human@example.invalid'
+                                }
+                            })
+                    })
+            }
+        $peerDigest =
+            Get-ContextualTestTextDigest $peer
+        $providerState = [ordered]@{
+            referenceCalls = 0
+        }
+        $provider = {
+            param($Operation, $Arguments)
+            if ($Operation -ceq 'Head') {
+                return $prepared.Head
+            }
+            if ($Operation -ceq
+                'ReferenceFiles') {
+                $providerState.referenceCalls++
+                return [ordered]@{
+                    schemaVersion = 1
+                    sourceCommit =
+                        $prepared.Head.
+                            sourceCommit
+                    entries = @([ordered]@{
+                            changeTrackingId =
+                                2000000000
+                            path =
+                                'src/Existing.cs'
+                            changeType = 'Edit'
+                            state = 'complete'
+                            spans = @()
+                            unavailableReason =
+                                $null
+                            content = $peer
+                            byteLength =
+                                [Text.Encoding]::UTF8.
+                                    GetByteCount(
+                                        $peer)
+                            sourceDigest =
+                                $peerDigest
+                            projectContext =
+                                $projectContext
+                            contextOnly = $true
+                        })
+                }
+            }
+            throw "Unexpected provider operation '$Operation'."
+        }.GetNewClosure()
+        $state = Join-Path $TestDrive `
+            'cited-reference-state'
+        $manifest = Join-Path $TestDrive `
+            'cited-reference-manifest.json'
+
+        $result =
+            Invoke-ContextualConventionsCurrentPrBridge `
+                -Config $config `
+                -Provider $provider `
+                -StateRoot $state `
+                -ManifestPath $manifest `
+                -RepositoryRoot $repoRoot `
+                -PreparedIntake (
+                    $prepared.Intake) `
+                -Run
+        $record = @($result.records)[0]
+        $observationPath = @(
+            Get-ChildItem $state -Recurse `
+                -File -Filter "$($record.identity).json" |
+                Where-Object {
+                    $_.Directory.Name -ceq
+                        'observations'
+                })[0].FullName
+        $observation =
+            Get-Content $observationPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $finding = @(
+            $observation.findings |
+                Where-Object {
+                    [string]$_.ruleId -ceq
+                        'duplicate-constant-declarations'
+                })
+
+        $providerState.referenceCalls |
+            Should -Be 1
+        $finding | Should -HaveCount 1
+        $finding[0].binding.span.startLine |
+            Should -Be 4
+        $finding[0].reconciliation.
+            classification |
+            Should -BeExactly humanCovered
+        $result.providerWrites |
+            Should -Be 0
+    }
+
     It 'consumes the prepared shared snapshot and writes one model-free finding' {
         $config = New-ContextualTestConfig
         $config.enabled = $true

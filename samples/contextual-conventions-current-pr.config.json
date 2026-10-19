@@ -58,8 +58,8 @@
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
-    "activePrIntakeSha256": "f4e022f5fc23ec1822340b72d1337974896ad99db434198c97af7347e42bd00d",
-    "contextualBridgeSha256": "b811e338bb525a8b3c888c5b3105b8a3b0c958d000e7e8218d39014ac652c06c",
+    "activePrIntakeSha256": "250834e7f63b3b4c8ec7786606872f24a8444d2cccaaeb33cf03873e3d7e66b6",
+    "contextualBridgeSha256": "7b91ca05e393d75e1b5f99242ae5fa0e3e2a4bf048df9d780ae1ba6b9cf78ff8",
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
   "autoCreateContextualConventionComments": false,

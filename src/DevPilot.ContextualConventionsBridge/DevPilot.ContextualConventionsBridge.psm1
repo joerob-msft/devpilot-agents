@@ -234,7 +234,7 @@ function New-ContextualBridgeAcquisitionProvider {
                     state = 'complete'
                     sourceDigest = & $digestCommand @(
                         $changeSet.entries | ForEach-Object {
-                            [ordered]@{
+                            $material = [ordered]@{
                                 path = $_.path
                                 changeType = $_.changeType
                                 sourceDigest = $_.sourceDigest
@@ -247,6 +247,15 @@ function New-ContextualBridgeAcquisitionProvider {
                                     $_.projectContext
                                 } else { $null })
                             }
+                            if ($_ -is
+                                    [Collections.IDictionary] -and
+                                $_.Contains(
+                                    'contextOnly') -and
+                                [bool]$_.contextOnly) {
+                                $material['contextOnly'] =
+                                    $true
+                            }
+                            $material
                         })
                     changes = @($changeSet.entries | ForEach-Object {
                         $change = [ordered]@{
@@ -262,6 +271,13 @@ function New-ContextualBridgeAcquisitionProvider {
                             isBinary = [string]$_.state -cne 'complete'
                             sourceDigest = [string]$_.sourceDigest
                             spans = @($_.spans)
+                        }
+                        if ($_ -is
+                                [Collections.IDictionary] -and
+                            $_.Contains('contextOnly') -and
+                            [bool]$_.contextOnly) {
+                            $change['contextOnly'] =
+                                $true
                         }
                         if ($_ -is
                                 [Collections.IDictionary] -and
@@ -425,6 +441,69 @@ function Get-ContextualBridgeRelevantChangeSet {
                 }
             } | Sort-Object path -Unique)
     }
+}
+
+function Get-ContextualBridgeCitedReferencePaths {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Snapshot,
+        [Parameter(Mandatory)][string[]]$ChangedPaths
+    )
+    $paths =
+        [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+    foreach ($thread in @(
+            $Snapshot.discussions.threads)) {
+        if ($thread -isnot
+                [Collections.IDictionary] -or
+            -not $thread.Contains('status') -or
+            [string]$thread.status -ine
+                'active' -or
+            ($thread.Contains('isDeleted') -and
+                [bool]$thread.isDeleted)) {
+            continue
+        }
+        $threadContext = if ($thread.Contains(
+                'threadContext')) {
+            $thread.threadContext
+        }
+        else { $null }
+        if ($threadContext -isnot
+                [Collections.IDictionary] -or
+            -not $threadContext.Contains(
+                'filePath') -or
+            ([string]$threadContext.filePath).
+                TrimStart('/') -notin $ChangedPaths) {
+            continue
+        }
+        foreach ($comment in @(
+                $thread.comments)) {
+            if ($comment -isnot
+                    [Collections.IDictionary] -or
+                [string]$comment.commentType -ine
+                    'text' -or
+                ($comment.Contains('isDeleted') -and
+                    [bool]$comment.isDeleted) -or
+                $comment.content -isnot [string] -or
+                [string]$comment.content -cnotmatch
+                    '(?i)\b(?:duplicat\w*|consolidat\w*|reconcil\w*|common\s+declar\w*|shared\s+constant\w*)\b') {
+                continue
+            }
+            foreach ($match in [regex]::Matches(
+                    [string]$comment.content,
+                    '(?i)(?<path>src/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.cs)\b')) {
+                $path = [string]$match.Groups[
+                    'path'].Value
+                if ($path -notin $ChangedPaths) {
+                    [void]$paths.Add($path)
+                }
+                if ($paths.Count -gt 8) {
+                    throw 'contextual-cited-reference-budget'
+                }
+            }
+        }
+    }
+    return @($paths | Sort-Object)
 }
 
 function Get-ContextualBridgeFailureDiagnostic {
@@ -610,6 +689,50 @@ function Invoke-ContextualConventionsCurrentPrBridge {
             $changeSet =
                 Get-ContextualBridgeRelevantChangeSet `
                     -ChangeSet $snapshot.changes
+            $referencePaths =
+                @(Get-ContextualBridgeCitedReferencePaths `
+                    -Snapshot $snapshot `
+                    -ChangedPaths @(
+                        $changeSet.entries.path))
+            if ($referencePaths.Count -gt 0) {
+                $referenceResponse = & $Provider `
+                    'ReferenceFiles' `
+                    ([ordered]@{
+                        repositoryId =
+                            [string]$head.repositoryId
+                        projectId =
+                            [string]$head.projectId
+                        pullRequestId =
+                            [long]$head.pullRequestId
+                        sourceCommit =
+                            [string]$head.sourceCommit
+                        paths = $referencePaths
+                        timeoutMilliseconds =
+                            [int]$Config.limits.
+                                maxSeconds * 1000
+                    })
+                if ($referenceResponse -isnot
+                        [Collections.IDictionary] -or
+                    [string]$referenceResponse.
+                        sourceCommit -cne
+                        [string]$head.sourceCommit -or
+                    $referenceResponse.entries -isnot
+                        [array] -or
+                    @($referenceResponse.entries).
+                        Count -ne
+                        $referencePaths.Count) {
+                    throw 'contextual-cited-reference-invalid'
+                }
+                $changeSet.entries =
+                    @($changeSet.entries) +
+                    @($referenceResponse.entries)
+                $changeSet.projectContexts =
+                    @($changeSet.projectContexts) +
+                    @($referenceResponse.entries |
+                        ForEach-Object {
+                            $_.projectContext
+                        })
+            }
             $heads[$id] = $head
             $changes[$id] = $changeSet
             $entriesById[$id] =

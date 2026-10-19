@@ -3253,6 +3253,9 @@ function Invoke-ContextualConventionsCapabilityResponse {
         $data = $file.data
         $path = [string]$data.path
         $evidenceIds = @('identity', 'rule', $id)
+        if (@($data.spans).Count -eq 0) {
+            continue
+        }
         if ([string]$file.state -cne 'complete' -or
             $data -isnot [Collections.IDictionary] -or
             $data.content -isnot [string]) {
