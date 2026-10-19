@@ -23,6 +23,10 @@ param(
     [string]$PreviousRuleHash = '',
     [long]$PreviousRuleLength = 0,
     [string[]]$UnchangedRuleId = @(),
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$AdditionalPreviousRuleHash = '',
+    [long]$AdditionalPreviousRuleLength = 0,
+    [string[]]$AdditionalUnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -203,6 +207,11 @@ if ($Command -ceq 'authorize-policy') {
             $PreviousRuleHash) -or
         $PreviousRuleLength -ne 0 -or
         $UnchangedRuleId.Count -ne 0
+    $additionalCompatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace(
+            $AdditionalPreviousRuleHash) -or
+        $AdditionalPreviousRuleLength -ne 0 -or
+        $AdditionalUnchangedRuleId.Count -ne 0
     if ($compatibilitySpecified -and (
             $Delivery -cne
                 'contextual-conventions' -or
@@ -212,6 +221,14 @@ if ($Command -ceq 'authorize-policy') {
             $UnchangedRuleId.Count -lt 1)) {
         throw 'Additive rule history compatibility requires one exact prior contextual rule and unchanged rule IDs.'
     }
+    if ($additionalCompatibilitySpecified -and (
+            -not $compatibilitySpecified -or
+            [string]::IsNullOrWhiteSpace(
+                $AdditionalPreviousRuleHash) -or
+            $AdditionalPreviousRuleLength -lt 1 -or
+            $AdditionalUnchangedRuleId.Count -lt 1)) {
+        throw 'Additional additive history compatibility requires a second exact prior contextual rule and unchanged rule IDs.'
+    }
     $policyArguments = @{
         Evidence = $evidence
         PolicyId = $PolicyId
@@ -220,7 +237,45 @@ if ($Command -ceq 'authorize-policy') {
             $MaxCreatesPerPullRequest
     }
     if ($compatibilitySpecified) {
-        $policyArguments.HistoryCompatibility =
+        $currentRule = [ordered]@{
+            hash =
+                [string]$evidence.
+                    Declaration.rule.hash
+            length =
+                [long]$evidence.
+                    Declaration.rule.length
+        }
+        $policyArguments.HistoryCompatibility = if (
+            $additionalCompatibilitySpecified) {
+            [ordered]@{
+                schemaVersion = 2
+                kind =
+                    'contextual-additive-rule-history-compatibility'
+                previousRules = @(
+                    [ordered]@{
+                        rule = [ordered]@{
+                            hash =
+                                $PreviousRuleHash
+                            length =
+                                $PreviousRuleLength
+                        }
+                        unchangedRuleIds =
+                            @($UnchangedRuleId)
+                    },
+                    [ordered]@{
+                        rule = [ordered]@{
+                            hash =
+                                $AdditionalPreviousRuleHash
+                            length =
+                                $AdditionalPreviousRuleLength
+                        }
+                        unchangedRuleIds =
+                            @($AdditionalUnchangedRuleId)
+                    })
+                currentRule = $currentRule
+            }
+        }
+        else {
             [ordered]@{
                 schemaVersion = 1
                 kind =
@@ -229,17 +284,11 @@ if ($Command -ceq 'authorize-policy') {
                     hash = $PreviousRuleHash
                     length = $PreviousRuleLength
                 }
-                currentRule = [ordered]@{
-                    hash =
-                        [string]$evidence.
-                            Declaration.rule.hash
-                    length =
-                        [long]$evidence.
-                            Declaration.rule.length
-                }
+                currentRule = $currentRule
                 unchangedRuleIds =
                     @($UnchangedRuleId)
             }
+        }
     }
     $policy =
         New-AutomaticOwnerV2ServicePolicy `

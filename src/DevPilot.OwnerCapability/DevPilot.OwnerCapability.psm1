@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:a8d368a37fc41310a412bca16ca9b843b03fe16e7993a2ebaacdc0b0c8b45dad'
+$script:ContextualDigest = 'v1:sha256:81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+$script:ContextualPolicyDigest = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -362,24 +362,13 @@ function Test-ContextualPriorRuleCompatibility {
             [Collections.IDictionary]) {
         return $false
     }
-    $keys = @($Compatibility.Keys |
-        ForEach-Object { [string]$_ } |
-        Sort-Object -CaseSensitive)
-    if (($keys -join "`n") -cne (
-            @(
-                'currentRule',
-                'kind',
-                'previousRule',
-                'schemaVersion',
-                'unchangedRuleIds') -join "`n") -or
-        $Compatibility.previousRule -isnot
-            [Collections.IDictionary] -or
-        $Compatibility.currentRule -isnot
-            [Collections.IDictionary]) {
+    if ($Compatibility.currentRule -isnot
+        [Collections.IDictionary] -or
+        [string]$Compatibility.kind -cne
+            'contextual-additive-rule-history-compatibility') {
         return $false
     }
     foreach ($binding in @(
-            $Compatibility.previousRule,
             $Compatibility.currentRule)) {
         $bindingKeys = @($binding.Keys |
             ForEach-Object { [string]$_ } |
@@ -392,34 +381,59 @@ function Test-ContextualPriorRuleCompatibility {
             return $false
         }
     }
-    $unchanged = @(
-        $Compatibility.unchangedRuleIds)
-    return (
-        [int]$Compatibility.schemaVersion -eq 1 -and
-        [string]$Compatibility.kind -ceq
-            'contextual-additive-rule-history-compatibility' -and
-        $unchanged.Count -ge 1 -and
-        $unchanged.Count -le 64 -and
-        @($unchanged |
-            Sort-Object -Unique -CaseSensitive).Count -eq
+    if ([string]$Compatibility.currentRule.hash -cne
+            [string]$Request.RuleHash -or
+        [long]$Compatibility.currentRule.length -ne
+            [long]$Request.RuleLength) {
+        return $false
+    }
+    $previousEntries = if (
+        [int]$Compatibility.schemaVersion -eq 1) {
+        @([ordered]@{
+                rule =
+                    $Compatibility.previousRule
+                unchangedRuleIds =
+                    $Compatibility.unchangedRuleIds
+            })
+    }
+    elseif ([int]$Compatibility.schemaVersion -eq 2) {
+        @($Compatibility.previousRules)
+    }
+    else { @() }
+    foreach ($entry in $previousEntries) {
+        if ($entry -isnot
+                [Collections.IDictionary] -or
+            $entry.rule -isnot
+                [Collections.IDictionary]) {
+            continue
+        }
+        $bindingKeys = @($entry.rule.Keys |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -CaseSensitive)
+        $unchanged = @(
+            $entry.unchangedRuleIds)
+        if (($bindingKeys -join "`n") -ceq
+                "hash`nlength" -and
+            [string]$entry.rule.hash -ceq
+                [string]$PriorRule.hash -and
+            [long]$entry.rule.length -eq
+                [long]$PriorRule.length -and
+            [string]$RuleId -cin
+                $unchanged -and
+            $unchanged.Count -ge 1 -and
+            $unchanged.Count -le 64 -and
+            @($unchanged |
+                Sort-Object -Unique `
+                    -CaseSensitive).Count -eq
                 $unchanged.Count -and
-        @($unchanged | Where-Object {
-                [string]$_ -cnotmatch
-                    '^[a-z][a-z0-9-]{0,127}$'
-            }).Count -eq 0 -and
-        [string]$RuleId -cin $unchanged -and
-        [string]$Compatibility.previousRule.hash -ceq
-            [string]$PriorRule.hash -and
-        [long]$Compatibility.previousRule.length -eq
-            [long]$PriorRule.length -and
-        [string]$Compatibility.currentRule.hash -ceq
-            [string]$Request.RuleHash -and
-        [long]$Compatibility.currentRule.length -eq
-            [long]$Request.RuleLength -and
-        ([string]$Compatibility.previousRule.hash -cne
-                [string]$Compatibility.currentRule.hash -or
-            [long]$Compatibility.previousRule.length -ne
-                [long]$Compatibility.currentRule.length))
+            @($unchanged | Where-Object {
+                    [string]$_ -cnotmatch
+                        '^[a-z][a-z0-9-]{0,127}$'
+                }).Count -eq 0) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Test-ContextualDuplicateConstantHumanCoverage {

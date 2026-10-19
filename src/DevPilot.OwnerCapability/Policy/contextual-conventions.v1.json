@@ -51,8 +51,9 @@
     },
     {
       "id": "named-call-arguments",
-      "name": "Name arguments at documented ambiguous call sites",
-      "sourceSection": "Named parameters / Name constant parameters"
+      "name": "Name arguments required by each documented call-site trigger",
+      "sourceSection": "Named parameters / Name constant parameters",
+      "constantOnlyScope": "When only the constant trigger applies, name every supplied compile-time constant argument; unrelated distinct nonconstant arguments need not be named."
     },
     {
       "id": "xml-summary-layout",

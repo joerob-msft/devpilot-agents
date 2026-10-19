@@ -962,7 +962,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -CurrentRule $compatibility.currentRule `
                 -AllowedRuleIds @(
                     'explicit-string-comparison')
-        } | Should -Throw '*exact additive rule binding*'
+        } | Should -Throw '*is invalid*'
     }
 
     It 'binds additive history compatibility into the signed contextual policy' {
@@ -975,8 +975,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
-        $evidence.Declaration.rule.length = 5205
+            'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+        $evidence.Declaration.rule.length = 5399
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1062,6 +1062,66 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -Evidence $evidence `
                 -Policy $policy
         } | Should -Not -Throw
+    }
+
+    It 'validates multiple exact prior bundles with rule-specific unchanged sets' {
+        $compatibility = [ordered]@{
+            schemaVersion = 2
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRules = @(
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+                        length = 3706
+                    }
+                    unchangedRuleIds = @(
+                        'explicit-string-comparison')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+                        length = 5205
+                    }
+                    unchangedRuleIds = @(
+                        'http-client-lifetime')
+                })
+            currentRule = [ordered]@{
+                hash =
+                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                length = 5399
+            }
+        }
+        $validated =
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $compatibility `
+                -CurrentRule (
+                    $compatibility.currentRule) `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison',
+                    'http-client-lifetime',
+                    'named-call-arguments')
+        @($validated.previousRules) |
+            Should -HaveCount 2
+
+        $duplicate = $compatibility |
+            ConvertTo-Json -Depth 16 |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 16
+        $duplicate.previousRules[1].rule =
+            $duplicate.previousRules[0].rule
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $duplicate `
+                -CurrentRule (
+                    $duplicate.currentRule) `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison',
+                    'http-client-lifetime',
+                    'named-call-arguments')
+        } | Should -Throw '*duplicate or current*'
     }
 
     It 'refuses prior history signed by a foreign key' {
