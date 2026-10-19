@@ -146,6 +146,209 @@ AfterAll {
     }
 }
 Describe 'Active PR read-only intake' {
+    It 'resumes a single retained project context and preserves completed progress' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $context = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            content =
+                '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+            byteLength = 82
+            sourceDigest =
+                'v1:sha256:' + ('1' * 64)
+        }
+        $state = $c.state
+        $baseProvider = $c.provider
+        $state['changeStarts'] =
+            [Collections.Generic.List[int]]::new()
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes') {
+                return & $baseProvider `
+                    $op $request
+            }
+            $start = [int]$request.
+                fileStartOrdinal
+            [void]$state.changeStarts.Add(
+                $start)
+            $entries = @(switch ($start) {
+                    0 {
+                        [ordered]@{
+                            changeTrackingId = 1
+                            path = 'src/A.cs'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('2' * 64)
+                                })
+                            content = 'class A {}'
+                            byteLength = 10
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('3' * 64)
+                            projectContext =
+                                $context
+                        }
+                        break
+                    }
+                    1 {
+                        [ordered]@{
+                            changeTrackingId = 2
+                            path = 'src/B.csproj'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('4' * 64)
+                                })
+                            content = '<Project />'
+                            byteLength = 11
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('5' * 64)
+                        }
+                        break
+                    }
+                    2 { break }
+                    default {
+                        throw "Unexpected file ordinal '$start'."
+                    }
+                })
+            return [ordered]@{
+                changedFiles = $entries.Count
+                changedLines =
+                    $entries.Count
+                entries = $entries
+                projectContexts = $(if (
+                    $start -eq 0) {
+                    @($context)
+                }
+                else { @() })
+                inventory = @(
+                    [ordered]@{
+                        changeTrackingId = 1
+                        path = 'src/A.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    },
+                    [ordered]@{
+                        changeTrackingId = 2
+                        path = 'src/B.csproj'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'contextual-project-metadata'
+                    })
+                fileProgress = [ordered]@{
+                    inventoryDigest = '6' * 64
+                    evidencePlanDigest = '7' * 64
+                    totalFiles = 2
+                    totalInventoryFiles = 2
+                    startOrdinal = $start
+                    nextOrdinal =
+                        $start + $entries.Count
+                    complete =
+                        $start -ge 1
+                    cumulativeChangedLines =
+                        [Math]::Min(2,
+                            $start +
+                            $entries.Count)
+                }
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $first.heads[0].reasonCode |
+            Should -BeExactly `
+                'file-progress-pending'
+        $second = Invoke-IntakeCase $c
+        $second.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $completedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $completedProgress.nextOrdinal |
+            Should -Be 2
+        @($completedProgress.entries) |
+            Should -HaveCount 2
+        @($completedProgress.projectContexts) |
+            Should -HaveCount 1
+
+        $third = Invoke-IntakeCase $c
+        $third.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2)
+        $reusedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $reusedProgress.nextOrdinal |
+            Should -Be 2
+        @($reusedProgress.entries) |
+            Should -HaveCount 2
+    }
+
+    It 'records one bounded local-stage diagnostic per failed pull request' {
+        $c = New-IntakeCase -Count 2 `
+            -MaxHeads 2
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($op, $request)
+            if ($op -ceq 'Changes') {
+                throw 'local progress failure'
+            }
+            return & $baseProvider `
+                $op $request
+        }.GetNewClosure()
+
+        $result = Invoke-IntakeCase $c
+        @($result.heads.reasonCode) |
+            Should -Be @(
+                'provider-inaccessible',
+                'provider-inaccessible')
+        $diagnostics = @(
+            Get-ChildItem (Join-Path $c.root `
+                    'active-pr-intake-v1\diagnostics') `
+                -File -Filter '*.json' |
+                ForEach-Object {
+                    Get-Content $_.FullName -Raw |
+                        ConvertFrom-Json `
+                            -AsHashtable -Depth 16
+                } |
+                Sort-Object pullRequestId)
+        $diagnostics | Should -HaveCount 2
+        @($diagnostics.pullRequestId) |
+            Should -Be @(1, 2)
+        @($diagnostics.intakeStage |
+                Sort-Object -Unique) |
+            Should -Be @('changes-read')
+        @($diagnostics.underlyingExceptionType |
+                Sort-Object -Unique) |
+            Should -Be @('RuntimeException')
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }

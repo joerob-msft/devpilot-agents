@@ -58,7 +58,7 @@
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
-    "activePrIntakeSha256": "250834e7f63b3b4c8ec7786606872f24a8444d2cccaaeb33cf03873e3d7e66b6",
+    "activePrIntakeSha256": "32f67536c1357480fb9d8e4b20600bce751080941e51965d9f4ddf9b02f894bc",
     "contextualBridgeSha256": "7b91ca05e393d75e1b5f99242ae5fa0e3e2a4bf048df9d780ae1ba6b9cf78ff8",
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
