@@ -2717,10 +2717,14 @@ function Get-ContextualXmlSummaryLayoutOutcome {
             foreach ($summary in @(
                     $documentation.Content |
                         Where-Object {
-                            $_ -is [
-                                Microsoft.CodeAnalysis.CSharp.Syntax.XmlElementSyntax] -and
-                            [string]$_.StartTag.Name.LocalName.ValueText -ceq
-                                'summary'
+                            ($_ -is [
+                                    Microsoft.CodeAnalysis.CSharp.Syntax.XmlElementSyntax] -and
+                                [string]$_.StartTag.Name.LocalName.ValueText -ceq
+                                    'summary') -or
+                            ($_ -is [
+                                    Microsoft.CodeAnalysis.CSharp.Syntax.XmlEmptyElementSyntax] -and
+                                [string]$_.Name.LocalName.ValueText -ceq
+                                    'summary')
                         })) {
                 $span = $summary.GetLocation().GetLineSpan()
                 $first =
@@ -2746,10 +2750,26 @@ function Get-ContextualXmlSummaryLayoutOutcome {
                 }
                 $opening = [string]$lines[$first - 1]
                 $closing = [string]$lines[$last - 1]
-                $openingStandalone = $opening -match
-                    '^\s*///\s*<summary>\s*$'
-                $closingStandalone = $closing -match
-                    '^\s*///\s*</summary>\s*$'
+                $openingMatch = [regex]::Match(
+                    $opening,
+                    '^(?<indent>[ \t]*)///[ \t]*<summary>[ \t]*$')
+                $openingStandalone =
+                    -not ($summary -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.XmlEmptyElementSyntax]) -and
+                    $openingMatch.Success
+                $indent = if ($openingMatch.Success) {
+                    [string]$openingMatch.Groups['indent'].Value
+                }
+                else { $null }
+                $linePrefix = if ($openingMatch.Success) {
+                    '^' + [regex]::Escape($indent) + '///'
+                }
+                else { '(?!)' }
+                $closingStandalone =
+                    $openingStandalone -and
+                    $closing -cmatch (
+                        $linePrefix +
+                        '[ \t]*</summary>[ \t]*$')
                 $bodyLines = @(
                     if ($last -gt $first + 1) {
                         $lines[$first..($last - 2)]
@@ -2757,12 +2777,48 @@ function Get-ContextualXmlSummaryLayoutOutcome {
                 $bodyStandalone =
                     $bodyLines.Count -gt 0 -and
                     @($bodyLines | Where-Object {
-                            [string]$_ -cnotmatch
-                                '^\s*///(?:\s|$)'
+                            [string]$_ -cnotmatch (
+                                $linePrefix + '(?:[ \t]|$)')
+                        }).Count -eq 0 -and
+                    @($bodyLines | Where-Object {
+                            [string]$_ -cmatch (
+                                $linePrefix + '[ \t]*\S')
+                        }).Count -gt 0
+                $documentationSpan =
+                    $documentation.GetLocation().GetLineSpan()
+                $documentationFirst =
+                    [int]$documentationSpan.
+                        StartLinePosition.Line + 1
+                $documentationLast =
+                    [int]$documentationSpan.
+                        EndLinePosition.Line + 1
+                if ($documentationSpan.
+                        EndLinePosition.Character -eq 0 -and
+                    $documentationLast -gt
+                        $documentationFirst) {
+                    $documentationLast--
+                }
+                $documentationLines = @(
+                    if ($documentationFirst -ge 1 -and
+                        $documentationLast -le
+                            $lines.Count -and
+                        $documentationFirst -le
+                            $documentationLast) {
+                        $lines[(
+                            $documentationFirst - 1
+                        )..(
+                            $documentationLast - 1
+                        )]
+                    })
+                $documentationAligned =
+                    $documentationLines.Count -gt 0 -and
+                    @($documentationLines | Where-Object {
+                            [string]$_ -cnotmatch $linePrefix
                         }).Count -eq 0
                 if ($openingStandalone -and
                     $closingStandalone -and
-                    $bodyStandalone) {
+                    $bodyStandalone -and
+                    $documentationAligned) {
                     continue
                 }
                 $anchors = @(
@@ -2779,6 +2835,17 @@ function Get-ContextualXmlSummaryLayoutOutcome {
                     $declaration.PSObject.Properties[
                         'Identifier']) {
                     [string]$declaration.Identifier.ValueText
+                }
+                elseif ($declaration.PSObject.Properties[
+                        'Declaration'] -and
+                    $null -ne $declaration.Declaration -and
+                    $declaration.Declaration.Variables.Count -gt 0) {
+                    [string]$declaration.Declaration.
+                        Variables[0].Identifier.ValueText
+                }
+                elseif ($declaration -is [
+                        Microsoft.CodeAnalysis.CSharp.Syntax.IndexerDeclarationSyntax]) {
+                    'this'
                 }
                 else { 'declaration' }
                 return New-ContextualOutcome `

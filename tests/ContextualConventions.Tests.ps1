@@ -541,6 +541,84 @@ class C
             Should -BeExactly compliant
     }
 
+    It 'requires matching documentation indentation and nonempty summary bodies' {
+        $cases = @(
+            @'
+class C
+{
+    /// <summary>
+        /// Mismatched body indentation.
+  /// </summary>
+    public int Value { get; set; }
+}
+'@,
+            @'
+class C
+{
+    /// <summary>
+    ///
+    /// </summary>
+    public int Value { get; set; }
+}
+'@,
+            @'
+class C
+{
+    /// <summary/>
+    public int Value { get; set; }
+}
+'@)
+        foreach ($content in $cases) {
+            (Invoke-ConventionCase `
+                -RuleId xml-summary-layout `
+                -Content $content).state |
+                Should -BeExactly violation
+        }
+    }
+
+    It 'reports field event-field and indexer declaration symbols' {
+        $cases = @(
+            [ordered]@{
+                symbol = 'value'
+                content = @'
+class C
+{
+    /// <summary>Compact field.</summary>
+    private readonly int value;
+}
+'@
+            },
+            [ordered]@{
+                symbol = 'Changed'
+                content = @'
+using System;
+class C
+{
+    /// <summary>Compact event.</summary>
+    public event EventHandler Changed;
+}
+'@
+            },
+            [ordered]@{
+                symbol = 'this'
+                content = @'
+class C
+{
+    /// <summary>Compact indexer.</summary>
+    public int this[int index] => index;
+}
+'@
+            })
+        foreach ($case in $cases) {
+            $outcome = Invoke-ConventionCase `
+                -RuleId xml-summary-layout `
+                -Content $case.content
+            $outcome.state | Should -BeExactly violation
+            $outcome.symbol |
+                Should -BeExactly $case.symbol
+        }
+    }
+
     It 'does not flag one-line param docs strings ordinary comments or missing docs' {
         $content = @'
 class C
