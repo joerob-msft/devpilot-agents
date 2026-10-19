@@ -503,6 +503,8 @@ Describe 'Contextual convention current PR bridge' {
         @{ Mode = 'foreign-identity' }
         @{ Mode = 'ambiguous' }
         @{ Mode = 'current-marker-conflict' }
+        @{ Mode = 'cross-rule-conflict' }
+        @{ Mode = 'ambiguous-identity-conflict' }
         @{ Mode = 'semantic-changed' }
         @{ Mode = 'head-changed' }
         @{ Mode = 'moved' }
@@ -561,6 +563,35 @@ Describe 'Contextual convention current PR bridge' {
                             "`n`n<!-- " +
                             'devpilot-contextual-convention:v1:' +
                             "$currentMarker -->")
+                    }
+            }
+            cross-rule-conflict {
+                $case.Thread.comments +=
+                    [ordered]@{
+                        commentId = 105
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $true
+                        reviewerIdentityState =
+                            'matched'
+                        body = (
+                            'Other automated review.' +
+                            "`n`n<!-- " +
+                            'devpilot-other-rule:v1:' +
+                            "$('8' * 64) -->")
+                    }
+            }
+            ambiguous-identity-conflict {
+                $case.Thread.comments +=
+                    [ordered]@{
+                        commentId = 106
+                        commentType = 'text'
+                        isDeleted = $false
+                        reviewerOwned = $false
+                        reviewerIdentityState =
+                            'ambiguous'
+                        body =
+                            'Ambiguous current review.'
                     }
             }
             semantic-changed {

@@ -466,7 +466,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                 [string]$proof.selection.symbol -cne
                     [string]$finding.anchor.symbol -or
                 [string]$proof.selection.constructIdentity -cne
-                    [string]$finding.binding.constructIdentity) {
+                    [string]$finding.binding.constructIdentity -or
+                [string]$proof.selection.marker -ceq
+                    $marker) {
                 continue
             }
             $priorEntries =
@@ -531,22 +533,64 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             }
         }
         if ($authenticatedMatches.Count -eq 1) {
-            $currentMarkerCount = 0
+            $entry = $authenticatedMatches[0]
+            $priorConflict = $false
             foreach ($thread in @(
                     $Snapshot.Threads)) {
+                $sameAnchor = $null -ne
+                        $thread.anchor -and
+                    [string]$thread.anchor.path -ieq
+                        [string]$finding.anchor.path -and
+                    [int]$thread.anchor.line -eq
+                        [int]$finding.anchor.line
+                $currentContext = $sameAnchor -and
+                    -not [bool]$thread.isDeleted -and
+                    -not [bool]$thread.isOutdated -and
+                    [string]$thread.status -ceq
+                        'active' -and
+                    [string]$thread.contextState -ceq
+                        'current' -and
+                    [string]$thread.sourceCommit -ceq
+                        [string]$Contract.Request.SourceCommit
                 foreach ($comment in @(
                         $thread.comments)) {
-                    $currentMarkerCount += @(
-                        [regex]::Matches(
+                    if ([long]$thread.threadId -eq
+                            [long]$entry.Thread.threadId -and
+                        [long]$comment.commentId -eq
+                            [long]$entry.Comment.commentId) {
+                        continue
+                    }
+                    if ([string]$comment.commentType -cne
+                            'text' -or
+                        [bool]$comment.isDeleted) {
+                        continue
+                    }
+                    if (@([regex]::Matches(
                             [string]$comment.body,
                             $targetPattern) |
                             Where-Object {
                                 $_.Groups[1].Value -ceq
                                     $marker
-                            }).Count
+                            }).Count -gt 0) {
+                        $priorConflict = $true
+                        break
+                    }
+                    if ($currentContext -and (
+                            [string]$comment.
+                                reviewerIdentityState -ceq
+                                'ambiguous' -or
+                            [regex]::IsMatch(
+                                [string]$comment.body,
+                                $anyMarkerPattern))) {
+                        $priorConflict = $true
+                        break
+                    }
+                }
+                if ($priorConflict) {
+                    break
                 }
             }
-            if ($currentMarkerCount -gt 0) {
+            if ($priorConflict) {
                 $finding.providerMarker =
                     New-OwnerProviderMarker `
                         -Value $marker `
@@ -561,7 +605,6 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                 $counts.unknown++
                 continue
             }
-            $entry = $authenticatedMatches[0]
             $finding.providerMarker =
                 New-OwnerProviderMarker `
                     -Value $marker
