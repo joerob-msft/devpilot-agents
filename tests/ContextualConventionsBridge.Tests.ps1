@@ -68,8 +68,8 @@ BeforeAll {
                 section =
                     'bpm-contextual-conventions@1'
                 hash =
-                    'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
-                length = 5205
+                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                length = 5399
             }
             toolkit = [ordered]@{
                 ref =
@@ -114,7 +114,7 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    'a8d368a37fc41310a412bca16ca9b843b03fe16e7993a2ebaacdc0b0c8b45dad'
+                    '81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb'
             }
             sharedAcquisition = [ordered]@{
                 kind =
@@ -546,6 +546,180 @@ Describe 'Contextual convention current PR bridge' {
             Should -Be 1
         $result.effects.dedupe.unknown |
             Should -Be 0
+    }
+
+    It 'supports exact multiple prior bundles without carrying changed rule meaning' {
+        $compatibility = [ordered]@{
+            schemaVersion = 2
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRules = @(
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+                        length = 3706
+                    }
+                    unchangedRuleIds = @(
+                        'explicit-string-comparison')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+                        length = 5205
+                    }
+                    unchangedRuleIds = @(
+                        'http-client-lifetime')
+                })
+            currentRule = [ordered]@{
+                hash =
+                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                length = 5399
+            }
+        }
+        $cases = @(
+            [ordered]@{
+                ruleId =
+                    'explicit-string-comparison'
+                prior =
+                    $compatibility.
+                        previousRules[0].rule
+                expected = 'noOp'
+            },
+            [ordered]@{
+                ruleId =
+                    'http-client-lifetime'
+                prior =
+                    $compatibility.
+                        previousRules[1].rule
+                expected = 'noOp'
+            },
+            [ordered]@{
+                ruleId =
+                    'named-call-arguments'
+                prior =
+                    $compatibility.
+                        previousRules[1].rule
+                expected = 'unknown'
+            })
+        foreach ($control in $cases) {
+            $case =
+                New-ContextualUpgradeRecognitionCase
+            $case.Observation.findings[0].
+                ruleId = $control.ruleId
+            $case.Proof.selection.ruleId =
+                $control.ruleId
+            $case.Proof.rule.hash =
+                $control.prior.hash
+            $case.Proof.rule.length =
+                $control.prior.length
+            $case.Proof['ruleCompatibility'] =
+                $compatibility
+
+            $result =
+                Resolve-OwnerV2DiscussionReconciliation `
+                    -Observation $case.Observation `
+                    -Contract $case.Contract `
+                    -Snapshot $case.Snapshot `
+                    -AuthenticatedPriorComments @(
+                        $case.Proof)
+
+            $result.findings[0].
+                reconciliation.classification |
+                Should -BeExactly `
+                    $control.expected
+        }
+    }
+
+    It 'rejects every malformed sibling in schema-v2 compatibility for <Mode>' -TestCases @(
+        @{ Mode = 'duplicate-prior' }
+        @{ Mode = 'malformed-sibling' }
+        @{ Mode = 'extra-top-key' }
+        @{ Mode = 'unregistered-rule' }
+    ) {
+        param($Mode)
+        $case =
+            New-ContextualUpgradeRecognitionCase
+        $case.Observation.findings[0].
+            ruleId = 'http-client-lifetime'
+        $case.Proof.selection.ruleId =
+            'http-client-lifetime'
+        $case.Proof.rule.hash =
+            'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'
+        $case.Proof.rule.length = 5205
+        $compatibility = [ordered]@{
+            schemaVersion = 2
+            kind =
+                'contextual-additive-rule-history-compatibility'
+            previousRules = @(
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'
+                        length = 3706
+                    }
+                    unchangedRuleIds = @(
+                        'explicit-string-comparison')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            $case.Proof.rule.hash
+                        length =
+                            $case.Proof.rule.length
+                    }
+                    unchangedRuleIds = @(
+                        'http-client-lifetime')
+                })
+            currentRule = [ordered]@{
+                hash =
+                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                length = 5399
+            }
+        }
+        switch ($Mode) {
+            duplicate-prior {
+                $compatibility.previousRules +=
+                    [ordered]@{
+                        rule =
+                            $compatibility.
+                                previousRules[1].
+                                rule
+                        unchangedRuleIds = @(
+                            'named-call-arguments')
+                    }
+            }
+            malformed-sibling {
+                $compatibility.previousRules +=
+                    'malformed'
+            }
+            extra-top-key {
+                $compatibility['unexpected'] =
+                    $true
+            }
+            unregistered-rule {
+                $compatibility.previousRules[1].
+                    unchangedRuleIds = @(
+                        'not-a-registered-rule')
+            }
+        }
+        $case.Proof['ruleCompatibility'] =
+            $compatibility
+
+        $result =
+            Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation `
+                -Contract $case.Contract `
+                -Snapshot $case.Snapshot `
+                -AuthenticatedPriorComments @(
+                    $case.Proof)
+
+        $result.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.findingsComplete |
+            Should -BeFalse
     }
 
     It 'keeps incompatible additive history unknown for <Mode>' -TestCases @(

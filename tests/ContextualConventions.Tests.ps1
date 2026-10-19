@@ -269,10 +269,14 @@ Describe 'Contextual convention analyzer' {
         $cases = @(
             @{
                 reason = 'repeated formal types'
+                expectedReason =
+                    'documented-trigger-positional-arguments'
                 source = 'class C { void Target(string left, string right, System.Uri endpoint) {} void M(string a, string b, System.Uri u) { Target(a, b, u); } }'
             },
             @{
                 reason = 'one argument per line'
+                expectedReason =
+                    'documented-trigger-positional-arguments'
                 source = @'
 class C {
     void Target(int first, string second, bool third) {}
@@ -287,10 +291,14 @@ class C {
             },
             @{
                 reason = 'literal constant'
+                expectedReason =
+                    'documented-constant-argument-positional'
                 source = 'class C { void Target(int count) {} void M() { Target(0); } }'
             },
             @{
                 reason = 'declared compile-time constant'
+                expectedReason =
+                    'documented-constant-argument-positional'
                 source = 'class C { const int Count = 1; void Target(int count) {} void M() { Target(Count); } }'
             })
         foreach ($case in $cases) {
@@ -302,8 +310,41 @@ class C {
                 -Because $case.reason
             $outcome.reason |
                 Should -BeExactly `
-                    documented-trigger-positional-arguments
+                    $case.expectedReason
         }
+    }
+
+    It 'limits a constant-only trigger to proven constant arguments' {
+        $compliant = @(
+            'class C { void Target(string text, int count, object state) {} void M(string text, int count) { Target(text, count, state: null); } }',
+            'class C { const int DefaultCount = 1; void Target(string text, int count) {} void M(string text) { Target(text, count: DefaultCount); } }')
+        foreach ($content in $compliant) {
+            $outcome =
+                Invoke-ConventionCase `
+                    -RuleId named-call-arguments `
+                    -Content $content
+            $outcome.state |
+                Should -BeExactly compliant
+            $outcome.reason |
+                Should -BeExactly `
+                    documented-constant-arguments-named
+        }
+
+        $violation =
+            Invoke-ConventionCase `
+                -RuleId named-call-arguments `
+                -Content (
+                    'class C { void Target(int count, object first, System.Uri second) {} void M(int count) { Target(count, null, second: null); } }')
+        $violation.state |
+            Should -BeExactly violation
+        $violation.reason |
+            Should -BeExactly `
+                documented-constant-argument-positional
+        $violation.evidence |
+            Should -BeExactly (
+                'Name each compile-time constant argument; ' +
+                'other distinct nonconstant arguments do not ' +
+                'need names.')
     }
 
     It 'accepts all-named calls for every documented trigger' {

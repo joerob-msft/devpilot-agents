@@ -2108,12 +2108,14 @@ function Get-ContextualNamedCallOutcome {
     if ($allNamed) {
         return $null
     }
-    $literalTrigger = @($arguments | Where-Object {
+    $constantArguments = @($arguments | Where-Object {
             Test-ContextualCompileTimeConstantArgument `
                 -Expression $_.Expression `
                 -CallNode $Node -Root $Root `
                 -Constants $Constants
-        }).Count -gt 0
+        })
+    $literalTrigger =
+        $constantArguments.Count -gt 0
     $argumentLines = @($arguments | ForEach-Object {
             [int]$_.GetLocation().GetLineSpan().
                 StartLinePosition.Line + 1
@@ -2317,22 +2319,51 @@ function Get-ContextualNamedCallOutcome {
     if ($literalTrigger) {
         [void]$triggers.Add('compile-time-constant')
     }
+    $allNamesRequired =
+        $repeatedTypeTrigger -or
+        $multilineTrigger
+    $unnamedConstants =
+        @($constantArguments |
+            Where-Object {
+                $null -eq $_.NameColon
+            })
+    $violation = if ($allNamesRequired) {
+        -not $allNamed
+    }
+    else {
+        $unnamedConstants.Count -gt 0
+    }
     return New-ContextualOutcome `
         -RuleId named-call-arguments `
-        -State $(if ($allNamed) {
-                'compliant'
-            } else { 'violation' }) `
-        -Reason $(if ($allNamed) {
-                'documented-trigger-arguments-named'
-            } else {
+        -State $(if ($violation) {
+                'violation'
+            } else { 'compliant' }) `
+        -Reason $(if (-not $violation) {
+                $(if ($allNamesRequired) {
+                        'documented-trigger-arguments-named'
+                    }
+                    else {
+                        'documented-constant-arguments-named'
+                    })
+            }
+            elseif ($allNamesRequired) {
                 'documented-trigger-positional-arguments'
+            }
+            else {
+                'documented-constant-argument-positional'
             }) `
         -Path $Path -Line $anchor `
         -EndLine $anchor `
         -Symbol ([string]$signature.Name) `
-        -Evidence $(if ($allNamed) { '' } else {
+        -Evidence $(if (-not $violation) { '' }
+        elseif ($allNamesRequired) {
             'Name every supplied argument because this call ' +
             'has: ' + ($triggers -join ', ') + '.'
+        }
+        else {
+            'Name each compile-time constant argument; ' +
+            'other distinct nonconstant arguments do not ' +
+            'need names.'
         })
 }
 
