@@ -1292,6 +1292,84 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -BeFalse
     }
 
+    It 'validates PR-wide actionable partials without a file anchor' {
+        $prUnknown = [ordered]@{
+            ruleId =
+                'pr-template-compliance'
+            issueIdentity =
+                'v1:sha256:' + ('1' * 64)
+            anchor = [ordered]@{
+                scope = 'pull-request'
+                subject = 'description'
+            }
+            constructRef =
+                'construct:' + ('2' * 64)
+            reconciliation = [ordered]@{
+                classification = 'unknown'
+                reason = 'other-review-at-anchor'
+            }
+        }
+        $codeActionable = [ordered]@{
+            ruleId =
+                'exception-logging'
+            anchor = [ordered]@{
+                path = 'src/Test.cs'
+                line = 20
+            }
+            constructRef =
+                'construct:' + ('3' * 64)
+            reconciliation = [ordered]@{
+                classification = 'wouldCreate'
+                reason = 'no-current-review-at-anchor'
+            }
+        }
+        $observation = [ordered]@{
+            findingsComplete = $false
+            counts = [ordered]@{
+                unknown = 0
+                uncovered = 0
+            }
+            validationErrors = @()
+            effects = [ordered]@{
+                dedupe = [ordered]@{
+                    unknown = 1
+                }
+            }
+            findings = @(
+                $prUnknown,
+                $codeActionable)
+        }
+
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeTrue
+
+        $prActionable =
+            $prUnknown |
+                ConvertTo-Json -Depth 16 -Compress |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 16
+        $prActionable.reconciliation.
+            classification = 'wouldCreate'
+        $observation.findings = @(
+            $prUnknown,
+            $prActionable)
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+
+        $prActionable.issueIdentity =
+            'v1:sha256:' + ('4' * 64)
+        $prActionable.constructRef =
+            'construct:' + ('5' * 64)
+        $observation.findings = @(
+            $prUnknown,
+            $prActionable)
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeTrue
+    }
+
     It 'exports the exact V1-compatible marker, body, anchor, and body digest' {
         $evidence = New-TestOwnerV2Evidence
         $package = New-ApprovedOwnerV2ReviewPackage -Evidence $evidence

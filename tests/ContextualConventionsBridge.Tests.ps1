@@ -2071,6 +2071,98 @@ internal const string Value = "wire-value";
             Should -BeExactly wouldCreate
     }
 
+    It 'reads PR-wide actionable partial evidence and exits disabled delivery with zero writes' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content (
+                    'class C { void M() { try { X(); } catch (System.Exception ex) { Logger.Error(ex.Message); } } }') `
+                -Description (
+                    'Synthetic PR description without required sections.')
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "Existing other rule.`n`n" +
+                "<!-- devpilot-named-areequal:v1:$('9' * 64) -->") `
+            -Identity human `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-approved-evidence
+        $result.state |
+            Should -BeExactly partial
+        $identity =
+            [string]$result.records[0].identity
+        $configPath = Join-Path $TestDrive `
+            'pr-template-approved-evidence-config.json'
+        [IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json `
+                -InputObject $config `
+                -Depth 64),
+            [Text.UTF8Encoding]::new($false))
+
+        $evidence =
+            Read-ApprovedOwnerV2Evidence `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-approved-evidence-state') `
+                -Identity $identity `
+                -RepoRoot $repoRoot `
+                -ToolkitConfigPath $configPath `
+                -Delivery contextual-conventions
+        $proposal =
+            Get-ApprovedOwnerV2Proposal `
+                -Evidence $evidence `
+                -Finding (
+                    @($evidence.Observation.findings |
+                        Where-Object {
+                            [string]$_.ruleId -ceq
+                                'pr-template-compliance'
+                        })[0]) `
+                -Delivery contextual-conventions
+        $deliveryRoot = Join-Path $TestDrive `
+            'pr-template-disabled-delivery'
+        $producer = Join-Path $repoRoot `
+            'tools\Invoke-ContextualDeliveryBatchJson.ps1'
+        $automatic = Join-Path $repoRoot `
+            'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+        $output = @(& $producer `
+                -AutomaticDeliveryTool $automatic `
+                -DeliveryRoot $deliveryRoot `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-approved-evidence-state') `
+                -Identity $identity `
+                -ToolkitConfigPath $configPath `
+                -AzureCliPath 'ignored' `
+                -GitPath 'git' `
+                -RepoRoot $repoRoot)
+        $envelope =
+            ($output -join "`n") |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+
+        $proposal.scope |
+            Should -BeExactly pull-request
+        $proposal.Contains('path') |
+            Should -BeFalse
+        $envelope.toolExitCode |
+            Should -Be 0
+        $envelope.result.health |
+            Should -BeExactly disabled
+        $envelope.result.providerWrites |
+            Should -Be 0
+        $envelope.result.modelWrites |
+            Should -Be 0
+        Test-Path -LiteralPath $deliveryRoot |
+            Should -BeFalse
+    }
+
     It 'withholds a PR-template finding when description metadata changes without a head change' {
         $config = New-ContextualTestConfig
         $config.enabled = $true

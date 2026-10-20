@@ -197,6 +197,62 @@ Describe 'Contextual scheduled observation disposition' {
             Should -BeExactly actionable-with-isolated-discussion-unknown
     }
 
+    It 'delivers a PR-wide template finding beside a disjoint code discussion unknown' {
+        $observation.findingsComplete = $false
+        $observation.effects.dedupe.unknown = 1
+        $observation.findings = @(
+            [ordered]@{
+                anchor = [ordered]@{
+                    path = 'src/Test.cs'
+                    line = 10
+                }
+                constructRef =
+                    'construct:code-unknown'
+                ruleId =
+                    'explicit-string-comparison'
+                reconciliation = [ordered]@{
+                    classification = 'unknown'
+                    reason =
+                        'other-review-at-anchor'
+                }
+            },
+            [ordered]@{
+                anchor = [ordered]@{
+                    scope = 'pull-request'
+                    subject = 'description'
+                }
+                constructRef =
+                    'construct:pr-template'
+                ruleId =
+                    'pr-template-compliance'
+                issueIdentity =
+                    'v1:sha256:' + ('1' * 64)
+                reconciliation = [ordered]@{
+                    classification =
+                        'wouldCreate'
+                    reason =
+                        'no-current-pr-template-review'
+                }
+            })
+
+        $result =
+            Get-ContextualScheduledObservationDisposition `
+                -Observation $observation `
+                -AllowedRuleIds @(
+                    'explicit-string-comparison',
+                    'pr-template-compliance')
+
+        $result.deliverable | Should -BeTrue
+        $result.reason |
+            Should -BeExactly `
+                actionable-with-isolated-discussion-unknown
+        $observation.findings[1].anchor.
+            Contains('path') |
+            Should -BeFalse
+        $observation.effects.providerWrites |
+            Should -Be 0
+    }
+
     It 'still rejects observations that report provider writes' {
         $observation.effects.providerWrites = 1
 

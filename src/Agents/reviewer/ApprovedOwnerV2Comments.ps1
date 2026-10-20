@@ -400,11 +400,30 @@ function Test-ApprovedContextualActionablePartial {
         })
     $unknownAnchors = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
+    $unknownPullRequests =
+        [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal)
     $unknownConstructs = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
     foreach ($finding in $unknown) {
-        [void]$unknownAnchors.Add(
-            "$([string]$finding.anchor.path)|$([int]$finding.anchor.line)")
+        $anchor =
+            Get-ApprovedOwnerV2Value `
+                $finding 'anchor'
+        if ($anchor -is
+                [Collections.IDictionary] -and
+            [string](Get-ApprovedOwnerV2Value `
+                $anchor 'scope' '') -ceq
+                'pull-request') {
+            [void]$unknownPullRequests.Add(
+                "$([string]$finding.ruleId)|$(
+                    [string]$finding.issueIdentity)")
+        }
+        elseif ($anchor -is
+                [Collections.IDictionary]) {
+            [void]$unknownAnchors.Add(
+                "$([string](Get-ApprovedOwnerV2Value $anchor 'path' ''))|$(
+                    [int](Get-ApprovedOwnerV2Value $anchor 'line' 0))")
+        }
         if (-not [string]::IsNullOrWhiteSpace(
                 [string]$finding.constructRef)) {
             [void]$unknownConstructs.Add(
@@ -412,12 +431,34 @@ function Test-ApprovedContextualActionablePartial {
         }
     }
     $overlap = @($actionable | Where-Object {
-            $unknownAnchors.Contains(
-                "$([string]$_.anchor.path)|$([int]$_.anchor.line)") -or
+            $candidate = $_
+            $anchor =
+                Get-ApprovedOwnerV2Value `
+                    $candidate 'anchor'
+            $pullRequestOverlap =
+                $anchor -is
+                    [Collections.IDictionary] -and
+                [string](Get-ApprovedOwnerV2Value `
+                    $anchor 'scope' '') -ceq
+                    'pull-request' -and
+                $unknownPullRequests.Contains(
+                    "$([string]$candidate.ruleId)|$(
+                        [string]$candidate.issueIdentity)")
+            $fileOverlap =
+                $anchor -is
+                    [Collections.IDictionary] -and
+                [string](Get-ApprovedOwnerV2Value `
+                    $anchor 'scope' '') -cne
+                    'pull-request' -and
+                $unknownAnchors.Contains(
+                    "$([string](Get-ApprovedOwnerV2Value $anchor 'path' ''))|$(
+                        [int](Get-ApprovedOwnerV2Value $anchor 'line' 0))")
+            $pullRequestOverlap -or
+            $fileOverlap -or
             (-not [string]::IsNullOrWhiteSpace(
-                    [string]$_.constructRef) -and
+                    [string]$candidate.constructRef) -and
                 $unknownConstructs.Contains(
-                    [string]$_.constructRef))
+                    [string]$candidate.constructRef))
         }).Count -gt 0
     return (
         -not [bool]$Observation.findingsComplete -and
