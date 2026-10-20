@@ -749,6 +749,21 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         }
                         continue
                     }
+                    $body =
+                        [string]$comment.body
+                    $prTemplateBody =
+                        $body -match
+                            '\A\*\*Complete the required pull request template sections\*\*' -or
+                        $body -match
+                            '(?m)^Missing or placeholder-only sections:' -or
+                        $body -match
+                            '\A\*\*`?pr-template-compliance`?\*\*'
+                    if ($null -ne $thread.anchor) {
+                        if ($prTemplateBody) {
+                            $ambiguous = $true
+                        }
+                        continue
+                    }
                     if ($topLevelCurrent -and
                         [string]$comment.
                             reviewerIdentityState -ceq
@@ -756,9 +771,13 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         $ambiguous = $true
                         continue
                     }
-                    if ($allMarkers.Count -gt 0) {
-                        $body =
-                            [string]$comment.body
+                    $hasAnyDevPilotMarker =
+                        [regex]::IsMatch(
+                            $body,
+                            $anyMarkerPattern)
+                    if ($allMarkers.Count -gt 0 -or
+                        $hasAnyDevPilotMarker -or
+                        [bool]$comment.reviewerOwned) {
                         $missingMatches = @(
                             [regex]::Matches(
                                 $body,
@@ -769,6 +788,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                                 '(?m)^Effective template: `(?<path>[^`\r\n]{1,1024})` from `(?<ref>refs/heads/[^`\r\n]+)` \(blob `(?<blob>[0-9a-f]{40})`; SHA-256 `(?<digest>[0-9a-f]{64})`\)\.$'))
                         $canonical =
                             $allMarkers.Count -eq 1 -and
+                            -not ($hasAnyDevPilotMarker -and
+                                $allMarkers.Count -eq 0) -and
                             $missingMatches.Count -eq 1 -and
                             $templateMatches.Count -eq 1 -and
                             $body -match
@@ -870,7 +891,6 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                 }
             }
             if ($ambiguous -or $foreign -or
-                $humanPartial -or
                 $markerEntries.Count -gt 1 -or
                 ($markerEntries.Count -eq 1 -and
                     [int]$markerEntries[0].Count -ne 1) -or
@@ -975,6 +995,22 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         -ThreadStatus (
                             [string]$entry.Thread.status)
                 $counts.noOp++
+                continue
+            }
+            if (-not $humanCovered -and
+                $humanPartial) {
+                $finding.providerMarker =
+                    New-OwnerProviderMarker `
+                        -Value $marker `
+                        -Integrity invalid
+                $finding.reconciliation =
+                    New-OwnerV2DiscussionReconciliation `
+                        -Classification unknown `
+                        -Reason partial-human-pr-template-coverage `
+                        -DiscussionDigest $discussionDigest `
+                        -BodyDigest $bodyDigest `
+                        -ThreadAvailability ambiguous
+                $counts.unknown++
                 continue
             }
             $classification = if (
