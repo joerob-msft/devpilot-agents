@@ -554,6 +554,9 @@ function Get-IntakePass {
                 status = 'active'
                 isDraft = [bool]$item.isDraft
                 targetRef = [string]$item.targetRef
+                creationUtc = $(if ($item.Contains('creationUtc')) {
+                        [string]$item.creationUtc
+                    } else { $null })
             }
             $key = [string]$id
             $digest = Get-IntakeDigest $value
@@ -988,6 +991,16 @@ function New-IntakeDisabledSummary {
         mode = 'dry-run-read-only'
         writerEligible = $false
         autoPost = $false
+        lifecycleWriterEligible = $false
+        lifecycle = [ordered]@{
+            state = 'disabled'
+            health = 'disabled'
+            providerWrites = 0
+            modelWrites = 0
+            confirmedAbandonedIds = @()
+            decisions = @()
+            events = @()
+        }
         state = 'disabled'
         populationKnown = $false
         inventory = [ordered]@{
@@ -1036,6 +1049,7 @@ function Invoke-ActivePrIntake {
         [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
         [ValidateRange(0, 720)]
         [int]$MaximumSecondsThisRun = 0,
+        [AllowNull()][scriptblock]$LifecycleEvaluator,
         [switch]$IncludeTransientSnapshots,
         [switch]$Run
     )
@@ -1158,7 +1172,11 @@ function Invoke-ActivePrIntake {
                 cursorTransitionApplied =
                     $cursorTransitionApplied
             }
-            mode = 'dry-run-read-only'
+            mode = $(if ($null -ne $LifecycleEvaluator) {
+                    'review-read-only-plus-stale-status-lifecycle'
+                } else {
+                    'dry-run-read-only'
+                })
             execution = [ordered]@{
                 maximumHeadsThisRun = $effectiveMaximumHeads
                 maximumSecondsThisRun =
@@ -1166,6 +1184,8 @@ function Invoke-ActivePrIntake {
             }
             writerEligible = $false
             autoPost = $false
+            lifecycleWriterEligible =
+                $null -ne $LifecycleEvaluator
             state = 'unknown'
             populationKnown = $false
             inventory = [ordered]@{
@@ -1188,6 +1208,15 @@ function Invoke-ActivePrIntake {
                 staleRules = 0; drift = 0 }
             pages = [ordered]@{ first = 0; second = 0 }
             cursor = [ordered]@{ nextPullRequestId = $null }
+            lifecycle = [ordered]@{
+                state = 'disabled'
+                health = 'disabled'
+                providerWrites = 0
+                modelWrites = 0
+                confirmedAbandonedIds = @()
+                decisions = @()
+                events = @()
+            }
             heads = @()
             rules = @()
             unmetCapabilities = @()
@@ -1268,9 +1297,57 @@ function Invoke-ActivePrIntake {
                 if ($envelope.gaps.duplicateEntries -gt 0) {
                     $envelope.inventory.gaps += 'duplicate-list-entries-reconciled'
                 }
+                $confirmedAbandoned =
+                    [Collections.Generic.HashSet[int]]::new()
+                if ($null -ne $LifecycleEvaluator) {
+                    try {
+                        $lifecycle = & $LifecycleEvaluator @(
+                            $ids | ForEach-Object {
+                                $first.seen[[string]$_].value
+                            })
+                        if (($lifecycle -isnot
+                                [Collections.IDictionary] -and
+                            $lifecycle -isnot [pscustomobject]) -or
+                            [string]$lifecycle.kind -cne
+                                'stale-pr-lifecycle-v1-run' -or
+                            [int]$lifecycle.providerWrites -lt 0 -or
+                            [int]$lifecycle.providerWrites -gt 2 -or
+                            [int]$lifecycle.modelWrites -ne 0) {
+                            throw 'lifecycle-result-invalid'
+                        }
+                        foreach ($abandonedId in @(
+                                $lifecycle.confirmedAbandonedIds)) {
+                            [void]$confirmedAbandoned.Add(
+                                (Assert-IntakeNumber `
+                                    $abandonedId pullRequestId 1 `
+                                    ([int]::MaxValue)))
+                        }
+                        if ($confirmedAbandoned.Count -gt
+                            [int]$lifecycle.providerWrites) {
+                            throw 'lifecycle-result-invalid'
+                        }
+                        $envelope.lifecycle = $lifecycle
+                    }
+                    catch {
+                        $envelope.lifecycle = [ordered]@{
+                            schemaVersion = 1
+                            kind = 'stale-pr-lifecycle-v1-run'
+                            health = 'unknown'
+                            state = 'unknown'
+                            reason = 'lifecycle-phase-failed'
+                            providerWrites = 0
+                            modelWrites = 0
+                            confirmedAbandonedIds = @()
+                            decisions = @()
+                            events = @()
+                        }
+                    }
+                }
                 $eligible = @($ids | Where-Object {
                         $item = $first.seen[[string]$_].value
-                        -not $item.isDraft -and $item.targetRef -ceq 'refs/heads/master'
+                        -not $item.isDraft -and
+                        $item.targetRef -ceq 'refs/heads/master' -and
+                        -not $confirmedAbandoned.Contains([int]$_)
                     })
                 $start = 0
                 if ($previous -and $cursorBindingCompatible -and
@@ -1293,7 +1370,10 @@ function Invoke-ActivePrIntake {
                         $eligible[($start + $limit) % $eligible.Count]
                 }
                 $processingOrder = @($selectedOrder.ToArray()) +
-                    @($nonDraftIds | Where-Object { -not $selected.Contains($_) })
+                    @($nonDraftIds | Where-Object {
+                            -not $selected.Contains($_) -and
+                            -not $confirmedAbandoned.Contains([int]$_)
+                        })
                 $selectedOrdinal = 0
                 foreach ($id in $processingOrder) {
                     $item = $first.seen[[string]$id].value
@@ -3309,7 +3389,8 @@ print(json.dumps({
                             throw 'repository-mismatch'
                         }
                         @{ pullRequestId = $_.pullRequestId; status = $_.status
-                            isDraft = $_.isDraft; targetRef = $_.targetRefName }
+                            isDraft = $_.isDraft; targetRef = $_.targetRefName
+                            creationUtc = $_.creationDate }
                     })
                 return @{ items = $items; count = $items.Count }
             }

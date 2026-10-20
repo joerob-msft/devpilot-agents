@@ -21,17 +21,75 @@ Import-Module (Join-Path $RepoRoot `
         'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
 Import-Module (Join-Path $RepoRoot `
         'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1') -Force
+Import-Module (Join-Path $RepoRoot `
+        'src\DevPilot.PullRequestLifecycle\DevPilot.PullRequestLifecycle.psd1') `
+    -Force
 
 $config = Get-Content -LiteralPath $ConfigPath -Raw |
     ConvertFrom-Json -AsHashtable -Depth 64
 $provider = New-ActivePrAzureDevOpsProvider `
     -Config $config -AzureCliPath $AzureCliPath
-$intake = Invoke-ActivePrIntake `
-    -Config $config -Provider $provider `
-    -StateRoot $StateRoot -RepositoryRoot $RepoRoot `
-    -MaximumHeadsThisRun $MaximumHeadsThisRun `
-    -MaximumSecondsThisRun $MaximumSecondsThisRun `
-    -IncludeTransientSnapshots -Run:$Run
+$lifecycleConfig =
+    Get-StalePrLifecycleConfiguration -Config $config
+$lifecycleEvaluator = $null
+$lifecycleKey = $null
+if ($lifecycleConfig.Enabled) {
+    $lifecycleContext =
+        Initialize-StalePrLifecycleRoot `
+            -DeliveryRoot $lifecycleConfig.DeliveryRoot `
+            -RepoRoot $RepoRoot
+    [void](Assert-AgentTrustedFile `
+        -Path $lifecycleConfig.PolicyPath `
+        -AllowedRoot (
+            Join-Path $lifecycleContext.Root 'policies') `
+        -Private)
+    if ((Get-FileHash -LiteralPath `
+                $lifecycleConfig.PolicyPath -Algorithm SHA256).
+            Hash.ToLowerInvariant() -cne
+            $lifecycleConfig.PolicySha256) {
+        throw 'Stale PR lifecycle policy digest changed.'
+    }
+    $lifecycleKey =
+        Get-StalePrLifecycleKey `
+            -LifecycleRoot $lifecycleContext.Root
+    $lifecyclePolicy =
+        Read-StalePrLifecyclePolicy `
+            -Path $lifecycleConfig.PolicyPath `
+            -Key $lifecycleKey
+    Assert-StalePrLifecyclePolicy `
+        -Policy $lifecyclePolicy -Config $config `
+        -RepoRoot $RepoRoot
+    $lifecycleProvider =
+        New-StalePrAzureDevOpsProvider `
+            -Config $config -AzureCliPath $AzureCliPath `
+            -IdentityProvider $provider
+    $cutoffUtc = [DateTime]::UtcNow.AddYears(-1)
+    $lifecycleEvaluator = {
+        param([object[]]$Inventory)
+        Invoke-StalePrLifecycle `
+            -Inventory $Inventory `
+            -CutoffUtc $cutoffUtc `
+            -Policy $lifecyclePolicy `
+            -LifecycleRoot $lifecycleContext.Root `
+            -Key $lifecycleKey `
+            -Provider $lifecycleProvider
+    }.GetNewClosure()
+}
+try {
+    $intake = Invoke-ActivePrIntake `
+        -Config $config -Provider $provider `
+        -StateRoot $StateRoot -RepositoryRoot $RepoRoot `
+        -MaximumHeadsThisRun $MaximumHeadsThisRun `
+        -MaximumSecondsThisRun $MaximumSecondsThisRun `
+        -LifecycleEvaluator $lifecycleEvaluator `
+        -IncludeTransientSnapshots -Run:$Run
+}
+finally {
+    if ($null -ne $lifecycleKey) {
+        [Array]::Clear(
+            $lifecycleKey, 0, $lifecycleKey.Length)
+    }
+}
 
 $directory = Resolve-AgentTrustedRoot `
     -Path (Split-Path -Parent $AcquisitionPath) `
@@ -78,7 +136,14 @@ finally {
 [void](Assert-AgentTrustedFile `
         -Path $path -AllowedRoot $directory -Private)
 
-$blobKeys = @($intake.transientSnapshots.GetEnumerator() |
+$transientSnapshots = if ($intake.Contains(
+        'transientSnapshots') -and
+    $intake.transientSnapshots -is
+        [Collections.IDictionary]) {
+    $intake.transientSnapshots
+}
+else { [ordered]@{} }
+$blobKeys = @($transientSnapshots.GetEnumerator() |
     ForEach-Object {
         $entry = $_
         @($entry.Value.changes.entries | ForEach-Object {
@@ -106,10 +171,15 @@ $blobKeys = @($intake.transientSnapshots.GetEnumerator() |
             [string]$_.reasonCode -ceq 'rules-incomplete'
         }).Count
     totalUniquePrSnapshotCount =
-        @($intake.transientSnapshots.Keys).Count
+        @($transientSnapshots.Keys).Count
     uniqueContentBlobCount = $blobKeys.Count
     uniqueContentBlobKeys = $blobKeys
     providerReadCount = [int]$intake.readCount
-    providerWrites = 0
+    providerWrites = [int]$intake.lifecycle.providerWrites
+    lifecycleProviderWrites =
+        [int]$intake.lifecycle.providerWrites
+    lifecycleHealth = [string]$intake.lifecycle.health
+    lifecycleConfirmedAbandonedIds =
+        @($intake.lifecycle.confirmedAbandonedIds)
     modelWrites = 0
 } | ConvertTo-Json -Depth 32
