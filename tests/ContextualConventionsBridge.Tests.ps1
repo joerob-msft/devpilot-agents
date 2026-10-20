@@ -7,6 +7,8 @@ BeforeAll {
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1') -Force
     Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
         'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
@@ -1945,6 +1947,127 @@ internal const string Value = "wire-value";
             Should -BeExactly 'Problem,Solution,Validation'
         $finding.reconciliation.
             classification |
+            Should -BeExactly wouldCreate
+    }
+
+    It 'evaluates PR-template metadata from a Named-only shared intake' {
+        $namedConfig = New-ContextualTestConfig
+        $namedConfig.enabled = $true
+        $namedConfig.rules = @([ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            })
+        $source =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description (
+                    'Named shared acquisition missing sections.')
+        $sourceValue = $source
+        $namedProvider = {
+            param($Operation, $Arguments)
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{
+                        id =
+                            $namedConfig.expectedAccount.id
+                        descriptor =
+                            $namedConfig.expectedAccount.descriptor
+                        uniqueName =
+                            $namedConfig.expectedAccount.uniqueName
+                    }
+                }
+                ListPage {
+                    $items = if (
+                        [int]$Arguments.skip -eq 0) {
+                        @([ordered]@{
+                                pullRequestId = 42
+                                status = 'active'
+                                isDraft = $false
+                                targetRef =
+                                    'refs/heads/master'
+                            })
+                    }
+                    else { @() }
+                    return [ordered]@{
+                        items = @($items)
+                        count = @($items).Count
+                        totalCount = 1
+                    }
+                }
+                Head {
+                    return [ordered]@{} +
+                        $sourceValue.Head
+                }
+                Changes {
+                    return $sourceValue.Intake.
+                        transientSnapshots['42'].
+                        changes
+                }
+                Discussions {
+                    return $sourceValue.Intake.
+                        transientSnapshots['42'].
+                        discussions
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        $shared =
+            Invoke-ActivePrIntake `
+                -Config $namedConfig `
+                -Provider $namedProvider `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'named-shared-template-state') `
+                -RepositoryRoot $repoRoot `
+                -MaximumHeadsThisRun 1 `
+                -IncludeTransientSnapshots -Run
+        $sharedTemplateState =
+            [string]$shared.
+                transientSnapshots['42'].
+                head.templateAuthority.state
+        $contextualConfig =
+            New-ContextualTestConfig
+        $contextualConfig.enabled = $true
+        $headProvider = {
+            param($Head)
+            return [ordered]@{} + $Head
+        }
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $contextualConfig `
+                -Prepared ([pscustomobject]@{
+                    Intake = $shared
+                    Head =
+                        $source.Head
+                }) `
+                -Name named-shared-template-contextual `
+                -HeadProvider $headProvider
+        $result.state |
+            Should -BeExactly completed `
+                -Because (
+                    $result |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $namedConfig.rules[0].capability |
+            Should -BeExactly `
+                bpm-named-areequal-arguments@1
+        $sharedTemplateState |
+            Should -BeExactly complete
+        $observation.findings[0].ruleId |
+            Should -BeExactly pr-template-compliance
+        $observation.findings[0].
+            reconciliation.classification |
             Should -BeExactly wouldCreate
     }
 
