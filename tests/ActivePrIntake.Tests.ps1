@@ -678,12 +678,241 @@ Describe 'Active PR read-only intake' {
 
         $state.description =
             'Edited PR description without a head change.'
+        $state['templateCommit'] =
+            '9' * 40
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($op, $request)
+            $value = & $baseProvider $op $request
+            if ($op -ceq 'Head') {
+                $value.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '8' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+            }
+            return $value
+        }.GetNewClosure()
         $fourth = Invoke-IntakeCase $c
         $fourth.heads[0].reasonCode |
             Should -BeExactly `
-                'file-progress-pending'
+                'rules-incomplete'
         @($state.changeStarts) |
-            Should -Be @(0, 1, 2, 0)
+            Should -Be @(0, 1, 2, 2)
+        $fourth.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+        $fourth.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly $state.templateCommit
+    }
+
+    It 'continues 32-file progress across metadata-only template commit drift and resets on a code head change' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $c.config.limits.maxChangedFiles = 64
+        $state = $c.state
+        $state['templateCommit'] = '8' * 40
+        $state['starts'] =
+            [Collections.Generic.List[int]]::new()
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($operation, $request)
+            if ($operation -ceq 'Head') {
+                $head = & $baseProvider `
+                    $operation $request
+                $head.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '7' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+                return $head
+            }
+            if ($operation -ceq 'Changes') {
+                $start =
+                    [int]$request.fileStartOrdinal
+                [void]$state.starts.Add($start)
+                $count = [Math]::Min(
+                    16, 48 - $start)
+                $entries = @(
+                    for ($offset = 0;
+                        $offset -lt $count;
+                        $offset++) {
+                        $ordinal =
+                            $start + $offset + 1
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            state = 'complete'
+                            spans = @()
+                            content = $null
+                            byteLength = 0
+                            sourceDigest =
+                                'v1:sha256:' +
+                                $ordinal.ToString(
+                                    'x64')
+                        }
+                    })
+                $inventory = @(
+                    for ($ordinal = 1;
+                        $ordinal -le 48;
+                        $ordinal++) {
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            originalPath = $null
+                            evidenceDisposition =
+                                'required'
+                            evidenceReason =
+                                'deleted-change'
+                        }
+                    })
+                return [ordered]@{
+                    changedFiles = $count
+                    changedLines = 0
+                    entries = $entries
+                    projectContexts = @()
+                    inventory = $inventory
+                    fileProgress = [ordered]@{
+                        inventoryDigest =
+                            '1' * 64
+                        evidencePlanDigest =
+                            '2' * 64
+                        totalFiles = 48
+                        totalInventoryFiles = 48
+                        startOrdinal = $start
+                        nextOrdinal =
+                            $start + $count
+                        complete =
+                            ($start + $count) -ge 48
+                        cumulativeChangedLines = 0
+                    }
+                }
+            }
+            return & $baseProvider `
+                $operation $request
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $second = Invoke-IntakeCase $c
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $legacyProgress =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyProgress.schemaVersion = 2
+        [void]$legacyProgress.Remove(
+            'fileProgressBindingDigest')
+        $legacyBytes =
+            [Text.UTF8Encoding]::new(
+                $false).GetBytes(
+                (ConvertTo-Json `
+                    -InputObject $legacyProgress `
+                    -Depth 64))
+        $legacyTemp =
+            "$progressPath.legacy"
+        [IO.File]::WriteAllBytes(
+            $legacyTemp, $legacyBytes)
+        [IO.File]::Move(
+            $legacyTemp, $progressPath, $true)
+        $previousCohort =
+            Get-Content (
+                Join-Path $c.root `
+                    'active-pr-intake-v1\cohort.json') `
+                -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyHead = @(
+            $previousCohort.heads |
+                Where-Object {
+                    [string]$_.declarationDigest -ceq
+                        [string]$legacyProgress.
+                            declarationDigest
+                })
+        $legacyHead | Should -HaveCount 1
+        $legacyBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $legacyHead[0].declaration
+        $state.templateCommit = '9' * 40
+        $state.description =
+            'Fresh metadata with identical template bytes.'
+        $currentHead = & $c.provider Head @{
+            pullRequestId = 1
+        }
+        $currentBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $currentHead
+        $legacyBinding |
+            Should -BeExactly $currentBinding
+        $third = Invoke-IntakeCase $c
+
+        $first.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        $second.heads[0].fileProgress.
+            processedFiles | Should -Be 32
+        $third.heads[0].reasonCode |
+            Should -BeExactly rules-incomplete `
+                -Because (
+                    $third |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        @($state.starts) |
+            Should -Be @(0, 16, 32)
+        $third.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly ('9' * 40)
+        $third.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+
+        $state.commit = 'c' * 40
+        $state.iteration = 2
+        $fourth = Invoke-IntakeCase $c
+        $fourth.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 0)
     }
 
     It 'records one bounded local-stage diagnostic per failed pull request' {
