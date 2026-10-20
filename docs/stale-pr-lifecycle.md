@@ -38,6 +38,11 @@ description, labels, votes, service statuses, and system-only thread events do
 not refresh the lifecycle clock. A system thread may contain an actual
 non-system comment; that comment still counts.
 
+When an iteration summary provides a push ID but omits its date, the provider
+loads that exact Git push once per push ID and requires the returned push ID,
+repository, project, and date to match. It does not request or require optional
+ref updates. Missing or mismatched push details remain unknown.
+
 Missing continuation proof, count mismatches, malformed timestamps, unknown
 comment types, inconsistent source refs, unavailable endpoints, or any other
 ambiguous required evidence produce `unknown` and zero writes.

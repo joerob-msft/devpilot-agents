@@ -12,6 +12,9 @@ BeforeAll {
             'samples\active-pr-intake.config.json') -Raw |
         ConvertFrom-Json -AsHashtable -Depth 64
     $config.enabled = $true
+    $config['subjectProvider'] = [ordered]@{
+        maximumReads = 128
+    }
     $policy = New-StalePrLifecyclePolicy `
         -Config $config -RepoRoot $repo -AllowDirty
     $script:roots = [Collections.Generic.List[string]]::new()
@@ -65,7 +68,9 @@ BeforeAll {
             [Parameter(Mandatory)]
             [Collections.IDictionary]$EvidenceById,
             [Collections.IDictionary]$SecondEvidenceById = @{},
-            [long[]]$AmbiguousWriteIds = @()
+            [long[]]$AmbiguousWriteIds = @(),
+            [Collections.IDictionary]$EvidenceFailureById = @{},
+            [Collections.IDictionary]$SecondEvidenceFailureById = @{}
         )
         $calls = [Collections.Generic.List[string]]::new()
         $reads = @{}
@@ -79,6 +84,16 @@ BeforeAll {
         foreach ($key in $SecondEvidenceById.Keys) {
             $normalizedSecondEvidence[[string]$key] =
                 $SecondEvidenceById[$key]
+        }
+        $normalizedFailure = @{}
+        foreach ($key in $EvidenceFailureById.Keys) {
+            $normalizedFailure[[string]$key] =
+                [string]$EvidenceFailureById[$key]
+        }
+        $normalizedSecondFailure = @{}
+        foreach ($key in $SecondEvidenceFailureById.Keys) {
+            $normalizedSecondFailure[[string]$key] =
+                [string]$SecondEvidenceFailureById[$key]
         }
         $ambiguous = [Collections.Generic.HashSet[long]]::new()
         foreach ($id in $AmbiguousWriteIds) {
@@ -106,10 +121,27 @@ BeforeAll {
                     }
                     $reads[$key]++
                     if ($reads[$key] -gt 1 -and
-                        $normalizedSecondEvidence.ContainsKey($key)) {
-                        return $normalizedSecondEvidence[$key]
+                        $normalizedSecondFailure.ContainsKey($key)) {
+                        throw $normalizedSecondFailure[$key]
                     }
-                    return $normalizedEvidence[$key]
+                    if ($reads[$key] -eq 1 -and
+                        $normalizedFailure.ContainsKey($key)) {
+                        throw $normalizedFailure[$key]
+                    }
+                    if ($reads[$key] -gt 1 -and
+                        $normalizedSecondEvidence.ContainsKey($key)) {
+                        $second =
+                            $normalizedSecondEvidence[$key]
+                        if ($second -is [Exception]) {
+                            throw $second
+                        }
+                        return $second
+                    }
+                    $current = $normalizedEvidence[$key]
+                    if ($current -is [Exception]) {
+                        throw $current
+                    }
+                    return $current
                 }
                 AbandonStatus {
                     if (-not $ambiguous.Contains($id)) {
@@ -167,7 +199,15 @@ BeforeAll {
                 [string]$SystemUtc = '2026-01-01T00:00:00Z',
                 [string]$ActualCommentUtc = '',
                 [switch]$MalformedComment,
-                [switch]$NoIterations
+                [switch]$NoIterations,
+                [switch]$DuplicatePushId,
+                [switch]$MissingSummaryPushDate,
+                [ValidateSet(
+                    'valid', 'missing', 'malformed',
+                    'mismatched-id', 'mismatched-repository',
+                    'mismatched-project')]
+                [string]$PushDetail = 'valid',
+                [AllowNull()][ref]$PushDetailReads
             )
             $handler = {
                 param($Arguments, $InputPath)
@@ -221,24 +261,46 @@ BeforeAll {
                                 value = @()
                             }
                         }
+                        $iterationRows = @(@{
+                                id = 1
+                                createdDate = $PushUtc
+                                updatedDate = $PushUtc
+                                push = @{
+                                    pushId = 7
+                                    date = $(if (
+                                        $MissingSummaryPushDate
+                                    ) { $null } else {
+                                        $PushUtc
+                                    })
+                                }
+                                sourceRefCommit = @{
+                                    commitId = 'a' * 40
+                                }
+                                targetRefCommit = @{
+                                    commitId = 'b' * 40
+                                }
+                            })
+                        if ($DuplicatePushId) {
+                            $iterationRows += @{
+                                id = 2
+                                createdDate = $PushUtc
+                                updatedDate = $PushUtc
+                                push = @{
+                                    pushId = 7
+                                    date = $null
+                                }
+                                sourceRefCommit = @{
+                                    commitId = 'a' * 40
+                                }
+                                targetRefCommit = @{
+                                    commitId = 'b' * 40
+                                }
+                            }
+                        }
                         return @{
-                            count = 1
+                            count = $iterationRows.Count
                             continuation_token = $null
-                            value = @(@{
-                                    id = 1
-                                    createdDate = $PushUtc
-                                    updatedDate = $PushUtc
-                                    push = @{
-                                        pushId = 7
-                                        date = $PushUtc
-                                    }
-                                    sourceRefCommit = @{
-                                        commitId = 'a' * 40
-                                    }
-                                    targetRefCommit = @{
-                                        commitId = 'b' * 40
-                                    }
-                                })
+                            value = $iterationRows
                         }
                     }
                     pullRequestThreads {
@@ -289,6 +351,76 @@ BeforeAll {
                                         'refs/heads/feature-1'
                                     objectId = 'a' * 40
                                 })
+                        }
+                    }
+                    pushes {
+                        if ($null -ne $PushDetailReads) {
+                            $PushDetailReads.Value++
+                        }
+                        switch ($PushDetail) {
+                            missing {
+                                throw 'synthetic-push-missing'
+                            }
+                            malformed {
+                                return @{
+                                    pushId = 7
+                                    date = 'not-a-date'
+                                    repository = @{
+                                        id = '11111111-1111-1111-1111-111111111111'
+                                        project = @{
+                                            id = '22222222-2222-2222-2222-222222222222'
+                                        }
+                                    }
+                                }
+                            }
+                            'mismatched-id' {
+                                return @{
+                                    pushId = 8
+                                    date = $PushUtc
+                                    repository = @{
+                                        id = '11111111-1111-1111-1111-111111111111'
+                                        project = @{
+                                            id = '22222222-2222-2222-2222-222222222222'
+                                        }
+                                    }
+                                }
+                            }
+                            'mismatched-repository' {
+                                return @{
+                                    pushId = 7
+                                    date = $PushUtc
+                                    repository = @{
+                                        id = '9' * 36
+                                        project = @{
+                                            id = '22222222-2222-2222-2222-222222222222'
+                                        }
+                                    }
+                                }
+                            }
+                            'mismatched-project' {
+                                return @{
+                                    pushId = 7
+                                    date = $PushUtc
+                                    repository = @{
+                                        id = '11111111-1111-1111-1111-111111111111'
+                                        project = @{
+                                            id = '9' * 36
+                                        }
+                                    }
+                                }
+                            }
+                            default {
+                                return @{
+                                    pushId = 7
+                                    date = $PushUtc
+                                    repository = @{
+                                        id = '11111111-1111-1111-1111-111111111111'
+                                        project = @{
+                                            id = '22222222-2222-2222-2222-222222222222'
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     default {
@@ -476,6 +608,108 @@ Describe 'Stale PR lifecycle decision and transition' {
         $result.providerWrites | Should -Be 0
         $result.decisions[0].reason |
             Should -BeExactly prewrite-race-withheld
+    }
+
+    It 'defers and stops scanning when read bounds are exhausted' `
+        -TestCases @(
+            @{
+                Stage = 'decision'
+                Reason = 'stale-pr-read-budget-exhausted'
+            }
+            @{
+                Stage = 'decision'
+                Reason = 'stale-pr-deadline-exhausted'
+            }
+            @{
+                Stage = 'prewrite'
+                Reason = 'stale-pr-read-budget-exhausted'
+            }
+            @{
+                Stage = 'prewrite'
+                Reason = 'stale-pr-deadline-exhausted'
+            }
+        ) {
+        param($Stage, $Reason)
+        $providerCalls =
+            [Collections.Generic.List[string]]::new()
+        $providerState =
+            [pscustomobject]@{ Reads = 0 }
+        $firstEvidence =
+            New-LifecycleEvidence -Id 1
+        $secondCandidateEvidence =
+            New-LifecycleEvidence -Id 2
+        $providerHandler = {
+            param($Operation, $Arguments)
+            $id = [long]$Arguments.pullRequestId
+            [void]$providerCalls.Add(
+                "$Operation`:$id")
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{
+                        id =
+                            '33333333-3333-3333-3333-333333333333'
+                        descriptor =
+                            'aad.synthetic-service-account'
+                        uniqueName =
+                            'service@example.invalid'
+                    }
+                }
+                ReadEvidence {
+                    if ($id -eq 1) {
+                        $providerState.Reads++
+                        if (($Stage -ceq 'decision' -and
+                                $providerState.Reads -eq 1) -or
+                            ($Stage -ceq 'prewrite' -and
+                                $providerState.Reads -eq 2)) {
+                            throw $Reason
+                        }
+                        return $firstEvidence
+                    }
+                    return $secondCandidateEvidence
+                }
+                AbandonStatus {
+                    throw 'exhaustion-test-write-forbidden'
+                }
+                ReadStatus {
+                    throw 'exhaustion-test-readback-forbidden'
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        $result = Invoke-LifecycleCase `
+            -Provider $providerHandler `
+            -Inventory @(
+                [ordered]@{
+                    pullRequestId = 1
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                },
+                [ordered]@{
+                    pullRequestId = 2
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                })
+
+        @($result.decisions) | Should -HaveCount 1 `
+            -Because (
+                $result | ConvertTo-Json -Depth 8 -Compress)
+        $result.decisions[0].state |
+            Should -BeExactly deferred
+        $result.decisions[0].reason |
+            Should -BeExactly $Reason
+        $result.providerWrites | Should -Be 0
+        @($providerCalls | Where-Object {
+                $_ -ceq 'ReadEvidence:2'
+            }) | Should -HaveCount 0
+        @($providerCalls | Where-Object {
+                $_ -like 'AbandonStatus:*'
+            }) | Should -HaveCount 0
     }
 
     It 'treats an already abandoned reread as an idempotent no-op' {
@@ -729,15 +963,19 @@ Describe 'Stale lifecycle provider authority source' {
     }
 
     It 'uses push occurrence time and rejects malformed comment evidence' {
+        $summaryPushReads = 0
         $recentPush = New-StalePrAzureDevOpsProvider `
             -Config $config -Invoker (
                 New-AzLifecycleInvoker `
-                    -PushUtc '2026-01-03T00:00:00Z')
+                    -PushUtc '2026-01-03T00:00:00Z' `
+                    -PushDetailReads (
+                        [ref]$summaryPushReads))
         $pushEvidence = & $recentPush ReadEvidence @{
             pullRequestId = 1
         }
         $pushEvidence.latestActivityUtc |
             Should -BeExactly '2026-01-03T00:00:00.0000000Z'
+        $summaryPushReads | Should -Be 0
 
         $malformed = New-StalePrAzureDevOpsProvider `
             -Config $config -Invoker (
@@ -749,6 +987,131 @@ Describe 'Stale lifecycle provider authority source' {
                 pullRequestId = 1
             }
         } | Should -Throw '*comment-time-unknown*'
+    }
+
+    It 'loads an authoritative push date when the iteration summary omits it' {
+        $detailReads = 0
+        $invoker = New-AzLifecycleInvoker `
+            -PushUtc '2024-12-03T04:05:06Z' `
+            -MissingSummaryPushDate `
+            -PushDetailReads ([ref]$detailReads)
+        $rawPush = & $invoker @(
+            'devops', 'invoke',
+            '--resource', 'pushes') ''
+        [long]$rawPush.pushId | Should -Be 7
+        [string]$rawPush.date |
+            Should -BeExactly '2024-12-03T04:05:06Z'
+        $rawPush.repository |
+            Should -BeOfType ([Collections.IDictionary])
+        [string]$rawPush.repository.id |
+            Should -BeExactly ([string]$config.repositoryId)
+        $rawPush.repository.project |
+            Should -BeOfType ([Collections.IDictionary])
+        [string]$rawPush.repository.project.id |
+            Should -BeExactly ([string]$config.projectId)
+        $detailReads = 0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config -Invoker $invoker
+        $evidence = & $provider ReadEvidence @{
+            pullRequestId = 1
+        }
+
+        $detailReads | Should -Be 1
+        $evidence.latestActivityUtc |
+            Should -BeExactly '2024-12-03T04:05:06.0000000Z'
+    }
+
+    It 'deduplicates missing summary push dates by pushId' {
+        $detailReads = 0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config -Invoker (
+                New-AzLifecycleInvoker `
+                    -PushUtc '2024-12-03T04:05:06Z' `
+                    -MissingSummaryPushDate `
+                    -DuplicatePushId `
+                    -PushDetailReads ([ref]$detailReads))
+        $evidence = & $provider ReadEvidence @{
+            pullRequestId = 1
+        }
+
+        $detailReads | Should -Be 1
+        $evidence.iterationId | Should -Be 2
+        $evidence.latestActivityUtc |
+            Should -BeExactly '2024-12-03T04:05:06.0000000Z'
+    }
+
+    It 'preserves read and deadline exhaustion from push detail' `
+        -TestCases @(
+            @{ Bound = 'read' }
+            @{ Bound = 'deadline' }
+        ) {
+        param($Bound)
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $clock = $null
+        if ($Bound -ceq 'read') {
+            $boundedConfig['subjectProvider'] =
+                [ordered]@{ maximumReads = 4 }
+            $expected = 'stale-pr-read-budget-exhausted'
+        }
+        else {
+            $expected = 'stale-pr-deadline-exhausted'
+            $start = [DateTime]::SpecifyKind(
+                [DateTime]'2026-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $clockCalls = [ref]0
+            $clock = {
+                $clockCalls.Value++
+                if ($clockCalls.Value -lt 10) {
+                    return $start
+                }
+                return $start.AddSeconds(
+                    [int]$boundedConfig.limits.maxSeconds + 1)
+            }.GetNewClosure()
+        }
+        $providerArguments = @{
+            Config = $boundedConfig
+            Invoker = (
+                New-AzLifecycleInvoker `
+                    -MissingSummaryPushDate)
+        }
+        if ($null -ne $clock) {
+            $providerArguments.UtcNowProvider = $clock
+        }
+        $provider = New-StalePrAzureDevOpsProvider `
+            @providerArguments
+
+        {
+            & $provider ReadEvidence @{
+                pullRequestId = 1
+            }
+        } | Should -Throw "*$expected*"
+    }
+
+    It 'fails closed for unavailable malformed or mismatched push detail' `
+        -TestCases @(
+            @{ Mode = 'missing' }
+            @{ Mode = 'malformed' }
+            @{ Mode = 'mismatched-id' }
+            @{ Mode = 'mismatched-repository' }
+            @{ Mode = 'mismatched-project' }
+        ) {
+        param($Mode)
+        $detailReads = 0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config -Invoker (
+                New-AzLifecycleInvoker `
+                    -MissingSummaryPushDate `
+                    -PushDetail $Mode `
+                    -PushDetailReads ([ref]$detailReads))
+
+        {
+            & $provider ReadEvidence @{
+                pullRequestId = 1
+            }
+        } | Should -Throw '*stale-pr-push-time-unknown*'
+        $detailReads | Should -Be 1
     }
 
     It 'accepts complete empty counted-activity histories using creation' {

@@ -34,6 +34,37 @@ function ConvertTo-StalePrUtc {
     return $parsed.ToUniversalTime()
 }
 
+function Get-StalePrFailureReason {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    $exception = $ErrorRecord.Exception
+    $messages = [Collections.Generic.List[string]]::new()
+    while ($null -ne $exception) {
+        if ($exception.Data.Contains('stalePrReason') -and
+            [string]$exception.Data['stalePrReason'] -cin @(
+                'stale-pr-read-budget-exhausted',
+                'stale-pr-deadline-exhausted')) {
+            return [string]$exception.Data['stalePrReason']
+        }
+        [void]$messages.Add([string]$exception.Message)
+        $exception = $exception.InnerException
+    }
+    foreach ($known in @(
+            'stale-pr-read-budget-exhausted',
+            'stale-pr-deadline-exhausted'
+        )) {
+        if (@($messages | Where-Object {
+                    [string]$_ -ceq $known -or
+                    [string]$_ -clike "*$known*"
+                }).Count -gt 0) {
+            return $known
+        }
+    }
+    return [string]$ErrorRecord.Exception.Message
+}
+
 function Get-StalePrLifecycleConfiguration {
     [CmdletBinding()]
     param(
@@ -456,7 +487,9 @@ function New-StalePrAzureDevOpsProvider {
         [Parameter(DontShow)]
         [AllowNull()][scriptblock]$IdentityProvider,
         [Parameter(DontShow)]
-        [AllowNull()][scriptblock]$Invoker
+        [AllowNull()][scriptblock]$Invoker,
+        [Parameter(DontShow)]
+        [AllowNull()][scriptblock]$UtcNowProvider
     )
     $organization = [string]$Config.organization
     $projectName = [string]$Config.projectName
@@ -464,10 +497,33 @@ function New-StalePrAzureDevOpsProvider {
     $repositoryId =
         ([string]$Config.repositoryId).ToLowerInvariant()
     $actor = $Config.expectedAccount
+    $configuredReadCeilings = @(
+        [int]$Config.subjectProvider.maximumReads
+        [int]$Config.limits.maxReads
+    )
+    if ($configuredReadCeilings.Count -ne 2 -or
+        @($configuredReadCeilings |
+            Where-Object { $_ -lt 1 }).Count -ne 0 -or
+        [int]$Config.limits.maxSeconds -lt 1) {
+        throw 'stale-pr-provider-budget-invalid'
+    }
+    $readCeiling = [int](
+        $configuredReadCeilings |
+            Measure-Object -Minimum).
+        Minimum
+    $maximumSeconds = [int]$Config.limits.maxSeconds
+    $getUtcNow = if ($null -ne $UtcNowProvider) {
+        [scriptblock]$UtcNowProvider
+    }
+    else {
+        { [DateTime]::UtcNow }
+    }
     $convertUtcCommand =
         ${function:ConvertTo-StalePrUtc}
     $digestCommand =
         ${function:Get-StalePrDigest}
+    $failureReasonCommand =
+        ${function:Get-StalePrFailureReason}
     $invoke = {
         param([string[]]$Arguments, [string]$InputPath = '')
         if ($null -ne $Invoker) {
@@ -487,9 +543,18 @@ function New-StalePrAzureDevOpsProvider {
         param(
             [string]$Resource,
             [long]$PullRequestId,
+            [Parameter(Mandatory)]$Budget,
             [string[]]$AdditionalRoute = @(),
             [string[]]$Query = @()
         )
+        if ([int]$Budget.Count -ge $readCeiling) {
+            throw 'stale-pr-read-budget-exhausted'
+        }
+        if ((& $getUtcNow) -ge
+            [DateTime]$Budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        $Budget.Count++
         $arguments = @(
             'devops', 'invoke',
             '--organization', $organization,
@@ -509,11 +574,58 @@ function New-StalePrAzureDevOpsProvider {
             '-o', 'json',
             '--only-show-errors'
         )
-        return & $invoke $arguments
+        $response = & $invoke $arguments
+        if ((& $getUtcNow) -ge
+            [DateTime]$Budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        return $response
+    }.GetNewClosure()
+    $readPush = {
+        param(
+            [long]$PushId,
+            [Parameter(Mandatory)]$Budget
+        )
+        if ([int]$Budget.Count -ge $readCeiling) {
+            throw 'stale-pr-read-budget-exhausted'
+        }
+        if ((& $getUtcNow) -ge
+            [DateTime]$Budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        $Budget.Count++
+        $response = & $invoke @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'pushes',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            "pushId=$PushId",
+            '--query-parameters',
+            'includeRefUpdates=false',
+            'includeCommits=false',
+            '--http-method', 'GET',
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        if ((& $getUtcNow) -ge
+            [DateTime]$Budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        return $response
     }.GetNewClosure()
     $readEvidence = {
         param([long]$PullRequestId)
-        $pr = & $read 'pullRequests' $PullRequestId
+        $budget = [pscustomobject]@{
+            Count = 0
+            DeadlineUtc = (& $getUtcNow).
+                AddSeconds($maximumSeconds)
+        }
+        $pushDates = @{}
+        $pr = & $read 'pullRequests' $PullRequestId $budget
         if ($pr.repository -isnot [Collections.IDictionary] -or
             [string]$pr.repository.id -ine $repositoryId -or
             $pr.repository.project -isnot
@@ -521,8 +633,10 @@ function New-StalePrAzureDevOpsProvider {
             [string]$pr.repository.project.id -ine $projectId) {
             throw 'stale-pr-repository-mismatch'
         }
-        $iterations = & $read 'pullRequestIterations' $PullRequestId
-        $threads = & $read 'pullRequestThreads' $PullRequestId
+        $iterations = & $read 'pullRequestIterations' `
+            $PullRequestId $budget
+        $threads = & $read 'pullRequestThreads' `
+            $PullRequestId $budget
         if ($null -ne $iterations.continuation_token -or
             [int]$iterations.count -ne @($iterations.value).Count -or
             $null -ne $threads.continuation_token -or
@@ -556,6 +670,14 @@ function New-StalePrAzureDevOpsProvider {
             '^refs/heads/(?<filter>.+)$') {
             throw 'stale-pr-source-ref-invalid'
         }
+        if ([int]$budget.Count -ge $readCeiling) {
+            throw 'stale-pr-read-budget-exhausted'
+        }
+        if ((& $getUtcNow) -ge
+            [DateTime]$budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        $budget.Count++
         $refs = & $invoke @(
             'devops', 'invoke',
             '--organization', $organization,
@@ -573,6 +695,10 @@ function New-StalePrAzureDevOpsProvider {
             '-o', 'json',
             '--only-show-errors'
         )
+        if ((& $getUtcNow) -ge
+            [DateTime]$budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
         $matchingRefs = @($refs.value | Where-Object {
                 [string]$_.name -ceq $sourceRef -and
                 [string]$_.objectId -cmatch
@@ -602,19 +728,61 @@ function New-StalePrAzureDevOpsProvider {
                     })
             }
             if ($null -ne $iteration.push) {
-                if ([long]$iteration.push.pushId -lt 1 -or
-                    [string]::IsNullOrWhiteSpace(
-                        [string]$iteration.push.date)) {
+                $pushId = [long]$iteration.push.pushId
+                if ($pushId -lt 1) {
+                    throw 'stale-pr-push-time-unknown'
+                }
+                $pushDate = [string]$iteration.push.date
+                if ([string]::IsNullOrWhiteSpace($pushDate)) {
+                    $pushKey = [string]$pushId
+                    if ($pushDates.ContainsKey($pushKey)) {
+                        $pushDate = [string]$pushDates[$pushKey]
+                    }
+                    else {
+                        try {
+                            $push = & $readPush $pushId $budget
+                        }
+                        catch {
+                            $pushFailure =
+                                & $failureReasonCommand $_
+                            if ($pushFailure -cin @(
+                                    'stale-pr-read-budget-exhausted',
+                                    'stale-pr-deadline-exhausted')) {
+                                throw $pushFailure
+                            }
+                            throw 'stale-pr-push-time-unknown'
+                        }
+                        if ($push -isnot
+                                [Collections.IDictionary] -or
+                            [long]$push.pushId -ne $pushId -or
+                            $push.repository -isnot
+                                [Collections.IDictionary] -or
+                            [string]$push.repository.id -ine
+                                $repositoryId -or
+                            $push.repository.project -isnot
+                                [Collections.IDictionary] -or
+                            [string]$push.repository.project.id -ine
+                                $projectId -or
+                            [string]::IsNullOrWhiteSpace(
+                                [string]$push.date)) {
+                            throw 'stale-pr-push-time-unknown'
+                        }
+                        $pushDate = [string]$push.date
+                        $pushDates[$pushKey] = $pushDate
+                    }
+                }
+                try {
+                    $pushUtc = & $convertUtcCommand `
+                        -Value $pushDate -Name pushDate
+                }
+                catch {
                     throw 'stale-pr-push-time-unknown'
                 }
                 [void]$activity.Add([ordered]@{
                         kind = 'source-push'
                         iterationId = [int]$iteration.id
-                        pushId = [long]$iteration.push.pushId
-                        occurredUtc = (
-                            & $convertUtcCommand `
-                                -Value ([string]$iteration.push.date) `
-                                -Name pushDate).ToString('o')
+                        pushId = $pushId
+                        occurredUtc = $pushUtc.ToString('o')
                     })
             }
         }
@@ -710,8 +878,14 @@ function New-StalePrAzureDevOpsProvider {
                     [long]$Arguments.pullRequestId)
             }
             ReadStatus {
-                $pr = & $read 'pullRequests' (
-                    [long]$Arguments.pullRequestId)
+                $budget = [pscustomobject]@{
+                    Count = 0
+                    DeadlineUtc = (& $getUtcNow).
+                        AddSeconds($maximumSeconds)
+                }
+                $pr = & $read 'pullRequests' `
+                    ([long]$Arguments.pullRequestId) `
+                    $budget
                 return [ordered]@{
                     pullRequestId = [long]$pr.pullRequestId
                     status = [string]$pr.status
@@ -807,6 +981,22 @@ function Invoke-StalePrLifecycle {
                 -Name creationUtc
         }
         catch {
+            $reason = [string](
+                Get-StalePrFailureReason $_)
+            if ([string]::IsNullOrWhiteSpace($reason)) {
+                $reason = [string]$_
+            }
+            if ($reason -cin @(
+                    'stale-pr-read-budget-exhausted',
+                    'stale-pr-deadline-exhausted')) {
+                [void]$results.Add([ordered]@{
+                        pullRequestId = $id
+                        state = 'deferred'
+                        reason = $reason
+                        providerWrites = 0
+                    })
+                break
+            }
             $unknown++
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
@@ -855,6 +1045,22 @@ function Invoke-StalePrLifecycle {
                 -Evidence $evidence -Policy $Policy
         }
         catch {
+            $reason = [string](
+                Get-StalePrFailureReason $_)
+            if ([string]::IsNullOrWhiteSpace($reason)) {
+                $reason = [string]$_
+            }
+            if ($reason -cin @(
+                    'stale-pr-read-budget-exhausted',
+                    'stale-pr-deadline-exhausted')) {
+                [void]$results.Add([ordered]@{
+                        pullRequestId = $id
+                        state = 'deferred'
+                        reason = $reason
+                        providerWrites = 0
+                    })
+                break
+            }
             $unknown++
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
@@ -907,6 +1113,22 @@ function Invoke-StalePrLifecycle {
                 Get-StalePrEvidenceBinding $prewrite)
         }
         catch {
+            $reason = [string](
+                Get-StalePrFailureReason $_)
+            if ([string]::IsNullOrWhiteSpace($reason)) {
+                $reason = [string]$_
+            }
+            if ($reason -cin @(
+                    'stale-pr-read-budget-exhausted',
+                    'stale-pr-deadline-exhausted')) {
+                [void]$results.Add([ordered]@{
+                        pullRequestId = $id
+                        state = 'deferred'
+                        reason = $reason
+                        providerWrites = 0
+                    })
+                break
+            }
             $unknown++
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
