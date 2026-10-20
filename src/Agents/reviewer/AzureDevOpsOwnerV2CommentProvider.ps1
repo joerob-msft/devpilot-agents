@@ -3,6 +3,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-ApprovedOwnerV2ProviderTextSha256 {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+    return ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).
+                GetBytes($Text)))).
+        ToLowerInvariant()
+}
+
 function Get-ApprovedOwnerV2ChangedSpans {
     [CmdletBinding()]
     param(
@@ -19,18 +32,6 @@ function Get-ApprovedOwnerV2ChangedSpans {
         return @([ordered]@{ startLine = 1; endLine = $count })
     }
 
-    function Get-ApprovedOwnerV2ProviderTextSha256 {
-        param(
-            [Parameter(Mandatory)]
-            [AllowEmptyString()]
-            [string]$Text
-        )
-        return ([Convert]::ToHexString(
-            [Security.Cryptography.SHA256]::HashData(
-                [Text.UTF8Encoding]::new($false).
-                    GetBytes($Text)))).
-            ToLowerInvariant()
-    }
     if ($ChangeType -match '(?i)^delete') { return @() }
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
         'owner-v2-diff-' + [guid]::NewGuid().ToString('N'))
