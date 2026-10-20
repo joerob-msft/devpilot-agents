@@ -1532,18 +1532,29 @@ function Invoke-ActivePrIntake {
                                             else { $null }
                                         }
                                         else { $null }
-                                    if (
+                                        $priorProgressConfigCompatible =
+                                            [string]$priorProgress.
+                                                configDigest -ceq
+                                                [string]$envelope.
+                                                    binding.
+                                                    configDigest -or
+                                            ([bool]$envelope.binding.
+                                                    cursorTransitionApplied -and
+                                                [string]$envelope.binding.
+                                                    cursorSourceConfigDigest -cmatch
+                                                    '^[0-9a-f]{64}$' -and
+                                                [string]$priorProgress.
+                                                    configDigest -ceq
+                                                    [string]$envelope.binding.
+                                                        cursorSourceConfigDigest)
+                                        if (
                                         [int]$priorProgress.
                                             schemaVersion -notin @(2, 3) -or
                                         [string]$priorProgress.kind -cne
                                             'active-pr-file-progress' -or
                                         [long]$priorProgress.
                                             pullRequestId -ne $id -or
-                                        [string]$priorProgress.
-                                            configDigest -cne
-                                            [string]$envelope.
-                                                binding.
-                                                configDigest -or
+                                        -not $priorProgressConfigCompatible -or
                                         [string]$priorProgressBindingDigest -cne
                                             $fileProgressBindingDigest -or
                                         [int]$priorProgress.

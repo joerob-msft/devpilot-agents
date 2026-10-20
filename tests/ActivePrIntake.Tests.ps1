@@ -1438,6 +1438,11 @@ $httpGet = {
         $c = New-IntakeCase -Count 1 `
             -MaxHeads 1
         $c.config.limits.maxChangedFiles = 64
+        $c.config['toolkit'] =
+            [ordered]@{
+                head = 'a' * 40
+                tree = 'b' * 40
+            }
         $state = $c.state
         $state['templateCommit'] = '8' * 40
         $state['starts'] =
@@ -1587,6 +1592,16 @@ $httpGet = {
         $state.templateCommit = '9' * 40
         $state.description =
             'Fresh metadata with identical template bytes.'
+        $c.config.toolkit.head = 'c' * 40
+        $c.config.toolkit.tree = 'd' * 40
+        $c.config['cursorCompatibility'] =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$second.binding.
+                        configDigest
+                previousToolkitHead = 'a' * 40
+                previousToolkitTree = 'b' * 40
+            }
         $currentHead = & $c.provider Head @{
             pullRequestId = 1
         }
@@ -1619,13 +1634,39 @@ $httpGet = {
             description |
             Should -BeExactly $state.description
 
-        $state.commit = 'c' * 40
-        $state.iteration = 2
+        $c.config.toolkit.head = 'e' * 40
+        $c.config.toolkit.tree = 'f' * 40
+        $c.config.cursorCompatibility =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$third.binding.
+                        configDigest
+                previousToolkitHead = 'c' * 40
+                previousToolkitTree = 'd' * 40
+            }
         $fourth = Invoke-IntakeCase $c
-        $fourth.heads[0].fileProgress.
+        $fourth.heads[0].reasonCode |
+            Should -BeExactly rules-incomplete
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48)
+
+        [void]$c.config.Remove(
+            'cursorCompatibility')
+        $c.config.automationMarker =
+            '[DevPilot-Automation:v2]'
+        $fifth = Invoke-IntakeCase $c
+        $fifth.heads[0].fileProgress.
             processedFiles | Should -Be 16
         @($state.starts) |
-            Should -Be @(0, 16, 32, 0)
+            Should -Be @(0, 16, 32, 48, 0)
+
+        $state.commit = 'c' * 40
+        $state.iteration = 2
+        $sixth = Invoke-IntakeCase $c
+        $sixth.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48, 0, 0)
     }
 
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
