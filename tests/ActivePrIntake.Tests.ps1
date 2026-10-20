@@ -29,6 +29,7 @@ BeforeAll {
             comments = @(); changeLines = 3; headVisits = @{}
             sourceContent = $null
             iteration = 1; commit = 'a' * 40
+            description = 'Initial PR description.'
             headStatus = @{}; headTarget = @{}; headDraft = @{} }
         $provider = {
             param($op, $request)
@@ -72,6 +73,9 @@ BeforeAll {
                             $state.headDraft[$id]
                         } else { $state.rows[$id - 1].isDraft }
                         sourceRef = 'refs/heads/feature'
+                        title = 'Synthetic PR'
+                        description =
+                            [string]$state.description
                         targetRef = if ($state.headTarget.ContainsKey($id)) {
                             $state.headTarget[$id]
                         } else { $state.rows[$id - 1].targetRef }
@@ -136,6 +140,227 @@ BeforeAll {
                 [string]$Snapshot.systemValue
             } else { $null }),
             [EnvironmentVariableTarget]::Process)
+    }
+    function New-TemplateAuthorityCase {
+        param(
+            [ValidateSet('true', 'false', 'absent', 'malformed')]
+            [string]$Flag = 'true',
+            [int]$MaxReads = 128,
+            [int]$PullRequestId = 17
+        )
+        $config = Get-Content (
+            Join-Path $repo `
+                'samples\named-areequal-current-pr.config.json'
+        ) -Raw | ConvertFrom-Json -AsHashtable
+        $config.enabled = $true
+        $config.limits.maxReads = $MaxReads
+        switch ($Flag) {
+            true {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            $true
+                    }
+            }
+            false {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            $false
+                    }
+            }
+            absent {
+                [void]$config.Remove(
+                    'sharedAcquisition')
+            }
+            malformed {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            'true'
+                    }
+            }
+        }
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-template-pester-' +
+            [guid]::NewGuid().ToString('N'))
+        $script:roots.Add($root)
+        New-Item -ItemType Directory -Path $root -Force |
+            Out-Null
+        $stub = Join-Path $root 'az-template-authority.ps1'
+        @'
+if ($args -contains 'get-access-token') {
+    @{ accessToken = 'x' * 128 } |
+        ConvertTo-Json -Compress
+}
+elseif ($args -contains 'repositories') {
+    @{ defaultBranch = 'refs/heads/master' } |
+        ConvertTo-Json -Compress
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $state = [ordered]@{
+            title = 'Current PR title'
+            description = "Summary`n`nDetails"
+            mode = 'complete'
+            uris =
+                [Collections.Generic.List[string]]::new()
+            itemUris =
+                [Collections.Generic.List[string]]::new()
+        }
+        $httpGet = {
+            param(
+                $Uri,
+                $Method,
+                $Headers,
+                $TimeoutSec,
+                $UseBasicParsing
+            )
+            $state.uris.Add([string]$Uri) |
+                Out-Null
+            if ([string]$Headers.Authorization -cne
+                ('Bearer ' + ('x' * 128))) {
+                throw 'unexpected-authorization'
+            }
+            $content = if (
+                [string]$Uri -match
+                    ("/pullRequests/$PullRequestId" +
+                        '\?')) {
+                [ordered]@{
+                    pullRequestId = $PullRequestId
+                    repository = [ordered]@{
+                        id = $config.repositoryId
+                        project = [ordered]@{
+                            id = $config.projectId
+                        }
+                    }
+                    status = 'active'
+                    isDraft = $false
+                    title = $state.title
+                    description =
+                        $state.description
+                    sourceRefName =
+                        'refs/heads/feature/test'
+                    targetRefName =
+                        'refs/heads/master'
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    ("/pullRequests/$PullRequestId" +
+                        '/iterations\?')) {
+                [ordered]@{
+                    value = @([ordered]@{
+                            id = 4
+                            sourceRefCommit =
+                                @{ commitId = ('a' * 40) }
+                            targetRefCommit =
+                                @{ commitId = ('b' * 40) }
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/refs\?filter=heads%2Ffeature%2Ftest') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            name =
+                                'refs/heads/feature/test'
+                            objectId = ('a' * 40)
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/refs\?filter=heads%2Fmaster') {
+                [ordered]@{
+                    value = $(if (
+                        $state.mode -ceq 'stale') {
+                        @()
+                    }
+                    else {
+                        @([ordered]@{
+                                name =
+                                    'refs/heads/master'
+                                objectId = ('d' * 40)
+                            })
+                    })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/items\?.*scopePath=%2F\.azuredevops') {
+                $state.itemUris.Add([string]$Uri) |
+                    Out-Null
+                $items = switch ($state.mode) {
+                    unavailable { @() }
+                    ambiguous {
+                        @(
+                            [ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = ('e' * 40)
+                                isFolder = $false
+                            },
+                            [ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template/other.md'
+                                objectId = ('f' * 40)
+                                isFolder = $false
+                            }
+                        )
+                    }
+                    malformed {
+                        @([ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = 'not-a-blob'
+                                isFolder = $false
+                            })
+                    }
+                    default {
+                        @([ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = ('e' * 40)
+                                isFolder = $false
+                            })
+                    }
+                }
+                [ordered]@{
+                    value = @($items)
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/items\?.*path=%2F\.azuredevops%2Fpull_request_template\.md') {
+                $state.itemUris.Add([string]$Uri) |
+                    Out-Null
+                "## Summary`nDescribe the change."
+            }
+            else {
+                throw "unexpected-uri:$Uri"
+            }
+            [pscustomobject]@{
+                RawContentLength =
+                    [Text.Encoding]::UTF8.
+                        GetByteCount($content)
+                Content = $content
+                Headers = @{
+                    'Content-Type' =
+                        'application/json'
+                }
+            }
+        }.GetNewClosure()
+        return [ordered]@{
+            config = $config
+            root = $root
+            stub = $stub
+            state = $state
+            httpGet = $httpGet
+        }
     }
 }
 AfterAll {
@@ -647,6 +872,333 @@ $httpGet = {
             Remove-Item Env:\ACTIVE_PR_HEAD_LOG `
                 -ErrorAction SilentlyContinue
         }
+    }
+
+    It 'acquires fresh Named PR metadata and unique default-branch template authority when explicitly enabled' {
+        $c = New-TemplateAuthorityCase -Flag true
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $first = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+        $c.state.title = 'Fresh title'
+        $c.state.description = 'Fresh description'
+        $second = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $first.title |
+            Should -BeExactly 'Current PR title'
+        $first.description |
+            Should -BeExactly "Summary`n`nDetails"
+        $second.title | Should -BeExactly 'Fresh title'
+        $second.description |
+            Should -BeExactly 'Fresh description'
+        $second.descriptionDigest |
+            Should -BeExactly (
+                'v1:sha256:' +
+                [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData(
+                        [Text.UTF8Encoding]::new($false).
+                            GetBytes('Fresh description'))).
+                    ToLowerInvariant())
+        $second.templateAuthority.state |
+            Should -BeExactly 'complete'
+        $second.templateAuthority.path |
+            Should -BeExactly `
+                '/.azuredevops/pull_request_template.md'
+        $second.templateAuthority.configurationRef |
+            Should -BeExactly 'refs/heads/master'
+        $second.templateAuthority.configurationCommit |
+            Should -BeExactly ('d' * 40)
+        $second.templateAuthority.blob |
+            Should -BeExactly ('e' * 40)
+        $second.templateAuthority.content |
+            Should -BeExactly `
+                "## Summary`nDescribe the change."
+        $second.templateAuthority.contentDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        @($c.state.itemUris |
+            Where-Object {
+                $_ -match 'scopePath=' -and
+                $_ -match 'recursionLevel=Full'
+            }) | Should -HaveCount 2
+    }
+
+    It 'carries enabled Named metadata through the shared transient snapshot route' {
+        $transportCase = New-TemplateAuthorityCase `
+            -Flag true -PullRequestId 1
+        $c = New-IntakeCase `
+            -Count 1 -MaxHeads 1
+        $c.config.rules = @(
+            [ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            }
+        )
+        $c.config.sharedAcquisition =
+            [ordered]@{
+                includePullRequestTemplateAuthority =
+                    $true
+            }
+        $transport =
+            New-ActivePrAzureDevOpsProvider `
+                -Config $c.config `
+                -AzureCliPath $transportCase.stub `
+                -HttpGetInvoker $transportCase.httpGet
+        $baseProvider = $c.provider
+        $provider = {
+            param($Operation, $Request)
+            if ($Operation -ceq 'Head') {
+                return & $transport `
+                    $Operation $Request
+            }
+            return & $baseProvider `
+                $Operation $Request
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo `
+            -IncludeTransientSnapshots -Run
+
+        $snapshot =
+            $result.transientSnapshots['1'].head
+        $snapshot.title |
+            Should -BeExactly 'Current PR title'
+        $snapshot.description |
+            Should -BeExactly "Summary`n`nDetails"
+        $snapshot.descriptionDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $snapshot.templateAuthority.state |
+            Should -BeExactly 'complete'
+        $snapshot.templateAuthority.configurationRef |
+            Should -BeExactly 'refs/heads/master'
+        $snapshot.templateAuthority.configurationCommit |
+            Should -BeExactly ('d' * 40)
+    }
+
+    It 'leaves template authority unknown without extra reads when the Named flag is <Flag>' `
+        -TestCases @(
+            @{ Flag = 'false' }
+            @{ Flag = 'absent' }
+        ) {
+        param($Flag)
+        $c = New-TemplateAuthorityCase -Flag $Flag
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $head = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $head.title |
+            Should -BeExactly 'Current PR title'
+        $head.descriptionDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $head.templateAuthority.state |
+            Should -BeExactly 'unknown'
+        $head.templateAuthority.reason |
+            Should -BeExactly `
+                'template-authority-unavailable'
+        $c.state.uris | Should -HaveCount 3
+        @($c.state.uris | Where-Object {
+                $_ -match 'heads%2Fmaster|scopePath='
+            }) | Should -HaveCount 0
+        $c.state.itemUris | Should -HaveCount 0
+    }
+
+    It 'rejects a malformed Named template authority flag' {
+        $c = New-TemplateAuthorityCase `
+            -Flag malformed
+        {
+            New-ActivePrAzureDevOpsProvider `
+                -Config $c.config `
+                -AzureCliPath $c.stub `
+                -HttpGetInvoker $c.httpGet
+        } | Should -Throw `
+            '*template authority flag must be a Boolean*'
+    }
+
+    It 'treats a changed PR description as fresh head drift' {
+        $c = New-IntakeCase `
+            -Count 1 -MaxHeads 1
+        $baseProvider = $c.provider
+        $provider = {
+            param($Operation, $Request)
+            $result = & $baseProvider `
+                $Operation $Request
+            if ($Operation -ceq 'Head' -and
+                $c.state.headVisits[
+                    [int]$Request.pullRequestId] -gt 1) {
+                $result.description =
+                    'Edited PR description.'
+            }
+            return $result
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo -Run
+
+        $result.heads[0].reasonCode |
+            Should -BeExactly 'head-drift'
+    }
+
+    It 'returns deterministic unknown template authority for <Mode>' `
+        -TestCases @(
+            @{
+                Mode = 'unavailable'
+                Reason =
+                    'template-authority-unavailable'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'ambiguous'
+                Reason =
+                    'template-authority-ambiguous'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'malformed'
+                Reason =
+                    'template-authority-malformed'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'stale'
+                Reason =
+                    'template-authority-stale'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'read-budget'
+                Reason =
+                    'template-authority-unavailable'
+                MaxReads = 7
+            }
+        ) {
+        param($Mode, $Reason, $MaxReads)
+        $c = New-TemplateAuthorityCase `
+            -Flag true -MaxReads $MaxReads
+        $c.state.mode = $Mode
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $head = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $head.templateAuthority.state |
+            Should -BeExactly 'unknown'
+        $head.templateAuthority.reason |
+            Should -BeExactly $Reason
+        if ($Mode -ceq 'stale') {
+            $c.state.itemUris |
+                Should -HaveCount 0
+        }
+        elseif ($Mode -ceq 'read-budget') {
+            $c.state.itemUris |
+                Should -HaveCount 1
+        }
+        else {
+            $c.state.itemUris |
+                Should -HaveCount 1
+        }
+    }
+
+    It 'rejects over-bound or inconsistent PR template metadata' {
+        $baseHead = [ordered]@{
+            pullRequestId = 17
+            repositoryId =
+                '11111111-1111-1111-1111-111111111111'
+            projectId =
+                '22222222-2222-2222-2222-222222222222'
+            status = 'active'
+            isDraft = $false
+            sourceRef = 'refs/heads/feature/test'
+            targetRef = 'refs/heads/master'
+            sourceCommit = 'a' * 40
+            targetCommit = 'b' * 40
+            iterationId = 4
+            title = 'Title'
+            description = 'Description'
+            descriptionDigest =
+                'v1:sha256:' + ('0' * 64)
+        }
+        $config = (New-TemplateAuthorityCase `
+                -Flag true).config
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.Remove(
+            'descriptionDigest')
+        $baseHead.title = 'x' * 4097
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.title = 'Title'
+        $baseHead.description = 'x' * 131073
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.description = 'Description'
+        $baseHead.templateAuthority =
+            [ordered]@{
+                state = 'complete'
+                path =
+                    '/.azuredevops/pull_request_template.md'
+                configurationRef =
+                    'refs/heads/master'
+                configurationCommit = 'd' * 40
+                blob = 'e' * 40
+                contentDigest =
+                    'v1:sha256:' + ('0' * 64)
+                content = 'Template'
+            }
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
     }
 
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {

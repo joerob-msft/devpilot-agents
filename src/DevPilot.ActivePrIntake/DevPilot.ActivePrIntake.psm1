@@ -29,6 +29,18 @@ function Get-IntakeDigest {
     ).ToLowerInvariant()
 }
 
+function Get-IntakeTextDigest {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+    return 'v1:sha256:' + [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).GetBytes($Value))).
+        ToLowerInvariant()
+}
+
 function New-IntakeTransportFailure {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -333,6 +345,18 @@ function Assert-IntakeConfig {
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
     }
+    if ($Config.Contains('sharedAcquisition')) {
+        $shared = $Config.sharedAcquisition
+        if ($shared -isnot
+                [Collections.IDictionary] -or
+            ($shared.Contains(
+                    'includePullRequestTemplateAuthority') -and
+                $shared.
+                    includePullRequestTemplateAuthority -isnot
+                        [bool])) {
+            throw 'Shared acquisition pull request template authority flag must be a Boolean.'
+        }
+    }
     if ($Config.Contains('cursorCompatibility')) {
         $compatibility = $Config.cursorCompatibility
         if ($compatibility -isnot [Collections.IDictionary] -or
@@ -544,6 +568,99 @@ function Assert-IntakeHead {
         throw 'invalid-head'
     }
     [void](Assert-IntakeNumber $Head.iterationId iterationId 1 ([int]::MaxValue))
+    $title = if (-not $Head.Contains(
+            'title') -or
+        $null -eq $Head.title) {
+        ''
+    }
+    else { [string]$Head.title }
+    $description = if (-not $Head.Contains(
+            'description') -or
+        $null -eq $Head.description) {
+        ''
+    }
+    else { [string]$Head.description }
+    if ($title.Length -gt 4096 -or
+        $description.Length -gt 131072) {
+        throw 'invalid-head'
+    }
+    $descriptionDigest =
+        Get-IntakeTextDigest -Value $description
+    if ($Head.Contains('descriptionDigest') -and
+        [string]$Head.descriptionDigest -cne
+            $descriptionDigest) {
+        throw 'invalid-head'
+    }
+    $templateAuthority = if (
+        $Head.Contains('templateAuthority') -and
+        $Head.templateAuthority -is
+            [Collections.IDictionary]) {
+        $Head.templateAuthority
+    }
+    else {
+        [ordered]@{
+            state = 'unknown'
+            reason =
+                'template-authority-unavailable'
+        }
+    }
+    if ([string]$templateAuthority.state -cnotin @(
+            'complete', 'unknown')) {
+        throw 'invalid-head'
+    }
+    if ([string]$templateAuthority.state -ceq
+        'complete') {
+        if ([string]$templateAuthority.path -cnotmatch
+                '^/\.azuredevops/pull_request_template\.(?:md|txt)$' -or
+            [string]$templateAuthority.configurationRef -cnotmatch
+                '^refs/heads/[^~^:?*\[\\]+$' -or
+            [string]$templateAuthority.configurationCommit -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$templateAuthority.blob -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$templateAuthority.contentDigest -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            $templateAuthority.content -isnot [string] -or
+            [Text.Encoding]::UTF8.GetByteCount(
+                [string]$templateAuthority.content) -gt 65536 -or
+            [string]$templateAuthority.contentDigest -cne
+                (Get-IntakeTextDigest -Value (
+                    [string]$templateAuthority.content))) {
+            throw 'invalid-head'
+        }
+        $templateAuthority =
+            [ordered]@{
+                state = 'complete'
+                path =
+                    [string]$templateAuthority.path
+                configurationRef =
+                    [string]$templateAuthority.configurationRef
+                configurationCommit =
+                    ([string]$templateAuthority.configurationCommit).
+                        ToLowerInvariant()
+                blob =
+                    ([string]$templateAuthority.blob).
+                        ToLowerInvariant()
+                contentDigest =
+                    [string]$templateAuthority.contentDigest
+                content =
+                    [string]$templateAuthority.content
+            }
+    }
+    else {
+        $reason = [string]$templateAuthority.reason
+        if ($reason -cnotin @(
+                'template-authority-unavailable',
+                'template-authority-ambiguous',
+                'template-authority-malformed',
+                'template-authority-stale')) {
+            throw 'invalid-head'
+        }
+        $templateAuthority = [ordered]@{
+            state = 'unknown'
+            reason = $reason
+        }
+    }
     return [ordered]@{
         repositoryId = ([string]$Head.repositoryId).ToLowerInvariant()
         projectId = ([string]$Head.projectId).ToLowerInvariant()
@@ -555,6 +672,12 @@ function Assert-IntakeHead {
         iterationId = [int]$Head.iterationId
         status = [string]$Head.status
         isDraft = [bool]$Head.isDraft
+        title = $title
+        description = $description
+        descriptionDigest =
+            $descriptionDigest
+        templateAuthority =
+            $templateAuthority
     }
 }
 
@@ -1986,7 +2109,10 @@ function Resolve-ActivePrHeadSnapshot {
         [object[]]$Iterations,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [object[]]$SourceRefs
+        [object[]]$SourceRefs,
+        [AllowNull()]
+        [Collections.IDictionary]$TemplateAuthority =
+            $null
     )
     if ($Iterations.Count -eq 0 -or
         $Iterations.Count -gt 200) {
@@ -2016,17 +2142,47 @@ function Resolve-ActivePrHeadSnapshot {
             $sourceCommit) {
         throw 'head-inconsistent'
     }
+    $description = if (-not $PullRequest.Contains(
+            'description') -or
+        $null -eq $PullRequest.description) {
+        ''
+    }
+    else {
+        [string]$PullRequest.description
+    }
     return [ordered]@{
         pullRequestId = $PullRequest.pullRequestId
         repositoryId = $PullRequest.repository.id
         projectId = $PullRequest.repository.project.id
         status = $PullRequest.status
         isDraft = $PullRequest.isDraft
+        title = $(if (-not $PullRequest.Contains(
+                    'title') -or
+                $null -eq $PullRequest.title) {
+                ''
+            }
+            else {
+                [string]$PullRequest.title
+            })
+        description = $description
+        descriptionDigest =
+            Get-IntakeTextDigest -Value $description
         sourceRef = $sourceRef
         targetRef = $PullRequest.targetRefName
         sourceCommit = $sourceCommit
         targetCommit = $targetCommit
         iterationId = $latest.id
+        templateAuthority = $(if ($null -eq
+                $TemplateAuthority) {
+                [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-unavailable'
+                }
+            }
+            else {
+                $TemplateAuthority
+            })
     }
 }
 
@@ -2171,10 +2327,20 @@ function New-ActivePrAzureDevOpsProvider {
     $project = [string]$Config.projectName
     $projectId = [string]$Config.projectId
     $repo = [string]$Config.repositoryId
+    $requiresPullRequestTemplate =
+        $Config.Contains('sharedAcquisition') -and
+        $Config.sharedAcquisition -is
+            [Collections.IDictionary] -and
+        $Config.sharedAcquisition.Contains(
+            'includePullRequestTemplateAuthority') -and
+        [bool]$Config.sharedAcquisition.
+            includePullRequestTemplateAuthority
     $maxFiles = [int]$Config.limits.maxChangedFiles
     $maxThreads = [int]$Config.limits.maxThreads
     $parseNumber = ${function:Assert-IntakeNumber}
     $digestCommand = ${function:Get-IntakeDigest}
+    $textDigestCommand =
+        ${function:Get-IntakeTextDigest}
     $changedSpansCommand =
         ${function:Get-ApprovedOwnerV2ChangedSpans}
     $changeDerivationCommand =
@@ -2578,12 +2744,35 @@ print(json.dumps({
             throw 'response-invalid'
         }
     }.GetNewClosure()
+    $invokeItemsHttp = {
+        param(
+            [Parameter(Mandatory)][uri]$Uri,
+            [Parameter(Mandatory)][string]$Method,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Headers,
+            [Parameter(Mandatory)][int]$TimeoutSec,
+            [switch]$UseBasicParsing
+        )
+        $request = @{
+            Uri = $Uri
+            Method = $Method
+            Headers = $Headers
+            TimeoutSec = $TimeoutSec
+            UseBasicParsing =
+                [bool]$UseBasicParsing
+        }
+        if ($null -eq $HttpGetInvoker) {
+            return Invoke-WebRequest @request
+        }
+        return & $HttpGetInvoker @request
+    }.GetNewClosure()
     $invokeItemsGet = {
         param(
             [string]$Path,
             [string]$Commit,
             [DateTime]$Deadline,
-            [switch]$Directory
+            [switch]$Directory,
+            [switch]$Recursive
         )
         if ($transportReads.Count -ge $readCeiling) {
             throw 'read-budget'
@@ -2610,7 +2799,12 @@ print(json.dumps({
             $query.Add(
                 'scopePath=' +
                 [Uri]::EscapeDataString($apiPath))
-            $query.Add('recursionLevel=OneLevel')
+            $query.Add($(if ($Recursive) {
+                        'recursionLevel=Full'
+                    }
+                    else {
+                        'recursionLevel=OneLevel'
+                    }))
             $query.Add('includeContentMetadata=true')
         }
         else {
@@ -2632,7 +2826,7 @@ print(json.dumps({
             ($query -join '&'))
         $transportReads.Count++
         try {
-            $response = Invoke-WebRequest `
+            $response = & $invokeItemsHttp `
                 -Uri $uri -Method Get `
                 -Headers @{
                     Authorization = "Bearer $token"
@@ -2707,6 +2901,130 @@ print(json.dumps({
             throw 'item-content-unavailable'
         }
         return $response
+    }.GetNewClosure()
+    $getPullRequestTemplateAuthority = {
+        param([DateTime]$Deadline)
+        try {
+            $repository = & $invoke 'git' 'repositories' @(
+                "project=$project",
+                "repositoryId=$repo"
+            ) @() $Deadline
+            $defaultRef =
+                [string]$repository.defaultBranch
+            if ($defaultRef -cnotmatch
+                    '^refs/heads/(?<filter>[^~^:?*\[\\]+)$') {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            $refs = & $invokeGitJsonGet (
+                'refs?filter=' +
+                [Uri]::EscapeDataString(
+                    "heads/$($Matches.filter)") +
+                '&includeStatuses=false' +
+                '&peelTags=false' +
+                '&api-version=7.1') $Deadline
+            $matches = @($refs.value |
+                Where-Object {
+                    $_ -is
+                        [Collections.IDictionary] -and
+                    [string]$_.name -ceq
+                        $defaultRef -and
+                    [string]$_.objectId -cmatch
+                        '^[0-9a-fA-F]{40}$'
+                })
+            if ($matches.Count -ne 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-stale'
+                }
+            }
+            $commit = ([string]$matches[0].
+                objectId).ToLowerInvariant()
+            $directory = & $invokeItemsGet `
+                '/.azuredevops' $commit $Deadline `
+                -Directory -Recursive
+            $items = if ($directory -is
+                    [Collections.IDictionary] -and
+                $directory.value -is [array]) {
+                @($directory.value)
+            }
+            elseif ($directory -is [array]) {
+                @($directory)
+            }
+            else { @() }
+            $templateRelated = @($items |
+                Where-Object {
+                    $_ -is
+                        [Collections.IDictionary] -and
+                    -not [bool]$_.isFolder -and
+                    [string]$_.path -match
+                        '(?i)^/\.azuredevops/(?:pull_request_template\.(?:md|txt)|pull_request_template/.+)$'
+                })
+            $candidates = @($templateRelated |
+                Where-Object {
+                    [string]$_.path -match
+                        '(?i)^/\.azuredevops/pull_request_template\.(?:md|txt)$'
+                })
+            if ($candidates.Count -ne 1 -or
+                $templateRelated.Count -ne 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = $(if (
+                        $templateRelated.Count -gt 1 -or
+                        $candidates.Count -gt 1) {
+                        'template-authority-ambiguous'
+                    }
+                    else {
+                        'template-authority-unavailable'
+                    })
+                }
+            }
+            $candidate = $candidates[0]
+            $blob =
+                ([string]$candidate.objectId).
+                    ToLowerInvariant()
+            if ($blob -cnotmatch
+                    '^[0-9a-f]{40}$') {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            $item = & $getItem `
+                ([string]$candidate.path) `
+                $commit $Deadline
+            $content = [string]$item.content
+            if ([Text.Encoding]::UTF8.GetByteCount(
+                    $content) -gt 65536) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            return [ordered]@{
+                state = 'complete'
+                path = [string]$candidate.path
+                configurationRef = $defaultRef
+                configurationCommit = $commit
+                blob = $blob
+                contentDigest =
+                    & $textDigestCommand $content
+                content = $content
+            }
+        }
+        catch {
+            return [ordered]@{
+                state = 'unknown'
+                reason =
+                    'template-authority-unavailable'
+            }
+        }
     }.GetNewClosure()
     $getProjectContext = {
         param(
@@ -2950,7 +3268,13 @@ print(json.dumps({
                 return & $resolveHeadSnapshot `
                     -PullRequest $r `
                     -Iterations $list `
-                    -SourceRefs @($refs.value)
+                    -SourceRefs @($refs.value) `
+                    -TemplateAuthority $(if (
+                        $requiresPullRequestTemplate) {
+                        & $getPullRequestTemplateAuthority `
+                            $deadline
+                    }
+                    else { $null })
             }
             Changes {
                 $id = [int]$Request.pullRequestId

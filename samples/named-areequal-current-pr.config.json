@@ -56,6 +56,9 @@
     "id": "bpm-named-areequal-arguments@1",
     "implementationSha256": "7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a"
   },
+  "sharedAcquisition": {
+    "includePullRequestTemplateAuthority": false
+  },
   "autoCreateNamedAreEqualComments": false,
   "limits": {
     "pageSize": 50,
