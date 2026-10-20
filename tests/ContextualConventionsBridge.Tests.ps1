@@ -131,6 +131,8 @@ BeforeAll {
             sharedAcquisition = [ordered]@{
                 kind =
                     'devpilot-shared-review-acquisition-v1'
+                includePullRequestTemplateAuthority =
+                    $true
                 activePrIntakeSha256 =
                     (Get-FileHash (
                         Join-Path $repoRoot `
@@ -824,6 +826,33 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'requires the contextual shared acquisition template authority switch to be literal true' {
+        foreach ($value in @(
+                $false,
+                'true')) {
+            $config =
+                New-ContextualTestConfig
+            $config.sharedAcquisition.
+                includePullRequestTemplateAuthority =
+                    $value
+            {
+                Invoke-ContextualConventionsCurrentPrBridge `
+                    -Config $config `
+                    -Provider {
+                        throw 'not invoked'
+                    } `
+                    -StateRoot (
+                        Join-Path $TestDrive `
+                            "invalid-shared-$value") `
+                    -ManifestPath (
+                        Join-Path $TestDrive `
+                            "invalid-shared-$value.json") `
+                    -RepositoryRoot $repoRoot
+            } | Should -Throw (
+                '*exactly one fixed rule bundle*')
+        }
+    }
+
     It 'recognizes an exact signed prior reviewer comment across an upgrade and on restart' {
         $case =
             New-ContextualUpgradeRecognitionCase

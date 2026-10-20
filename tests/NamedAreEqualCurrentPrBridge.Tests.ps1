@@ -375,6 +375,28 @@ BeforeAll {
 }
 
 Describe 'Named AreEqual current PR bridge' {
+    It 'rejects a malformed shared template authority switch' {
+        $config = New-BridgeConfig
+        $config.sharedAcquisition[
+            'includePullRequestTemplateAuthority'] =
+                'true'
+        {
+            Invoke-NamedAreEqualCurrentPrBridge `
+                -Config $config `
+                -Provider {
+                    throw 'not invoked'
+                } `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'named-invalid-shared-state') `
+                -ManifestPath (
+                    Join-Path $TestDrive `
+                        'named-invalid-shared-manifest.json') `
+                -RepositoryRoot $repoRoot
+        } | Should -Throw (
+            '*exactly one named AreEqual rule*')
+    }
+
     It 'completes in a fresh process with only bridge imports' `
         -TestCases @(
             @{ Mode = 'empty'; ExpectedExit = 0

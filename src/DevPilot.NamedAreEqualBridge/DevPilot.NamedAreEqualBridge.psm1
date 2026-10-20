@@ -49,6 +49,14 @@ function Assert-NamedBridgeConfig {
         [string]$Config.capability.id -cne $script:NamedCapability -or
         [string]$Config.capability.implementationSha256 -cne
             $script:NamedCapabilityDigest.Substring(10) -or
+        ($Config.Contains('sharedAcquisition') -and (
+            $Config.sharedAcquisition -isnot
+                [Collections.IDictionary] -or
+            ($Config.sharedAcquisition.Contains(
+                    'includePullRequestTemplateAuthority') -and
+                $Config.sharedAcquisition.
+                    includePullRequestTemplateAuthority -isnot
+                        [bool]))) -or
         $Config.subjectProvider -isnot [Collections.IDictionary] -or
         $Config.discussionProvider -isnot [Collections.IDictionary]) {
         throw 'Named bridge requires exactly one named AreEqual rule.'

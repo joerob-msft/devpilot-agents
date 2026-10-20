@@ -663,6 +663,11 @@ function Read-ApprovedOwnerV2Evidence {
         if ($shared -isnot [Collections.IDictionary] -or
             [string]$shared.kind -cne
                     'devpilot-shared-review-acquisition-v1' -or
+            ($shared.Contains(
+                    'includePullRequestTemplateAuthority') -and
+                $shared.
+                    includePullRequestTemplateAuthority -isnot
+                        [bool]) -or
             [string]$shared.activePrIntakeSha256 -cne
                     [string]$toolkitBinding.activePrIntakeSha256 -or
             [string]$shared.namedBridgeSha256 -cne
@@ -719,6 +724,11 @@ function Read-ApprovedOwnerV2Evidence {
         if ($shared -isnot [Collections.IDictionary] -or
             [string]$shared.kind -cne
                 'devpilot-shared-review-acquisition-v1' -or
+            $shared.
+                includePullRequestTemplateAuthority -isnot
+                    [bool] -or
+            -not [bool]$shared.
+                includePullRequestTemplateAuthority -or
             [string]$shared.activePrIntakeSha256 -cne
                 [string]$toolkitBinding.activePrIntakeSha256 -or
             [string]$shared.contextualBridgeSha256 -cne

@@ -49,6 +49,12 @@ function Assert-ContextualBridgeConfig {
         [string]$Config.capability.id -cne $script:ContextualCapability -or
         [string]$Config.capability.implementationSha256 -cne
             $script:ContextualCapabilityDigest.Substring(10) -or
+        $Config.sharedAcquisition -isnot
+            [Collections.IDictionary] -or
+        $Config.sharedAcquisition.
+            includePullRequestTemplateAuthority -isnot [bool] -or
+        -not [bool]$Config.sharedAcquisition.
+            includePullRequestTemplateAuthority -or
         $Config.subjectProvider -isnot [Collections.IDictionary] -or
         $Config.discussionProvider -isnot [Collections.IDictionary]) {
         throw 'Contextual bridge requires exactly one fixed rule bundle.'

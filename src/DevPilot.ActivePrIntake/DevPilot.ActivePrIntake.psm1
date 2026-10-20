@@ -345,6 +345,18 @@ function Assert-IntakeConfig {
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
     }
+    if ($Config.Contains('sharedAcquisition')) {
+        $shared = $Config.sharedAcquisition
+        if ($shared -isnot
+                [Collections.IDictionary] -or
+            ($shared.Contains(
+                    'includePullRequestTemplateAuthority') -and
+                $shared.
+                    includePullRequestTemplateAuthority -isnot
+                        [bool])) {
+            throw 'Shared acquisition pull request template authority flag must be a Boolean.'
+        }
+    }
     if ($Config.Contains('cursorCompatibility')) {
         $compatibility = $Config.cursorCompatibility
         if ($compatibility -isnot [Collections.IDictionary] -or
@@ -2316,10 +2328,13 @@ function New-ActivePrAzureDevOpsProvider {
     $projectId = [string]$Config.projectId
     $repo = [string]$Config.repositoryId
     $requiresPullRequestTemplate =
-        @($Config.rules | Where-Object {
-                [string]$_.capability -ceq
-                    'bpm-contextual-conventions@1'
-            }).Count -eq 1
+        $Config.Contains('sharedAcquisition') -and
+        $Config.sharedAcquisition -is
+            [Collections.IDictionary] -and
+        $Config.sharedAcquisition.Contains(
+            'includePullRequestTemplateAuthority') -and
+        [bool]$Config.sharedAcquisition.
+            includePullRequestTemplateAuthority
     $maxFiles = [int]$Config.limits.maxChangedFiles
     $maxThreads = [int]$Config.limits.maxThreads
     $parseNumber = ${function:Assert-IntakeNumber}
@@ -2729,6 +2744,28 @@ print(json.dumps({
             throw 'response-invalid'
         }
     }.GetNewClosure()
+    $invokeItemsHttp = {
+        param(
+            [Parameter(Mandatory)][uri]$Uri,
+            [Parameter(Mandatory)][string]$Method,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Headers,
+            [Parameter(Mandatory)][int]$TimeoutSec,
+            [switch]$UseBasicParsing
+        )
+        $request = @{
+            Uri = $Uri
+            Method = $Method
+            Headers = $Headers
+            TimeoutSec = $TimeoutSec
+            UseBasicParsing =
+                [bool]$UseBasicParsing
+        }
+        if ($null -eq $HttpGetInvoker) {
+            return Invoke-WebRequest @request
+        }
+        return & $HttpGetInvoker @request
+    }.GetNewClosure()
     $invokeItemsGet = {
         param(
             [string]$Path,
@@ -2789,7 +2826,7 @@ print(json.dumps({
             ($query -join '&'))
         $transportReads.Count++
         try {
-            $response = Invoke-WebRequest `
+            $response = & $invokeItemsHttp `
                 -Uri $uri -Method Get `
                 -Headers @{
                     Authorization = "Bearer $token"

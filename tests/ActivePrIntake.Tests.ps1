@@ -29,6 +29,7 @@ BeforeAll {
             comments = @(); changeLines = 3; headVisits = @{}
             sourceContent = $null
             iteration = 1; commit = 'a' * 40
+            description = 'Initial PR description.'
             headStatus = @{}; headTarget = @{}; headDraft = @{} }
         $provider = {
             param($op, $request)
@@ -72,6 +73,9 @@ BeforeAll {
                             $state.headDraft[$id]
                         } else { $state.rows[$id - 1].isDraft }
                         sourceRef = 'refs/heads/feature'
+                        title = 'Synthetic PR'
+                        description =
+                            [string]$state.description
                         targetRef = if ($state.headTarget.ContainsKey($id)) {
                             $state.headTarget[$id]
                         } else { $state.rows[$id - 1].targetRef }
@@ -137,6 +141,201 @@ BeforeAll {
             } else { $null }),
             [EnvironmentVariableTarget]::Process)
     }
+    function New-TemplateAuthorityTransportCase {
+        param(
+            [ValidateSet(
+                'absent',
+                'false',
+                'true',
+                'malformed')]
+            [string]$Flag,
+            [switch]$NamedOnly
+        )
+        $config = Get-Content (
+            Join-Path $repo `
+                'samples\active-pr-intake.config.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $config.enabled = $true
+        $config.rules = @([ordered]@{
+                id =
+                    'bpm-contextual-conventions@1'
+                capability =
+                    'bpm-contextual-conventions@1'
+            })
+        if ($NamedOnly) {
+            $config.rules = @([ordered]@{
+                    id =
+                        'bpm-named-areequal-arguments@1'
+                    capability =
+                        'bpm-named-areequal-arguments@1'
+                })
+        }
+        $config['sharedAcquisition'] =
+            [ordered]@{
+                kind =
+                    'devpilot-shared-review-acquisition-v1'
+            }
+        switch ($Flag) {
+            false {
+                $config.sharedAcquisition[
+                    'includePullRequestTemplateAuthority'] =
+                        $false
+            }
+            true {
+                $config.sharedAcquisition[
+                    'includePullRequestTemplateAuthority'] =
+                        $true
+            }
+            malformed {
+                $config.sharedAcquisition[
+                    'includePullRequestTemplateAuthority'] =
+                        'true'
+            }
+        }
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\template-authority-pester-' +
+            [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory `
+                -Path $root -Force)
+        $script:roots.Add($root)
+        $log = Join-Path $root 'az.log'
+        $stub = Join-Path $root 'az.ps1'
+        @'
+[IO.File]::AppendAllText(
+    $env:ACTIVE_PR_TEMPLATE_AZ_LOG,
+    (($args -join '|') + "`n"))
+if ($args -contains 'get-access-token') {
+    @{ accessToken = ('x' * 128) } |
+        ConvertTo-Json -Compress
+    exit 0
+}
+if ($args -contains 'repositories') {
+    @{ defaultBranch = 'refs/heads/master' } |
+        ConvertTo-Json -Compress
+    exit 0
+}
+exit 9
+'@ | Set-Content -LiteralPath $stub `
+            -Encoding utf8
+        $httpLog =
+            [Collections.Generic.List[string]]::new()
+        $template = @'
+**Problem:**
+
+**Solution:**
+
+**Validation:**
+'@
+        $invoker = {
+            param($Uri, $Method, $Headers,
+                $TimeoutSec, $UseBasicParsing)
+            $uriText = [string]$Uri
+            [void]$httpLog.Add($uriText)
+            $contentType = 'application/json'
+            $content = if ($uriText -match
+                    '/pullRequests/1\?') {
+                [ordered]@{
+                    pullRequestId = 1
+                    title = 'Synthetic PR'
+                    description =
+                        'Synthetic description.'
+                    status = 'active'
+                    isDraft = $false
+                    sourceRefName =
+                        'refs/heads/feature'
+                    targetRefName =
+                        'refs/heads/master'
+                    repository = [ordered]@{
+                        id = $config.repositoryId
+                        project = [ordered]@{
+                            id = $config.projectId
+                        }
+                    }
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif ($uriText -match
+                '/pullRequests/1/iterations\?') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            id = 3
+                            sourceRefCommit =
+                                [ordered]@{
+                                    commitId = 'a' * 40
+                                }
+                            targetRefCommit =
+                                [ordered]@{
+                                    commitId = 'b' * 40
+                                }
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif ($uriText -match
+                    '/refs\?' -and
+                $uriText -match
+                    'filter=heads%2Ffeature') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            name =
+                                'refs/heads/feature'
+                            objectId = 'a' * 40
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif ($uriText -match
+                    '/refs\?' -and
+                $uriText -match
+                    'filter=heads%2Fmaster') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            name =
+                                'refs/heads/master'
+                            objectId = 'c' * 40
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif ($uriText -match
+                'scopePath=%2F\.azuredevops') {
+                [ordered]@{
+                    value = @(
+                        [ordered]@{
+                            path = '/.azuredevops'
+                            isFolder = $true
+                        },
+                        [ordered]@{
+                            path =
+                                '/.azuredevops/pull_request_template.txt'
+                            objectId = 'd' * 40
+                            isFolder = $false
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif ($uriText -match
+                'path=%2F\.azuredevops%2Fpull_request_template\.txt') {
+                $contentType = 'text/plain'
+                $template
+            }
+            else {
+                throw "Unexpected URI '$uriText'."
+            }
+            return [pscustomobject]@{
+                Content = $content
+                RawContentLength =
+                    [Text.Encoding]::UTF8.
+                        GetByteCount($content)
+                Headers = @{
+                    'Content-Type' = $contentType
+                }
+            }
+        }.GetNewClosure()
+        return [pscustomobject]@{
+            Config = $config
+            Stub = $stub
+            Log = $log
+            HttpLog = $httpLog
+            HttpInvoker = $invoker
+            Template = $template
+        }
+    }
 }
 AfterAll {
     foreach ($root in $script:roots) {
@@ -146,6 +345,174 @@ AfterAll {
     }
 }
 Describe 'Active PR read-only intake' {
+    It 'does not acquire template authority when the shared switch is <Flag>' -TestCases @(
+        @{ Flag = 'absent' }
+        @{ Flag = 'false' }
+    ) {
+        param($Flag)
+        $case =
+            New-TemplateAuthorityTransportCase `
+                -Flag $Flag
+        $previous = $env:ACTIVE_PR_TEMPLATE_AZ_LOG
+        try {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $case.Log
+            $provider =
+                New-ActivePrAzureDevOpsProvider `
+                    -Config $case.Config `
+                    -AzureCliPath $case.Stub `
+                    -HttpGetInvoker $case.HttpInvoker
+            $head = & $provider 'Head' @{
+                pullRequestId = 1
+                timeoutMilliseconds = 30000
+            }
+        }
+        finally {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $previous
+        }
+
+        $head.templateAuthority.state |
+            Should -BeExactly unknown
+        $head.templateAuthority.reason |
+            Should -BeExactly `
+                template-authority-unavailable
+        @($case.HttpLog | Where-Object {
+                $_ -match
+                    'heads%2Fmaster|scopePath=|pull_request_template'
+            }) | Should -HaveCount 0
+        (Get-Content -LiteralPath $case.Log -Raw) |
+            Should -Not -Match 'repositories'
+    }
+
+    It 'acquires exact template authority when the shared switch is true' {
+        $case =
+            New-TemplateAuthorityTransportCase `
+                -Flag true
+        $previous = $env:ACTIVE_PR_TEMPLATE_AZ_LOG
+        try {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $case.Log
+            $provider =
+                New-ActivePrAzureDevOpsProvider `
+                    -Config $case.Config `
+                    -AzureCliPath $case.Stub `
+                    -HttpGetInvoker $case.HttpInvoker
+            $head = & $provider 'Head' @{
+                pullRequestId = 1
+                timeoutMilliseconds = 30000
+            }
+        }
+        finally {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $previous
+        }
+        $expectedDescription =
+            'v1:sha256:' +
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.UTF8Encoding]::new($false).
+                        GetBytes(
+                            'Synthetic description.'))).
+                ToLowerInvariant()
+        $expectedTemplate =
+            'v1:sha256:' +
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.UTF8Encoding]::new($false).
+                        GetBytes($case.Template))).
+                ToLowerInvariant()
+
+        $head.title |
+            Should -BeExactly 'Synthetic PR'
+        $head.descriptionDigest |
+            Should -BeExactly $expectedDescription
+        $head.templateAuthority.state |
+            Should -BeExactly complete `
+                -Because (
+                    [ordered]@{
+                        reason =
+                            $head.templateAuthority.reason
+                        az = $(if (
+                            Test-Path $case.Log) {
+                            Get-Content $case.Log -Raw
+                        }
+                        else { '' })
+                        http = @($case.HttpLog)
+                    } | ConvertTo-Json `
+                        -Depth 8 -Compress)
+        $head.templateAuthority.path |
+            Should -BeExactly (
+                '/.azuredevops/pull_request_template.txt')
+        $head.templateAuthority.configurationRef |
+            Should -BeExactly refs/heads/master
+        $head.templateAuthority.configurationCommit |
+            Should -BeExactly ('c' * 40)
+        $head.templateAuthority.blob |
+            Should -BeExactly ('d' * 40)
+        $head.templateAuthority.contentDigest |
+            Should -BeExactly $expectedTemplate
+        (Get-Content -LiteralPath $case.Log -Raw) |
+            Should -Match 'repositories'
+    }
+
+    It 'acquires template authority for a Named-only rule roster when the shared switch is true' {
+        $case =
+            New-TemplateAuthorityTransportCase `
+                -Flag true -NamedOnly
+        $previous = $env:ACTIVE_PR_TEMPLATE_AZ_LOG
+        try {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $case.Log
+            $provider =
+                New-ActivePrAzureDevOpsProvider `
+                    -Config $case.Config `
+                    -AzureCliPath $case.Stub `
+                    -HttpGetInvoker $case.HttpInvoker
+            $head = & $provider 'Head' @{
+                pullRequestId = 1
+                timeoutMilliseconds = 30000
+            }
+        }
+        finally {
+            $env:ACTIVE_PR_TEMPLATE_AZ_LOG =
+                $previous
+        }
+
+        $case.Config.rules[0].capability |
+            Should -BeExactly `
+                bpm-named-areequal-arguments@1
+        $head.templateAuthority.state |
+            Should -BeExactly complete `
+                -Because (
+                    [ordered]@{
+                        reason =
+                            $head.templateAuthority.reason
+                        az = $(if (
+                            Test-Path $case.Log) {
+                            Get-Content $case.Log -Raw
+                        }
+                        else { '' })
+                        http = @($case.HttpLog)
+                    } | ConvertTo-Json `
+                        -Depth 8 -Compress)
+        $head.templateAuthority.blob |
+            Should -BeExactly ('d' * 40)
+    }
+
+    It 'rejects a malformed shared template authority switch' {
+        $case =
+            New-TemplateAuthorityTransportCase `
+                -Flag malformed
+        {
+            New-ActivePrAzureDevOpsProvider `
+                -Config $case.Config `
+                -AzureCliPath $case.Stub `
+                -HttpGetInvoker $case.HttpInvoker
+        } | Should -Throw (
+            '*template authority flag must be a Boolean*')
+    }
+
     It 'resumes a single retained project context and preserves completed progress' {
         $c = New-IntakeCase -Count 1 `
             -MaxHeads 1
@@ -308,6 +675,15 @@ Describe 'Active PR read-only intake' {
             Should -Be 2
         @($reusedProgress.entries) |
             Should -HaveCount 2
+
+        $state.description =
+            'Edited PR description without a head change.'
+        $fourth = Invoke-IntakeCase $c
+        $fourth.heads[0].reasonCode |
+            Should -BeExactly `
+                'file-progress-pending'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2, 0)
     }
 
     It 'records one bounded local-stage diagnostic per failed pull request' {
