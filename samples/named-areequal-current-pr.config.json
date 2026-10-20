@@ -60,6 +60,7 @@
     "includePullRequestTemplateAuthority": true
   },
   "autoCreateNamedAreEqualComments": false,
+  "stalePullRequestLifecycle": false,
   "limits": {
     "pageSize": 50,
     "maxPages": 512,
