@@ -59,7 +59,7 @@
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
     "includePullRequestTemplateAuthority": true,
-    "activePrIntakeSha256": "f669b6276567737f5e2b2010a183f865db367c3adc62f671c9231b59dca969f1",
+    "activePrIntakeSha256": "8b155001eb57c774dab05bf74f5a863d86dbf2401e878a78b48ca68f31b36796",
     "contextualBridgeSha256": "5ff7904ad6914104ef21ac522d99a7ff3448a61bf7eff7f4f44058dddada26d7",
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },

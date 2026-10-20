@@ -900,6 +900,23 @@ Describe 'Active PR read-only intake' {
         } $currentHead
         $legacyBinding |
             Should -BeExactly $currentBinding
+        $state.rows =
+            @($state.rows[0], $state.rows[0])
+        $transition = Invoke-IntakeCase $c
+        $transition.reasonCodes |
+            Should -Contain 'missing-page'
+        $transition.heads |
+            Should -HaveCount 0
+        @($transition.binding.configLineage) |
+            Should -Be @(
+                [string]$transition.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
+        @($transition.binding.
+                fileProgressMigrationProofs) |
+            Should -HaveCount 1
+        $state.rows = @($state.rows[0])
         $third = Invoke-IntakeCase $c
 
         $first.heads[0].fileProgress.
@@ -914,6 +931,12 @@ Describe 'Active PR read-only intake' {
                             -Depth 16 -Compress)
         @($state.starts) |
             Should -Be @(0, 16, 32)
+        @($third.binding.configLineage) |
+            Should -Be @(
+                [string]$third.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
         $third.heads[0].declaration.
             templateAuthority.configurationCommit |
             Should -BeExactly ('9' * 40)
@@ -936,6 +959,14 @@ Describe 'Active PR read-only intake' {
             Should -BeExactly rules-incomplete
         @($state.starts) |
             Should -Be @(0, 16, 32, 48)
+        @($fourth.binding.configLineage) |
+            Should -Be @(
+                [string]$fourth.binding.
+                    configDigest,
+                [string]$third.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
 
         [void]$c.config.Remove(
             'cursorCompatibility')
@@ -946,6 +977,27 @@ Describe 'Active PR read-only intake' {
             processedFiles | Should -Be 16
         @($state.starts) |
             Should -Be @(0, 16, 32, 48, 0)
+        @($fifth.binding.configLineage) |
+            Should -Be @(
+                [string]$fifth.binding.
+                    configDigest)
+
+        $foreignProgress =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $foreignProgress.configDigest =
+            '9' * 64
+        [IO.File]::WriteAllText(
+            $progressPath,
+            (ConvertTo-Json `
+                -InputObject $foreignProgress `
+                -Depth 64))
+        $foreign = Invoke-IntakeCase $c
+        $foreign.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48, 0, 0)
 
         $state.commit = 'c' * 40
         $state.iteration = 2
@@ -953,7 +1005,192 @@ Describe 'Active PR read-only intake' {
         $sixth.heads[0].fileProgress.
             processedFiles | Should -Be 16
         @($state.starts) |
-            Should -Be @(0, 16, 32, 48, 0, 0)
+            Should -Be @(0, 16, 32, 48, 0, 0, 0)
+
+        $legacyWithoutProof =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyWithoutProof.schemaVersion = 2
+        [void]$legacyWithoutProof.Remove(
+            'fileProgressBindingDigest')
+        [IO.File]::WriteAllText(
+            $progressPath,
+            (ConvertTo-Json `
+                -InputObject $legacyWithoutProof `
+                -Depth 64))
+        $c.config.toolkit.head = '1' * 40
+        $c.config.toolkit.tree = '2' * 40
+        $c.config.cursorCompatibility =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$sixth.binding.
+                        configDigest
+                previousToolkitHead = 'e' * 40
+                previousToolkitTree = 'f' * 40
+            }
+        $state.rows =
+            @($state.rows[0], $state.rows[0])
+        $proofTransition =
+            Invoke-IntakeCase $c
+        @($proofTransition.binding.
+                fileProgressMigrationProofs) |
+            Should -HaveCount 1
+        $cohortPath = Join-Path $c.root `
+            'active-pr-intake-v1\cohort.json'
+        $cohort =
+            Get-Content $cohortPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $cohort.binding.
+            fileProgressMigrationProofs = @()
+        $cohortJson =
+            ConvertTo-Json -InputObject $cohort `
+                -Depth 64
+        [IO.File]::WriteAllText(
+            $cohortPath, $cohortJson)
+        [IO.File]::WriteAllText(
+            (Join-Path (
+                    Join-Path $c.root `
+                        'active-pr-intake-v1') `
+                $proofTransition.generationFile),
+            $cohortJson)
+        $state.rows = @($state.rows[0])
+        $withoutProof =
+            Invoke-IntakeCase $c
+        $withoutProof.heads[0].
+            fileProgress.processedFiles |
+            Should -Be 16
+        @($state.starts) |
+            Should -Be @(
+                0, 16, 32, 48, 0, 0, 0, 0)
+    }
+
+    It 'fails closed on malformed duplicate foreign or over-cap config lineage' {
+        $mutations = @(
+            @{
+                name = 'malformed'
+                apply = {
+                    param($cohort)
+                    $cohort.binding.configLineage =
+                        @('not-a-digest')
+                }
+            },
+            @{
+                name = 'duplicate'
+                apply = {
+                    param($cohort)
+                    $digest =
+                        [string]$cohort.binding.
+                            configDigest
+                    $cohort.binding.configLineage =
+                        @($digest, $digest)
+                }
+            },
+            @{
+                name = 'foreign-current'
+                apply = {
+                    param($cohort)
+                    $foreign = 'f' * 64
+                    $cohort.binding.configLineage =
+                        @($foreign)
+                }
+            },
+            @{
+                name = 'over-cap'
+                apply = {
+                    param($cohort)
+                    $current =
+                        [string]$cohort.binding.
+                            configDigest
+                    $firstPrior = '1' * 64
+                    $secondPrior = '2' * 64
+                    $thirdPrior = '3' * 64
+                    $cohort.binding.configLineage =
+                        @(
+                            $current,
+                            $firstPrior,
+                            $secondPrior,
+                            $thirdPrior)
+                }
+            },
+            @{
+                name = 'malformed-proof'
+                apply = {
+                    param($cohort)
+                    $cohort.binding.
+                        fileProgressMigrationProofs =
+                        @([ordered]@{
+                                pullRequestId = 1
+                                configDigest =
+                                    [string]$cohort.
+                                        binding.
+                                        configDigest
+                                declarationDigest =
+                                    'not-a-digest'
+                                fileProgressBindingDigest =
+                                    '1' * 64
+                            })
+                }
+            },
+            @{
+                name = 'over-cap-proofs'
+                apply = {
+                    param($cohort)
+                    $proofs = @(
+                        for ($id = 1;
+                            $id -le 4;
+                            $id++) {
+                            [ordered]@{
+                                pullRequestId = $id
+                                configDigest =
+                                    [string]$cohort.
+                                        binding.
+                                        configDigest
+                                declarationDigest =
+                                    $id.ToString('x64')
+                                fileProgressBindingDigest =
+                                    ($id + 4).
+                                        ToString('x64')
+                            }
+                        })
+                    $cohort.binding.
+                        fileProgressMigrationProofs =
+                        $proofs
+                }
+            })
+
+        foreach ($mutation in $mutations) {
+            $c = New-IntakeCase -Count 1 `
+                -MaxHeads 1
+            $c.config.limits.
+                maxPullRequests = 1
+            $first = Invoke-IntakeCase $c
+            $cohortPath = Join-Path $c.root `
+                'active-pr-intake-v1\cohort.json'
+            $generationPath = Join-Path (
+                Join-Path $c.root `
+                    'active-pr-intake-v1') `
+                $first.generationFile
+            $cohort =
+                Get-Content $cohortPath -Raw |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 64
+            & $mutation.apply $cohort
+            $mutatedJson =
+                ConvertTo-Json `
+                    -InputObject $cohort `
+                    -Depth 64
+            [IO.File]::WriteAllText(
+                $cohortPath, $mutatedJson)
+            [IO.File]::WriteAllText(
+                $generationPath, $mutatedJson)
+
+            {
+                Invoke-IntakeCase $c
+            } | Should -Throw `
+                -Because $mutation.name
+        }
     }
 
     It 'records one bounded local-stage diagnostic per failed pull request' {
