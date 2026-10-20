@@ -41,6 +41,35 @@ function Get-IntakeTextDigest {
         ToLowerInvariant()
 }
 
+function Get-IntakeFileProgressBindingDigest {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Head
+    )
+    return Get-IntakeDigest ([ordered]@{
+            repositoryId =
+                [string]$Head.repositoryId
+            projectId =
+                [string]$Head.projectId
+            pullRequestId =
+                [long]$Head.pullRequestId
+            sourceRef =
+                [string]$Head.sourceRef
+            targetRef =
+                [string]$Head.targetRef
+            sourceCommit =
+                [string]$Head.sourceCommit
+            targetCommit =
+                [string]$Head.targetCommit
+            iterationId =
+                [int]$Head.iterationId
+            status =
+                [string]$Head.status
+            isDraft =
+                [bool]$Head.isDraft
+        })
+}
+
 function New-IntakeTransportFailure {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -1323,6 +1352,9 @@ function Invoke-ActivePrIntake {
                             $entry.targetRef = $before.targetRef
                             $entry.declaration = $before
                             $entry.declarationDigest = Get-IntakeDigest $before
+                            $fileProgressBindingDigest =
+                                Get-IntakeFileProgressBindingDigest `
+                                    -Head $before
                             foreach ($ruleResult in $entry.rules) {
                                 $ruleResult.identityDigest = Get-IntakeRuleIdentity `
                                     $before $ruleResult.id $ruleResult.capability `
@@ -1379,9 +1411,50 @@ function Invoke-ActivePrIntake {
                                         ConvertFrom-Json `
                                             -AsHashtable `
                                             -Depth 64
+                                    $priorProgressBindingDigest =
+                                        if (
+                                            [int]$priorProgress.
+                                                schemaVersion -eq 3 -and
+                                            $priorProgress.Contains(
+                                                'fileProgressBindingDigest') -and
+                                            [string]$priorProgress[
+                                                'fileProgressBindingDigest'] -cmatch
+                                                '^[0-9a-f]{64}$') {
+                                            [string]$priorProgress[
+                                                'fileProgressBindingDigest']
+                                        }
+                                        elseif (
+                                            [int]$priorProgress.
+                                                schemaVersion -eq 2 -and
+                                            $previous -and
+                                            [string]$priorProgress.
+                                                declarationDigest -cmatch
+                                                '^[0-9a-f]{64}$') {
+                                            $priorHeads = @(
+                                                $previous.heads |
+                                                    Where-Object {
+                                                        [long]$_.
+                                                            pullRequestId -eq
+                                                            $id -and
+                                                        $_.declaration -is
+                                                            [Collections.IDictionary] -and
+                                                        [string]$_.
+                                                            declarationDigest -ceq
+                                                            [string]$priorProgress.
+                                                                declarationDigest
+                                                    })
+                                            if ($priorHeads.Count -eq 1) {
+                                                Get-IntakeFileProgressBindingDigest `
+                                                    -Head (
+                                                        $priorHeads[0].
+                                                            declaration)
+                                            }
+                                            else { $null }
+                                        }
+                                        else { $null }
                                     if (
                                         [int]$priorProgress.
-                                            schemaVersion -ne 2 -or
+                                            schemaVersion -notin @(2, 3) -or
                                         [string]$priorProgress.kind -cne
                                             'active-pr-file-progress' -or
                                         [long]$priorProgress.
@@ -1391,10 +1464,8 @@ function Invoke-ActivePrIntake {
                                             [string]$envelope.
                                                 binding.
                                                 configDigest -or
-                                        [string]$priorProgress.
-                                            declarationDigest -cne
-                                            [string]$entry.
-                                                declarationDigest -or
+                                        [string]$priorProgressBindingDigest -cne
+                                            $fileProgressBindingDigest -or
                                         [int]$priorProgress.
                                             nextOrdinal -lt 1 -or
                                         [int]$priorProgress.
@@ -1592,7 +1663,7 @@ function Invoke-ActivePrIntake {
                                     }
                                     $progressRecord =
                                         [ordered]@{
-                                            schemaVersion = 2
+                                            schemaVersion = 3
                                             kind =
                                                 'active-pr-file-progress'
                                             pullRequestId = $id
@@ -1603,6 +1674,8 @@ function Invoke-ActivePrIntake {
                                             declarationDigest =
                                                 [string]$entry.
                                                     declarationDigest
+                                            fileProgressBindingDigest =
+                                                $fileProgressBindingDigest
                                             inventoryDigest =
                                                 [string]$fileProgress.
                                                     inventoryDigest

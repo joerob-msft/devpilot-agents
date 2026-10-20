@@ -1201,6 +1201,433 @@ $httpGet = {
         } | Should -Throw 'invalid-head'
     }
 
+    It 'resumes a single retained project context and preserves completed progress' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $c.config.rules = @(
+            [ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            }
+        )
+        $c.config.sharedAcquisition =
+            [ordered]@{
+                includePullRequestTemplateAuthority =
+                    $true
+            }
+        $context = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            content =
+                '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+            byteLength = 82
+            sourceDigest =
+                'v1:sha256:' + ('1' * 64)
+        }
+        $state = $c.state
+        $baseProvider = $c.provider
+        $state['changeStarts'] =
+            [Collections.Generic.List[int]]::new()
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes') {
+                return & $baseProvider `
+                    $op $request
+            }
+            $start = [int]$request.
+                fileStartOrdinal
+            [void]$state.changeStarts.Add(
+                $start)
+            $entries = @(switch ($start) {
+                    0 {
+                        [ordered]@{
+                            changeTrackingId = 1
+                            path = 'src/A.cs'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('2' * 64)
+                                })
+                            content = 'class A {}'
+                            byteLength = 10
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('3' * 64)
+                            projectContext =
+                                $context
+                        }
+                        break
+                    }
+                    1 {
+                        [ordered]@{
+                            changeTrackingId = 2
+                            path = 'src/B.csproj'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('4' * 64)
+                                })
+                            content = '<Project />'
+                            byteLength = 11
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('5' * 64)
+                        }
+                        break
+                    }
+                    2 { break }
+                    default {
+                        throw "Unexpected file ordinal '$start'."
+                    }
+                })
+            return [ordered]@{
+                changedFiles = $entries.Count
+                changedLines =
+                    $entries.Count
+                entries = $entries
+                projectContexts = $(if (
+                    $start -eq 0) {
+                    @($context)
+                }
+                else { @() })
+                inventory = @(
+                    [ordered]@{
+                        changeTrackingId = 1
+                        path = 'src/A.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    },
+                    [ordered]@{
+                        changeTrackingId = 2
+                        path = 'src/B.csproj'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'contextual-project-metadata'
+                    })
+                fileProgress = [ordered]@{
+                    inventoryDigest = '6' * 64
+                    evidencePlanDigest = '7' * 64
+                    totalFiles = 2
+                    totalInventoryFiles = 2
+                    startOrdinal = $start
+                    nextOrdinal =
+                        $start + $entries.Count
+                    complete =
+                        $start -ge 1
+                    cumulativeChangedLines =
+                        [Math]::Min(2,
+                            $start +
+                            $entries.Count)
+                }
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $first.heads[0].reasonCode |
+            Should -BeExactly `
+                'file-progress-pending'
+        $second = Invoke-IntakeCase $c
+        $second.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $completedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $completedProgress.nextOrdinal |
+            Should -Be 2
+        @($completedProgress.entries) |
+            Should -HaveCount 2
+        @($completedProgress.projectContexts) |
+            Should -HaveCount 1
+
+        $third = Invoke-IntakeCase $c
+        $third.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2)
+        $reusedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $reusedProgress.nextOrdinal |
+            Should -Be 2
+        @($reusedProgress.entries) |
+            Should -HaveCount 2
+
+        $state.description =
+            'Edited PR description without a head change.'
+        $state['templateCommit'] =
+            '9' * 40
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($op, $request)
+            $value = & $baseProvider $op $request
+            if ($op -ceq 'Head') {
+                $value.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '8' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+            }
+            return $value
+        }.GetNewClosure()
+        $fourth = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $c.provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo `
+            -IncludeTransientSnapshots -Run
+        $fourth.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2, 2)
+        $fourth.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+        $fourth.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly $state.templateCommit
+        $sharedHead =
+            $fourth.transientSnapshots['1'].head
+        $sharedHead.description |
+            Should -BeExactly $state.description
+        $sharedHead.templateAuthority.
+            configurationCommit |
+            Should -BeExactly $state.templateCommit
+    }
+
+    It 'continues 32-file progress across metadata-only template commit drift and resets on a code head change' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $c.config.limits.maxChangedFiles = 64
+        $state = $c.state
+        $state['templateCommit'] = '8' * 40
+        $state['starts'] =
+            [Collections.Generic.List[int]]::new()
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($operation, $request)
+            if ($operation -ceq 'Head') {
+                $head = & $baseProvider `
+                    $operation $request
+                $head.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '7' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+                return $head
+            }
+            if ($operation -ceq 'Changes') {
+                $start =
+                    [int]$request.fileStartOrdinal
+                [void]$state.starts.Add($start)
+                $count = [Math]::Min(
+                    16, 48 - $start)
+                $entries = @(
+                    for ($offset = 0;
+                        $offset -lt $count;
+                        $offset++) {
+                        $ordinal =
+                            $start + $offset + 1
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            state = 'complete'
+                            spans = @()
+                            content = $null
+                            byteLength = 0
+                            sourceDigest =
+                                'v1:sha256:' +
+                                $ordinal.ToString(
+                                    'x64')
+                        }
+                    })
+                $inventory = @(
+                    for ($ordinal = 1;
+                        $ordinal -le 48;
+                        $ordinal++) {
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            originalPath = $null
+                            evidenceDisposition =
+                                'required'
+                            evidenceReason =
+                                'deleted-change'
+                        }
+                    })
+                return [ordered]@{
+                    changedFiles = $count
+                    changedLines = 0
+                    entries = $entries
+                    projectContexts = @()
+                    inventory = $inventory
+                    fileProgress = [ordered]@{
+                        inventoryDigest =
+                            '1' * 64
+                        evidencePlanDigest =
+                            '2' * 64
+                        totalFiles = 48
+                        totalInventoryFiles = 48
+                        startOrdinal = $start
+                        nextOrdinal =
+                            $start + $count
+                        complete =
+                            ($start + $count) -ge 48
+                        cumulativeChangedLines = 0
+                    }
+                }
+            }
+            return & $baseProvider `
+                $operation $request
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $second = Invoke-IntakeCase $c
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $legacyProgress =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyProgress.schemaVersion = 2
+        [void]$legacyProgress.Remove(
+            'fileProgressBindingDigest')
+        $legacyBytes =
+            [Text.UTF8Encoding]::new(
+                $false).GetBytes(
+                (ConvertTo-Json `
+                    -InputObject $legacyProgress `
+                    -Depth 64))
+        $legacyTemp =
+            "$progressPath.legacy"
+        [IO.File]::WriteAllBytes(
+            $legacyTemp, $legacyBytes)
+        [IO.File]::Move(
+            $legacyTemp, $progressPath, $true)
+        $previousCohort =
+            Get-Content (
+                Join-Path $c.root `
+                    'active-pr-intake-v1\cohort.json') `
+                -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyHead = @(
+            $previousCohort.heads |
+                Where-Object {
+                    [string]$_.declarationDigest -ceq
+                        [string]$legacyProgress.
+                            declarationDigest
+                })
+        $legacyHead | Should -HaveCount 1
+        $legacyBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $legacyHead[0].declaration
+        $state.templateCommit = '9' * 40
+        $state.description =
+            'Fresh metadata with identical template bytes.'
+        $currentHead = & $c.provider Head @{
+            pullRequestId = 1
+        }
+        $currentBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $currentHead
+        $legacyBinding |
+            Should -BeExactly $currentBinding
+        $third = Invoke-IntakeCase $c
+
+        $first.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        $second.heads[0].fileProgress.
+            processedFiles | Should -Be 32
+        $third.heads[0].reasonCode |
+            Should -BeExactly rules-incomplete `
+                -Because (
+                    $third |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        @($state.starts) |
+            Should -Be @(0, 16, 32)
+        $third.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly ('9' * 40)
+        $third.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+
+        $state.commit = 'c' * 40
+        $state.iteration = 2
+        $fourth = Invoke-IntakeCase $c
+        $fourth.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 0)
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }
