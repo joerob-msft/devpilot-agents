@@ -1075,6 +1075,21 @@ function Invoke-ActivePrIntake {
         $previous = $null
         $cursorBindingCompatible = $false
         $cursorTransitionApplied = $false
+        $currentConfigDigest =
+            Get-IntakeDigest $Config
+        $maximumPullRequests =
+            [long]$Config.limits.
+                maxPullRequests
+        if ($maximumPullRequests -gt
+            [long]::MaxValue / 3L) {
+            throw 'Invalid limits.maxPullRequests.'
+        }
+        $maximumMigrationProofs =
+            [Math]::Min(
+                20000L,
+                $maximumPullRequests * 3L)
+        $previousConfigLineage = @()
+        $previousMigrationProofs = @()
         if (Test-Path -LiteralPath $path) {
             $file = Get-Item -LiteralPath $path -Force
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -gt 8388608) {
@@ -1111,7 +1126,71 @@ function Invoke-ActivePrIntake {
                 [string]$previous.binding.repositoryId -ine [string]$Config.repositoryId) {
                 throw 'Intake state is bound to a different repository.'
             }
-            $currentConfigDigest = Get-IntakeDigest $Config
+            $previousConfigLineage = @(
+                if ($previous.binding.Contains(
+                        'configLineage')) {
+                    $previous.binding.
+                        configLineage
+                }
+                else {
+                    [string]$previous.binding.
+                        configDigest
+                })
+            if ($previousConfigLineage.Count -lt 1 -or
+                $previousConfigLineage.Count -gt 3 -or
+                @($previousConfigLineage |
+                    Sort-Object -Unique `
+                        -CaseSensitive).Count -ne
+                    $previousConfigLineage.Count -or
+                @($previousConfigLineage |
+                    Where-Object {
+                        [string]$_ -cnotmatch
+                            '^[0-9a-f]{64}$'
+                    }).Count -ne 0 -or
+                [string]$previousConfigLineage[0] -cne
+                    [string]$previous.binding.
+                        configDigest) {
+                throw 'Previous intake config lineage is invalid.'
+            }
+            if ($previous.binding.Contains(
+                    'fileProgressMigrationProofs')) {
+                $previousMigrationProofs =
+                    @($previous.binding.
+                        fileProgressMigrationProofs)
+                $proofKeys =
+                    [Collections.Generic.HashSet[string]]::new(
+                        [StringComparer]::Ordinal)
+                if ([long]$previousMigrationProofs.Count -gt
+                    $maximumMigrationProofs) {
+                    throw 'Previous intake progress migration proofs are invalid.'
+                }
+                foreach ($proof in
+                    $previousMigrationProofs) {
+                    if ($proof -isnot
+                            [Collections.IDictionary] -or
+                        $proof.Count -ne 4 -or
+                        [long]$proof.pullRequestId -lt 1 -or
+                        [string]$proof.configDigest -cnotmatch
+                            '^[0-9a-f]{64}$' -or
+                        [string]$proof.configDigest -cnotin
+                            $previousConfigLineage -or
+                        [string]$proof.declarationDigest -cnotmatch
+                            '^[0-9a-f]{64}$' -or
+                        [string]$proof.
+                            fileProgressBindingDigest -cnotmatch
+                            '^[0-9a-f]{64}$') {
+                        throw 'Previous intake progress migration proofs are invalid.'
+                    }
+                    $proofKey =
+                        "$([long]$proof.pullRequestId)|" +
+                        "$([string]$proof.configDigest)|" +
+                        "$([string]$proof.declarationDigest)"
+                    if (-not $proofKeys.Add(
+                            $proofKey)) {
+                        throw 'Previous intake progress migration proofs are invalid.'
+                    }
+                }
+            }
             $cursorBindingCompatible =
                 [string]$previous.binding.configDigest -ceq
                     $currentConfigDigest
@@ -1125,6 +1204,128 @@ function Invoke-ActivePrIntake {
                 $cursorBindingCompatible = $true
                 $cursorTransitionApplied = $true
             }
+        }
+        $lineage =
+            [Collections.Generic.List[string]]::new()
+        [void]$lineage.Add(
+            $currentConfigDigest)
+        if ($previous -and (
+                $cursorBindingCompatible -or
+                $cursorTransitionApplied)) {
+            foreach ($digest in
+                $previousConfigLineage) {
+                if ($lineage.Count -ge 3) {
+                    break
+                }
+                if (-not $lineage.Contains(
+                        [string]$digest)) {
+                    [void]$lineage.Add(
+                        [string]$digest)
+                }
+            }
+        }
+        $migrationProofCandidates =
+            [Collections.Generic.List[object]]::new()
+        foreach ($proof in
+            $previousMigrationProofs) {
+            [void]$migrationProofCandidates.Add(
+                $proof)
+        }
+        if ($previous) {
+            foreach ($head in
+                @($previous.heads)) {
+                if ($head.declaration -is
+                        [Collections.IDictionary] -and
+                    [long]$head.pullRequestId -ge 1 -and
+                    [string]$head.declarationDigest -cmatch
+                        '^[0-9a-f]{64}$') {
+                    $migrationBindingDigest =
+                        Get-IntakeFileProgressBindingDigest `
+                            -Head $head.declaration
+                    [void]$migrationProofCandidates.Add(
+                        [ordered]@{
+                            pullRequestId =
+                                [long]$head.
+                                    pullRequestId
+                            configDigest =
+                                [string]$previous.
+                                    binding.
+                                    configDigest
+                            declarationDigest =
+                                [string]$head.
+                                    declarationDigest
+                            fileProgressBindingDigest =
+                                $migrationBindingDigest
+                        })
+                }
+            }
+        }
+        if ([long]$migrationProofCandidates.Count -gt
+            $maximumMigrationProofs) {
+            throw 'Intake progress migration proof candidates exceed the supported bound.'
+        }
+        $migrationProofs =
+            [Collections.Generic.List[object]]::new()
+        $migrationProofKeys =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
+        foreach ($proof in
+            $migrationProofCandidates) {
+            if ([string]$proof.configDigest -cnotin
+                    $lineage) {
+                continue
+            }
+            $proofProgressPath = Join-Path `
+                $fileProgressRoot `
+                "$([long]$proof.pullRequestId).json"
+            if (-not (Test-Path -LiteralPath `
+                    $proofProgressPath -PathType Leaf)) {
+                continue
+            }
+            $proofProgressFile =
+                Get-Item -LiteralPath `
+                    $proofProgressPath -Force
+            if ($proofProgressFile.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint -or
+                $proofProgressFile.Length -gt
+                    33554432) {
+                throw 'file-progress-invalid'
+            }
+            [void](
+                Assert-AgentTrustedFile `
+                    -Path $proofProgressPath `
+                    -AllowedRoot $fileProgressRoot `
+                    -Private)
+            $proofProgress =
+                Get-Content -LiteralPath `
+                    $proofProgressPath -Raw |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 64
+            if ([int]$proofProgress.schemaVersion -ne
+                    2 -or
+                [string]$proofProgress.kind -cne
+                    'active-pr-file-progress' -or
+                [long]$proofProgress.pullRequestId -ne
+                    [long]$proof.pullRequestId -or
+                [string]$proofProgress.configDigest -cne
+                    [string]$proof.configDigest -or
+                [string]$proofProgress.declarationDigest -cne
+                    [string]$proof.declarationDigest) {
+                continue
+            }
+            $proofKey =
+                "$([long]$proof.pullRequestId)|" +
+                "$([string]$proof.configDigest)|" +
+                "$([string]$proof.declarationDigest)"
+            if ($migrationProofKeys.Add(
+                    $proofKey)) {
+                [void]$migrationProofs.Add(
+                    $proof)
+            }
+        }
+        if ([long]$migrationProofs.Count -gt
+            $maximumMigrationProofs) {
+            throw 'Intake progress migration proofs exceed the supported bound.'
         }
         $effectiveMaximumHeads = if ($MaximumHeadsThisRun -gt 0) {
             $MaximumHeadsThisRun
@@ -1165,7 +1366,11 @@ function Invoke-ActivePrIntake {
                 organization = [string]$Config.organization
                 projectId = ([string]$Config.projectId).ToLowerInvariant()
                 repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
-                configDigest = Get-IntakeDigest $Config
+                configDigest = $currentConfigDigest
+                configLineage =
+                    $lineage.ToArray()
+                fileProgressMigrationProofs =
+                    $migrationProofs.ToArray()
                 cursorSourceConfigDigest = $(if ($previous) {
                         [string]$previous.binding.configDigest
                     } else { $null })
@@ -1506,47 +1711,38 @@ function Invoke-ActivePrIntake {
                                         elseif (
                                             [int]$priorProgress.
                                                 schemaVersion -eq 2 -and
-                                            $previous -and
                                             [string]$priorProgress.
                                                 declarationDigest -cmatch
                                                 '^[0-9a-f]{64}$') {
-                                            $priorHeads = @(
-                                                $previous.heads |
+                                            $priorProofs = @(
+                                                $envelope.binding.
+                                                    fileProgressMigrationProofs |
                                                     Where-Object {
                                                         [long]$_.
                                                             pullRequestId -eq
                                                             $id -and
-                                                        $_.declaration -is
-                                                            [Collections.IDictionary] -and
+                                                        [string]$_.
+                                                            configDigest -ceq
+                                                            [string]$priorProgress.
+                                                                configDigest -and
                                                         [string]$_.
                                                             declarationDigest -ceq
                                                             [string]$priorProgress.
                                                                 declarationDigest
                                                     })
-                                            if ($priorHeads.Count -eq 1) {
-                                                Get-IntakeFileProgressBindingDigest `
-                                                    -Head (
-                                                        $priorHeads[0].
-                                                            declaration)
+                                            if ($priorProofs.Count -eq 1) {
+                                                [string]$priorProofs[0].
+                                                    fileProgressBindingDigest
                                             }
                                             else { $null }
                                         }
                                         else { $null }
                                         $priorProgressConfigCompatible =
                                             [string]$priorProgress.
-                                                configDigest -ceq
-                                                [string]$envelope.
+                                                configDigest -cin
+                                                @($envelope.
                                                     binding.
-                                                    configDigest -or
-                                            ([bool]$envelope.binding.
-                                                    cursorTransitionApplied -and
-                                                [string]$envelope.binding.
-                                                    cursorSourceConfigDigest -cmatch
-                                                    '^[0-9a-f]{64}$' -and
-                                                [string]$priorProgress.
-                                                    configDigest -ceq
-                                                    [string]$envelope.binding.
-                                                        cursorSourceConfigDigest)
+                                                    configLineage)
                                         if (
                                         [int]$priorProgress.
                                             schemaVersion -notin @(2, 3) -or
