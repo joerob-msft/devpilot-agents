@@ -1,0 +1,113 @@
+# Stale pull request lifecycle
+
+The stale pull request lifecycle is a bounded phase of shared review
+acquisition. It runs after the existing two-pass active pull request inventory
+is reconciled and before any review head, changed file, or discussion
+acquisition. It does not add a task, worker, model, or polling loop.
+
+The feature is disabled by default. This change does not authorize a deployed
+policy, create a production key, update the scheduled task, or abandon a live
+pull request.
+
+## Eligibility
+
+One UTC cutoff is frozen for each run:
+
+```powershell
+[DateTime]::UtcNow.AddYears(-1)
+```
+
+An AzureUX-BPM pull request is eligible only when all of these facts are
+proven:
+
+- its status is `active`;
+- it is not a draft;
+- its target is exactly `refs/heads/master`;
+- its creation time is strictly before the cutoff; and
+- its latest counted activity is at or before the cutoff.
+
+Counted activity is deliberately limited to:
+
+- source push occurrence time from the pull request iteration push;
+- iteration creation and update time; and
+- publication, reply, or content/update time of an actual non-system comment
+  by any actor, including automation.
+
+Commit author and committer dates are never push evidence. PR title,
+description, labels, votes, service statuses, and system-only thread events do
+not refresh the lifecycle clock. A system thread may contain an actual
+non-system comment; that comment still counts.
+
+Missing continuation proof, count mismatches, malformed timestamps, unknown
+comment types, inconsistent source refs, unavailable endpoints, or any other
+ambiguous required evidence produce `unknown` and zero writes.
+
+## Checked transition
+
+The initial decision is read-only. Immediately before a write, the lifecycle
+provider reloads status, draft state, source and target refs, current source
+head, target head, iterations, pushes, and actual comments. Any change in the
+bound evidence digest withholds the write.
+
+An eligible transition writes exactly this body once:
+
+```json
+{ "status": "abandoned" }
+```
+
+It never deletes the source branch and cannot merge, transition work items,
+vote, label, edit PR metadata, create or edit comments, change thread status,
+or send a notification. A GET readback must confirm `abandoned` before the PR
+ID is excluded from the same-cycle review cohort. Failed or ambiguous
+transitions remain `unknown` and are not excluded.
+
+Azure DevOps REST 7.1 does not expose a verified ETag, `If-Match`, revision, or
+other optimistic-concurrency precondition for this PATCH. The immediate
+reread is therefore a best-effort checked transition, not an atomic compare
+and swap. A change can still occur between the last GET and PATCH. The signed
+event records this limitation, and an ambiguous send is never blindly
+retried.
+
+## Separate authority and audit
+
+Lifecycle authorization is independent of every comment writer. Its private
+root is:
+
+```text
+<automatic-delivery-root>\stale-pr-lifecycle-v1
+```
+
+It has a distinct HMAC key, signed policy, intents, outcomes, events, and
+lock namespace. The policy binds the exact actor, project, repository,
+master/non-draft scope, one-calendar-year thresholds, counted and excluded
+activity kinds, implementation digests, `status:abandoned` authority, and a
+maximum of two attempted status writes and 200 old candidates per run.
+
+Initialize the private key and create a signed policy only after review:
+
+```powershell
+.\tools\Invoke-StalePrLifecycleAuthorization.ps1 initialize-key `
+    -DeliveryRoot C:\private\owner-v2-delivery `
+    -ConfigPath C:\private\contextual-config.json
+
+.\tools\Invoke-StalePrLifecycleAuthorization.ps1 authorize-policy `
+    -DeliveryRoot C:\private\owner-v2-delivery `
+    -ConfigPath C:\private\contextual-config.json `
+    -MaxAbandonsPerRun 2
+```
+
+Then bind the returned policy path and file SHA-256 in external deployment
+configuration:
+
+```json
+{
+  "stalePullRequestLifecycle": {
+    "enabled": true,
+    "deliveryRoot": "C:\\private\\owner-v2-delivery",
+    "policyPath": "C:\\private\\owner-v2-delivery\\stale-pr-lifecycle-v1\\policies\\azureux-bpm-stale-pr-lifecycle-v1.json",
+    "policySha256": "<64 lowercase hex>"
+  }
+}
+```
+
+Use the literal `false` to disable the phase. A bare `true` is invalid.

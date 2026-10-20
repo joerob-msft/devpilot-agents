@@ -13,6 +13,7 @@
     "uniqueName": "service@example.invalid"
   },
   "automationMarker": "[DevPilot-Automation:v1]",
+  "stalePullRequestLifecycle": false,
   "rules": [
     {
       "id": "example-rule@1",
