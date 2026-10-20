@@ -164,6 +164,15 @@
                   "line": { "type": "integer", "minimum": 1 },
                   "symbol": { "$ref": "#/$defs/knownText" }
                 }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["scope", "subject"],
+                "properties": {
+                  "scope": { "const": "pull-request" },
+                  "subject": { "const": "description" }
+                }
               }
             ]
           },
@@ -188,6 +197,19 @@
           "reason": {
             "type": "string",
             "pattern": "^[a-z][a-z0-9-]{2,127}$"
+          },
+          "issueIdentity": {
+            "type": "string",
+            "pattern": "^v1:sha256:[0-9a-f]{64}$"
+          },
+          "missingSections": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": {
+              "enum": ["Problem", "Solution", "Validation"]
+            }
           },
           "reconciliation": { "$ref": "#/$defs/discussionReconciliation" },
           "binding": {
@@ -355,48 +377,94 @@
       }
     },
     "findingBinding": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schemaVersion", "repositoryPath", "span", "symbol", "constructIdentity", "source"],
-      "properties": {
-        "schemaVersion": { "const": 1 },
-        "repositoryPath": { "$ref": "#/$defs/repositoryPath" },
-        "span": {
+      "oneOf": [
+        {
           "type": "object",
           "additionalProperties": false,
-          "required": ["startLine", "endLine", "startColumn", "endColumn"],
+          "required": ["schemaVersion", "repositoryPath", "span", "symbol", "constructIdentity", "source"],
           "properties": {
-            "startLine": { "type": "integer", "minimum": 1 },
-            "endLine": { "type": "integer", "minimum": 1 },
-            "startColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
-            "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" }
-          }
-        },
-        "symbol": { "$ref": "#/$defs/text" },
-        "constructIdentity": { "$ref": "#/$defs/text" },
-        "source": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["representation", "sha256"],
-          "properties": {
-            "representation": {
+            "schemaVersion": { "const": 1 },
+            "repositoryPath": { "$ref": "#/$defs/repositoryPath" },
+            "span": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["path", "startLine", "endLine", "startColumn", "endColumn", "symbol", "constructIdentity"],
+              "required": ["startLine", "endLine", "startColumn", "endColumn"],
               "properties": {
-                "path": { "$ref": "#/$defs/text" },
                 "startLine": { "type": "integer", "minimum": 1 },
                 "endLine": { "type": "integer", "minimum": 1 },
                 "startColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
-                "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
-                "symbol": { "$ref": "#/$defs/text" },
-                "constructIdentity": { "$ref": "#/$defs/text" }
+                "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" }
               }
             },
-            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            "symbol": { "$ref": "#/$defs/text" },
+            "constructIdentity": { "$ref": "#/$defs/text" },
+            "source": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["representation", "sha256"],
+              "properties": {
+                "representation": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "startLine", "endLine", "startColumn", "endColumn", "symbol", "constructIdentity"],
+                  "properties": {
+                    "path": { "$ref": "#/$defs/text" },
+                    "startLine": { "type": "integer", "minimum": 1 },
+                    "endLine": { "type": "integer", "minimum": 1 },
+                    "startColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
+                    "endColumn": { "$ref": "#/$defs/countPositiveOrUnknown" },
+                    "symbol": { "$ref": "#/$defs/text" },
+                    "constructIdentity": { "$ref": "#/$defs/text" }
+                  }
+                },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "scope", "subject", "constructIdentity", "source"],
+          "properties": {
+            "schemaVersion": { "const": 1 },
+            "scope": { "const": "pull-request" },
+            "subject": { "const": "description" },
+            "constructIdentity": { "$ref": "#/$defs/text" },
+            "source": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["representation", "sha256"],
+              "properties": {
+                "representation": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["scope", "subject", "descriptionSha256", "template", "constructIdentity"],
+                  "properties": {
+                    "scope": { "const": "pull-request" },
+                    "subject": { "const": "description" },
+                    "descriptionSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                    "template": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["path", "ref", "commit", "blob", "contentSha256"],
+                      "properties": {
+                        "path": { "$ref": "#/$defs/repositoryPath" },
+                        "ref": { "type": "string", "pattern": "^refs/heads/.+" },
+                        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                        "blob": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                        "contentSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                      }
+                    },
+                    "constructIdentity": { "$ref": "#/$defs/text" }
+                  }
+                },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              }
+            }
           }
         }
-      }
+      ]
     },
     "repositoryPath": {
       "type": "string",

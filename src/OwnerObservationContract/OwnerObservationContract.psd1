@@ -13,6 +13,7 @@
         'ConvertTo-OwnerRepositoryPath',
         'Get-OwnerSemanticFindingKey',
         'New-OwnerCanonicalAnchor',
+        'New-OwnerCanonicalPullRequestBinding',
         'New-OwnerMeasurement',
         'New-OwnerProviderMarker'
     )

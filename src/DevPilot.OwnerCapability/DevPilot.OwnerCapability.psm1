@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb'
+$script:ContextualDigest = 'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+$script:ContextualPolicyDigest = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -284,27 +284,54 @@ function Get-ContextualConventionMarkerKey {
         throw 'Contextual convention finding is not bound to the fixed capability.'
     }
     $anchor = $Finding.anchor
+    $pullRequestScope =
+        $anchor -is
+            [Collections.IDictionary] -and
+        [string](Get-OwnerV2Member `
+            -Value $anchor -Name scope) -ceq
+            'pull-request' -and
+        [string](Get-OwnerV2Member `
+            -Value $anchor -Name subject) -ceq
+            'description'
     if ($anchor -isnot [Collections.IDictionary] -or
-        [int]$anchor.line -lt 1 -or
-        [string]::IsNullOrWhiteSpace(
-            [string]$anchor.path) -or
-        [string]::IsNullOrWhiteSpace(
-            [string]$anchor.symbol)) {
+        (-not $pullRequestScope -and (
+            [int]$anchor.line -lt 1 -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$anchor.path) -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$anchor.symbol)))) {
         throw 'Contextual convention finding has no precise changed anchor.'
     }
-    $material = @(
-        $script:ContextualMarkerPrefix
-        [string]$request.RepositoryId
-        [string]$request.PullRequestId
-        [string]$request.SourceCommit
-        [string]$request.RuleHash
-        [string]$Finding.ruleId
-        (ConvertTo-OwnerV1WriterPath -Path (
-            [string]$anchor.path))
-        [string][int]$anchor.line
-        [string]$anchor.symbol
-        [string]$Finding.constructRef
-    ) -join "`n"
+    $material = if ($pullRequestScope) {
+        if ([string]$Finding.ruleId -cne
+                'pr-template-compliance' -or
+            [string]$Finding.issueIdentity -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$') {
+            throw 'Contextual PR finding has no stable issue identity.'
+        }
+        @(
+            $script:ContextualMarkerPrefix
+            [string]$request.RepositoryId
+            [string]$request.PullRequestId
+            [string]$Finding.ruleId
+            [string]$Finding.issueIdentity
+        ) -join "`n"
+    }
+    else {
+        @(
+            $script:ContextualMarkerPrefix
+            [string]$request.RepositoryId
+            [string]$request.PullRequestId
+            [string]$request.SourceCommit
+            [string]$request.RuleHash
+            [string]$Finding.ruleId
+            (ConvertTo-OwnerV1WriterPath -Path (
+                [string]$anchor.path))
+            [string][int]$anchor.line
+            [string]$anchor.symbol
+            [string]$Finding.constructRef
+        ) -join "`n"
+    }
     return Get-OwnerV1WriterSha256 -Text $material
 }
 
@@ -321,11 +348,11 @@ function Format-ContextualConventionComment {
         throw 'Contextual convention marker does not match its finding.'
     }
     $request = $Contract.Request
-    $path = ConvertTo-OwnerV1WriterMarkdownCode (
-        ConvertTo-OwnerV1WriterPath -Path (
-            [string]$Finding.anchor.path))
-    $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
-        [string]$Finding.anchor.symbol)
+    $pullRequestScope =
+        [string](Get-OwnerV2Member `
+            -Value $Finding.anchor `
+            -Name scope) -ceq
+            'pull-request'
     $ruleId = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.ruleId)
     $summary = ConvertTo-OwnerV1WriterMarkdownCode (
@@ -337,6 +364,48 @@ function Format-ContextualConventionComment {
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path (
             [string]$request.RulePath))
+    if ($pullRequestScope) {
+        $source =
+            $Finding.binding.source.representation
+        if ($source -isnot
+                [Collections.IDictionary] -or
+            [string]$source.scope -cne
+                'pull-request' -or
+            [string]$source.subject -cne
+                'description' -or
+            @($Finding.missingSections).Count -lt 1) {
+            throw 'Contextual PR finding binding is invalid.'
+        }
+        $missing = @($Finding.missingSections |
+            ForEach-Object {
+                ConvertTo-OwnerV1WriterMarkdownCode `
+                    ([string]$_)
+            }) -join ', '
+        $templatePath =
+            ConvertTo-OwnerV1WriterMarkdownCode (
+                ConvertTo-OwnerV1WriterPath `
+                    -Path ([string]$source.template.path))
+        return @(
+            '**Complete the required pull request template sections**'
+            ''
+            "$summary"
+            ''
+            "Missing or placeholder-only sections: $missing."
+            ''
+            "Effective template: ``$templatePath`` from ``$([string]$source.template.ref)`` (blob ``$([string]$source.template.blob)``; SHA-256 ``$([string]$source.template.contentSha256)``)."
+            ''
+            'This is a PR-wide description issue; no code line is implicated.'
+            ''
+            "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+            ''
+            "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
+    $path = ConvertTo-OwnerV1WriterMarkdownCode (
+        ConvertTo-OwnerV1WriterPath -Path (
+            [string]$Finding.anchor.path))
+    $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
+        [string]$Finding.anchor.symbol)
     return @(
         "**$ruleId**"
         ''
@@ -610,6 +679,153 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     -DiscussionDigest unknown `
                     -BodyDigest $bodyDigest
             $counts.unknown++
+            continue
+        }
+        $pullRequestScope =
+            [string](Get-OwnerV2Member `
+                -Value $finding.anchor `
+                -Name scope) -ceq
+                'pull-request'
+        if ($pullRequestScope) {
+            $markerEntries =
+                [Collections.Generic.List[object]]::new()
+            $foreign = $false
+            $ambiguous = $false
+            $humanCovered = $false
+            foreach ($thread in @(
+                    $Snapshot.Threads)) {
+                $topLevelCurrent =
+                    $null -eq $thread.anchor -and
+                    -not [bool]$thread.isDeleted -and
+                    -not [bool]$thread.isOutdated -and
+                    [string]$thread.status -ceq
+                        'active'
+                foreach ($comment in @(
+                        $thread.comments)) {
+                    if ([string]$comment.commentType -cne
+                            'text' -or
+                        [bool]$comment.isDeleted) {
+                        continue
+                    }
+                    $target = @(
+                        [regex]::Matches(
+                            [string]$comment.body,
+                            $targetPattern) |
+                            Where-Object {
+                                $_.Groups[1].Value -ceq
+                                    $marker
+                            })
+                    if ($target.Count -gt 0) {
+                        if (-not $topLevelCurrent -or
+                            [string]$comment.
+                                reviewerIdentityState -ceq
+                                'ambiguous') {
+                            $ambiguous = $true
+                        }
+                        elseif (-not [bool]$comment.
+                                reviewerOwned) {
+                            $foreign = $true
+                        }
+                        else {
+                            [void]$markerEntries.Add(
+                                [pscustomobject]@{
+                                    Thread = $thread
+                                    Comment = $comment
+                                    Count = $target.Count
+                                })
+                        }
+                        continue
+                    }
+                    if ($topLevelCurrent -and
+                        -not [bool]$comment.reviewerOwned -and
+                        [string]$comment.
+                            reviewerIdentityState -cne
+                                'ambiguous') {
+                        $humanBody =
+                            [string]$comment.body
+                        if (($humanBody -match
+                                '(?i)\b(?:pull\s+request|pr)\s+template\b' -and
+                                $humanBody -match
+                                    '(?i)\b(?:problem|solution|validation)\b') -or
+                            ($humanBody -match
+                                '(?i)\bproblem\b' -and
+                                $humanBody -match
+                                    '(?i)\bsolution\b' -and
+                                $humanBody -match
+                                    '(?i)\bvalidation\b' -and
+                                $humanBody -match
+                                    '(?i)\b(?:add|fill|include|missing|provide|complete)\w*\b')) {
+                            $humanCovered = $true
+                        }
+                    }
+                }
+            }
+            if ($ambiguous -or $foreign -or
+                $markerEntries.Count -gt 1 -or
+                ($markerEntries.Count -eq 1 -and
+                    [int]$markerEntries[0].Count -ne 1)) {
+                $finding.providerMarker =
+                    New-OwnerProviderMarker `
+                        -Value $marker `
+                        -Integrity invalid
+                $finding.reconciliation =
+                    New-OwnerV2DiscussionReconciliation `
+                        -Classification unknown `
+                        -Reason duplicate-or-foreign-reviewer-marker `
+                        -DiscussionDigest $discussionDigest `
+                        -BodyDigest $bodyDigest `
+                        -ThreadAvailability ambiguous
+                $counts.unknown++
+                continue
+            }
+            if ($markerEntries.Count -eq 1) {
+                $entry = $markerEntries[0]
+                $finding.providerMarker =
+                    New-OwnerProviderMarker `
+                        -Value $marker `
+                        -Integrity verified
+                $finding.reconciliation =
+                    New-OwnerV2DiscussionReconciliation `
+                        -Classification noOp `
+                        -Reason exact-current-pr-wide-comment `
+                        -DiscussionDigest $discussionDigest `
+                        -BodyDigest $bodyDigest `
+                        -ThreadAvailability available `
+                        -ThreadId (
+                            [long]$entry.Thread.threadId) `
+                        -CommentId (
+                            [long]$entry.Comment.commentId) `
+                        -ThreadStatus (
+                            [string]$entry.Thread.status)
+                $counts.noOp++
+                continue
+            }
+            $classification = if (
+                $humanCovered) {
+                'humanCovered'
+            }
+            else { 'wouldCreate' }
+            $finding.providerMarker =
+                New-OwnerProviderMarker `
+                    -Value $marker `
+                    -Integrity verified
+            $finding.reconciliation =
+                New-OwnerV2DiscussionReconciliation `
+                    -Classification $classification `
+                    -Reason $(if ($humanCovered) {
+                        'current-human-pr-template-review'
+                    }
+                    else {
+                        'no-current-pr-template-review'
+                    }) `
+                    -DiscussionDigest $discussionDigest `
+                    -BodyDigest $bodyDigest
+            if ($humanCovered) {
+                $counts.humanCovered++
+            }
+            else {
+                $counts.wouldCreate++
+            }
             continue
         }
         $authenticatedMatches =
@@ -3213,6 +3429,10 @@ function Invoke-ContextualConventionsCapabilityResponse {
     $files = @($units | Where-Object {
             [string]$_.unitId -like 'file:*'
         } | Sort-Object { [string]$_.unitId })
+    $pullRequests = @($units | Where-Object {
+            [string]$_.unitId -ceq
+                'pull-request'
+        })
     $diagnostics =
         [Collections.Generic.List[object]]::new()
     $policyPath = Join-Path $PSScriptRoot `
@@ -3231,6 +3451,7 @@ function Invoke-ContextualConventionsCapabilityResponse {
             $script:OwnerV2DigestPattern -and
         $identityUnits.Count -eq 1 -and
         $ruleUnits.Count -eq 1 -and
+        $pullRequests.Count -le 1 -and
         [string]$identityUnits[0].state -ceq
             'complete' -and
         [string]$ruleUnits[0].state -ceq
@@ -3289,6 +3510,230 @@ function Invoke-ContextualConventionsCapabilityResponse {
             state = 'complete'
             findings = @()
         })
+    $pullRequestUnit = if (
+        $pullRequests.Count -eq 1) {
+        $pullRequests[0]
+    }
+    else {
+        [ordered]@{
+            state = 'complete'
+            data = [ordered]@{
+                applicable = $false
+            }
+        }
+    }
+    $pullRequestRuleId =
+        'pr-template-compliance'
+    if (-not [bool]$pullRequestUnit.data.
+            applicable) {
+        $notApplicableDigest = (
+            Get-OwnerV2Digest -Value (
+                "$bindingId|$ruleRef|$pullRequestRuleId|not-applicable")).
+            Substring(10)
+        [void]$assessments.Add([ordered]@{
+                assessmentId =
+                    "method:c:$notApplicableDigest"
+                evidenceUnitIds =
+                    @('identity', 'rule', 'pull-request')
+                state = 'complete'
+                data = $null
+                findings = @()
+            })
+    }
+    elseif ([string]$pullRequestUnit.state -cne
+            'complete' -or
+        $pullRequestUnit.data -isnot
+            [Collections.IDictionary]) {
+        $withheldDigest = (
+            Get-OwnerV2Digest -Value (
+                "$bindingId|$ruleRef|$pullRequestRuleId|withheld")).
+            Substring(10)
+        [void]$assessments.Add([ordered]@{
+                assessmentId =
+                    "method:c:$withheldDigest"
+                evidenceUnitIds =
+                    @('identity', 'rule', 'pull-request')
+                state = 'unknown'
+                data = [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'pr-template-proof-withheld'
+                    constructRef =
+                        "construct:$withheldDigest"
+                    ruleId =
+                        $pullRequestRuleId
+                }
+                findings = @()
+            })
+    }
+    else {
+        $metadata = [ordered]@{
+            state = 'complete'
+            title =
+                [string]$pullRequestUnit.data.title
+            description =
+                [string]$pullRequestUnit.data.description
+            descriptionDigest =
+                [string]$pullRequestUnit.data.descriptionDigest
+            template =
+                $pullRequestUnit.data.template
+        }
+        $templateOutcome =
+            Get-ContextualPullRequestTemplateOutcome `
+                -Metadata $metadata
+        $templateMaterial = [ordered]@{
+            bindingId = $bindingId
+            evidenceDigest = $evidenceDigest
+            capabilityId =
+                $script:ContextualCapability
+            capabilityDigest =
+                $CapabilityDigest
+            ruleRef = $ruleRef
+            ruleId = $pullRequestRuleId
+            evidenceUnitId = 'pull-request'
+            descriptionDigest =
+                [string]$metadata.descriptionDigest
+            templatePath =
+                [string]$metadata.template.path
+            templateRef =
+                [string]$metadata.template.configurationRef
+            templateCommit =
+                [string]$metadata.template.configurationCommit
+            templateBlob =
+                [string]$metadata.template.blob
+            templateContentDigest =
+                [string]$metadata.template.contentDigest
+            state =
+                [string]$templateOutcome.state
+            reason =
+                [string]$templateOutcome.reason
+            missingSections =
+                @($templateOutcome.missingSections)
+        }
+        $templateDigest = (
+            Get-OwnerV2Digest `
+                -Value $templateMaterial).
+            Substring(10)
+        $templateConstructRef =
+            "construct:$templateDigest"
+        $templateAssessmentId =
+            "method:c:$templateDigest"
+        $templateFinding = @()
+        $templateOutcomeData = $null
+        $templateAssessmentState = 'complete'
+        if ([string]$templateOutcome.state -ceq
+            'violation') {
+            $issueMaterial = [ordered]@{
+                repositoryId =
+                    [string]$identityUnits[0].data.repositoryId
+                pullRequestId =
+                    [long]$identityUnits[0].data.pullRequestId
+                ruleId = $pullRequestRuleId
+                missingSections =
+                    @($templateOutcome.missingSections |
+                        Sort-Object)
+                templatePath =
+                    [string]$metadata.template.path
+                templateRef =
+                    [string]$metadata.template.configurationRef
+                templateBlob =
+                    [string]$metadata.template.blob
+                templateContentDigest =
+                    [string]$metadata.template.contentDigest
+            }
+            $issueIdentity = 'v1:sha256:' +
+                (Get-OwnerV2Digest `
+                    -Value $issueMaterial).
+                Substring(10)
+            $findingData = [ordered]@{
+                disposition = 'violation'
+                eligibility =
+                    'pull-request-template-compliance'
+                capabilityId =
+                    $script:ContextualCapability
+                bindingId = $bindingId
+                evidenceDigest = $evidenceDigest
+                ruleRef = $ruleRef
+                ruleId = $pullRequestRuleId
+                constructRef =
+                    $templateConstructRef
+                groupRef =
+                    $templateAssessmentId
+                headCommit =
+                    [string]$identityUnits[0].data.sourceCommit
+                anchor = [ordered]@{
+                    scope = 'pull-request'
+                    subject = 'description'
+                }
+                issueIdentity =
+                    $issueIdentity
+                missingSections =
+                    @($templateOutcome.missingSections)
+                descriptionSha256 =
+                    ([string]$metadata.descriptionDigest).
+                        Substring(10)
+                template = [ordered]@{
+                    path =
+                        [string]$metadata.template.path
+                    ref =
+                        [string]$metadata.template.configurationRef
+                    commit =
+                        [string]$metadata.template.configurationCommit
+                    blob =
+                        [string]$metadata.template.blob
+                    contentSha256 =
+                        ([string]$metadata.template.contentDigest).
+                            Substring(10)
+                }
+                evidence =
+                    [string]$templateOutcome.evidence
+                reason =
+                    [string]$templateOutcome.reason
+            }
+            $templateFinding = @(
+                [ordered]@{
+                    findingId =
+                        'contextual-v1:' +
+                        (Get-OwnerV2Digest -Value (
+                            [ordered]@{
+                                bindingId = $bindingId
+                                capabilityId =
+                                    $script:ContextualCapability
+                                ruleId =
+                                    $pullRequestRuleId
+                                constructRef =
+                                    $templateConstructRef
+                                disposition =
+                                    'violation'
+                            })).Substring(10)
+                    summary =
+                        [string]$templateOutcome.evidence
+                    data = $findingData
+                })
+        }
+        elseif ([string]$templateOutcome.state -ceq
+            'unknown') {
+            $templateAssessmentState = 'unknown'
+            $templateOutcomeData = [ordered]@{
+                state = 'unknown'
+                reason =
+                    [string]$templateOutcome.reason
+                constructRef =
+                    $templateConstructRef
+                ruleId = $pullRequestRuleId
+            }
+        }
+        [void]$assessments.Add([ordered]@{
+                assessmentId =
+                    $templateAssessmentId
+                evidenceUnitIds =
+                    @('identity', 'rule', 'pull-request')
+                state =
+                    $templateAssessmentState
+                data = $templateOutcomeData
+                findings = $templateFinding
+            })
+    }
     $snapshotFiles = [Collections.Generic.List[object]]::new()
     $snapshotPaths =
         [Collections.Generic.HashSet[string]]::new(
@@ -3348,7 +3793,11 @@ function Invoke-ContextualConventionsCapabilityResponse {
             $data -isnot [Collections.IDictionary] -or
             $data.content -isnot [string]) {
             foreach ($ruleId in @(
-                    Get-ContextualConventionRuleIds)) {
+                    Get-ContextualConventionRuleIds |
+                    Where-Object {
+                        $_ -cne
+                            'pr-template-compliance'
+                    })) {
                 [void]$withheldRules.Add(
                     [string]$ruleId)
             }
@@ -3362,6 +3811,10 @@ function Invoke-ContextualConventionsCapabilityResponse {
         foreach ($outcome in $outcomes) {
             $state = [string]$outcome.state
             $ruleId = [string]$outcome.ruleId
+            if ($ruleId -ceq
+                'pr-template-compliance') {
+                continue
+            }
             if ($state -ceq 'unknown') {
                 [void]$withheldRules.Add($ruleId)
                 continue
@@ -3631,24 +4084,56 @@ function ConvertTo-OwnerV2Observation {
         $data = Get-OwnerV2Member -Value $finding -Name data
         $anchor = Get-OwnerV2Member -Value $data -Name anchor
         $constructRef = [string](Get-OwnerV2Member -Value $data -Name constructRef)
-        $binding = New-OwnerCanonicalAnchor `
-            -Path ([string](Get-OwnerV2Member -Value $anchor -Name path)) `
-            -StartLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
-            -EndLine $(if ($null -ne (
-                        Get-OwnerV2Member `
+        $pullRequestScope =
+            [string](Get-OwnerV2Member `
+                -Value $anchor -Name scope) -ceq
+                'pull-request'
+        $binding = if ($pullRequestScope) {
+            $template = Get-OwnerV2Member `
+                -Value $data -Name template
+            New-OwnerCanonicalPullRequestBinding `
+                -DescriptionSha256 (
+                    [string](Get-OwnerV2Member `
+                        -Value $data `
+                        -Name descriptionSha256)) `
+                -TemplatePath (
+                    [string](Get-OwnerV2Member `
+                        -Value $template -Name path)) `
+                -TemplateRef (
+                    [string](Get-OwnerV2Member `
+                        -Value $template -Name ref)) `
+                -TemplateCommit (
+                    [string](Get-OwnerV2Member `
+                        -Value $template -Name commit)) `
+                -TemplateBlob (
+                    [string](Get-OwnerV2Member `
+                        -Value $template -Name blob)) `
+                -TemplateContentSha256 (
+                    [string](Get-OwnerV2Member `
+                        -Value $template `
+                        -Name contentSha256)) `
+                -ConstructIdentity $constructRef
+        }
+        else {
+            New-OwnerCanonicalAnchor `
+                -Path ([string](Get-OwnerV2Member -Value $anchor -Name path)) `
+                -StartLine ([int](Get-OwnerV2Member -Value $anchor -Name line)) `
+                -EndLine $(if ($null -ne (
+                            Get-OwnerV2Member `
+                                -Value $anchor `
+                                -Name endLine)) {
+                        [int](Get-OwnerV2Member `
                             -Value $anchor `
-                            -Name endLine)) {
-                    [int](Get-OwnerV2Member `
-                        -Value $anchor `
-                        -Name endLine)
-                }
-                else {
-                    [int](Get-OwnerV2Member `
-                        -Value $anchor `
-                        -Name line)
-                }) `
-            -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
-            -ConstructIdentity $constructRef
+                            -Name endLine)
+                    }
+                    else {
+                        [int](Get-OwnerV2Member `
+                            -Value $anchor `
+                            -Name line)
+                    }) `
+                -Symbol ([string](Get-OwnerV2Member -Value $anchor -Name symbol)) `
+                -ConstructIdentity $constructRef
+        }
         $normalizedFinding = [ordered]@{
                 identity = [string](Get-OwnerV2Member -Value $finding -Name findingId)
                 semanticKey = Get-OwnerSemanticFindingKey `
@@ -3659,11 +4144,19 @@ function ConvertTo-OwnerV2Observation {
                 disposition = 'violation'
                 ruleRef = [string](Get-OwnerV2Member -Value $data -Name ruleRef)
                 constructRef = $constructRef
-                anchor = [ordered]@{
-                    path = [string](Get-OwnerV2Member -Value $anchor -Name path)
-                    line = [int](Get-OwnerV2Member -Value $anchor -Name line)
-                    symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
+                anchor = $(if ($pullRequestScope) {
+                    [ordered]@{
+                        scope = 'pull-request'
+                        subject = 'description'
+                    }
                 }
+                else {
+                    [ordered]@{
+                        path = [string](Get-OwnerV2Member -Value $anchor -Name path)
+                        line = [int](Get-OwnerV2Member -Value $anchor -Name line)
+                        symbol = [string](Get-OwnerV2Member -Value $anchor -Name symbol)
+                    }
+                })
                 binding = $binding
             }
         if ($namedAreEqual) {
@@ -3684,6 +4177,16 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.reason =
                 [string](Get-OwnerV2Member `
                     -Value $data -Name reason)
+            if ($pullRequestScope) {
+                $normalizedFinding.issueIdentity =
+                    [string](Get-OwnerV2Member `
+                        -Value $data `
+                        -Name issueIdentity)
+                $normalizedFinding.missingSections =
+                    @(Get-OwnerV2Member `
+                        -Value $data `
+                        -Name missingSections)
+            }
         }
         [void]$normalizedFindings.Add($normalizedFinding)
     }

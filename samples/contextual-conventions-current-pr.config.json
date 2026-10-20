@@ -23,8 +23,8 @@
     "repositoryId": "devpilot-agents",
     "path": "src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json",
     "section": "bpm-contextual-conventions@1",
-    "hash": "v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e",
-    "length": 5399
+    "hash": "v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac",
+    "length": 6249
   },
   "toolkit": {
     "ref": "refs/heads/example-contextual-rules",
@@ -54,12 +54,12 @@
   },
   "capability": {
     "id": "bpm-contextual-conventions@1",
-    "implementationSha256": "81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb"
+    "implementationSha256": "c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5"
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
-    "activePrIntakeSha256": "32f67536c1357480fb9d8e4b20600bce751080941e51965d9f4ddf9b02f894bc",
-    "contextualBridgeSha256": "7b91ca05e393d75e1b5f99242ae5fa0e3e2a4bf048df9d780ae1ba6b9cf78ff8",
+    "activePrIntakeSha256": "d399a9d0fa66562346d91536771808272abce8e9240b091c26914dbe01c7f440",
+    "contextualBridgeSha256": "a232dbcbaf7bf1ba020969af11de02966374337018b97e50fa2772654d928283",
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
   "autoCreateContextualConventionComments": false,

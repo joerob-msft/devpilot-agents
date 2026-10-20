@@ -116,6 +116,47 @@ Describe 'Owner canonical finding contract' {
         $missing.availability | Should -Be 'unavailable'
         $missing.sha256 | Should -Be 'unknown'
     }
+
+    It 'binds PR-wide description and effective-template evidence without a code anchor' {
+        $first =
+            New-OwnerCanonicalPullRequestBinding `
+                -DescriptionSha256 ('1' * 64) `
+                -TemplatePath '/.azuredevops/pull_request_template.txt' `
+                -TemplateRef refs/heads/master `
+                -TemplateCommit ('2' * 40) `
+                -TemplateBlob ('3' * 40) `
+                -TemplateContentSha256 ('4' * 64) `
+                -ConstructIdentity 'construct:first'
+        $edited =
+            New-OwnerCanonicalPullRequestBinding `
+                -DescriptionSha256 ('5' * 64) `
+                -TemplatePath '.azuredevops/pull_request_template.txt' `
+                -TemplateRef refs/heads/master `
+                -TemplateCommit ('2' * 40) `
+                -TemplateBlob ('3' * 40) `
+                -TemplateContentSha256 ('4' * 64) `
+                -ConstructIdentity 'construct:edited'
+        $advanced =
+            New-OwnerCanonicalPullRequestBinding `
+                -DescriptionSha256 ('1' * 64) `
+                -TemplatePath '.azuredevops/pull_request_template.txt' `
+                -TemplateRef refs/heads/master `
+                -TemplateCommit ('6' * 40) `
+                -TemplateBlob ('3' * 40) `
+                -TemplateContentSha256 ('4' * 64) `
+                -ConstructIdentity 'construct:advanced'
+
+        $first.scope | Should -BeExactly pull-request
+        $first.subject | Should -BeExactly description
+        $first.Contains('repositoryPath') |
+            Should -BeFalse
+        $first.source.representation.template.path |
+            Should -BeExactly '.azuredevops/pull_request_template.txt'
+        $first.source.sha256 |
+            Should -Not -Be $edited.source.sha256
+        $first.source.sha256 |
+            Should -Not -Be $advanced.source.sha256
+    }
 }
 
 Describe 'Owner exact-byte and read-only attestation contract' {

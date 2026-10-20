@@ -991,11 +991,20 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'http-client-lifetime')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                        length = 5399
+                    }
+                    unchangedRuleIds = @(
+                        'named-call-arguments')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-                length = 5399
+                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                length = 6249
             }
         }
 
@@ -1012,7 +1021,7 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -Be 2
         @($proofs[0].
                 ruleCompatibility.previousRules) |
-            Should -HaveCount 2
+            Should -HaveCount 3
     }
 
     It 'binds additive history compatibility into the signed contextual policy' {
@@ -1025,8 +1034,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-        $evidence.Declaration.rule.length = 5399
+            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+        $evidence.Declaration.rule.length = 6249
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1137,11 +1146,20 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'http-client-lifetime')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                        length = 5399
+                    }
+                    unchangedRuleIds = @(
+                        'named-call-arguments')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-                length = 5399
+                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                length = 6249
             }
         }
         $validated =
@@ -1154,7 +1172,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                     'http-client-lifetime',
                     'named-call-arguments')
         @($validated.previousRules) |
-            Should -HaveCount 2
+            Should -HaveCount 3
 
         $duplicate = $compatibility |
             ConvertTo-Json -Depth 16 |
@@ -1542,6 +1560,15 @@ Describe 'Approved Owner v2 live safety boundary' {
         $provider | Should -Not -Match 'Open-AgentMcpSession|vote|status update|notification'
         $provider | Should -Match "'CreateThread'"
         $provider | Should -Match "'UpdateComment'"
+        $automaticTool = Get-Command (
+            Join-Path $repoRoot `
+                'tools\Invoke-AutomaticOwnerV2Delivery.ps1')
+        $automaticTool.Parameters.Keys |
+            Should -Contain ThirdPreviousRuleHash
+        $automaticTool.Parameters.Keys |
+            Should -Contain ThirdPreviousRuleLength
+        $automaticTool.Parameters.Keys |
+            Should -Contain ThirdUnchangedRuleId
     }
 }
 

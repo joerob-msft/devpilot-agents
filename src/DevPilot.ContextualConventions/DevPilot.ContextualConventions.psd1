@@ -9,7 +9,8 @@
     PowerShellVersion = '7.0'
     FunctionsToExport = @(
         'Get-ContextualConventionOutcomes',
-        'Get-ContextualConventionRuleIds'
+        'Get-ContextualConventionRuleIds',
+        'Get-ContextualPullRequestTemplateOutcome'
     )
     CmdletsToExport = @()
     VariablesToExport = @()

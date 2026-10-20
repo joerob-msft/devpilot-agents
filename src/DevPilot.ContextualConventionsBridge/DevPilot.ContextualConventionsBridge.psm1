@@ -14,11 +14,11 @@ Import-Module (Join-Path $PSScriptRoot `
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb'
+    'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
-    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
 $script:ContextualConfigId = 'contextual-conventions-v1-user-approved'
 
 function Get-ContextualBridgeDigest {
@@ -65,14 +65,14 @@ function Assert-ContextualBridgeConfig {
         $policyPath, [Text.UTF8Encoding]::new($false))
     if ((Get-ContextualBridgeTextDigest $policy) -cne
             $script:ContextualPolicyDigest -or
-        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 5399 -or
+        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 6249 -or
         [string]$Config.contextualRule.path -cne
             $script:ContextualPolicyPath -or
         [string]$Config.contextualRule.section -cne
             $script:ContextualCapability -or
         [string]$Config.contextualRule.hash -cne
             $script:ContextualPolicyDigest -or
-        [long]$Config.contextualRule.length -ne 5399 -or
+        [long]$Config.contextualRule.length -ne 6249 -or
         [string]$Config.contextualRule.repositoryId -notmatch
             '^[A-Za-z0-9_.-]{1,256}$' -or
         [string]$Config.toolkit.head -cnotmatch '^[0-9a-f]{40}$' -or
@@ -94,11 +94,22 @@ function Assert-ContextualBridgeHead {
     foreach ($name in @(
             'repositoryId', 'projectId', 'pullRequestId', 'sourceRef',
             'targetRef', 'sourceCommit', 'targetCommit', 'iterationId',
-            'status', 'isDraft'
+            'status', 'isDraft', 'title',
+            'description', 'descriptionDigest'
         )) {
         if ([string]$Expected[$name] -cne [string]$Actual[$name]) {
             throw 'head-drift'
         }
+    }
+    if ($Expected.templateAuthority -isnot
+            [Collections.IDictionary] -or
+        $Actual.templateAuthority -isnot
+            [Collections.IDictionary] -or
+        (Get-ContextualBridgeDigest `
+            $Expected.templateAuthority) -cne
+        (Get-ContextualBridgeDigest `
+            $Actual.templateAuthority)) {
+        throw 'head-drift'
     }
 }
 
@@ -128,7 +139,7 @@ function New-ContextualBridgeManifestEntry {
         commit = [string]$Config.toolkit.head
         section = $script:ContextualCapability
         hash = $script:ContextualPolicyDigest
-        length = 5399
+        length = 6249
     }
     $capability = [ordered]@{
         id = $script:ContextualCapability
@@ -202,6 +213,8 @@ function New-ContextualBridgeAcquisitionProvider {
         $snapshot = $Snapshots[$prId]
         switch ($Operation) {
             'GetSubject' {
+                $template =
+                    $expected.templateAuthority
                 return [ordered]@{
                     schemaVersion = 1
                     repositoryId = [string]$expected.repositoryId
@@ -212,6 +225,30 @@ function New-ContextualBridgeAcquisitionProvider {
                     targetRef = [string]$expected.targetRef
                     changedFileCount = @($changeSet.entries).Count
                     state = 'complete'
+                    pullRequestMetadata =
+                        [ordered]@{
+                            state = $(if (
+                                [string]$template.state -ceq
+                                    'complete') {
+                                'complete'
+                            }
+                            else { 'unknown' })
+                            title =
+                                [string]$expected.title
+                            description =
+                                [string]$expected.description
+                            descriptionDigest =
+                                [string]$expected.descriptionDigest
+                            template = $template
+                            unknownReason = $(if (
+                                [string]$template.state -ceq
+                                    'complete') {
+                                $null
+                            }
+                            else {
+                                [string]$template.reason
+                            })
+                        }
                     sourceDigest = & $digestCommand $expected
                 }
             }
@@ -786,7 +823,7 @@ function Invoke-ContextualConventionsCurrentPrBridge {
                     ruleCommit = [string]$Config.toolkit.head
                     ruleSection = $script:ContextualCapability
                     ruleHash = $script:ContextualPolicyDigest
-                    ruleLength = 5399
+                    ruleLength = 6249
                 }))
             foreach ($change in @($page.changes | Where-Object {
                         [string]$_.changeType -cne 'deleted' -and

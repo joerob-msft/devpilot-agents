@@ -27,6 +27,10 @@ param(
     [string]$AdditionalPreviousRuleHash = '',
     [long]$AdditionalPreviousRuleLength = 0,
     [string[]]$AdditionalUnchangedRuleId = @(),
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$ThirdPreviousRuleHash = '',
+    [long]$ThirdPreviousRuleLength = 0,
+    [string[]]$ThirdUnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -212,6 +216,11 @@ if ($Command -ceq 'authorize-policy') {
             $AdditionalPreviousRuleHash) -or
         $AdditionalPreviousRuleLength -ne 0 -or
         $AdditionalUnchangedRuleId.Count -ne 0
+    $thirdCompatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace(
+            $ThirdPreviousRuleHash) -or
+        $ThirdPreviousRuleLength -ne 0 -or
+        $ThirdUnchangedRuleId.Count -ne 0
     if ($compatibilitySpecified -and (
             $Delivery -cne
                 'contextual-conventions' -or
@@ -228,6 +237,14 @@ if ($Command -ceq 'authorize-policy') {
             $AdditionalPreviousRuleLength -lt 1 -or
             $AdditionalUnchangedRuleId.Count -lt 1)) {
         throw 'Additional additive history compatibility requires a second exact prior contextual rule and unchanged rule IDs.'
+    }
+    if ($thirdCompatibilitySpecified -and (
+            -not $additionalCompatibilitySpecified -or
+            [string]::IsNullOrWhiteSpace(
+                $ThirdPreviousRuleHash) -or
+            $ThirdPreviousRuleLength -lt 1 -or
+            $ThirdUnchangedRuleId.Count -lt 1)) {
+        throw 'Third additive history compatibility requires a third exact prior contextual rule and unchanged rule IDs.'
     }
     $policyArguments = @{
         Evidence = $evidence
@@ -247,31 +264,46 @@ if ($Command -ceq 'authorize-policy') {
         }
         $policyArguments.HistoryCompatibility = if (
             $additionalCompatibilitySpecified) {
+            $previousRules = @(
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            $PreviousRuleHash
+                        length =
+                            $PreviousRuleLength
+                    }
+                    unchangedRuleIds =
+                        @($UnchangedRuleId)
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            $AdditionalPreviousRuleHash
+                        length =
+                            $AdditionalPreviousRuleLength
+                    }
+                    unchangedRuleIds =
+                        @($AdditionalUnchangedRuleId)
+                })
+            if ($thirdCompatibilitySpecified) {
+                $previousRules +=
+                    [ordered]@{
+                        rule = [ordered]@{
+                            hash =
+                                $ThirdPreviousRuleHash
+                            length =
+                                $ThirdPreviousRuleLength
+                        }
+                        unchangedRuleIds =
+                            @($ThirdUnchangedRuleId)
+                    }
+            }
             [ordered]@{
                 schemaVersion = 2
                 kind =
                     'contextual-additive-rule-history-compatibility'
-                previousRules = @(
-                    [ordered]@{
-                        rule = [ordered]@{
-                            hash =
-                                $PreviousRuleHash
-                            length =
-                                $PreviousRuleLength
-                        }
-                        unchangedRuleIds =
-                            @($UnchangedRuleId)
-                    },
-                    [ordered]@{
-                        rule = [ordered]@{
-                            hash =
-                                $AdditionalPreviousRuleHash
-                            length =
-                                $AdditionalPreviousRuleLength
-                        }
-                        unchangedRuleIds =
-                            @($AdditionalUnchangedRuleId)
-                    })
+                previousRules =
+                    $previousRules
                 currentRule = $currentRule
             }
         }

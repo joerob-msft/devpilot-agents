@@ -32,7 +32,8 @@ $script:ApprovedContextualRuleIds = @(
     'api-errors',
     'secret-redaction',
     'dependency-fanout',
-    'test-class-code-coverage'
+    'test-class-code-coverage',
+    'pr-template-compliance'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
@@ -870,6 +871,10 @@ function Get-ApprovedOwnerV2Proposal {
         }
     }
     if ($Delivery -ceq 'contextual-conventions') {
+        $pullRequestScope =
+            [string](Get-ApprovedOwnerV2Value `
+                $Finding.anchor 'scope' '') -ceq
+                'pull-request'
         if ([string]$Evidence.Declaration.capability.id -cne
                 $script:ApprovedContextualCapability -or
             [string]$Finding.identity -cnotmatch
@@ -884,7 +889,32 @@ function Get-ApprovedOwnerV2Proposal {
             throw 'Only exact allowlisted contextual findings are writer eligible.'
         }
         $source = $Finding.binding.source.representation
-        if ($source -isnot [Collections.IDictionary] -or
+        if ($pullRequestScope) {
+            if ([string]$Finding.ruleId -cne
+                    'pr-template-compliance' -or
+                [string]$Finding.issueIdentity -cnotmatch
+                    '^v1:sha256:[0-9a-f]{64}$' -or
+                @($Finding.missingSections).Count -lt 1 -or
+                [string](Get-ApprovedOwnerV2Value `
+                    $Finding.binding 'scope' '') -cne
+                    'pull-request' -or
+                [string]$Finding.binding.subject -cne
+                    'description' -or
+                $source -isnot
+                    [Collections.IDictionary] -or
+                [string](Get-ApprovedOwnerV2Value `
+                    $source 'scope' '') -cne
+                    'pull-request' -or
+                [string]$source.subject -cne
+                    'description' -or
+                [string]$source.constructIdentity -cne
+                    [string]$Finding.constructRef -or
+                [string]$Finding.binding.source.sha256 -cnotmatch
+                    '^[0-9a-f]{64}$') {
+                throw 'Contextual PR finding is not one exact PR-wide binding.'
+            }
+        }
+        elseif ($source -isnot [Collections.IDictionary] -or
             [string]$source.constructIdentity -cne
                 [string]$Finding.constructRef -or
             [string]$source.path -cne
@@ -917,16 +947,13 @@ function Get-ApprovedOwnerV2Proposal {
                 (Get-ApprovedOwnerV2TextSha256 $marker)) {
             throw "Contextual finding '$($Finding.identity)' does not match the exact formatter contract."
         }
-        return [ordered]@{
+        $proposal = [ordered]@{
             findingId = [string]$Finding.identity
             semanticKey = [string]$Finding.semanticKey
             ruleId = [string]$Finding.ruleId
             constructRef = [string]$Finding.constructRef
             constructIdentity =
                 [string]$Finding.binding.constructIdentity
-            path = [string]$Finding.anchor.path
-            line = [int]$Finding.anchor.line
-            symbol = [string]$Finding.anchor.symbol
             marker = $marker
             markerComment =
                 "<!-- devpilot-contextual-convention:v1:$marker -->"
@@ -936,6 +963,26 @@ function Get-ApprovedOwnerV2Proposal {
             rationale =
                 [string]$Finding.reconciliation.reason
         }
+        if ($pullRequestScope) {
+            $proposal['scope'] = 'pull-request'
+            $proposal['subject'] = 'description'
+            $proposal['metadataSha256'] =
+                [string]$Finding.binding.source.sha256
+            $proposal['issueIdentity'] =
+                [string]$Finding.issueIdentity
+            $proposal['missingSections'] =
+                @($Finding.missingSections)
+        }
+        else {
+            $proposal['scope'] = 'changed-line'
+            $proposal['path'] =
+                [string]$Finding.anchor.path
+            $proposal['line'] =
+                [int]$Finding.anchor.line
+            $proposal['symbol'] =
+                [string]$Finding.anchor.symbol
+        }
+        return $proposal
     }
     if ([string]$Finding.identity -notmatch '^owner-v2:[0-9a-f]{64}$' -or
         [string]$Finding.disposition -cne 'violation' -or
@@ -1289,18 +1336,33 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
         $bodySha256 =
             Get-ApprovedOwnerV2TextSha256 `
                 -Text ([string]$selection.body)
+        $pullRequestScope =
+            [string](Get-ApprovedOwnerV2Value `
+                $selection 'scope' '') -ceq
+                'pull-request'
         if ([Text.Encoding]::UTF8.GetByteCount(
                 [string]$selection.body) -gt 65536 -or
             $bodySha256 -cne
                 [string]$selection.bodySha256 -or
             $bodySha256 -cne
                 [string]$event.finding.bodySha256 -or
-            [string]$selection.path -ine
-                [string]$event.finding.path -or
-            [int]$selection.line -ne
-                [int]$event.finding.line -or
-            [string]$selection.symbol -cne
-                [string]$event.finding.symbol -or
+            ($pullRequestScope -and (
+                [string](Get-ApprovedOwnerV2Value `
+                    $event.finding 'scope' '') -cne
+                    'pull-request' -or
+                [string]$selection.subject -cne
+                    [string]$event.finding.subject -or
+                [string]$selection.metadataSha256 -cne
+                    [string]$event.finding.metadataSha256 -or
+                [string]$selection.issueIdentity -cne
+                    [string]$event.finding.issueIdentity)) -or
+            (-not $pullRequestScope -and (
+                [string]$selection.path -ine
+                    [string]$event.finding.path -or
+                [int]$selection.line -ne
+                    [int]$event.finding.line -or
+                [string]$selection.symbol -cne
+                    [string]$event.finding.symbol)) -or
             [string]$selection.ruleId -cne
                 [string]$event.finding.ruleId) {
             continue
@@ -1336,9 +1398,10 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     semanticKey =
                         [string]$selection.semanticKey
                     ruleId = [string]$selection.ruleId
-                    path = [string]$selection.path
-                    line = [int]$selection.line
-                    symbol = [string]$selection.symbol
+                    scope = $(if ($pullRequestScope) {
+                        'pull-request'
+                    }
+                    else { 'changed-line' })
                 }
                 event = [ordered]@{
                     eventId = [string]$event.eventId
@@ -1348,6 +1411,22 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     commentId = [long]$event.commentId
                 }
             }
+        if ($pullRequestScope) {
+            $proof.selection['subject'] =
+                [string]$selection.subject
+            $proof.selection['metadataSha256'] =
+                [string]$selection.metadataSha256
+            $proof.selection['issueIdentity'] =
+                [string]$selection.issueIdentity
+        }
+        else {
+            $proof.selection['path'] =
+                [string]$selection.path
+            $proof.selection['line'] =
+                [int]$selection.line
+            $proof.selection['symbol'] =
+                [string]$selection.symbol
+        }
         if ($null -ne $RuleCompatibility) {
             if ($Delivery -cne
                 'contextual-conventions') {
@@ -1580,13 +1659,53 @@ function Assert-ApprovedOwnerV2LiveRead {
         $namedAreEqual = $Delivery -ceq 'named-areequal'
         $contextual = $Delivery -ceq
             'contextual-conventions'
-        $anchors = @($Live.Anchors | Where-Object {
-                [string]$_.path -ieq [string]$selection.path -and
-                [int]$selection.line -ge [int]$_.startLine -and
-                [int]$selection.line -le [int]$_.endLine
-            })
-        if ($anchors.Count -ne 1 -or [int]$anchors[0].changeTrackingId -lt 1) {
-            throw "Anchor '$($selection.path):$($selection.line)' is stale or ambiguous."
+        $pullRequestScope =
+            [string](Get-ApprovedOwnerV2Value `
+                $selection 'scope' '') -ceq
+                'pull-request'
+        if ($pullRequestScope) {
+            $metadata = $Live.PullRequest.metadata
+            if ($metadata -isnot
+                    [Collections.IDictionary]) {
+                throw 'Live pull request metadata is unavailable.'
+            }
+            $liveBinding = [ordered]@{
+                scope = 'pull-request'
+                subject = 'description'
+                descriptionSha256 =
+                    [string]$metadata.descriptionSha256
+                template = [ordered]@{
+                    path =
+                        [string]$metadata.template.path
+                    ref =
+                        [string]$metadata.template.ref
+                    commit =
+                        [string]$metadata.template.commit
+                    blob =
+                        [string]$metadata.template.blob
+                    contentSha256 =
+                        [string]$metadata.template.contentSha256
+                }
+                constructIdentity =
+                    [string]$selection.constructRef
+            }
+            if ([string]$selection.subject -cne
+                    'description' -or
+                [string]$selection.metadataSha256 -cne
+                    (Get-ApprovedOwnerV2Digest `
+                        $liveBinding).Substring(10)) {
+                throw 'Live PR description or effective template binding changed.'
+            }
+        }
+        else {
+            $anchors = @($Live.Anchors | Where-Object {
+                    [string]$_.path -ieq [string]$selection.path -and
+                    [int]$selection.line -ge [int]$_.startLine -and
+                    [int]$selection.line -le [int]$_.endLine
+                })
+            if ($anchors.Count -ne 1 -or [int]$anchors[0].changeTrackingId -lt 1) {
+                throw "Anchor '$($selection.path):$($selection.line)' is stale or ambiguous."
+            }
         }
         if ($namedAreEqual) {
             foreach ($line in @($selection.affectedCallLines)) {
@@ -1835,11 +1954,19 @@ function Invoke-ApprovedOwnerV2Comments {
                 } | Out-Null
             }
             elseif ($classification -ceq 'wouldCreate') {
-                $anchor = @($freshState.Anchors | Where-Object {
-                        [string]$_.path -ieq [string]$selection.path -and
-                        [int]$selection.line -ge [int]$_.startLine -and
-                        [int]$selection.line -le [int]$_.endLine
-                    })[0]
+                $anchor = if ([string](
+                    Get-ApprovedOwnerV2Value `
+                        $selection 'scope' '') -ceq
+                        'pull-request') {
+                    $null
+                }
+                else {
+                    @($freshState.Anchors | Where-Object {
+                            [string]$_.path -ieq [string]$selection.path -and
+                            [int]$selection.line -ge [int]$_.startLine -and
+                            [int]$selection.line -le [int]$_.endLine
+                        })[0]
+                }
                 & $Provider 'CreateThread' @{
                     evidence = $Evidence
                     operator = $Approval.operator

@@ -21,6 +21,12 @@
       "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
       "lines": [980, 1007]
     },
+    "pullRequestTemplateCompliance": {
+      "authorityState": "user-directed current repository configuration",
+      "selection": "unique pull_request_template.md or pull_request_template.txt under /.azuredevops on the current default-branch commit",
+      "requiredSections": ["Problem", "Solution", "Validation"],
+      "optionalSectionsAndChecks": "Release notes, full-test-pass, bundle/settings conditions, and unchecked checklist items are not required by this rule."
+    },
     "duplicateConstantDeclarations": {
       "authorityState": "user-directed Azure DevOps review comment",
       "pullRequestId": 17562908,
@@ -134,6 +140,13 @@
       "id": "test-class-code-coverage",
       "name": "Exclude every class compiled by a test project from code coverage",
       "sourceSection": "Automated tests / code-coverage exclusion"
+    },
+    {
+      "id": "pr-template-compliance",
+      "name": "Provide meaningful content in required repository PR-template sections",
+      "sourceSection": "Current effective repository pull request template / Problem, Solution, Validation",
+      "scope": "pull-request-description",
+      "requiredSections": ["Problem", "Solution", "Validation"]
     }
   ]
 }

@@ -71,6 +71,36 @@ owned by the separate MSTest rule. Ambiguous overloads, dynamic calls, expanded
 `params`, unsupported expression-tree syntax, or unknown language-version
 evidence remain unknown and cannot reach delivery.
 
+The contextual bundle's `pr-template-compliance` rule is PR metadata, not
+changed-line analysis. It selects one effective
+`/.azuredevops/pull_request_template.md` or `.txt` from the repository's
+current default-branch commit and requires meaningful authored content under
+Problem, Solution, and Validation. Bold-colon and equivalent ATX headings are
+accepted; headings in fenced code or quoted examples are ignored. Copied empty
+scaffolds do not satisfy the rule. Optional release notes, the optional full
+test pass, conditional bundle/settings checks, and unchecked checklist items
+are not required.
+
+Its finding uses an explicit `pull-request` / `description` binding and is
+delivered as a top-level PR thread with no file, line, symbol, or code anchor.
+Evaluation and every live create preflight bind the exact description digest
+and effective template path, ref, default-branch commit, blob, and content
+digest. Description edits or template drift refuse the stale create. A
+separate stable issue identity covers the same missing-section set and
+identical effective template content, so an existing reviewer marker or
+current human request remains a no-op across invalid description revisions or
+a default-branch advance that preserves the same template blob/content.
+Changed missing requirements require new proof; they are never blindly
+promoted from history. Contextual automatic delivery remains create-only,
+model-free, and capped at two creates per run and five creates per PR.
+
+When authorizing this additive bundle, retain three exact prior bindings:
+the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
+only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
+21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
+`-ThirdPreviousRule*` respectively. Never include
+`pr-template-compliance` in a prior bundle's unchanged IDs.
+
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
 different local key, policy kind, intent kind, outcome kind, directories, and
@@ -209,6 +239,7 @@ The stable payload is `schemaVersion: 1`,
     "stateIdentity": "<64 hex>",
     "findingId": "owner-v2:<64 hex>",
     "marker": "<64 hex>",
+    "scope": "changed-line",
     "path": "tests/WidgetTests.cs",
     "line": 12,
     "symbol": "CreatesWidget"
@@ -227,6 +258,10 @@ The stable payload is `schemaVersion: 1`,
   }
 }
 ```
+
+For the PR-template rule, `finding.scope` is `pull-request`; the event carries
+`subject: "description"`, `metadataSha256`, and `issueIdentity` instead of
+`path`, `line`, and `symbol`.
 
 No comment body, UPN, credential, token, raw provider response, or model packet
 is in the event. IDs, path/line/symbol, hashes, URL, health, outcome, bounded

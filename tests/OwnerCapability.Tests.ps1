@@ -1046,4 +1046,91 @@ Describe 'Owner capability module surface' {
                 -Contract $contract -Finding $finding
         } | Should -Throw '*fixed capability*'
     }
+
+    It 'formats a PR-wide template finding with a stable issue marker and no code anchor' {
+        $contract = [pscustomobject]@{
+            Request = [pscustomobject]@{
+                CapabilityId =
+                    'bpm-contextual-conventions@1'
+                RuleSection =
+                    'bpm-contextual-conventions@1'
+                RepositoryId = 'repo'
+                PullRequestId = 42
+                SourceCommit = 'a' * 40
+                RuleHash =
+                    'v1:sha256:' + ('b' * 64)
+                RulePath =
+                    'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
+                RuleCommit = 'c' * 40
+            }
+        }
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'pr-template-compliance'
+            constructRef =
+                'construct:' + ('d' * 64)
+            issueIdentity =
+                'v1:sha256:' + ('e' * 64)
+            evidence =
+                'Add meaningful content under the required PR description sections: Problem, Solution, Validation.'
+            missingSections = @(
+                'Problem',
+                'Solution',
+                'Validation')
+            anchor = [ordered]@{
+                scope = 'pull-request'
+                subject = 'description'
+            }
+            binding = [ordered]@{
+                source = [ordered]@{
+                    representation =
+                        [ordered]@{
+                            scope =
+                                'pull-request'
+                            subject =
+                                'description'
+                            descriptionSha256 =
+                                '1' * 64
+                            template =
+                                [ordered]@{
+                                    path =
+                                        '.azuredevops/pull_request_template.txt'
+                                    ref =
+                                        'refs/heads/master'
+                                    commit = '2' * 40
+                                    blob = '3' * 40
+                                    contentSha256 =
+                                        '4' * 64
+                                }
+                            constructIdentity =
+                                'construct:' +
+                                ('d' * 64)
+                        }
+                }
+            }
+        }
+        $marker =
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $finding
+        $body =
+            Format-ContextualConventionComment `
+                -Contract $contract `
+                -Finding $finding `
+                -MarkerKey $marker
+        $finding.binding.source.
+            representation.descriptionSha256 =
+                '5' * 64
+        $finding.binding.source.
+            representation.template.commit =
+                '6' * 40
+
+        (Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $finding) |
+            Should -BeExactly $marker
+        $body | Should -Match 'PR-wide'
+        $body | Should -Match 'Problem, Solution, Validation'
+        $body | Should -Not -Match 'Changed code:'
+    }
 }
