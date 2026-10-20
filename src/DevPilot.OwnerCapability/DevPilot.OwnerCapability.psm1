@@ -689,9 +689,18 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         if ($pullRequestScope) {
             $markerEntries =
                 [Collections.Generic.List[object]]::new()
+            $priorReviewerEntries =
+                [Collections.Generic.List[object]]::new()
             $foreign = $false
             $ambiguous = $false
             $humanCovered = $false
+            $humanPartial = $false
+            $currentMissing =
+                @($finding.missingSections |
+                    Sort-Object -Unique)
+            $currentTemplate =
+                $finding.binding.source.
+                    representation.template
             foreach ($thread in @(
                     $Snapshot.Threads)) {
                 $topLevelCurrent =
@@ -715,6 +724,10 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                                 $_.Groups[1].Value -ceq
                                     $marker
                             })
+                    $allMarkers = @(
+                        [regex]::Matches(
+                            [string]$comment.body,
+                            $targetPattern))
                     if ($target.Count -gt 0) {
                         if (-not $topLevelCurrent -or
                             [string]$comment.
@@ -737,33 +750,133 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         continue
                     }
                     if ($topLevelCurrent -and
-                        -not [bool]$comment.reviewerOwned -and
                         [string]$comment.
-                            reviewerIdentityState -cne
+                            reviewerIdentityState -ceq
                                 'ambiguous') {
+                        $ambiguous = $true
+                        continue
+                    }
+                    if ($allMarkers.Count -gt 0) {
+                        $body =
+                            [string]$comment.body
+                        $missingMatches = @(
+                            [regex]::Matches(
+                                $body,
+                                '(?m)^Missing or placeholder-only sections: (?<sections>(?:Problem|Solution|Validation)(?:, (?:Problem|Solution|Validation))*)\.$'))
+                        $templateMatches = @(
+                            [regex]::Matches(
+                                $body,
+                                '(?m)^Effective template: `(?<path>[^`\r\n]{1,1024})` from `(?<ref>refs/heads/[^`\r\n]+)` \(blob `(?<blob>[0-9a-f]{40})`; SHA-256 `(?<digest>[0-9a-f]{64})`\)\.$'))
+                        $canonical =
+                            $allMarkers.Count -eq 1 -and
+                            $missingMatches.Count -eq 1 -and
+                            $templateMatches.Count -eq 1 -and
+                            $body -match
+                                '\A\*\*Complete the required pull request template sections\*\*' -and
+                            $body -match
+                                '(?m)^This is a PR-wide description issue; no code line is implicated\.$'
+                        if ([bool]$comment.reviewerOwned -and
+                            [string]$comment.
+                                reviewerIdentityState -ceq
+                                    'matched' -and
+                            $canonical) {
+                            if (-not $topLevelCurrent) {
+                                $ambiguous = $true
+                                continue
+                            }
+                            $priorMissing = @(
+                                $missingMatches[0].
+                                    Groups['sections'].
+                                    Value.Split(',') |
+                                    ForEach-Object {
+                                        $_.Trim()
+                                    } |
+                                    Sort-Object -Unique)
+                            [void]$priorReviewerEntries.Add(
+                                [pscustomobject]@{
+                                    Thread = $thread
+                                    Comment = $comment
+                                    MissingSections =
+                                        $priorMissing
+                                    Template =
+                                        [ordered]@{
+                                            path =
+                                                $templateMatches[0].
+                                                    Groups['path'].Value.
+                                                    TrimStart('/')
+                                            ref =
+                                                $templateMatches[0].
+                                                    Groups['ref'].Value
+                                            blob =
+                                                $templateMatches[0].
+                                                    Groups['blob'].Value
+                                            contentSha256 =
+                                                $templateMatches[0].
+                                                    Groups['digest'].Value
+                                        }
+                                })
+                        }
+                        else {
+                            $ambiguous = $true
+                            if (-not [bool]$comment.
+                                    reviewerOwned) {
+                                $foreign = $true
+                            }
+                        }
+                        continue
+                    }
+                    if ($topLevelCurrent -and
+                        -not [bool]$comment.reviewerOwned) {
                         $humanBody =
                             [string]$comment.body
-                        if (($humanBody -match
-                                '(?i)\b(?:pull\s+request|pr)\s+template\b' -and
-                                $humanBody -match
-                                    '(?i)\b(?:problem|solution|validation)\b') -or
-                            ($humanBody -match
-                                '(?i)\bproblem\b' -and
-                                $humanBody -match
-                                    '(?i)\bsolution\b' -and
-                                $humanBody -match
-                                    '(?i)\bvalidation\b' -and
-                                $humanBody -match
-                                    '(?i)\b(?:add|fill|include|missing|provide|complete)\w*\b')) {
-                            $humanCovered = $true
+                        $templateCue =
+                            $humanBody -match
+                                '(?i)\b(?:pull\s+request|pr)\s+template\b'
+                        $actionCue =
+                            $humanBody -match
+                                '(?i)\b(?:add|fill|include|missing|provide|complete|update)\w*\b'
+                        if ($templateCue -and
+                            $actionCue) {
+                            $mentioned =
+                                [Collections.Generic.HashSet[string]]::new(
+                                    [StringComparer]::OrdinalIgnoreCase)
+                            foreach ($section in @(
+                                    'Problem',
+                                    'Solution',
+                                    'Validation')) {
+                                if ($humanBody -match (
+                                    '(?i)\b' +
+                                    [regex]::Escape(
+                                        $section) +
+                                    '\b')) {
+                                    [void]$mentioned.Add(
+                                        $section)
+                                }
+                            }
+                            $coversCurrent =
+                                @($currentMissing |
+                                    Where-Object {
+                                        -not $mentioned.Contains(
+                                            [string]$_)
+                                    }).Count -eq 0
+                            if ($coversCurrent) {
+                                $humanCovered = $true
+                            }
+                            else {
+                                $humanPartial = $true
+                            }
                         }
                     }
                 }
             }
             if ($ambiguous -or $foreign -or
+                $humanPartial -or
                 $markerEntries.Count -gt 1 -or
                 ($markerEntries.Count -eq 1 -and
-                    [int]$markerEntries[0].Count -ne 1)) {
+                    [int]$markerEntries[0].Count -ne 1) -or
+                ($markerEntries.Count -eq 1 -and
+                    $priorReviewerEntries.Count -gt 0) -or
+                $priorReviewerEntries.Count -gt 1) {
                 $finding.providerMarker =
                     New-OwnerProviderMarker `
                         -Value $marker `
@@ -788,6 +901,70 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     New-OwnerV2DiscussionReconciliation `
                         -Classification noOp `
                         -Reason exact-current-pr-wide-comment `
+                        -DiscussionDigest $discussionDigest `
+                        -BodyDigest $bodyDigest `
+                        -ThreadAvailability available `
+                        -ThreadId (
+                            [long]$entry.Thread.threadId) `
+                        -CommentId (
+                            [long]$entry.Comment.commentId) `
+                        -ThreadStatus (
+                            [string]$entry.Thread.status)
+                $counts.noOp++
+                continue
+            }
+            if ($priorReviewerEntries.Count -eq 1) {
+                $entry =
+                    $priorReviewerEntries[0]
+                $priorTemplate =
+                    $entry.Template
+                $sameTemplate =
+                    [string]$priorTemplate.path -ceq
+                        [string]$currentTemplate.path -and
+                    [string]$priorTemplate.ref -ceq
+                        [string]$currentTemplate.ref -and
+                    [string]$priorTemplate.blob -ceq
+                        [string]$currentTemplate.blob -and
+                    [string]$priorTemplate.contentSha256 -ceq
+                        [string]$currentTemplate.contentSha256
+                $priorMissing =
+                    [Collections.Generic.HashSet[string]]::new(
+                        [StringComparer]::OrdinalIgnoreCase)
+                foreach ($section in @(
+                        $entry.MissingSections)) {
+                    [void]$priorMissing.Add(
+                        [string]$section)
+                }
+                $coversCurrent =
+                    @($currentMissing |
+                        Where-Object {
+                            -not $priorMissing.Contains(
+                                [string]$_)
+                        }).Count -eq 0
+                if (-not $sameTemplate -or
+                    -not $coversCurrent) {
+                    $finding.providerMarker =
+                        New-OwnerProviderMarker `
+                            -Value $marker `
+                            -Integrity invalid
+                    $finding.reconciliation =
+                        New-OwnerV2DiscussionReconciliation `
+                            -Classification unknown `
+                            -Reason prior-pr-template-review-coverage-unproven `
+                            -DiscussionDigest $discussionDigest `
+                            -BodyDigest $bodyDigest `
+                            -ThreadAvailability ambiguous
+                    $counts.unknown++
+                    continue
+                }
+                $finding.providerMarker =
+                    New-OwnerProviderMarker `
+                        -Value $marker `
+                        -Integrity verified
+                $finding.reconciliation =
+                    New-OwnerV2DiscussionReconciliation `
+                        -Classification noOp `
+                        -Reason prior-pr-template-review-covers-current-missing-sections `
                         -DiscussionDigest $discussionDigest `
                         -BodyDigest $bodyDigest `
                         -ThreadAvailability available `

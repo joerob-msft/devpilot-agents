@@ -318,6 +318,168 @@ Describe what validations are needed:
             -PreparedIntake $Prepared.Intake -Run
     }
 
+    function New-SyntheticPrTemplateReviewerComment {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Head,
+            [Parameter(Mandatory)]
+            [string[]]$MissingSections,
+            [AllowNull()]
+            [Collections.IDictionary]$TemplateAuthority =
+                $null
+        )
+        $template = if ($null -eq
+                $TemplateAuthority) {
+            $Head.templateAuthority
+        }
+        else { $TemplateAuthority }
+        $contract =
+            New-OwnerAcquisitionContract `
+                -RepositoryId $Head.repositoryId `
+                -ProjectId $Head.projectId `
+                -PullRequestId $Head.pullRequestId `
+                -SourceCommit $Head.sourceCommit `
+                -TargetCommit $Head.targetCommit `
+                -TargetRef $Head.targetRef `
+                -RuleRepositoryId (
+                    $Config.contextualRule.repositoryId) `
+                -RulePath $Config.contextualRule.path `
+                -RuleCommit $Config.toolkit.head `
+                -RuleSection (
+                    $Config.contextualRule.section) `
+                -RuleHash $Config.contextualRule.hash `
+                -RuleLength $Config.contextualRule.length `
+                -ConfigId contextual-test `
+                -ConfigDigest (
+                    'v1:sha256:' + ('7' * 64)) `
+                -CapabilityId $Config.capability.id `
+                -CapabilityDigest (
+                    'v1:sha256:' +
+                    $Config.capability.
+                        implementationSha256)
+        $constructRef =
+            'construct:' + ('6' * 64)
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'pr-template-compliance'
+            constructRef = $constructRef
+            issueIdentity =
+                Get-ContextualTestTextDigest (
+                    @($MissingSections |
+                        Sort-Object) -join ',')
+            evidence =
+                'Add meaningful content under the required PR description sections: ' +
+                (@($MissingSections) -join ', ') +
+                '.'
+            missingSections =
+                @($MissingSections)
+            anchor = [ordered]@{
+                scope = 'pull-request'
+                subject = 'description'
+            }
+            binding = [ordered]@{
+                source = [ordered]@{
+                    representation =
+                        [ordered]@{
+                            scope =
+                                'pull-request'
+                            subject =
+                                'description'
+                            descriptionSha256 =
+                                $Head.descriptionDigest.
+                                    Substring(10)
+                            template =
+                                [ordered]@{
+                                    path =
+                                        ([string]$template.path).
+                                            TrimStart('/')
+                                    ref =
+                                        [string]$template.configurationRef
+                                    commit =
+                                        [string]$template.configurationCommit
+                                    blob =
+                                        [string]$template.blob
+                                    contentSha256 =
+                                        ([string]$template.contentDigest).
+                                            Substring(10)
+                                }
+                            constructIdentity =
+                                $constructRef
+                        }
+                }
+            }
+        }
+
+        $marker =
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $finding
+        return [pscustomobject]@{
+            Marker = $marker
+            Body =
+                Format-ContextualConventionComment `
+                    -Contract $contract `
+                    -Finding $finding `
+                    -MarkerKey $marker
+        }
+    }
+
+    function Set-SyntheticTopLevelDiscussion {
+        param(
+            [Parameter(Mandatory)]$Prepared,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)][string]$Body,
+            [ValidateSet(
+                'reviewer',
+                'human',
+                'ambiguous')]
+            [string]$Identity = 'reviewer'
+        )
+        $author = switch ($Identity) {
+            reviewer {
+                [ordered]@{
+                    id =
+                        $Config.expectedAccount.id
+                    descriptor =
+                        $Config.expectedAccount.descriptor
+                    uniqueName =
+                        $Config.expectedAccount.uniqueName
+                }
+            }
+            human {
+                [ordered]@{
+                    id =
+                        '44444444-4444-4444-4444-444444444444'
+                    descriptor = 'aad.human'
+                    uniqueName =
+                        'human@example.invalid'
+                }
+            }
+            ambiguous {
+                [ordered]@{}
+            }
+        }
+        $Prepared.Intake.
+            transientSnapshots['42'].
+            discussions = [ordered]@{
+                count = 1
+                threads = @([ordered]@{
+                        id = 500
+                        status = 'active'
+                        isDeleted = $false
+                        comments = @([ordered]@{
+                                id = 501
+                                commentType = 'text'
+                                content = $Body
+                                author = $author
+                            })
+                    })
+            }
+    }
+
     function New-ContextualUpgradeRecognitionCase {
         $config = New-ContextualTestConfig
         $head = [ordered]@{
@@ -1767,6 +1929,218 @@ Filled.
                         ConvertTo-Json -Compress)
         $result.providerWrites |
             Should -Be 0
+    }
+
+    It 'reuses one active reviewer PR-template comment when prior missing sections cover the narrowed finding' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation')
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-narrowed
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        @($observation.findings[0].
+                missingSections) -join ',' |
+            Should -BeExactly 'Solution,Validation'
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-covers-current-missing-sections
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds a disjoint prior reviewer PR-template comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem')
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-disjoint
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-coverage-unproven
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds a prior reviewer PR-template comment from a different template blob' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $priorTemplate =
+            $prepared.Head.templateAuthority |
+                ConvertTo-Json -Depth 16 -Compress |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 16
+        $priorTemplate.blob = '8' * 40
+        $priorTemplate.contentDigest =
+            'v1:sha256:' + ('9' * 64)
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation') `
+                -TemplateAuthority $priorTemplate
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-template-drift
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-coverage-unproven
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds an ambiguous top-level reviewer identity without an exact marker' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body 'Synthetic ambiguous discussion.' `
+            -Identity ambiguous
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-ambiguous-identity
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds partial human PR-template coverage of different missing sections' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                'Per the PR template, please fill out the Problem section.') `
+            -Identity human
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-partial-human
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        @($observation.findings[0].
+                missingSections) -join ',' |
+            Should -BeExactly 'Solution,Validation'
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.providerWrites | Should -Be 0
     }
 
     It 'keeps one own marker across invalid description and identical-template commit changes' {
