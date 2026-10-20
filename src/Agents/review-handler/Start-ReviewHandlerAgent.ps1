@@ -3135,7 +3135,9 @@ function Invoke-HandlerCycle {
                 $postRunWorktreeStatus = [string]((& $git.Source -C $worktreePath status --porcelain=v1 -uno 2>$null) -join "`n")
             }
             catch { $localHead = '' }
-            $modifiedFiles = if ($cliOutcome) { @($cliOutcome.ModifiedFiles) } else { @() }
+            $modifiedFiles = @(
+                if ($cliOutcome) { $cliOutcome.ModifiedFiles }
+            )
             $partialWorkDetected = ($EnableCodeChanges -and (
                 $modifiedFiles.Count -gt 0 -or
                 ($preRunLocalHead -and $localHead -and $localHead -ine $preRunLocalHead) -or
