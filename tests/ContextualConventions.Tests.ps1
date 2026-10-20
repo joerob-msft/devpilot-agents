@@ -150,12 +150,70 @@ BeforeAll {
                 Where-Object ruleId -CEQ $RuleId)[0]
     }
 
+    function New-SyntheticPullRequestMetadata {
+        param(
+            [Parameter(Mandatory)]
+            [AllowEmptyString()]
+            [string]$Description,
+            [string]$Template = @'
+**Problem:**
+
+**Solution:**
+
+**Validation:**
+Describe what validations are needed:
+- [ ] Optional full test pass
+
+**Release Notes**
+'@,
+            [string]$State = 'complete'
+        )
+        $digest = {
+            param([string]$Text)
+            'v1:sha256:' + [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.UTF8Encoding]::new($false).
+                        GetBytes($Text))).
+                ToLowerInvariant()
+        }
+        if ($State -cne 'complete') {
+            return [ordered]@{
+                state = 'unknown'
+                title = 'Synthetic PR'
+                description = $Description
+                descriptionDigest = & $digest $Description
+                template = [ordered]@{
+                    state = 'unknown'
+                    reason = $State
+                }
+            }
+        }
+        return [ordered]@{
+            state = 'complete'
+            title = 'Synthetic PR'
+            description = $Description
+            descriptionDigest =
+                & $digest $Description
+            template = [ordered]@{
+                path =
+                    '/.azuredevops/pull_request_template.txt'
+                configurationRef =
+                    'refs/heads/master'
+                configurationCommit = 'a' * 40
+                blob = 'b' * 40
+                contentDigest =
+                    & $digest $Template
+                content = $Template
+            }
+        }
+    }
+
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed twenty-one-rule allow set' {
+    It 'exports the fixed twenty-two-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 21
+            Should -HaveCount 22
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -1015,11 +1073,11 @@ internal const string Value = "same";
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 21
+            $outcomes | Should -HaveCount 22
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 20
+                }) | Should -HaveCount 21
         }
     }
 
@@ -1572,5 +1630,107 @@ internal const string Value = "same";
             -RuleId collection-cardinality -Content $source
         $outcome.state | Should -BeExactly violation
         $outcome.reason | Should -BeExactly arbitrary-first-selection
+    }
+
+    It 'evaluates the synthetic required PR-template structure without optional checklist expansion' {
+        $description = @'
+**Problem:**
+The dispatcher is not started by the test host.
+
+**Solution:**
+Start the dispatcher during test-host initialization.
+
+**Validation:**
+N/A because this synthetic change only exercises documentation parsing.
+- [ ] Optional full test pass
+
+**Release Notes**
+'@
+        $outcome =
+            Get-ContextualPullRequestTemplateOutcome `
+                -Metadata (
+                    New-SyntheticPullRequestMetadata `
+                        -Description $description)
+        $outcome.state |
+            Should -BeExactly compliant
+    }
+
+    It 'accepts bold and ATX heading variants with case and whitespace normalization' {
+        $description = @'
+##   problem
+Observed synthetic failure.
+
+** SOLUTION : **
+Applied a synthetic correction.
+
+### VaLiDaTiOn:
+Focused synthetic verification completed.
+'@
+        (Get-ContextualPullRequestTemplateOutcome `
+                -Metadata (
+                    New-SyntheticPullRequestMetadata `
+                        -Description $description)).state |
+            Should -BeExactly compliant
+    }
+
+    It 'rejects missing, empty, copied-scaffold, fenced, and quoted required sections' {
+        $cases = @(
+            'No structural sections are present.'
+            @'
+**Problem:**
+
+**Solution:**
+
+**Validation:**
+Describe what validations are needed:
+- [ ] Optional full test pass
+'@
+            @'
+```markdown
+**Problem:**
+Example
+**Solution:**
+Example
+**Validation:**
+Example
+```
+'@
+            @'
+> **Problem:**
+> Example
+> **Solution:**
+> Example
+> **Validation:**
+> Example
+'@
+        )
+        foreach ($description in $cases) {
+            $outcome =
+                Get-ContextualPullRequestTemplateOutcome `
+                    -Metadata (
+                        New-SyntheticPullRequestMetadata `
+                            -Description $description)
+            $outcome.state |
+                Should -BeExactly violation
+            @($outcome.missingSections).Count |
+                Should -BeGreaterThan 0
+        }
+    }
+
+    It 'fails closed when current template authority is unavailable, ambiguous, stale, or malformed' {
+        foreach ($reason in @(
+                'template-authority-unavailable',
+                'template-authority-ambiguous',
+                'template-authority-stale',
+                'template-authority-malformed')) {
+            $outcome =
+                Get-ContextualPullRequestTemplateOutcome `
+                    -Metadata (
+                        New-SyntheticPullRequestMetadata `
+                            -Description 'Synthetic' `
+                            -State $reason)
+            $outcome.state |
+                Should -BeExactly unknown
+        }
     }
 }

@@ -134,6 +134,7 @@ function New-OwnerCanonicalAnchor {
     if ($EndLine -lt $StartLine) {
         throw 'Owner finding span endLine must not precede startLine.'
     }
+
     foreach ($column in @($StartColumn, $EndColumn)) {
         if ($column -is [string]) {
             if ($column -cne $script:OwnerUnknown) {
@@ -200,6 +201,86 @@ function New-OwnerCanonicalAnchor {
     }
 }
 
+function New-OwnerCanonicalPullRequestBinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$DescriptionSha256,
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$TemplateRef,
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{40}$')]
+        [string]$TemplateCommit,
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{40}$')]
+        [string]$TemplateBlob,
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{64}$')]
+        [string]$TemplateContentSha256,
+        [Parameter(Mandatory)][string]$ConstructIdentity
+    )
+    $path = ConvertTo-OwnerRepositoryPath `
+        -Path $TemplatePath
+    if ($TemplateRef -cnotmatch
+            '^refs/heads/[^~^:?*\[\\]+$' -or
+        [string]::IsNullOrWhiteSpace(
+            $ConstructIdentity) -or
+        $ConstructIdentity -cne
+            $ConstructIdentity.Trim() -or
+        $ConstructIdentity.Length -gt 1024 -or
+        $ConstructIdentity -match '[\r\n]') {
+        throw 'Owner pull-request binding metadata is invalid.'
+    }
+    $raw = [ordered]@{
+        scope = 'pull-request'
+        subject = 'description'
+        descriptionSha256 =
+            $DescriptionSha256
+        template = [ordered]@{
+            path = $path
+            ref = $TemplateRef
+            commit = $TemplateCommit
+            blob = $TemplateBlob
+            contentSha256 =
+                $TemplateContentSha256
+        }
+        constructIdentity =
+            $ConstructIdentity
+    }
+    $canonical = [ordered]@{
+        schemaVersion =
+            $script:OwnerBindingVersion
+        scope = 'pull-request'
+        subject = 'description'
+        descriptionSha256 =
+            $DescriptionSha256
+        template = $raw.template
+    }
+    return [ordered]@{
+        schemaVersion =
+            $script:OwnerBindingVersion
+        scope = 'pull-request'
+        subject = 'description'
+        constructIdentity =
+            'v1:sha256:' +
+            (Get-OwnerContractSha256 -Bytes (
+                [Text.UTF8Encoding]::new(
+                    $false).GetBytes(
+                    (ConvertTo-OwnerContractCanonicalJson `
+                        -Value $canonical))))
+        source = [ordered]@{
+            representation = $raw
+            sha256 =
+                Get-OwnerContractSha256 -Bytes (
+                    [Text.UTF8Encoding]::new(
+                        $false).GetBytes(
+                        (ConvertTo-OwnerContractCanonicalJson `
+                            -Value $raw)))
+        }
+    }
+}
+
 function Get-OwnerSemanticFindingKey {
     [CmdletBinding()]
     param(
@@ -217,6 +298,40 @@ function Get-OwnerSemanticFindingKey {
     if ($rulePath -and $rulePath -cne $script:OwnerUnknown) {
         $rulePath = ConvertTo-OwnerRepositoryPath -Path $rulePath
     }
+    $bindingScope =
+        [string](Get-OwnerContractMember `
+            $Binding 'scope' '')
+    $anchor = if ($bindingScope -ceq
+            'pull-request') {
+        [ordered]@{
+            scope = $bindingScope
+            subject = [string](
+                Get-OwnerContractMember `
+                    $Binding 'subject' '')
+            constructIdentity = [string](
+                Get-OwnerContractMember `
+                    $Binding 'constructIdentity' '')
+            sourceSha256 = [string](
+                Get-OwnerContractMember (
+                    Get-OwnerContractMember `
+                        $Binding 'source') 'sha256' '')
+        }
+    }
+    else {
+        [ordered]@{
+            repositoryPath = [string](
+                Get-OwnerContractMember `
+                    $Binding 'repositoryPath' '')
+            span = Get-OwnerContractMember `
+                $Binding 'span'
+            symbol = [string](
+                Get-OwnerContractMember `
+                    $Binding 'symbol' '')
+            constructIdentity = [string](
+                Get-OwnerContractMember `
+                    $Binding 'constructIdentity' '')
+        }
+    }
     $material = [ordered]@{
         schemaVersion = 1
         subject = [ordered]@{
@@ -231,12 +346,7 @@ function Get-OwnerSemanticFindingKey {
             sha256 = [string](Get-OwnerContractMember $Rule 'sha256' '')
         }
         capability = $Capability
-        anchor = [ordered]@{
-            repositoryPath = [string](Get-OwnerContractMember $Binding 'repositoryPath' '')
-            span = Get-OwnerContractMember $Binding 'span'
-            symbol = [string](Get-OwnerContractMember $Binding 'symbol' '')
-            constructIdentity = [string](Get-OwnerContractMember $Binding 'constructIdentity' '')
-        }
+        anchor = $anchor
     }
     $json = ConvertTo-OwnerContractCanonicalJson -Value $material
     return 'v1:sha256:' + (Get-OwnerContractSha256 -Bytes (
@@ -291,6 +401,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-OwnerRepositoryPath',
     'Get-OwnerSemanticFindingKey',
     'New-OwnerCanonicalAnchor',
+    'New-OwnerCanonicalPullRequestBinding',
     'New-OwnerMeasurement',
     'New-OwnerProviderMarker'
 )

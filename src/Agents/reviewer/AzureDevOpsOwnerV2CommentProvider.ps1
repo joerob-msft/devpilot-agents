@@ -3,6 +3,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-ApprovedOwnerV2ProviderTextSha256 {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+    return ([Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).
+                GetBytes($Text)))).
+        ToLowerInvariant()
+}
+
 function Get-ApprovedOwnerV2ChangedSpans {
     [CmdletBinding()]
     param(
@@ -18,6 +31,7 @@ function Get-ApprovedOwnerV2ChangedSpans {
             1, [regex]::Split($SourceContent, '\r?\n').Count)
         return @([ordered]@{ startLine = 1; endLine = $count })
     }
+
     if ($ChangeType -match '(?i)^delete') { return @() }
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) (
         'owner-v2-diff-' + [guid]::NewGuid().ToString('N'))
@@ -324,6 +338,8 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         ${function:Resolve-ApprovedOwnerV2LiveHead}
     $getChangedSpansCommand =
         ${function:Get-ApprovedOwnerV2ChangedSpans}
+    $textSha256Command =
+        ${function:Get-ApprovedOwnerV2ProviderTextSha256}
     $newReviewerIdentityCommand =
         (Get-Command `
             New-OwnerAzureDevOpsReviewerIdentity `
@@ -430,6 +446,145 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
             '--only-show-errors'
         )
         return @($response.value)
+    }.GetNewClosure()
+
+    $getPullRequestTemplate = {
+        $repository = & $invokeAzJson @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'repositories',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        $defaultRef =
+            [string]$repository.defaultBranch
+        if ($defaultRef -cnotmatch
+                '^refs/heads/(?<filter>[^~^:?*\[\\]+)$') {
+            throw 'Live repository default branch is unavailable.'
+        }
+        $refs = & $invokeAzJson @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'refs',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            '--query-parameters',
+            "filter=heads/$($Matches.filter)",
+            'includeStatuses=false',
+            'peelTags=false',
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        $refMatches = @($refs.value |
+            Where-Object {
+                [string]$_.name -ceq
+                    $defaultRef -and
+                [string]$_.objectId -cmatch
+                    '^[0-9a-fA-F]{40}$'
+            })
+        if ($refMatches.Count -ne 1) {
+            throw 'Live repository default branch commit is stale or ambiguous.'
+        }
+        $commit = ([string]$refMatches[0].
+            objectId).ToLowerInvariant()
+        $directory = & $invokeAzJson @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'items',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            '--query-parameters',
+            'scopePath=/.azuredevops',
+            'recursionLevel=Full',
+            'includeContentMetadata=true',
+            "versionDescriptor.version=$commit",
+            'versionDescriptor.versionType=commit',
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        $items = if ($directory -is
+                [Collections.IDictionary] -and
+            $directory.value -is [array]) {
+            @($directory.value)
+        }
+        elseif ($directory -is [array]) {
+            @($directory)
+        }
+        else { @() }
+        $templateRelated = @($items |
+            Where-Object {
+                $_ -is
+                    [Collections.IDictionary] -and
+                -not [bool]$_.isFolder -and
+                [string]$_.path -match
+                    '(?i)^/\.azuredevops/(?:pull_request_template\.(?:md|txt)|pull_request_template/.+)$'
+            })
+        $candidates = @($templateRelated |
+            Where-Object {
+                [string]$_.path -match
+                    '(?i)^/\.azuredevops/pull_request_template\.(?:md|txt)$'
+            })
+        if ($candidates.Count -ne 1 -or
+            $templateRelated.Count -ne 1) {
+            throw 'Live effective pull request template is unavailable or ambiguous.'
+        }
+        $candidate = $candidates[0]
+        $blob = ([string]$candidate.objectId).
+            ToLowerInvariant()
+        if ($blob -cnotmatch
+                '^[0-9a-f]{40}$') {
+            throw 'Live effective pull request template blob is malformed.'
+        }
+        $contentResponse = & $invokeAzJson @(
+            'devops', 'invoke',
+            '--organization', $organization,
+            '--area', 'git',
+            '--resource', 'items',
+            '--route-parameters',
+            "project=$projectName",
+            "repositoryId=$repositoryId",
+            '--query-parameters',
+            "path=$([string]$candidate.path)",
+            "versionDescriptor.version=$commit",
+            'versionDescriptor.versionType=commit',
+            'includeContent=true',
+            'includeContentMetadata=true',
+            '--api-version', '7.1',
+            '-o', 'json',
+            '--only-show-errors'
+        )
+        if ($contentResponse -isnot
+                [Collections.IDictionary] -or
+            $contentResponse.content -isnot
+                [string]) {
+            throw 'Live effective pull request template content is unavailable.'
+        }
+        $content = [string]$contentResponse.content
+        if ([Text.Encoding]::UTF8.GetByteCount(
+                $content) -gt 65536) {
+            throw 'Live effective pull request template is oversized.'
+        }
+        return [ordered]@{
+            path =
+                ([string]$candidate.path).
+                    TrimStart('/')
+            ref = $defaultRef
+            commit = $commit
+            blob = $blob
+            contentSha256 =
+                & $textSha256Command $content
+        }
     }.GetNewClosure()
 
     $getItemContent = {
@@ -614,7 +769,16 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                 if ($selections.Count -lt 1 -or $selections.Count -gt 5) {
                     throw 'Live provider requires one to five exact approved selections.'
                 }
-                $paths = @($selections.path | Sort-Object -Unique)
+                $paths = @($selections |
+                    Where-Object {
+                        -not $_.Contains('scope') -or
+                        [string]$_.scope -cne
+                            'pull-request'
+                    } |
+                    ForEach-Object {
+                        [string]$_.path
+                    } |
+                    Sort-Object -Unique)
                 foreach ($path in $paths) {
                     $matches = @($changes | Where-Object {
                             ([string]$_.item.path).TrimStart('/') -ieq [string]$path
@@ -648,6 +812,27 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                         sourceCommit = [string]$liveHead.sourceCommit
                         targetCommit = [string]$liveHead.targetCommit
                         targetRef = [string]$liveHead.targetRef
+                        metadata = $(if (@($selections |
+                                Where-Object {
+                                    $_.Contains('scope') -and
+                                    [string]$_.scope -ceq
+                                        'pull-request'
+                                }).Count -gt 0) {
+                            [ordered]@{
+                                descriptionSha256 =
+                                    & $textSha256Command (
+                                        $(if ($null -eq
+                                            $pr.description) {
+                                            ''
+                                        }
+                                        else {
+                                            [string]$pr.description
+                                        }))
+                                template =
+                                    & $getPullRequestTemplate
+                            }
+                        }
+                        else { $null })
                     }
                     Reviewer = [ordered]@{
                         id = ([string]$reviewer.id).ToLowerInvariant()
@@ -668,24 +853,40 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                             commentType = 1
                         })
                     status = 1
-                    threadContext = [ordered]@{
-                        filePath = '/' + ([string]$selection.path).TrimStart('/')
-                        rightFileStart = [ordered]@{
-                            line = [int]$selection.line
-                            offset = 1
-                        }
-                        rightFileEnd = [ordered]@{
-                            line = [int]$selection.line
-                            offset = 1
-                        }
-                    }
-                    pullRequestThreadContext = [ordered]@{
-                        changeTrackingId = [int]$anchor.changeTrackingId
-                        iterationContext = [ordered]@{
-                            firstComparingIteration = 1
-                            secondComparingIteration = [int]$anchor.iterationId
-                        }
-                    }
+                }
+                if (-not $selection.Contains(
+                        'scope') -or
+                    [string]$selection.scope -cne
+                        'pull-request') {
+                        $body['threadContext'] =
+                            [ordered]@{
+                                filePath = '/' +
+                                    ([string]$selection.path).
+                                        TrimStart('/')
+                                rightFileStart =
+                                    [ordered]@{
+                                        line =
+                                            [int]$selection.line
+                                        offset = 1
+                                    }
+                                rightFileEnd =
+                                    [ordered]@{
+                                        line =
+                                            [int]$selection.line
+                                        offset = 1
+                                    }
+                            }
+                        $body['pullRequestThreadContext'] =
+                            [ordered]@{
+                                changeTrackingId =
+                                    [int]$anchor.changeTrackingId
+                                iterationContext =
+                                    [ordered]@{
+                                        firstComparingIteration = 1
+                                        secondComparingIteration =
+                                            [int]$anchor.iterationId
+                                    }
+                            }
                 }
                 return & $writeRequest 'pullRequestThreads' 'POST' @(
                     "project=$projectName",

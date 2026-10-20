@@ -779,9 +779,13 @@ function New-AutomaticOwnerV2Event {
             stateIdentity = [string]$Evidence.Identity
             findingId = [string]$Selection.findingId
             marker = [string]$Selection.marker
-            path = [string]$Selection.path
-            line = [int]$Selection.line
-            symbol = [string]$Selection.symbol
+            scope = $(if (
+                [string](Get-ApprovedOwnerV2Value `
+                    $Selection 'scope' '')) {
+                [string](Get-ApprovedOwnerV2Value `
+                    $Selection 'scope' '')
+            }
+            else { 'changed-line' })
         }
         action = $Action
         outcome = $Outcome
@@ -792,6 +796,16 @@ function New-AutomaticOwnerV2Event {
         providerWriteCount = $ProviderWriteCount
         providerWriteState = $ProviderWriteState
         diagnostic = $Diagnostic
+    }
+    if ([string](Get-ApprovedOwnerV2Value `
+            $Selection 'scope' '') -cne
+        'pull-request') {
+        $event.finding['path'] =
+            [string]$Selection.path
+        $event.finding['line'] =
+            [int]$Selection.line
+        $event.finding['symbol'] =
+            [string]$Selection.symbol
     }
     if ($namedAreEqual) {
         if ([string]$Selection.bodySha256 -cnotmatch '^[0-9a-f]{64}$') {
@@ -814,6 +828,24 @@ function New-AutomaticOwnerV2Event {
             [string]$Selection.ruleId
         $event.finding['bodySha256'] =
             [string]$Selection.bodySha256
+        if ([string](Get-ApprovedOwnerV2Value `
+                $Selection 'scope' '') -ceq
+            'pull-request') {
+            $event.finding['subject'] =
+                [string]$Selection.subject
+            $event.finding['metadataSha256'] =
+                [string]$Selection.metadataSha256
+            $event.finding['issueIdentity'] =
+                [string]$Selection.issueIdentity
+        }
+        else {
+            $event.finding['path'] =
+                [string]$Selection.path
+            $event.finding['line'] =
+                [int]$Selection.line
+            $event.finding['symbol'] =
+                [string]$Selection.symbol
+        }
     }
     return $event
 }
@@ -822,7 +854,8 @@ function Get-AutomaticOwnerV2CommentUrl {
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$Provider,
         [Parameter(Mandatory)][long]$PullRequestId,
-        [Parameter(Mandatory)][long]$ThreadId
+        [Parameter(Mandatory)][long]$ThreadId,
+        [string]$Scope = 'changed-line'
     )
     $organization = ([string]$Provider.organization).TrimEnd('/')
     $project = [Uri]::EscapeDataString([string]$Provider.projectName)
@@ -831,8 +864,13 @@ function Get-AutomaticOwnerV2CommentUrl {
         $ThreadId -lt 1) {
         return ''
     }
+    $view = if ($Scope -ceq
+            'pull-request') {
+        'overview'
+    }
+    else { 'files' }
     return "$organization/$project/_git/$repository/pullrequest/" +
-        "${PullRequestId}?_a=files&discussionId=$ThreadId"
+        "${PullRequestId}?_a=$view&discussionId=$ThreadId"
 }
 
 function New-AutomaticNamedAreEqualReviewPackage {
@@ -969,7 +1007,21 @@ function Get-AutomaticOwnerV2ConfirmedEntry {
             -not [bool]$_.Comment.isDeleted
         })
     if ($confirmed.Count -eq 1 -and $entries.Count -eq 1) {
-        if (($NamedAreEqual -or $Contextual) -and (
+        $pullRequestScope =
+            [string](Get-ApprovedOwnerV2Value `
+                $Selection 'scope' '') -ceq
+                'pull-request'
+        if ($pullRequestScope -and (
+                [bool]$confirmed[0].Thread.isDeleted -or
+                [bool]$confirmed[0].Thread.isOutdated -or
+                [string]$confirmed[0].Thread.status -cne
+                    'active' -or
+                $null -ne
+                    $confirmed[0].Thread.anchor)) {
+            throw "Finding '$($Selection.findingId)' readback is stale."
+        }
+        if (-not $pullRequestScope -and
+            ($NamedAreEqual -or $Contextual) -and (
                 [string]::IsNullOrWhiteSpace($SourceCommit) -or
                 [bool]$confirmed[0].Thread.isDeleted -or
                 [bool]$confirmed[0].Thread.isOutdated -or
@@ -1125,7 +1177,9 @@ function Repair-AutomaticOwnerV2Intents {
                     -Url (Get-AutomaticOwnerV2CommentUrl `
                         -Provider $Evidence.Provider `
                         -PullRequestId ([long]$intent.subject.pullRequestId) `
-                        -ThreadId ([long]$entry.Thread.threadId)
+                        -ThreadId ([long]$entry.Thread.threadId) `
+                        -Scope ([string](Get-ApprovedOwnerV2Value `
+                            $selection 'scope' 'changed-line'))
                     ) -ProviderWriteCount 1 -ProviderWriteState confirmed
             }
             else {
@@ -1679,11 +1733,19 @@ function Invoke-AutomaticOwnerV2Comments {
                 if ($classification -cne 'wouldCreate') {
                     throw 'Live classification is not create-only eligible.'
                 }
-                $anchor = @($freshState.Anchors | Where-Object {
-                        [string]$_.path -ieq [string]$selection.path -and
-                        [int]$selection.line -ge [int]$_.startLine -and
-                        [int]$selection.line -le [int]$_.endLine
-                    })[0]
+                $anchor = if (
+                    [string](Get-ApprovedOwnerV2Value `
+                        $selection 'scope' '') -ceq
+                        'pull-request') {
+                    $null
+                }
+                else {
+                    @($freshState.Anchors | Where-Object {
+                            [string]$_.path -ieq [string]$selection.path -and
+                            [int]$selection.line -ge [int]$_.startLine -and
+                            [int]$selection.line -le [int]$_.endLine
+                        })[0]
+                }
                 $writeError = $null
                 $writeCounted = $false
                 try {
@@ -1770,7 +1832,9 @@ function Invoke-AutomaticOwnerV2Comments {
                     -Url (Get-AutomaticOwnerV2CommentUrl `
                         -Provider $Evidence.Provider `
                         -PullRequestId ([long]$authorization.subject.pullRequestId) `
-                        -ThreadId ([long]$entry.Thread.threadId)
+                        -ThreadId ([long]$entry.Thread.threadId) `
+                        -Scope ([string](Get-ApprovedOwnerV2Value `
+                            $selection 'scope' 'changed-line'))
                     ) -ProviderWriteCount 1 -ProviderWriteState confirmed
                 [void](Write-AutomaticOwnerV2Event `
                         -DeliveryRoot $DeliveryRoot -Event $event -Key $Key)

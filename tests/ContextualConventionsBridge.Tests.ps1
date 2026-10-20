@@ -7,6 +7,8 @@ BeforeAll {
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1') -Force
     Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
         'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
@@ -33,6 +35,11 @@ BeforeAll {
                 -Name contextual-bridge-config `
                 -ReviewerIdentity $reviewer `
                 -Handler { throw 'not invoked' }
+        $policyPath = Join-Path $repoRoot `
+            'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json'
+        $policyText = [IO.File]::ReadAllText(
+            $policyPath,
+            [Text.UTF8Encoding]::new($false))
         return [ordered]@{
             schemaVersion = 1
             enabled = $false
@@ -68,8 +75,11 @@ BeforeAll {
                 section =
                     'bpm-contextual-conventions@1'
                 hash =
-                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-                length = 5399
+                    Get-ContextualTestTextDigest `
+                        $policyText
+                length =
+                    [Text.Encoding]::UTF8.
+                        GetByteCount($policyText)
             }
             toolkit = [ordered]@{
                 ref =
@@ -114,11 +124,17 @@ BeforeAll {
                 id =
                     'bpm-contextual-conventions@1'
                 implementationSha256 =
-                    '81250040982450c3233c13954fead55c62eb7654fe85c013ca805fd6cd1a59fb'
+                    (Get-FileHash (
+                        Join-Path $repoRoot `
+                            'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1') `
+                        -Algorithm SHA256).Hash.
+                    ToLowerInvariant()
             }
             sharedAcquisition = [ordered]@{
                 kind =
                     'devpilot-shared-review-acquisition-v1'
+                includePullRequestTemplateAuthority =
+                    $true
                 activePrIntakeSha256 =
                     (Get-FileHash (
                         Join-Path $repoRoot `
@@ -158,8 +174,29 @@ BeforeAll {
     function New-ContextualPreparedIntake {
         param(
             [string]$Content =
-                'using System.IO; class C { void M() { try { X(); } catch (IOException ex) when (!ex.IsFatal()) { Logger.Error(ex.Message); } } }'
+                'using System.IO; class C { void M() { try { X(); } catch (IOException ex) when (!ex.IsFatal()) { Logger.Error(ex.Message); } } }',
+            [string]$Description = @'
+**Problem:**
+Synthetic problem.
+
+**Solution:**
+Synthetic solution.
+
+**Validation:**
+Synthetic validation.
+'@
         )
+        $template = @'
+**Problem:**
+
+**Solution:**
+
+**Validation:**
+Describe what validations are needed:
+- [ ] Optional full test pass
+
+**Release Notes**
+'@
         $head = [ordered]@{
             repositoryId =
                 '11111111-1111-1111-1111-111111111111'
@@ -173,6 +210,24 @@ BeforeAll {
             iterationId = 3
             status = 'active'
             isDraft = $false
+            title = 'Synthetic PR'
+            description = $Description
+            descriptionDigest =
+                Get-ContextualTestTextDigest `
+                    $Description
+            templateAuthority = [ordered]@{
+                state = 'complete'
+                path =
+                    '/.azuredevops/pull_request_template.txt'
+                configurationRef =
+                    'refs/heads/master'
+                configurationCommit = '1' * 40
+                blob = '2' * 40
+                contentDigest =
+                    Get-ContextualTestTextDigest `
+                        $template
+                content = $template
+            }
         }
         $digest =
             Get-ContextualTestTextDigest $Content
@@ -231,6 +286,325 @@ BeforeAll {
         return [pscustomobject]@{
             Intake = $intake
             Head = $head
+        }
+    }
+
+    function Invoke-SyntheticContextualBridge {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)]$Prepared,
+            [Parameter(Mandatory)]
+            [string]$Name,
+            [scriptblock]$HeadProvider
+        )
+        $preparedValue = $Prepared
+        $headCommand = $HeadProvider
+        $provider = {
+            param($Operation, $Arguments)
+            if ($Operation -ceq 'Head') {
+                if ($null -ne $headCommand) {
+                    return & $headCommand `
+                        $preparedValue.Head
+                }
+                return [ordered]@{} +
+                    $preparedValue.Head
+            }
+            throw "unexpected:$Operation"
+        }.GetNewClosure()
+        return Invoke-ContextualConventionsCurrentPrBridge `
+            -Config $Config -Provider $provider `
+            -StateRoot (
+                Join-Path $TestDrive "$Name-state") `
+            -ManifestPath (
+                Join-Path $TestDrive "$Name-manifest.json") `
+            -RepositoryRoot $repoRoot `
+            -PreparedIntake $Prepared.Intake -Run
+    }
+
+    function New-SyntheticPrTemplateReviewerComment {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Head,
+            [Parameter(Mandatory)]
+            [string[]]$MissingSections,
+            [AllowNull()]
+            [Collections.IDictionary]$TemplateAuthority =
+                $null
+        )
+        $template = if ($null -eq
+                $TemplateAuthority) {
+            $Head.templateAuthority
+        }
+        else { $TemplateAuthority }
+        $contract =
+            New-OwnerAcquisitionContract `
+                -RepositoryId $Head.repositoryId `
+                -ProjectId $Head.projectId `
+                -PullRequestId $Head.pullRequestId `
+                -SourceCommit $Head.sourceCommit `
+                -TargetCommit $Head.targetCommit `
+                -TargetRef $Head.targetRef `
+                -RuleRepositoryId (
+                    $Config.contextualRule.repositoryId) `
+                -RulePath $Config.contextualRule.path `
+                -RuleCommit $Config.toolkit.head `
+                -RuleSection (
+                    $Config.contextualRule.section) `
+                -RuleHash $Config.contextualRule.hash `
+                -RuleLength $Config.contextualRule.length `
+                -ConfigId contextual-test `
+                -ConfigDigest (
+                    'v1:sha256:' + ('7' * 64)) `
+                -CapabilityId $Config.capability.id `
+                -CapabilityDigest (
+                    'v1:sha256:' +
+                    $Config.capability.
+                        implementationSha256)
+        $constructRef =
+            'construct:' + ('6' * 64)
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'pr-template-compliance'
+            constructRef = $constructRef
+            issueIdentity =
+                Get-ContextualTestTextDigest (
+                    @($MissingSections |
+                        Sort-Object) -join ',')
+            evidence =
+                'Add meaningful content under the required PR description sections: ' +
+                (@($MissingSections) -join ', ') +
+                '.'
+            missingSections =
+                @($MissingSections)
+            anchor = [ordered]@{
+                scope = 'pull-request'
+                subject = 'description'
+            }
+            binding = [ordered]@{
+                source = [ordered]@{
+                    representation =
+                        [ordered]@{
+                            scope =
+                                'pull-request'
+                            subject =
+                                'description'
+                            descriptionSha256 =
+                                $Head.descriptionDigest.
+                                    Substring(10)
+                            template =
+                                [ordered]@{
+                                    path =
+                                        ([string]$template.path).
+                                            TrimStart('/')
+                                    ref =
+                                        [string]$template.configurationRef
+                                    commit =
+                                        [string]$template.configurationCommit
+                                    blob =
+                                        [string]$template.blob
+                                    contentSha256 =
+                                        ([string]$template.contentDigest).
+                                            Substring(10)
+                                }
+                            constructIdentity =
+                                $constructRef
+                        }
+                }
+            }
+        }
+
+        $marker =
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $finding
+        return [pscustomobject]@{
+            Marker = $marker
+            Body =
+                Format-ContextualConventionComment `
+                    -Contract $contract `
+                    -Finding $finding `
+                    -MarkerKey $marker
+        }
+    }
+
+    function Get-SyntheticDiscussionAuthor {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [ValidateSet(
+                'reviewer',
+                'human',
+                'ambiguous')]
+            [string]$Identity
+        )
+        switch ($Identity) {
+            reviewer {
+                return [ordered]@{
+                    id = $Config.expectedAccount.id
+                    descriptor =
+                        $Config.expectedAccount.descriptor
+                    uniqueName =
+                        $Config.expectedAccount.uniqueName
+                }
+            }
+            human {
+                return [ordered]@{
+                    id =
+                        '44444444-4444-4444-4444-444444444444'
+                    descriptor = 'aad.human'
+                    uniqueName = 'human@example.invalid'
+                }
+            }
+            ambiguous {
+                return [ordered]@{}
+            }
+        }
+    }
+
+    function Add-SyntheticDiscussion {
+        param(
+            [Parameter(Mandatory)]$Prepared,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)][string]$Body,
+            [ValidateSet(
+                'reviewer',
+                'human',
+                'ambiguous')]
+            [string]$Identity = 'reviewer',
+            [int]$ThreadId = 600,
+            [int]$CommentId = 601,
+            [string]$Path = '',
+            [int]$Line = 0
+        )
+        $thread = [ordered]@{
+            id = $ThreadId
+            status = 'active'
+            isDeleted = $false
+            comments = @([ordered]@{
+                    id = $CommentId
+                    commentType = 'text'
+                    content = $Body
+                    author =
+                        Get-SyntheticDiscussionAuthor `
+                            -Config $Config `
+                            -Identity $Identity
+                })
+        }
+        if ($Path) {
+            $thread['threadContext'] =
+                [ordered]@{
+                    filePath = '/' + $Path.TrimStart('/')
+                    rightFileStart =
+                        [ordered]@{
+                            line = $Line
+                            offset = 1
+                        }
+                    rightFileEnd =
+                        [ordered]@{
+                            line = $Line
+                            offset = 1
+                        }
+                }
+            $thread['pullRequestThreadContext'] =
+                [ordered]@{
+                    changeTrackingId = 7
+                    iterationContext =
+                        [ordered]@{
+                            firstComparingIteration = 3
+                            secondComparingIteration = 3
+                        }
+                }
+        }
+        $discussions =
+            $Prepared.Intake.
+                transientSnapshots['42'].discussions
+        $discussions.threads =
+            @($discussions.threads) + @($thread)
+        $discussions.count =
+            @($discussions.threads).Count
+    }
+
+    function Set-SyntheticTopLevelDiscussion {
+        param(
+            [Parameter(Mandatory)]$Prepared,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)][string]$Body,
+            [ValidateSet(
+                'reviewer',
+                'human',
+                'ambiguous')]
+            [string]$Identity = 'reviewer'
+        )
+        $Prepared.Intake.
+            transientSnapshots['42'].
+            discussions = [ordered]@{
+                count = 0
+                threads = @()
+            }
+        Add-SyntheticDiscussion `
+            -Prepared $Prepared `
+            -Config $Config `
+            -Body $Body `
+            -Identity $Identity `
+            -ThreadId 500 -CommentId 501
+    }
+
+    function Get-SyntheticCurrentPrTemplateComment {
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Config,
+            [Parameter(Mandatory)]$Prepared,
+            [Parameter(Mandatory)][string]$Name
+        )
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $Config `
+                -Prepared $Prepared `
+                -Name $Name
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+        $contract =
+            New-OwnerAcquisitionContract `
+                -RepositoryId $Prepared.Head.repositoryId `
+                -ProjectId $Prepared.Head.projectId `
+                -PullRequestId $Prepared.Head.pullRequestId `
+                -SourceCommit $Prepared.Head.sourceCommit `
+                -TargetCommit $Prepared.Head.targetCommit `
+                -TargetRef $Prepared.Head.targetRef `
+                -RuleRepositoryId (
+                    $Config.contextualRule.repositoryId) `
+                -RulePath $Config.contextualRule.path `
+                -RuleCommit $Config.toolkit.head `
+                -RuleSection $Config.contextualRule.section `
+                -RuleHash $Config.contextualRule.hash `
+                -RuleLength $Config.contextualRule.length `
+                -ConfigId contextual-test `
+                -ConfigDigest (
+                    'v1:sha256:' + ('7' * 64)) `
+                -CapabilityId $Config.capability.id `
+                -CapabilityDigest (
+                    'v1:sha256:' +
+                    $Config.capability.
+                        implementationSha256)
+        $finding = $observation.findings[0]
+        $marker =
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract -Finding $finding
+        return [pscustomobject]@{
+            Marker = $marker
+            Body =
+                Format-ContextualConventionComment `
+                    -Contract $contract `
+                    -Finding $finding `
+                    -MarkerKey $marker
         }
     }
 
@@ -454,6 +828,33 @@ BeforeAll {
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'requires the contextual shared acquisition template authority switch to be literal true' {
+        foreach ($value in @(
+                $false,
+                'true')) {
+            $config =
+                New-ContextualTestConfig
+            $config.sharedAcquisition.
+                includePullRequestTemplateAuthority =
+                    $value
+            {
+                Invoke-ContextualConventionsCurrentPrBridge `
+                    -Config $config `
+                    -Provider {
+                        throw 'not invoked'
+                    } `
+                    -StateRoot (
+                        Join-Path $TestDrive `
+                            "invalid-shared-$value") `
+                    -ManifestPath (
+                        Join-Path $TestDrive `
+                            "invalid-shared-$value.json") `
+                    -RepositoryRoot $repoRoot
+            } | Should -Throw (
+                '*exactly one fixed rule bundle*')
+        }
+    }
+
     It 'recognizes an exact signed prior reviewer comment across an upgrade and on restart' {
         $case =
             New-ContextualUpgradeRecognitionCase
@@ -549,6 +950,17 @@ Describe 'Contextual convention current PR bridge' {
     }
 
     It 'supports exact multiple prior bundles without carrying changed rule meaning' {
+        $priorTwentyOne = @(
+            (Get-Content -LiteralPath (
+                Join-Path $repoRoot `
+                    'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json') `
+                -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 32).rules.id |
+                    Where-Object {
+                        [string]$_ -cne
+                            'pr-template-compliance'
+                    })
         $compatibility = [ordered]@{
             schemaVersion = 2
             kind =
@@ -571,11 +983,20 @@ Describe 'Contextual convention current PR bridge' {
                     }
                     unchangedRuleIds = @(
                         'http-client-lifetime')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
+                        length = 5399
+                    }
+                    unchangedRuleIds =
+                        $priorTwentyOne
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-                length = 5399
+                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                length = 6249
             }
         }
         $cases = @(
@@ -601,6 +1022,22 @@ Describe 'Contextual convention current PR bridge' {
                 prior =
                     $compatibility.
                         previousRules[1].rule
+                expected = 'unknown'
+            },
+            [ordered]@{
+                ruleId =
+                    'named-call-arguments'
+                prior =
+                    $compatibility.
+                        previousRules[2].rule
+                expected = 'noOp'
+            },
+            [ordered]@{
+                ruleId =
+                    'pr-template-compliance'
+                prior =
+                    $compatibility.
+                        previousRules[2].rule
                 expected = 'unknown'
             })
         foreach ($control in $cases) {
@@ -674,8 +1111,8 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'
-                length = 5399
+                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                length = 6249
             }
         }
         switch ($Mode) {
@@ -1426,6 +1863,7 @@ internal const string Value = "wire-value";
                 return [ordered]@{} +
                     $prepared.Head
             }
+
             throw "unexpected:$Operation"
         }.GetNewClosure()
         $state = Join-Path $TestDrive `
@@ -1472,6 +1910,1029 @@ internal const string Value = "wire-value";
         @($observation.sourceArtifacts.kind) |
             Should -Contain `
                 owner-v2-discussion-snapshot
+    }
+
+    It 'evaluates one synthetic PR-wide template violation with zero writes' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic change without required sections.'
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-violation
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $result.state | Should -BeExactly completed
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        @($observation.findings) |
+            Should -HaveCount 1
+        $finding = $observation.findings[0]
+        $finding.ruleId |
+            Should -BeExactly pr-template-compliance
+        $finding.anchor.scope |
+            Should -BeExactly pull-request
+        $finding.binding.scope |
+            Should -BeExactly pull-request
+        @($finding.missingSections) -join ',' |
+            Should -BeExactly 'Problem,Solution,Validation'
+        $finding.reconciliation.
+            classification |
+            Should -BeExactly wouldCreate
+    }
+
+    It 'evaluates PR-template metadata from a Named-only shared intake' {
+        $namedConfig = New-ContextualTestConfig
+        $namedConfig.enabled = $true
+        $namedConfig.rules = @([ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            })
+        $source =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description (
+                    'Named shared acquisition missing sections.')
+        $sourceValue = $source
+        $namedProvider = {
+            param($Operation, $Arguments)
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{
+                        id =
+                            $namedConfig.expectedAccount.id
+                        descriptor =
+                            $namedConfig.expectedAccount.descriptor
+                        uniqueName =
+                            $namedConfig.expectedAccount.uniqueName
+                    }
+                }
+                ListPage {
+                    $items = if (
+                        [int]$Arguments.skip -eq 0) {
+                        @([ordered]@{
+                                pullRequestId = 42
+                                status = 'active'
+                                isDraft = $false
+                                targetRef =
+                                    'refs/heads/master'
+                            })
+                    }
+                    else { @() }
+                    return [ordered]@{
+                        items = @($items)
+                        count = @($items).Count
+                        totalCount = 1
+                    }
+                }
+                Head {
+                    return [ordered]@{} +
+                        $sourceValue.Head
+                }
+                Changes {
+                    return $sourceValue.Intake.
+                        transientSnapshots['42'].
+                        changes
+                }
+                Discussions {
+                    return $sourceValue.Intake.
+                        transientSnapshots['42'].
+                        discussions
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        $shared =
+            Invoke-ActivePrIntake `
+                -Config $namedConfig `
+                -Provider $namedProvider `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'named-shared-template-state') `
+                -RepositoryRoot $repoRoot `
+                -MaximumHeadsThisRun 1 `
+                -IncludeTransientSnapshots -Run
+        $sharedTemplateState =
+            [string]$shared.
+                transientSnapshots['42'].
+                head.templateAuthority.state
+        $contextualConfig =
+            New-ContextualTestConfig
+        $contextualConfig.enabled = $true
+        $headProvider = {
+            param($Head)
+            return [ordered]@{} + $Head
+        }
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $contextualConfig `
+                -Prepared ([pscustomobject]@{
+                    Intake = $shared
+                    Head =
+                        $source.Head
+                }) `
+                -Name named-shared-template-contextual `
+                -HeadProvider $headProvider
+        $result.state |
+            Should -BeExactly completed `
+                -Because (
+                    $result |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $namedConfig.rules[0].capability |
+            Should -BeExactly `
+                bpm-named-areequal-arguments@1
+        $sharedTemplateState |
+            Should -BeExactly complete
+        $observation.findings[0].ruleId |
+            Should -BeExactly pr-template-compliance
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly wouldCreate
+    }
+
+    It 'reads PR-wide actionable partial evidence and exits disabled delivery with zero writes' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content (
+                    'class C { void M() { try { X(); } catch (System.Exception ex) { Logger.Error(ex.Message); } } }') `
+                -Description (
+                    'Synthetic PR description without required sections.')
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "Existing other rule.`n`n" +
+                "<!-- devpilot-named-areequal:v1:$('9' * 64) -->") `
+            -Identity human `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-approved-evidence
+        $result.state |
+            Should -BeExactly partial
+        $identity =
+            [string]$result.records[0].identity
+        $configPath = Join-Path $TestDrive `
+            'pr-template-approved-evidence-config.json'
+        [IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json `
+                -InputObject $config `
+                -Depth 64),
+            [Text.UTF8Encoding]::new($false))
+
+        $evidence =
+            Read-ApprovedOwnerV2Evidence `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-approved-evidence-state') `
+                -Identity $identity `
+                -RepoRoot $repoRoot `
+                -ToolkitConfigPath $configPath `
+                -Delivery contextual-conventions
+        $proposal =
+            Get-ApprovedOwnerV2Proposal `
+                -Evidence $evidence `
+                -Finding (
+                    @($evidence.Observation.findings |
+                        Where-Object {
+                            [string]$_.ruleId -ceq
+                                'pr-template-compliance'
+                        })[0]) `
+                -Delivery contextual-conventions
+        $deliveryRoot = Join-Path $TestDrive `
+            'pr-template-disabled-delivery'
+        $producer = Join-Path $repoRoot `
+            'tools\Invoke-ContextualDeliveryBatchJson.ps1'
+        $automatic = Join-Path $repoRoot `
+            'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+        $output = @(& $producer `
+                -AutomaticDeliveryTool $automatic `
+                -DeliveryRoot $deliveryRoot `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-approved-evidence-state') `
+                -Identity $identity `
+                -ToolkitConfigPath $configPath `
+                -AzureCliPath 'ignored' `
+                -GitPath 'git' `
+                -RepoRoot $repoRoot)
+        $envelope =
+            ($output -join "`n") |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+
+        $proposal.scope |
+            Should -BeExactly pull-request
+        $proposal.Contains('path') |
+            Should -BeFalse
+        $envelope.toolExitCode |
+            Should -Be 0
+        $envelope.result.health |
+            Should -BeExactly disabled
+        $envelope.result.providerWrites |
+            Should -Be 0
+        $envelope.result.modelWrites |
+            Should -Be 0
+        Test-Path -LiteralPath $deliveryRoot |
+            Should -BeFalse
+    }
+
+    It 'withholds a PR-template finding when description metadata changes without a head change' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic missing sections.'
+        $headProvider = {
+            param($Head)
+            $current = [ordered]@{} + $Head
+            $current.description = @'
+**Problem:**
+Filled.
+**Solution:**
+Filled.
+**Validation:**
+Filled.
+'@
+            $current.descriptionDigest =
+                Get-ContextualTestTextDigest `
+                    $current.description
+            return $current
+        }
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-description-drift `
+                -HeadProvider $headProvider
+
+        $result.state | Should -BeExactly partial
+        $result.providerWrites | Should -Be 0
+        @($result.outcomes | Where-Object {
+                [string]$_.reason -ceq
+                    'post-evaluation-head-refused'
+            }) | Should -HaveCount 1
+    }
+
+    It 'withholds a PR-template finding when effective template content drifts' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic missing sections.'
+        $headProvider = {
+            param($Head)
+            $current =
+                $Head | ConvertTo-Json `
+                    -Depth 16 -Compress |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 16
+            $current.templateAuthority.content +=
+                "`nSynthetic template change."
+            $current.templateAuthority.contentDigest =
+                Get-ContextualTestTextDigest `
+                    $current.templateAuthority.content
+            $current.templateAuthority.blob =
+                '8' * 40
+            return $current
+        }
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-content-drift `
+                -HeadProvider $headProvider
+
+        $result.state | Should -BeExactly partial
+        $result.providerWrites | Should -Be 0
+        @($result.outcomes | Where-Object {
+                [string]$_.reason -ceq
+                    'post-evaluation-head-refused'
+            }) | Should -HaveCount 1
+    }
+
+    It 'treats a current top-level human PR-template request as coverage' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        $prepared.Intake.
+            transientSnapshots['42'].
+            discussions = [ordered]@{
+                count = 1
+                threads = @([ordered]@{
+                        id = 300
+                        status = 'active'
+                        isDeleted = $false
+                        comments = @([ordered]@{
+                                id = 301
+                                commentType = 'text'
+                                content =
+                                    'Please complete the PR template with Problem, Solution, and Validation.'
+                                author = [ordered]@{
+                                    id =
+                                        '44444444-4444-4444-4444-444444444444'
+                                    descriptor =
+                                        'aad.human'
+                                    uniqueName =
+                                        'human@example.invalid'
+                                }
+                            })
+                    })
+            }
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-human
+        $result.state |
+            Should -BeExactly completed `
+                -Because (
+                    $result.outcomes |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly humanCovered `
+                -Because (
+                    $observation.findings[0].
+                        reconciliation |
+                        ConvertTo-Json -Compress)
+        $result.providerWrites |
+            Should -Be 0
+    }
+
+    It 'reuses one active reviewer PR-template comment when prior missing sections cover the narrowed finding' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation')
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-narrowed
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        @($observation.findings[0].
+                missingSections) -join ',' |
+            Should -BeExactly 'Solution,Validation'
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-covers-current-missing-sections
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds a disjoint prior reviewer PR-template comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem')
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-disjoint
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-coverage-unproven
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds a prior reviewer PR-template comment from a different template blob' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $priorTemplate =
+            $prepared.Head.templateAuthority |
+                ConvertTo-Json -Depth 16 -Compress |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 16
+        $priorTemplate.blob = '8' * 40
+        $priorTemplate.contentDigest =
+            'v1:sha256:' + ('9' * 64)
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation') `
+                -TemplateAuthority $priorTemplate
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-template-drift
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $observation.findings[0].
+            reconciliation.reason |
+            Should -BeExactly `
+                prior-pr-template-review-coverage-unproven
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds an ambiguous top-level reviewer identity without an exact marker' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body 'Synthetic ambiguous discussion.' `
+            -Identity ambiguous
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-ambiguous-identity
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'withholds partial human PR-template coverage of different missing sections' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                'Per the PR template, please fill out the Problem section.') `
+            -Identity human
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-partial-human
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        @($observation.findings[0].
+                missingSections) -join ',' |
+            Should -BeExactly 'Solution,Validation'
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'ignores an active code-anchored contextual rule comment for a new PR-template finding' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "**exception-logging**`n`nExisting code review." +
+                "`n`n<!-- devpilot-contextual-convention:v1:$('a' * 64) -->") `
+            -Identity reviewer `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-code-comment-create
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly wouldCreate
+        $observation.findingsComplete |
+            Should -BeTrue
+    }
+
+    It 'keeps an exact current PR-template marker no-op beside an unrelated code marker' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $first =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        $current =
+            Get-SyntheticCurrentPrTemplateComment `
+                -Config $config `
+                -Prepared $first `
+                -Name pr-template-exact-code-first
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $current.Body `
+            -Identity reviewer
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "**exception-logging**`n`nExisting code review." +
+                "`n`n<!-- devpilot-contextual-convention:v1:$('b' * 64) -->") `
+            -Identity reviewer `
+            -ThreadId 610 -CommentId 611 `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-exact-code-second
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        $observation.findingsComplete |
+            Should -BeTrue
+    }
+
+    It 'keeps a proven prior reviewer no-op beside an unrelated code marker' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description @'
+**Problem:**
+Synthetic problem is filled.
+'@
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation')
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "**exception-logging**`n`nExisting code review." +
+                "`n`n<!-- devpilot-contextual-convention:v1:$('c' * 64) -->") `
+            -Identity reviewer `
+            -ThreadId 620 -CommentId 621 `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-prior-code
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        $observation.findingsComplete |
+            Should -BeTrue
+    }
+
+    It 'keeps a proven reviewer no-op despite a separate partial human comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $first =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        $current =
+            Get-SyntheticCurrentPrTemplateComment `
+                -Config $config `
+                -Prepared $first `
+                -Name pr-template-reviewer-partial-first
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $current.Body `
+            -Identity reviewer
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                'Per the PR template, please fill out the Problem section.') `
+            -Identity human `
+            -ThreadId 630 -CommentId 631
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-reviewer-partial-second
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+    }
+
+    It 'keeps full human coverage despite a separate partial human comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                'Please complete the PR template with Problem, Solution, and Validation.') `
+            -Identity human
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                'Per the PR template, please fill out the Problem section.') `
+            -Identity human `
+            -ThreadId 640 -CommentId 641
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-human-full-partial
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly humanCovered
+    }
+
+    It 'withholds a top-level markerless reviewer-owned comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body 'Reviewer-owned top-level text without a marker.' `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-markerless-reviewer
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+    }
+
+    It 'withholds a top-level comment carrying another devpilot marker' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        Set-SyntheticTopLevelDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body (
+                "Other automation.`n`n" +
+                "<!-- devpilot-named-areequal:v1:$('d' * 64) -->") `
+            -Identity human
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-other-marker
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+    }
+
+    It 'withholds a misplaced code-anchored PR-template comment' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic invalid description.'
+        $prior =
+            New-SyntheticPrTemplateReviewerComment `
+                -Config $config `
+                -Head $prepared.Head `
+                -MissingSections @(
+                    'Problem',
+                    'Solution',
+                    'Validation')
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body $prior.Body `
+            -Identity reviewer `
+            -Path src/Checks.cs -Line 1
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-misplaced-code
+        $observation =
+            Get-Content -LiteralPath (
+                [string]$result.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $observation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly unknown
+    }
+
+    It 'keeps one own marker across invalid description and identical-template commit changes' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $first =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic first invalid description.'
+        $firstResult =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $first `
+                -Name pr-template-own-first
+        $firstObservation =
+            Get-Content -LiteralPath (
+                [string]$firstResult.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+        $contract =
+            New-OwnerAcquisitionContract `
+                -RepositoryId $first.Head.repositoryId `
+                -ProjectId $first.Head.projectId `
+                -PullRequestId $first.Head.pullRequestId `
+                -SourceCommit $first.Head.sourceCommit `
+                -TargetCommit $first.Head.targetCommit `
+                -TargetRef $first.Head.targetRef `
+                -RuleRepositoryId (
+                    $config.contextualRule.repositoryId) `
+                -RulePath $config.contextualRule.path `
+                -RuleCommit $config.toolkit.head `
+                -RuleSection (
+                    $config.contextualRule.section) `
+                -RuleHash $config.contextualRule.hash `
+                -RuleLength $config.contextualRule.length `
+                -ConfigId contextual-test `
+                -ConfigDigest (
+                    'v1:sha256:' + ('7' * 64)) `
+                -CapabilityId $config.capability.id `
+                -CapabilityDigest (
+                    'v1:sha256:' +
+                    $config.capability.
+                        implementationSha256)
+        $firstFinding =
+            $firstObservation.findings[0]
+        $marker =
+            Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $firstFinding
+        $body =
+            Format-ContextualConventionComment `
+                -Contract $contract `
+                -Finding $firstFinding `
+                -MarkerKey $marker
+        $second =
+            New-ContextualPreparedIntake `
+                -Content 'class C { }' `
+                -Description 'Synthetic second invalid description.'
+        $second.Head.templateAuthority.
+            configurationCommit = '9' * 40
+        $second.Intake.heads[0].
+            declaration = $second.Head
+        $second.Intake.
+            transientSnapshots['42'].head =
+                $second.Head
+        $second.Intake.
+            transientSnapshots['42'].
+            discussions = [ordered]@{
+                count = 1
+                threads = @([ordered]@{
+                        id = 400
+                        status = 'active'
+                        isDeleted = $false
+                        comments = @([ordered]@{
+                                id = 401
+                                commentType = 'text'
+                                content = $body
+                                author = [ordered]@{
+                                    id =
+                                        $config.expectedAccount.id
+                                    descriptor =
+                                        $config.expectedAccount.descriptor
+                                    uniqueName =
+                                        $config.expectedAccount.uniqueName
+                                }
+                            })
+                    })
+            }
+        $secondResult =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $second `
+                -Name pr-template-own-second
+        $secondObservation =
+            Get-Content -LiteralPath (
+                [string]$secondResult.outcomes[
+                    0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable `
+                    -Depth 64
+
+        $secondObservation.findings[0].
+            reconciliation.classification |
+            Should -BeExactly noOp
+        (Get-ContextualConventionMarkerKey `
+                -Contract $contract `
+                -Finding $secondObservation.findings[0]) |
+            Should -BeExactly $marker
+        $secondResult.providerWrites |
+            Should -Be 0
     }
 
     It 'withholds a changed head without provider writes' {

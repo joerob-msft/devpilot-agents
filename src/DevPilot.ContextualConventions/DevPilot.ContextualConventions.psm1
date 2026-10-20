@@ -27,7 +27,8 @@ $script:RuleIds = @(
     'api-errors',
     'secret-redaction',
     'dependency-fanout',
-    'test-class-code-coverage'
+    'test-class-code-coverage',
+    'pr-template-compliance'
 )
 
 function Get-ContextualConventionRuleIds {
@@ -58,14 +59,244 @@ function New-ContextualOutcome {
         evidence = $Evidence
     }
     if ($State -ceq 'violation') {
-        $collector = Get-Variable -Name contextualCandidateOutcomes `
+        $collector = Get-Variable `
+            -Name contextualCandidateOutcomes `
             -Scope 1 -ErrorAction SilentlyContinue
         if ($null -ne $collector -and
-            $collector.Value -is [Collections.Generic.List[object]]) {
+            $collector.Value -is
+                [Collections.Generic.List[object]]) {
             [void]$collector.Value.Add($outcome)
         }
     }
     return $outcome
+}
+
+function Get-ContextualTextDigest {
+        param(
+            [Parameter(Mandatory)]
+            [AllowEmptyString()]
+            [string]$Value
+        )
+        return 'v1:sha256:' + [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData(
+                [Text.UTF8Encoding]::new($false).GetBytes($Value))).
+            ToLowerInvariant()
+    }
+
+    function Get-ContextualMarkdownSections {
+        param(
+            [Parameter(Mandatory)]
+            [AllowEmptyString()]
+            [string]$Content
+        )
+        $sections = [Collections.Generic.List[object]]::new()
+        $current = $null
+        $fence = $null
+        $lineNumber = 0
+        foreach ($line in [regex]::Split($Content, '\r?\n')) {
+            $lineNumber++
+            if ($line -match '^\s{0,3}>') {
+                continue
+            }
+            if ($line -match '^\s{0,3}(?<fence>`{3,}|~{3,})') {
+                $marker = [string]$Matches.fence
+                if ($null -eq $fence) {
+                    $fence = $marker.Substring(0, 1)
+                }
+                elseif ($marker.StartsWith(
+                        [string]$fence,
+                        [StringComparison]::Ordinal)) {
+                    $fence = $null
+                }
+                continue
+            }
+            if ($null -ne $fence) {
+                continue
+            }
+            $heading = $null
+            if ($line -match
+                '^\s{0,3}#{1,6}\s+(?<heading>.+?)\s*#*\s*$') {
+                $heading = [string]$Matches.heading
+            }
+            elseif ($line -match
+                '^\s*\*\*\s*(?<heading>[^*]{1,128}?)\s*:?\s*\*\*\s*$') {
+                $heading = [string]$Matches.heading
+            }
+            if ($null -ne $heading) {
+                $name = ($heading.Trim().TrimEnd(':').Trim() -replace
+                        '\s+', ' ').ToLowerInvariant()
+                $current = [ordered]@{
+                    name = $name
+                    line = $lineNumber
+                    lines = [Collections.Generic.List[string]]::new()
+                }
+                [void]$sections.Add($current)
+                continue
+            }
+            if ($null -ne $current) {
+                [void]$current.lines.Add([string]$line)
+            }
+        }
+        return $sections.ToArray()
+    }
+
+    function Test-ContextualMeaningfulSection {
+        param(
+            [Parameter(Mandatory)][object]$Section,
+            [Parameter(Mandatory)]
+            [AllowEmptyCollection()]
+            [Collections.Generic.HashSet[string]]$PlaceholderLines
+        )
+        foreach ($line in @($Section.lines)) {
+            $text = ([string]$line).Trim()
+            if (-not $text -or
+                $text -match '^<!--.*-->$' -or
+                $text -match '^[-*+]\s+\[[ xX]\]\s+' -or
+                $text -match '^(?i)(?:todo|tbd|n/?a|none|unknown|placeholder)[.!:;\s-]*$' -or
+                $text -match '^<[^>]+>$') {
+                continue
+            }
+            $normalized = ($text -replace '\s+', ' ').
+                ToLowerInvariant()
+            if ($PlaceholderLines.Contains($normalized)) {
+                continue
+            }
+            return $true
+        }
+        return $false
+    }
+
+    function Get-ContextualPullRequestTemplateOutcome {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Metadata
+        )
+        $ruleId = 'pr-template-compliance'
+        if ([string]$Metadata.state -cne 'complete') {
+            return [ordered]@{
+                ruleId = $ruleId
+                state = 'unknown'
+                reason = 'pr-template-authority-unavailable'
+                missingSections = @()
+                evidence = ''
+            }
+        }
+        $template = $Metadata.template
+        if ($template -isnot [Collections.IDictionary] -or
+            [string]$Metadata.title -cne
+                ([string]$Metadata.title).Trim() -or
+            ([string]$Metadata.title).Length -gt 4096 -or
+            ([string]$Metadata.description).Length -gt 131072 -or
+            [string]$Metadata.descriptionDigest -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            [string]$Metadata.descriptionDigest -cne
+                (Get-ContextualTextDigest `
+                    -Value ([string]$Metadata.description)) -or
+            [string]$template.path -cnotmatch
+                '^/\.azuredevops/pull_request_template\.(?:md|txt)$' -or
+            [string]$template.configurationRef -cnotmatch
+                '^refs/heads/[^~^:?*\[\\]+$' -or
+            [string]$template.configurationCommit -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$template.blob -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$template.contentDigest -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            [string]$template.contentDigest -cne
+                (Get-ContextualTextDigest `
+                    -Value ([string]$template.content)) -or
+            [Text.Encoding]::UTF8.GetByteCount(
+                [string]$template.content) -gt 65536) {
+            return [ordered]@{
+                ruleId = $ruleId
+                state = 'unknown'
+                reason = 'pr-template-authority-malformed'
+                missingSections = @()
+                evidence = ''
+            }
+        }
+
+        $required = @('problem', 'solution', 'validation')
+        $templateSections = @(
+            Get-ContextualMarkdownSections `
+                -Content ([string]$template.content))
+        $templateRequiredValid = $true
+        foreach ($requiredName in $required) {
+            if (@($templateSections |
+                    Where-Object {
+                        [string]$_.name -ceq
+                            $requiredName
+                    }).Count -ne 1) {
+                $templateRequiredValid = $false
+                break
+            }
+        }
+        if (-not $templateRequiredValid) {
+            return [ordered]@{
+                ruleId = $ruleId
+                state = 'unknown'
+                reason = 'pr-template-required-sections-unproven'
+                missingSections = @()
+                evidence = ''
+            }
+        }
+
+        $descriptionSections = @(
+            Get-ContextualMarkdownSections `
+                -Content ([string]$Metadata.description))
+        $missing = [Collections.Generic.List[string]]::new()
+        foreach ($name in $required) {
+            $matches = @($descriptionSections | Where-Object {
+                    [string]$_.name -ceq $name
+                })
+            if ($matches.Count -ne 1) {
+                [void]$missing.Add(
+                    [Globalization.CultureInfo]::InvariantCulture.
+                        TextInfo.ToTitleCase($name))
+                continue
+            }
+            $placeholders =
+                [Collections.Generic.HashSet[string]]::new(
+                    [StringComparer]::OrdinalIgnoreCase)
+            $templateSection = @($templateSections |
+                Where-Object {
+                    [string]$_.name -ceq $name
+                })[0]
+            foreach ($line in @($templateSection.lines)) {
+                $text = ([string]$line).Trim()
+                if ($text) {
+                    [void]$placeholders.Add(
+                        ($text -replace '\s+', ' ').
+                        ToLowerInvariant())
+                }
+            }
+            if (-not (Test-ContextualMeaningfulSection `
+                    -Section $matches[0] `
+                    -PlaceholderLines $placeholders)) {
+                [void]$missing.Add(
+                    [Globalization.CultureInfo]::InvariantCulture.
+                        TextInfo.ToTitleCase($name))
+            }
+        }
+        if ($missing.Count -gt 0) {
+            return [ordered]@{
+                ruleId = $ruleId
+                state = 'violation'
+                reason = 'required-pr-template-sections-missing-or-placeholder'
+                missingSections = $missing.ToArray()
+                evidence = (
+                    'Add meaningful content under the required PR description ' +
+                    "sections: $($missing -join ', ').")
+            }
+        }
+        return [ordered]@{
+            ruleId = $ruleId
+            state = 'compliant'
+            reason = 'required-pr-template-sections-complete'
+            missingSections = @()
+            evidence = ''
+        }
 }
 
 function Test-ContextualChangedLine {
@@ -4645,5 +4876,6 @@ function Get-ContextualConventionOutcomes {
 
 Export-ModuleMember -Function @(
     'Get-ContextualConventionOutcomes',
-    'Get-ContextualConventionRuleIds'
+    'Get-ContextualConventionRuleIds',
+    'Get-ContextualPullRequestTemplateOutcome'
 )

@@ -1951,10 +1951,177 @@ function ConvertTo-OwnerAcquisitionResponse {
     if ($afterChangedFileCount -ne $changedFileCount) {
         throw 'Subject denominator changed or exceeded the file cap.'
     }
+    $pullRequestBefore =
+        Get-OwnerAdapterMember -Value $subjectBefore `
+            -Name pullRequestMetadata
+    $pullRequestAfter =
+        Get-OwnerAdapterMember -Value $subjectAfter `
+            -Name pullRequestMetadata
+    $metadataApplicable =
+        $null -ne $pullRequestBefore -or
+        $null -ne $pullRequestAfter
+    if (-not $metadataApplicable) {
+        $emptyDigest =
+            Get-OwnerAdapterDigest -Value ''
+        $pullRequestBefore = [ordered]@{
+            state = 'complete'
+            applicable = $false
+            title = ''
+            description = ''
+            descriptionDigest = $emptyDigest
+            template = [ordered]@{
+                state = 'not-applicable'
+            }
+            unknownReason = $null
+        }
+        $pullRequestAfter =
+            $pullRequestBefore
+    }
+    if ($pullRequestBefore -isnot
+            [Collections.IDictionary] -or
+        $pullRequestAfter -isnot
+            [Collections.IDictionary] -or
+        (Get-OwnerAdapterDigest `
+            -Value $pullRequestBefore) -cne
+        (Get-OwnerAdapterDigest `
+            -Value $pullRequestAfter)) {
+        throw 'Pull request metadata changed during acquisition.'
+    }
+    $metadataState = [string](
+        Get-OwnerAdapterMember `
+            -Value $pullRequestBefore `
+            -Name state -Required)
+    if ($metadataState -cnotin @(
+            'complete', 'unknown')) {
+        throw 'Pull request metadata state is invalid.'
+    }
+    if ($metadataApplicable -and
+        $pullRequestBefore.Contains(
+            'applicable')) {
+        $metadataApplicable =
+            Get-OwnerAdapterBoolean `
+                -Value $pullRequestBefore.applicable `
+                -Name pullRequestMetadata.applicable
+    }
+    $metadataTitle = [string](
+        Get-OwnerAdapterMember `
+            -Value $pullRequestBefore `
+            -Name title -Required)
+    $metadataDescription = [string](
+        Get-OwnerAdapterMember `
+            -Value $pullRequestBefore `
+            -Name description -Required)
+    $metadataDescriptionDigest =
+        [string](Get-OwnerAdapterMember `
+            -Value $pullRequestBefore `
+            -Name descriptionDigest -Required)
+    if ($metadataTitle.Length -gt 4096 -or
+        $metadataDescription.Length -gt 131072 -or
+        $metadataDescriptionDigest -cnotmatch
+            '^v1:sha256:[0-9a-f]{64}$' -or
+        $metadataDescriptionDigest -cne
+            (Get-OwnerAdapterDigest `
+                -Value $metadataDescription)) {
+        throw 'Pull request metadata content is invalid.'
+    }
+    $metadataTemplate =
+        Get-OwnerAdapterMember `
+            -Value $pullRequestBefore `
+            -Name template -Required
+    if ($metadataTemplate -isnot
+            [Collections.IDictionary]) {
+        throw 'Pull request template metadata is invalid.'
+    }
+    $normalizedTemplate = if (
+        -not $metadataApplicable) {
+        [ordered]@{
+            state = 'not-applicable'
+        }
+    }
+    elseif ($metadataState -ceq 'complete') {
+        $templateContent = [string](
+            Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name content -Required)
+        $templateDigest = [string](
+            Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name contentDigest -Required)
+        $templatePath = [string](
+            Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name path -Required)
+        if ($templatePath -cnotmatch
+                '^/\.azuredevops/pull_request_template\.(?:md|txt)$' -or
+            [string](Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name configurationRef -Required) -cnotmatch
+                    '^refs/heads/[^~^:?*\[\\]+$' -or
+            [string](Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name configurationCommit -Required) -cnotmatch
+                    '^[0-9a-f]{40}$' -or
+            [string](Get-OwnerAdapterMember `
+                -Value $metadataTemplate `
+                -Name blob -Required) -cnotmatch
+                    '^[0-9a-f]{40}$' -or
+            $templateDigest -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            $templateDigest -cne
+                (Get-OwnerAdapterDigest `
+                    -Value $templateContent) -or
+            [Text.Encoding]::UTF8.GetByteCount(
+                $templateContent) -gt 65536) {
+            throw 'Pull request template metadata is invalid.'
+        }
+        [ordered]@{
+            path = $templatePath
+            configurationRef = [string](
+                Get-OwnerAdapterMember `
+                    -Value $metadataTemplate `
+                    -Name configurationRef -Required)
+            configurationCommit = [string](
+                Get-OwnerAdapterMember `
+                    -Value $metadataTemplate `
+                    -Name configurationCommit -Required)
+            blob = [string](
+                Get-OwnerAdapterMember `
+                    -Value $metadataTemplate `
+                    -Name blob -Required)
+            contentDigest = $templateDigest
+            content = $templateContent
+        }
+    }
+    else {
+        $unknownReason = [string](
+            Get-OwnerAdapterMember `
+                -Value $pullRequestBefore `
+                -Name unknownReason -Required)
+        if ($unknownReason -cnotin @(
+                'template-authority-unavailable',
+                'template-authority-ambiguous',
+                'template-authority-malformed',
+                'template-authority-stale')) {
+            throw 'Pull request template unknown reason is invalid.'
+        }
+        [ordered]@{
+            state = 'unknown'
+            reason = $unknownReason
+        }
+    }
 
     $diagnostics = [Collections.Generic.List[object]]::new()
     $artifactDigests = [Collections.Generic.List[object]]::new()
     [void]$artifactDigests.Add([ordered]@{ artifact = 'subject'; digest = $subjectBeforeDigest })
+    if ($metadataApplicable) {
+        [void]$artifactDigests.Add([ordered]@{
+                artifact =
+                    'pull-request-metadata'
+                digest =
+                    Get-OwnerAdapterDigest `
+                        -Value $pullRequestBefore
+            })
+    }
     $changes = [Collections.Generic.List[object]]::new()
     $expectedPage = 0
     $expectedToken = $null
@@ -2179,6 +2346,31 @@ function ConvertTo-OwnerAcquisitionResponse {
     [void]$artifactDigests.Add([ordered]@{ artifact = 'rule'; digest = $ruleSourceDigest })
 
     $units = [Collections.Generic.List[object]]::new()
+    if ($metadataApplicable) {
+        [void]$units.Add([ordered]@{
+                unitId = 'pull-request'
+                state = $metadataState
+                data = [ordered]@{
+                    applicable = $true
+                    title = $metadataTitle
+                    description =
+                        $metadataDescription
+                    descriptionDigest =
+                        $metadataDescriptionDigest
+                    template =
+                        $normalizedTemplate
+                }
+            })
+        if ($metadataState -ceq 'unknown') {
+            Add-OwnerAdapterDiagnostic `
+                -Diagnostics $diagnostics `
+                -Limits $limits `
+                -Code 'pull-request-metadata-unknown' `
+                -Message (
+                    'Current PR description or effective ' +
+                    'repository template was unavailable.')
+        }
+    }
     $ruleUnitState = if ($ruleState -ceq 'complete') { 'complete' } else { 'unknown' }
     if ($ruleUnitState -ceq 'unknown') {
         Add-OwnerAdapterDiagnostic -Diagnostics $diagnostics -Limits $limits `
