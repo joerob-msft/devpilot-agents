@@ -1840,6 +1840,11 @@ function Get-OwnerLivePackage {
         }
         if ($null -ne $content) {
             $contentBytes = [Text.Encoding]::UTF8.GetByteCount([string]$content)
+            $comparison = Get-OwnerAdapterMember -Value $file -Name comparison
+            if ($comparison -is [Collections.IDictionary] -and
+                $comparison.Contains('content') -and $comparison.content -is [string]) {
+                $contentBytes += [Text.Encoding]::UTF8.GetByteCount([string]$comparison.content)
+            }
             if ($bytesRead + $contentBytes -gt $limits.MaximumBytes) {
                 [void]$files.Add((New-OwnerSyntheticFileResponse -Request $request -Path $path `
                         -State unknown -Reason oversize -SourceDigest $changeDigest))
@@ -1867,6 +1872,44 @@ function Get-OwnerLivePackage {
         files = @($files)
         subjectAfter = $subjectAfter
     })
+}
+
+function ConvertTo-OwnerComparisonEvidence {
+    param(
+        [AllowNull()]$Value,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$ChangeType,
+        [AllowNull()]$Content
+    )
+    $unknown = [ordered]@{state='unknown';reason='comparison-baseline-unavailable'}
+    $keys = @('schemaVersion','state','path','targetPath','sourceCommit','targetCommit',
+        'sourceDigest','targetDigest','byteLength','content','targetState')
+    if ($Value -isnot [Collections.IDictionary] -or
+        @($keys | Where-Object { -not $Value.Contains($_) }).Count -gt 0) {
+        return $unknown
+    }
+    if (($Value.schemaVersion -isnot [int] -and $Value.schemaVersion -isnot [long]) -or
+        ($Value.byteLength -isnot [int] -and $Value.byteLength -isnot [long]) -or
+        [long]$Value.schemaVersion -ne 1 -or
+        [string]$Value.state -cne 'complete' -or
+        $Value.content -isnot [string] -or $Content -isnot [string] -or
+        [string]$Value.path -cne $Path -or
+        [string]$Value.targetPath -cne $TargetPath -or
+        [string]$Value.sourceCommit -cne [string]$Request.SourceCommit -or
+        [string]$Value.targetCommit -cne [string]$Request.TargetCommit -or
+        [string]$Value.sourceDigest -cne (Get-OwnerAdapterDigest -Value $Content) -or
+        [string]$Value.targetDigest -cne (Get-OwnerAdapterDigest -Value ([string]$Value.content)) -or
+        [long]$Value.byteLength -ne [Text.Encoding]::UTF8.GetByteCount([string]$Value.content) -or
+        ($ChangeType -ceq 'added' -and (
+            [string]$Value.targetState -cne 'absent' -or [string]$Value.content -cne '')) -or
+        ($ChangeType -cne 'added' -and [string]$Value.targetState -cne 'present')) {
+        return $unknown
+    }
+    $normalized = [ordered]@{}
+    foreach ($key in $keys) { $normalized[$key] = $Value[$key] }
+    return $normalized
 }
 
 function ConvertTo-OwnerSpanData {
@@ -2441,6 +2484,19 @@ function ConvertTo-OwnerAcquisitionResponse {
         if ($change['changeType'] -ceq 'deleted' -and $null -ne $content) {
             throw 'Deleted file evidence cannot contain current content.'
         }
+        $rawComparison = Get-OwnerAdapterMember -Value $file -Name comparison
+        if ($rawComparison -is [Collections.IDictionary] -and
+            $rawComparison.Contains('content') -and $rawComparison.content -is [string]) {
+            $totalContentBytes += [Text.Encoding]::UTF8.GetByteCount([string]$rawComparison.content)
+        }
+        $comparison = ConvertTo-OwnerComparisonEvidence -Value $rawComparison `
+            -Request $request -Path $path -TargetPath $(if ($change['changeType'] -ceq 'renamed') {
+                [string]$change['oldPath']
+            } else { $path }) -ChangeType ([string]$change['changeType']) -Content $content
+        if ($null -ne $rawComparison -and [string]$comparison.state -cne 'complete') {
+            Add-OwnerAdapterDiagnostic -Diagnostics $diagnostics -Limits $limits `
+                -Code comparison-baseline-unknown -Message 'Comparison baseline identity or content did not match the current file and immutable heads.'
+        }
         if ($totalContentBytes -gt $limits.MaximumBytes) {
             throw 'File package exceeded the configured byte cap.'
         }
@@ -2518,6 +2574,7 @@ function ConvertTo-OwnerAcquisitionResponse {
                     byteLength = $byteLength
                     truncated = $truncated
                     content = $content
+                    comparison = $comparison
                     projectContext =
                         $change['projectContext']
                 }

@@ -721,6 +721,90 @@ Describe 'Active PR read-only intake' {
             Should -BeExactly $state.templateCommit
     }
 
+    It 'retains a reused literal writer and reader across separate durable acquisition chunks' {
+        $c = New-IntakeCase -Count 1 -MaxHeads 1
+        $baseProvider = $c.provider
+        $context = @{
+            state='complete';path='src/App.csproj';content='<Project />'
+            byteLength=11
+            sourceDigest='v1:sha256:' + [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('<Project />'))).ToLowerInvariant()
+        }
+        $entries = @(
+            @{changeTrackingId=1;path='src/Reader.cs';content='class Reader { string Read(Exception ex) => ex.Data["SharedKey"] as string; }'},
+            @{changeTrackingId=2;path='src/Writer.cs';content='class Writer { void Write(Exception ex) { ex.Data["SharedKey"] = null; } }'}
+        )
+        foreach ($entry in $entries) {
+            $entry.changeType='edit'; $entry.state='complete'
+            $entry.byteLength=[Text.Encoding]::UTF8.GetByteCount($entry.content)
+            $entry.sourceDigest='v1:sha256:' + [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($entry.content))).ToLowerInvariant()
+            $entry.spans=@(@{startLine=1;endLine=1;state='complete';sourceDigest=$entry.sourceDigest})
+            $entry.projectContext=$context
+            $entry.sourceCommit='a'*40
+            $entry.targetCommit='b'*40
+            $target=$(if($entry.changeTrackingId -eq 1){$entry.content}else{''})
+            $entry.comparison=@{
+                schemaVersion=1;state='complete';path=$entry.path;targetPath=$entry.path
+                sourceCommit=('a'*40);targetCommit=('b'*40);sourceDigest=$entry.sourceDigest
+                targetDigest=('v1:sha256:'+ [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($target))).ToLowerInvariant())
+                byteLength=[Text.Encoding]::UTF8.GetByteCount($target);content=$target;targetState='present'
+            }
+        }
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes') { return & $baseProvider $op $request }
+            $start=[int]$request.fileStartOrdinal
+            $batch = @(if ($start -lt 2) { $entries[$start] })
+            return @{
+                changedFiles=$batch.Count;changedLines=$batch.Count;entries=$batch;projectContexts=@($context)
+                inventory=@($entries | ForEach-Object {
+                    @{changeTrackingId=$_.changeTrackingId;path=$_.path;changeType='edit';originalPath=$null
+                        evidenceDisposition='required';evidenceReason='non-generated-csharp'}
+                })
+                fileProgress=@{
+                    inventoryDigest=('6'*64);evidencePlanDigest=('7'*64);totalFiles=2;totalInventoryFiles=2
+                    startOrdinal=$start;nextOrdinal=($start+$batch.Count);complete=($start -ge 1)
+                    cumulativeChangedLines=[Math]::Min(2,$start+$batch.Count)
+                }
+            }
+        }.GetNewClosure()
+        $first = Invoke-IntakeCase $c
+        $first.heads[0].reasonCode | Should -BeExactly 'file-progress-pending'
+        $second = Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo -IncludeTransientSnapshots -Run
+        $snapshot = $second.transientSnapshots['1'].changes
+        $snapshot.entries | Should -HaveCount 2
+        $progress=Get-Content (Join-Path $c.root 'active-pr-intake-v1\file-progress\1.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $progress.entries[0].comparison.content | Should -BeExactly $entries[0].content
+        $progress.totalBytes | Should -Be (
+            $entries[0].byteLength + $entries[1].byteLength + $entries[0].comparison.byteLength)
+        Import-Module (Join-Path $repo 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1') -Force
+        $outcomes = @($snapshot.entries | ForEach-Object {
+            Get-ContextualConventionOutcomes -Content $_.content -Path $_.path `
+                -Spans $_.spans -SnapshotFiles $snapshot.entries |
+                Where-Object ruleId -CEQ reused-string-literals
+        })
+        $violations = @($outcomes | Where-Object state -CEQ violation)
+        $violations | Should -HaveCount 1
+        $violations[0].path | Should -BeExactly 'src/Reader.cs'
+        $violations[0].relatedUses | Should -HaveCount 2
+        $progress.entries[0].comparison.Remove('content')
+        $progress | ConvertTo-Json -Depth 64 | Set-Content (
+            Join-Path $c.root 'active-pr-intake-v1\file-progress\1.json')
+        $resumed=Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo -IncludeTransientSnapshots -Run
+        $retained=$resumed.transientSnapshots['1'].changes.entries
+        $retained | Should -HaveCount 2
+        $outcomes=@(Get-ContextualConventionOutcomes -Content $retained[0].content `
+            -Path $retained[0].path -Spans $retained[0].spans -SnapshotFiles $retained |
+            Where-Object ruleId -CEQ reused-string-literals)
+        @($outcomes | Where-Object state -CEQ violation) | Should -HaveCount 0
+        @($outcomes | Where-Object state -CEQ unknown) | Should -HaveCount 1
+    }
+
     It 'continues 32-file progress across metadata-only template commit drift and resets on a code head change' {
         $c = New-IntakeCase -Count 1 `
             -MaxHeads 1

@@ -19,6 +19,7 @@ $script:ApprovedContextualRuleIds = @(
     'named-call-arguments',
     'xml-summary-layout',
     'duplicate-constant-declarations',
+    'reused-string-literals',
     'collection-cardinality',
     'cheap-validation',
     'async-all-the-way',
@@ -144,7 +145,8 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
                     [string]$_ -cnotmatch
                         '^[a-z][a-z0-9-]{0,127}$' -or
                     [string]$_ -cnotin
-                        $AllowedRuleIds
+                        $AllowedRuleIds -or
+                    [string]$_ -ceq 'reused-string-literals'
                 }).Count -ne 0) {
             throw "$Name is invalid."
         }
@@ -975,7 +977,9 @@ function Get-ApprovedOwnerV2Proposal {
             [int]$source.startLine -ne
                 [int]$Finding.anchor.line -or
             [int]$source.endLine -ne
-                [int]$Finding.anchor.line) {
+                [int]$Finding.binding.span.endLine -or
+            [int]$source.endLine -lt
+                [int]$source.startLine) {
             throw 'Contextual finding is not one exact changed anchor.'
         }
         $classification =
@@ -1030,6 +1034,8 @@ function Get-ApprovedOwnerV2Proposal {
                 [string]$Finding.anchor.path
             $proposal['line'] =
                 [int]$Finding.anchor.line
+            $proposal['endLine'] =
+                [int]$Finding.binding.span.endLine
             $proposal['symbol'] =
                 [string]$Finding.anchor.symbol
         }

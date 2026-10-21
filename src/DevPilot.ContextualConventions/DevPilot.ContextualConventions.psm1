@@ -14,6 +14,7 @@ $script:RuleIds = @(
     'named-call-arguments',
     'xml-summary-layout',
     'duplicate-constant-declarations',
+    'reused-string-literals',
     'collection-cardinality',
     'cheap-validation',
     'async-all-the-way',
@@ -3536,6 +3537,364 @@ function Get-ContextualDuplicateConstantOutcome {
         -Path $Path
 }
 
+function Get-ContextualStringLiteralProject {
+    param([AllowNull()]$File)
+    if ($null -eq $File -or
+        $File -isnot [Collections.IDictionary] -or
+        -not $File.Contains('projectContext') -or
+        $File.projectContext -isnot [Collections.IDictionary] -or
+        -not $File.projectContext.Contains('state') -or
+        -not $File.projectContext.Contains('path') -or
+        -not $File.projectContext.Contains('content') -or
+        [string]$File.projectContext.state -cne 'complete') {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+    $context = $File.projectContext
+    try {
+        [xml]$xml = [string]$context.content
+    }
+    catch {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+    $conditional = @($xml.SelectNodes(
+            '//*[(local-name()="IsTestProject" or local-name()="LangVersion") and ancestor-or-self::*[@Condition]] | //*[@Condition and (local-name()="Compile" or local-name()="DefineConstants" or local-name()="PackageReference")]'))
+    if ($conditional.Count -gt 0 -or
+        $null -eq $xml.DocumentElement -or
+        $xml.DocumentElement.LocalName -cne 'Project') {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+    $test = @($xml.SelectNodes(
+            '//*[local-name()="IsTestProject"]') |
+        Where-Object { $_.InnerText.Trim() -ieq 'true' }).Count -gt 0 -or
+        @($xml.SelectNodes(
+            '//*[local-name()="PackageReference"]') |
+        Where-Object {
+            $_.GetAttribute('Include') -ceq 'Microsoft.NET.Test.Sdk'
+        }).Count -gt 0
+    if ($test) {
+        return [pscustomobject]@{ State = 'test' }
+    }
+    if ([string]$context.path -inotmatch '\.csproj$' -or
+        ($context.Contains('sourceDigest') -and
+            [string]$context.sourceDigest -cne
+                (Get-ContextualTextDigest -Value ([string]$context.content)))) {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+    $directory = [IO.Path]::GetDirectoryName(
+        ([string]$context.path).Replace('/', [IO.Path]::DirectorySeparatorChar))
+    if ($directory -and -not ([string]$File.path).Replace('\', '/').StartsWith(
+            $directory.Replace('\', '/') + '/', [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+    $language = Get-ContextualNamedCallLanguageState -Path ([string]$File.path) -SnapshotFiles @($File)
+    $rawSupported = [string]$language.State -ceq 'supported' -and
+        ([string]$language.Version -cin @('latest', 'latestMajor', 'preview') -or
+            [string]$language.Version -match '^(?:1[1-9]|[2-9][0-9])(?:\.0)?$')
+    return [pscustomobject]@{
+        State = 'complete'
+        Path = [string]$context.path
+        Digest = Get-ContextualTextDigest -Value ([string]$context.content)
+        RawStringsSupported = $rawSupported
+    }
+}
+
+function Get-ContextualStringComparisonRoot {
+    param([Parameter(Mandatory)]$File)
+    $keys = @('comparison','sourceCommit','targetCommit')
+    if (@($keys | Where-Object { -not $File.Contains($_) }).Count -gt 0 -or
+        $File.comparison -isnot [Collections.IDictionary]) { return $null }
+    $baseline = $File.comparison
+    $required = @('schemaVersion','state','path','targetPath','sourceCommit','targetCommit',
+        'sourceDigest','targetDigest','byteLength','content','targetState')
+    if (@($required | Where-Object { -not $baseline.Contains($_) }).Count -gt 0 -or
+        [string]$File.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$File.targetCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$baseline.schemaVersion -cne '1' -or [string]$baseline.state -cne 'complete' -or
+        $baseline.content -isnot [string] -or
+        [string]$baseline.path -cne [string]$File.path -or
+        [string]$baseline.targetPath -cne $(if ($File.Contains('oldPath') -and $File.oldPath) {
+            [string]$File.oldPath
+        } else { [string]$File.path }) -or
+        [string]$baseline.sourceCommit -cne [string]$File.sourceCommit -or
+        [string]$baseline.targetCommit -cne [string]$File.targetCommit -or
+        [string]$baseline.sourceDigest -cne (Get-ContextualTextDigest ([string]$File.content)) -or
+        [string]$baseline.targetDigest -cne (Get-ContextualTextDigest ([string]$baseline.content)) -or
+        [string]$baseline.byteLength -cne [string][Text.Encoding]::UTF8.GetByteCount([string]$baseline.content) -or
+        ([string]$baseline.targetState -ceq 'absent' -and (
+            -not $File.Contains('changeType') -or [string]$File.changeType -cne 'added' -or
+            [string]$baseline.content -cne '')) -or
+        ($File.Contains('changeType') -and [string]$File.changeType -ceq 'added' -and
+            [string]$baseline.targetState -cne 'absent') -or
+        [string]$baseline.targetState -cnotin @('present','absent') -or
+        [string]$baseline.content -match '(?m)^[ \t]*#(?:if|elif|else|endif)\b') {
+        return $null
+    }
+    $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText([string]$baseline.content)
+    if (@($tree.GetDiagnostics() | Where-Object {
+        $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+    }).Count -gt 0) { return $null }
+    return $tree.GetRoot()
+}
+
+function Get-ContextualReusedStringOutcomes {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Spans,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $ruleId = 'reused-string-literals'
+    $uses = [Collections.Generic.List[object]]::new()
+    $byValue = [Collections.Generic.Dictionary[string,object]]::new(
+        [StringComparer]::Ordinal)
+    $targetCounts = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $constants = [Collections.Generic.List[object]]::new()
+    $baselineUnknown = $false
+    $incompletePeer = $false
+    $conditionalCurrent = $false
+    $currentFiles = @($SnapshotFiles | Where-Object {
+            [string]$_.path -ieq $Path
+        })
+    $currentFile = if ($currentFiles.Count -eq 1) {
+        $currentFiles[0]
+    } else { $null }
+    $sources = @([ordered]@{
+            path = $Path
+            state = 'complete'
+            content = $Root.ToFullString()
+            spans = $Spans
+            projectContext = $(if ($null -ne $currentFile -and
+                    $currentFile.Contains('projectContext')) {
+                    $currentFile.projectContext
+                } else { $null })
+        }) + @($SnapshotFiles | Where-Object {
+            [string]$_.path -ine $Path -and
+            [string]$_.path -imatch '\.cs$'
+        })
+    foreach ($key in @('comparison','sourceCommit','targetCommit','changeType','oldPath')) {
+        if ($null -ne $currentFile -and $currentFile.Contains($key)) {
+            $sources[0][$key] = $currentFile[$key]
+        }
+    }
+    foreach ($file in $sources) {
+        $filePath = ([string]$file.path).Replace('\', '/')
+        $current = $filePath -ieq $Path.Replace('\', '/')
+        if ($filePath -imatch
+                '(^|/)(?:obj|generated|Ignore-AddedForReferenceOnly)(/|$)|(?:\.g|\.designer)\.cs$' -or
+            [string]$file.content -match
+                '(?im)^\s*//\s*<auto-generated(?:\s|>)') {
+            continue
+        }
+        if ([string]$file.state -cne 'complete' -or
+            $file.content -isnot [string]) {
+            $incompletePeer = $true
+            $baselineUnknown = $true
+            continue
+        }
+        $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+            [string]$file.content)
+        if (@($tree.GetDiagnostics() | Where-Object {
+                    $_.Severity -eq
+                        [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            $incompletePeer = $true
+            $baselineUnknown = $true
+            continue
+        }
+        $project = Get-ContextualStringLiteralProject -File $file
+        if ([string]$project.State -ceq 'test') {
+            continue
+        }
+        $conditional = [regex]::IsMatch(
+            [string]$file.content, '(?m)^[ \t]*#(?:if|elif|else|endif)\b')
+        if ($current -and $conditional) { $conditionalCurrent = $true }
+        $targetRoot = Get-ContextualStringComparisonRoot -File $file
+        if ($null -eq $targetRoot) { $baselineUnknown = $true }
+        $scans = @(@{Root=$tree.GetRoot();Target=$false})
+        if ($null -ne $targetRoot) { $scans += @{Root=$targetRoot;Target=$true} }
+        $fileSpans = @(if ($file.Contains('spans')) { $file.spans })
+        foreach ($scan in $scans) {
+        foreach ($literal in @($scan.Root.DescendantNodes() |
+                Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.LiteralExpressionSyntax] -and
+                    [int]$_.RawKind -eq
+                        [int][Microsoft.CodeAnalysis.CSharp.SyntaxKind]::StringLiteralExpression
+                })) {
+            $ancestors = @($literal.Ancestors())
+            if (@($ancestors | Where-Object {
+                        $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.AttributeSyntax]
+                    }).Count -gt 0) {
+                continue
+            }
+            $constant = @($ancestors | Where-Object {
+                ($_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -or
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.LocalDeclarationStatementSyntax]) -and
+                'const' -cin @($_.Modifiers | ForEach-Object { $_.Text })
+            })
+            if ([bool]$scan.Target) {
+                if ($constant.Count -eq 0) {
+                    $value = [string]$literal.Token.ValueText
+                    if (-not $targetCounts.ContainsKey($value)) { $targetCounts[$value] = 0 }
+                    $targetCounts[$value]++
+                }
+                continue
+            }
+            $type = @($ancestors | Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                } | Select-Object -First 1)
+            if ($type.Count -ne 1) {
+                continue
+            }
+            $names = @($ancestors | Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax] -or
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax]
+                } | ForEach-Object {
+                    if ($_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]) {
+                        $_.Identifier.ValueText + '`' + $_.Arity
+                    } else { $_.Name.ToString() }
+                })
+            [array]::Reverse($names)
+            if ($constant.Count -gt 0) {
+                $field = $constant[0]
+                $variable = @($ancestors | Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax]
+                } | Select-Object -First 1)
+                if ($field -is [Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                    $field.Declaration.Type.ToString() -cin @('string','System.String') -and
+                    $variable.Count -eq 1 -and $null -ne $variable[0].Initializer -and
+                    $variable[0].Initializer.Value -eq $literal -and
+                    -not $conditional -and @($ancestors | Where-Object {
+                        $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax] -and $_.Arity -gt 0
+                    }).Count -eq 0) {
+                    $visibility = @($field.Modifiers | ForEach-Object { $_.Text })
+                    $constantNames = @($names | ForEach-Object { $_ -replace '`0$', '' })
+                    $constants.Add([pscustomobject]@{
+                        Value=[string]$literal.Token.ValueText
+                        Symbol=($names -join '.')
+                        Name=($constantNames -join '.') + '.' + $variable[0].Identifier.ValueText
+                        Project=$project
+                        Shared=(('public' -cin $visibility -or 'internal' -cin $visibility) -and
+                            @($type[0].Ancestors() | Where-Object {
+                                $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                            }).Count -eq 0)
+                    })
+                }
+                continue
+            }
+            $line = Get-ContextualNodeLine $literal
+            $use = [pscustomobject]@{
+                Path = $filePath
+                Line = $line
+                Column = $literal.GetLocation().GetLineSpan().StartLinePosition.Character + 1
+                EndLine = $literal.GetLocation().GetLineSpan().EndLinePosition.Line + 1
+                Symbol = $names -join '.'
+                Value = [string]$literal.Token.ValueText
+                Project = $project
+                Unsupported = $conditional -or (
+                    [string]$literal.Token.Text -match '^"{3,}' -and
+                    ([string]$project.State -cne 'complete' -or -not $project.RawStringsSupported))
+                Current = $current
+                Changed = Test-ContextualChangedLine -Line $line -Spans $fileSpans
+            }
+            [void]$uses.Add($use)
+            if (-not $byValue.ContainsKey($use.Value)) {
+                $byValue[$use.Value] = [Collections.Generic.List[object]]::new()
+            }
+            [void]$byValue[$use.Value].Add($use)
+        }
+        }
+    }
+    $outcomes = [Collections.Generic.List[object]]::new()
+    $values = [string[]]@($byValue.Keys)
+    [array]::Sort($values, [StringComparer]::Ordinal)
+    foreach ($value in $values) {
+        $peers = @($byValue[$value] | Sort-Object Path, Line, Column -CaseSensitive)
+        $changed = @($peers | Where-Object { $_.Current -and $_.Changed })
+        if ($changed.Count -eq 0) { continue }
+        if ($peers.Count -lt 2) {
+            if ($incompletePeer) {
+                $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                    -Reason reused-string-scope-unproven -Path $Path))
+            }
+            continue
+        }
+        if ($baselineUnknown -or @($peers | Where-Object {
+            $_.Unsupported -or [string]$_.Project.State -cne 'complete'
+        }).Count -gt 0) {
+            $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason reused-string-baseline-unproven -Path $Path))
+            continue
+        }
+        $priorCount = if ($targetCounts.ContainsKey($value)) { $targetCounts[$value] } else { 0 }
+        if ($peers.Count -le $priorCount) { continue }
+        $leader = @($peers | Where-Object Changed | Sort-Object Path, Line, Column -CaseSensitive)[0]
+        if ([string]$leader.Path -ine $Path) { continue }
+        $ordered = @($changed | Where-Object {
+            [StringComparer]::Ordinal.Equals([string]$_.Symbol, [string]$leader.Symbol)
+        } | Sort-Object Line, Column)
+        if ($peers.Count -gt 1024) {
+            $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason reused-string-evidence-cap-exhausted -Path $Path))
+            continue
+        }
+            $projects = @($peers.Project.Path | Sort-Object -Unique)
+            $types = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($peer in $peers) {
+                [void]$types.Add($peer.Symbol)
+            }
+            $placement = if ($projects.Count -gt 1) {
+                'Use public const string in a shared Constants class in the lowest common project dependency; the exact dependency is not proven here.'
+            } elseif ($types.Count -gt 1) {
+                'Use public const string in a common Constants class for the project.'
+            } else {
+                'Use private const string atop the class.'
+            }
+            $existing = @($constants | Where-Object {
+                [StringComparer]::Ordinal.Equals([string]$_.Value, $value) -and
+                [string]$_.Project.State -ceq 'complete' -and
+                $projects.Count -eq 1 -and [string]$_.Project.Path -ieq $projects[0] -and
+                [string]$_.Project.Digest -ceq [string]$leader.Project.Digest -and
+                ($_.Shared -or ($types.Count -eq 1 -and
+                    [StringComparer]::Ordinal.Equals([string]$_.Symbol, [string]$leader.Symbol)))
+            })
+            $escaped = ConvertTo-Json -InputObject $value -Compress
+            $display = if ($escaped.Length -le 64) { $escaped } else { $escaped.Substring(0,61) + '...' }
+            $advice = if ($existing.Count -eq 1) {
+                "Reuse $($existing[0].Name) for $display instead of declaring another constant."
+            } elseif ($existing.Count -gt 1) {
+                "Reuse an existing accessible constant for $display; do not declare another."
+            } else {
+                "Declare constants for reused string $display. $placement Reuse an existing accessible constant instead of duplicating its declaration."
+            }
+            $outcome = New-ContextualOutcome -RuleId $ruleId -State violation `
+                -Reason reused-string-requires-constant -Path $Path `
+                -Line $ordered[0].Line -EndLine ([int]($ordered.EndLine | Measure-Object -Maximum).Maximum) `
+                -Symbol ([string]$leader.Symbol) -Evidence $advice
+            $outcome['literalValues'] = @($value)
+            $outcome['occurrenceCounts'] = [ordered]@{source=$peers.Count;target=$priorCount}
+            $outcome['relatedUses'] = @($peers | ForEach-Object {
+                    [ordered]@{
+                        path = $_.Path
+                        line = $_.Line
+                        column = $_.Column
+                        endLine = $_.EndLine
+                        symbol = $_.Symbol
+                        value = $_.Value
+                    }
+                })
+            [void]$outcomes.Add($outcome)
+    }
+    if ($outcomes.Count -eq 0) {
+        if ($conditionalCurrent) {
+            return New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason reused-string-scope-unproven -Path $Path
+        }
+        return New-ContextualOutcome -RuleId $ruleId -State compliant `
+            -Reason no-changed-reused-string -Path $Path
+    }
+    return $outcomes.ToArray()
+}
+
 function Get-ContextualRoslynOutcomes {
     param(
         [Parameter(Mandatory)][string]$Content,
@@ -3547,6 +3906,8 @@ function Get-ContextualRoslynOutcomes {
         Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::
         ParseText($Content)
     $root = $tree.GetRoot()
+    $reusedStringOutcomes = @(Get-ContextualReusedStringOutcomes `
+            -Root $root -Path $Path -Spans $Spans -SnapshotFiles $SnapshotFiles)
     $parseErrors = @($tree.GetDiagnostics() |
         Where-Object {
             $_.Severity -eq [
@@ -4805,13 +5166,16 @@ function Get-ContextualRoslynOutcomes {
                 -State unknown `
                 -Reason csharp-syntax-incomplete `
                 -Path $Path)
+        $reusedStringOutcomes = @(
+            New-ContextualOutcome -RuleId reused-string-literals `
+                -State unknown -Reason csharp-syntax-incomplete -Path $Path)
     }
     $baseOutcomes = @($script:RuleIds | Where-Object {
-            $_ -cne 'test-class-code-coverage'
+            $_ -cnotin @('test-class-code-coverage', 'reused-string-literals')
         } | ForEach-Object {
             $results[$_]
         })
-    return @($baseOutcomes + $coverageOutcomes)
+    return @($baseOutcomes + $coverageOutcomes + $reusedStringOutcomes)
 }
 
 function Get-ContextualConventionOutcomes {
@@ -4829,7 +5193,19 @@ function Get-ContextualConventionOutcomes {
         [AllowEmptyCollection()]
         [object[]]$SnapshotFiles
     )
-    if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt
+    $snapshotBytes = 0L
+    foreach ($file in $SnapshotFiles) {
+        if ($file.content -is [string]) {
+            $snapshotBytes += [Text.Encoding]::UTF8.GetByteCount([string]$file.content)
+        }
+        if ($file -is [Collections.IDictionary] -and $file.Contains('comparison') -and
+            $file.comparison -is [Collections.IDictionary] -and
+            $file.comparison.Contains('content') -and $file.comparison.content -is [string]) {
+            $snapshotBytes += [Text.Encoding]::UTF8.GetByteCount([string]$file.comparison.content)
+        }
+    }
+    if ($snapshotBytes -gt 16MB -or
+        [Text.Encoding]::UTF8.GetByteCount($Content) -gt
             16MB -or
         $Spans.Count -gt 4096 -or
         $SnapshotFiles.Count -gt 64) {

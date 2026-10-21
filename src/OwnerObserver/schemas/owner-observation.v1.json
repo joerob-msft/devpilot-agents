@@ -188,6 +188,40 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9-]{2,63}$"
           },
+          "literalValues": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1024,
+            "uniqueItems": true,
+            "items": { "type": "string", "maxLength": 16777216 }
+          },
+          "occurrenceCounts": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "target"],
+            "properties": {
+              "source": { "type": "integer", "minimum": 2, "maximum": 1024 },
+              "target": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "relatedUses": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "line", "column", "endLine", "symbol", "value"],
+              "properties": {
+                "path": { "$ref": "#/$defs/text" },
+                "line": { "type": "integer", "minimum": 1 },
+                "column": { "type": "integer", "minimum": 1 },
+                "endLine": { "type": "integer", "minimum": 1 },
+                "symbol": { "$ref": "#/$defs/knownText" },
+                "value": { "type": "string", "maxLength": 16777216 }
+              }
+            }
+          },
           "evidence": {
             "type": "string",
             "minLength": 1,

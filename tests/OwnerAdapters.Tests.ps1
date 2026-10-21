@@ -430,6 +430,24 @@ BeforeAll {
 }
 
 Describe 'Owner acquisition contracts' {
+    It 'charges comparison text against the existing package byte ceiling' {
+        $package=New-TestOwnerPackage
+        $file=$package.files[0]
+        $target=' ' * 4096
+        $file['comparison']=@{
+            schemaVersion=1;state='complete';path=$file.path;targetPath=$file.path
+            sourceCommit=('a'*40);targetCommit=('b'*40);sourceDigest=$file.sourceDigest
+            targetDigest=(Get-TestOwnerDigest $target);byteLength=4096;content=$target;targetState='present'
+        }
+        $sourceBytes=[Text.Encoding]::UTF8.GetByteCount('require review') +
+            [Text.Encoding]::UTF8.GetByteCount($package.files[0].content) +
+            [Text.Encoding]::UTF8.GetByteCount($package.files[1].content)
+        $contract=New-TestOwnerContract -Limits (New-OwnerAdapterLimits -MaximumBytes ($sourceBytes+1))
+        $result=Invoke-TestOwnerReplay -Contract $contract -Package $package
+        $result.state | Should -BeExactly failed
+        $result.evidence | Should -BeNullOrEmpty
+    }
+
     It 'creates immutable identities that bind every production input partition' {
         $contract = New-TestOwnerContract
         { $contract.Request.SourceCommit = ('d' * 40) } | Should -Throw
