@@ -1194,6 +1194,89 @@ Describe 'Stale lifecycle provider authority source' {
         $httpCalls.Value | Should -Be 0
     }
 
+    It 'terminates the native token process tree at the shared deadline' {
+        $sdkRoot = Join-Path $TestDrive 'fake-azure-cli'
+        $wbin = Join-Path $sdkRoot 'wbin'
+        New-Item -ItemType Directory -Path $wbin `
+            -Force | Out-Null
+        $python = Join-Path $sdkRoot 'python.exe'
+        $project = Join-Path $repo `
+            'tests\fixtures\StalePrSlowTokenProcess.csproj'
+        $build = @(& dotnet build $project `
+            -o $sdkRoot -nologo `
+            --verbosity quiet 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($build -join "`n")
+        Test-Path -LiteralPath $python `
+            -PathType Leaf | Should -BeTrue
+        $az = Join-Path $wbin 'az.cmd'
+        [IO.File]::WriteAllLines(
+            $az,
+            @(
+                '@IF EXIST "%~dp0\..\python.exe" (',
+                'SET AZ_INSTALLER=MSI',
+                '"%~dp0\..\python.exe" -IBm azure.cli %*',
+                ') ELSE (',
+                'echo Failed to load python executable.',
+                'exit /b 1',
+                ')'
+            ),
+            [Text.ASCIIEncoding]::new())
+        $pidLog = Join-Path $TestDrive 'token-pids.txt'
+        $prior = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+            $pidLog,
+            [EnvironmentVariableTarget]::Process)
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $boundedConfig.limits.maxSeconds = 1
+        $httpCalls = [ref]0
+        try {
+            $provider = New-StalePrAzureDevOpsProvider `
+                -Config $boundedConfig `
+                -AzureCliPath $az `
+                -HttpInvoker {
+                    param($Request)
+                    $httpCalls.Value++
+                    throw 'HTTP must not be dispatched.'
+                }.GetNewClosure()
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            {
+                & $provider Identity @{}
+            } | Should -Throw '*stale-pr-deadline-exhausted*'
+            $watch.Stop()
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+                $prior,
+                [EnvironmentVariableTarget]::Process)
+        }
+
+        $watch.Elapsed.TotalSeconds |
+            Should -BeLessThan 3
+        $httpCalls.Value | Should -Be 0
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
+        while (-not (Test-Path $pidLog) -and
+            [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 25
+        }
+        $pids = @(Get-Content $pidLog |
+            ForEach-Object {
+                [int]($_.Split('=')[1])
+            })
+        $pids | Should -HaveCount 2
+        foreach ($processId in $pids) {
+            Get-Process -Id $processId `
+                -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty
+        }
+    }
+
     It 'constructs every lifecycle GET URI with one cached token' {
         $requests =
             [Collections.Generic.List[object]]::new()
