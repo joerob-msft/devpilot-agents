@@ -1135,7 +1135,8 @@ function New-OwnerAzureDevOpsReadOnlyProviderAdapter {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]
         [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]$ReviewerIdentity,
-        [Parameter(Mandatory)][scriptblock]$Handler
+        [Parameter(Mandatory)][scriptblock]$Handler,
+        [AllowNull()][Collections.IDictionary]$CommentPresentation
     )
 
     $provider = New-OwnerReadOnlyProviderAdapter -Name $Name -Handler $Handler
@@ -1145,6 +1146,10 @@ function New-OwnerAzureDevOpsReadOnlyProviderAdapter {
         -NotePropertyValue (
             Get-OwnerAzureDevOpsReviewerIdentityDigest -ReviewerIdentity $ReviewerIdentity
         )
+    if ($null -ne $CommentPresentation) {
+        $provider | Add-Member -NotePropertyName CommentPresentation `
+            -NotePropertyValue $CommentPresentation
+    }
     return $provider
 }
 

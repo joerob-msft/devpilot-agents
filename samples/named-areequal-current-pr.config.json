@@ -57,6 +57,22 @@
     "implementationSha256": "7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a"
   },
   "autoCreateNamedAreEqualComments": false,
+  "commentRuleRepository": {
+    "organization": "https://dev.azure.com/msazure",
+    "projectName": "One",
+    "repositoryName": "AzureUX-BPM-EngHub"
+  },
+  "commentRuleReferences": {
+    "named-areequal": {
+      "label": "EngHub rules",
+      "links": [
+        {
+          "name": "Named parameters for Assert",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/AutomatedTests.md&line=166"
+        }
+      ]
+    }
+  },
   "limits": {
     "pageSize": 50,
     "maxPages": 512,

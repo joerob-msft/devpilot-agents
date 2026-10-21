@@ -8,6 +8,7 @@
     Description = 'Owner v2 semantic capability adapter with preview reconciliation and the exact V1-compatible writer formatter.'
     PowerShellVersion = '7.0'
     FunctionsToExport = @(
+        'Assert-OwnerCommentRuleReferences',
         'ConvertTo-OwnerV2Observation',
         'Format-ContextualConventionComment',
         'Format-NamedAreEqualComment',

@@ -11,6 +11,8 @@ Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
 Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1')
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
@@ -40,6 +42,8 @@ function Assert-ContextualBridgeConfig {
         [Parameter(Mandatory)][string]$RepositoryRoot
     )
 
+    Assert-OwnerCommentRuleReferences -References $Config['commentRuleReferences'] `
+        -Repository $Config['commentRuleRepository'] -Delivery contextual-conventions
     if ($Config.rules -isnot [array] -or $Config.rules.Count -ne 1 -or
         [string]$Config.rules[0].id -cne $script:ContextualCapability -or
         [string]$Config.rules[0].capability -cne $script:ContextualCapability -or
@@ -400,7 +404,12 @@ function New-ContextualBridgeAcquisitionProvider {
     }.GetNewClosure()
     return New-OwnerAzureDevOpsReadOnlyProviderAdapter `
         -Name 'contextual-conventions-current-pr-read-only' `
-        -ReviewerIdentity $reviewer -Handler $handler
+        -ReviewerIdentity $reviewer -Handler $handler `
+        -CommentPresentation ([ordered]@{
+            subjectProvider = $Config.subjectProvider
+            ruleReferences = $Config['commentRuleReferences']
+            ruleRepository = $Config['commentRuleRepository']
+        })
 }
 
 function Get-ContextualBridgeRelevantChangeSet {

@@ -1370,7 +1370,55 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -BeTrue
     }
 
-    It 'exports the exact V1-compatible marker, body, anchor, and body digest' {
+    It 'reconstructs plain and linked Owner presentation without requiring existing providers to opt in' {
+        foreach ($linked in @($false, $true)) {
+            $evidence = New-TestOwnerV2Evidence
+            $config = [ordered]@{ subjectProvider = $evidence.Provider }
+            if ($linked) {
+                $evidence.Contract | Add-Member -NotePropertyName CommentPresentation `
+                    -NotePropertyValue ([ordered]@{ subjectProvider = $evidence.Provider; ruleReferences = $null })
+            }
+            $evidence.Observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $evidence.Observation -Contract $evidence.Contract `
+                -Snapshot (New-TestOwnerV2Snapshot -Evidence $evidence)
+            $evidence.Contract = New-ApprovedOwnerV2Contract -Declaration $evidence.Declaration
+            Set-ApprovedOwnerV2CommentPresentation -Contract $evidence.Contract `
+                -Observation $evidence.Observation -ToolkitConfig $config
+            $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+                -Finding $evidence.Observation.findings[0]
+            $proposal.body | Should -Match '\*\*Changed-line occurrences:\*\*'
+            if ($linked) {
+                $proposal.body | Should -Match '\[tests/WidgetTests.cs:12\]\(https://'
+            } else {
+                $proposal.body | Should -Match '- `/tests/WidgetTests.cs:12`'
+                $proposal.body | Should -Not -Match 'https://'
+            }
+            $proposal.bodySha256 | Should -BeExactly (
+                Get-ApprovedOwnerV2TextSha256 $proposal.body)
+        }
+    }
+
+    It 'rejects unknown or duplicate persisted presentation modes' {
+        foreach ($variant in @('unknown', 'duplicate')) {
+            $evidence = New-TestOwnerV2Evidence
+            $mode = [ordered]@{
+                kind = 'owner-v2-comment-presentation'
+                sha256 = Get-ApprovedOwnerV2TextSha256 'owner-v2-comment-presentation:subject-provider-links-v1'
+                signature = 'not-applicable'
+            }
+            if ($variant -ceq 'unknown') { $mode.sha256 = '0' * 64 }
+            $evidence.Observation.sourceArtifacts += $mode
+            if ($variant -ceq 'duplicate') { $evidence.Observation.sourceArtifacts += $mode }
+            {
+                Set-ApprovedOwnerV2CommentPresentation -Contract $evidence.Contract `
+                    -Observation $evidence.Observation -ToolkitConfig @{
+                        subjectProvider = $evidence.Provider
+                    }
+            } | Should -Throw '*unknown or ambiguous comment presentation mode*'
+        }
+    }
+
+    It 'exports the unchanged V1 marker and anchor with the exact current body digest' {
         $evidence = New-TestOwnerV2Evidence
         $package = New-ApprovedOwnerV2ReviewPackage -Evidence $evidence
 
@@ -1378,7 +1426,7 @@ Describe 'Approved Owner v2 review and approval packages' {
         $proposal = $package.proposals[0]
         $proposal.markerComment | Should -BeExactly (
             "<!-- devpilot-owner-comment:v1:$($proposal.marker) -->")
-        $proposal.body | Should -Match '\*\*Owner attribute missing\*\*'
+        $proposal.body | Should -Match '\*\*Add an Owner attribute to this changed test method\*\*'
         $proposal.path | Should -BeExactly 'tests/WidgetTests.cs'
         $proposal.line | Should -Be 12
         (Get-ApprovedOwnerV2TextSha256 $proposal.body) |

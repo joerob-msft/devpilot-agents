@@ -11,6 +11,8 @@ Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
 Import-Module (Join-Path $PSScriptRoot `
     '..\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1')
+Import-Module (Join-Path $PSScriptRoot `
+    '..\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1')
 
 $script:NamedCapability = 'bpm-named-areequal-arguments@1'
 $script:NamedCapabilityDigest =
@@ -40,6 +42,8 @@ function Assert-NamedBridgeConfig {
         [Parameter(Mandatory)][string]$RepositoryRoot
     )
 
+    Assert-OwnerCommentRuleReferences -References $Config['commentRuleReferences'] `
+        -Repository $Config['commentRuleRepository'] -Delivery named-areequal
     if ($Config.rules -isnot [array] -or $Config.rules.Count -ne 1 -or
         [string]$Config.rules[0].id -cne $script:NamedCapability -or
         [string]$Config.rules[0].capability -cne $script:NamedCapability -or
@@ -334,7 +338,12 @@ function New-NamedBridgeAcquisitionProvider {
     }.GetNewClosure()
     return New-OwnerAzureDevOpsReadOnlyProviderAdapter `
         -Name 'named-areequal-current-pr-read-only' `
-        -ReviewerIdentity $reviewer -Handler $handler
+        -ReviewerIdentity $reviewer -Handler $handler `
+        -CommentPresentation ([ordered]@{
+            subjectProvider = $Config.subjectProvider
+            ruleReferences = $Config['commentRuleReferences']
+            ruleRepository = $Config['commentRuleRepository']
+        })
 }
 
 function Get-NamedBridgeRelevantChangeSet {

@@ -64,6 +64,39 @@
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
   "autoCreateContextualConventionComments": false,
+  "commentRuleRepository": {
+    "organization": "https://dev.azure.com/msazure",
+    "projectName": "One",
+    "repositoryName": "AzureUX-BPM-EngHub"
+  },
+  "commentRuleReferences": {
+    "exception-logging": {
+      "label": "EngHub rules",
+      "links": [
+        {
+          "name": "Log at Source or Sink",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingPatterns.md&line=699"
+        }
+      ]
+    },
+    "named-call-arguments": {
+      "label": "EngHub rules",
+      "links": [
+        {
+          "name": "Name same-type parameters",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=547"
+        },
+        {
+          "name": "Name parameters for multi-line method call",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=590"
+        },
+        {
+          "name": "Name constant parameters",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=617"
+        }
+      ]
+    }
+  },
   "limits": {
     "pageSize": 50,
     "maxPages": 512,
