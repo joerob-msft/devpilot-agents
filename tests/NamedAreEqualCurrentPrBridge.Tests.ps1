@@ -746,6 +746,49 @@ Describe 'Named AreEqual current PR bridge' {
         Test-Path -LiteralPath $manifest | Should -BeFalse
     }
 
+    It 'does not evaluate a lifecycle-withheld old PR' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider -Config $config
+        $state = Join-Path $TestDrive `
+            'lifecycle-withheld-state'
+        $manifest = Join-Path $TestDrive `
+            'lifecycle-withheld-manifest.json'
+        $intake = [ordered]@{
+            populationKnown = $true
+            inventory = [ordered]@{
+                state = 'complete'
+                eligible = 1
+            }
+            counts = [ordered]@{
+                error = 1
+            }
+            heads = @([ordered]@{
+                    pullRequestId = 42
+                    targetRef = 'refs/heads/master'
+                    state = 'unknown'
+                    reasonCode =
+                        'lifecycle-activity-unverified'
+                    automaticCommentEligible = $false
+                    declaration = [ordered]@{
+                        pullRequestId = 42
+                    }
+                })
+            transientSnapshots = [ordered]@{}
+        }
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot `
+            -PreparedIntake $intake -Run
+
+        $result.state | Should -BeExactly 'unknown'
+        @($result.records) | Should -HaveCount 0
+        $provider.Calls.Count | Should -Be 0
+        Test-Path -LiteralPath $manifest |
+            Should -BeFalse
+    }
+
     It 'discovers a current head and writes one completed model-free observation' {
         $config = New-BridgeConfig
         $config.enabled = $true

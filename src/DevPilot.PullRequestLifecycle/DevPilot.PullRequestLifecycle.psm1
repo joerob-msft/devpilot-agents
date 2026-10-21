@@ -65,6 +65,45 @@ function Get-StalePrFailureReason {
     return [string]$ErrorRecord.Exception.Message
 }
 
+function Get-StalePrBudgetDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    $reason = Get-StalePrFailureReason $ErrorRecord
+    if ($reason -cnotin @(
+            'stale-pr-read-budget-exhausted',
+            'stale-pr-deadline-exhausted')) {
+        return $null
+    }
+    $diagnostic = [ordered]@{
+        reason = $reason
+        kind = 'unknown'
+        readCount = $null
+        readCeiling = $null
+        responseBytes = $null
+        responseByteCeiling = 16777216
+        deadlineUtc = $null
+    }
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        foreach ($entry in @(
+                @{ Data = 'stalePrBudgetKind'; Output = 'kind' }
+                @{ Data = 'stalePrReadCount'; Output = 'readCount' }
+                @{ Data = 'stalePrReadCeiling'; Output = 'readCeiling' }
+                @{ Data = 'stalePrResponseBytes'; Output = 'responseBytes' }
+                @{ Data = 'stalePrDeadlineUtc'; Output = 'deadlineUtc' }
+            )) {
+            if ($exception.Data.Contains($entry.Data)) {
+                $diagnostic[$entry.Output] =
+                    $exception.Data[$entry.Data]
+            }
+        }
+        $exception = $exception.InnerException
+    }
+    return $diagnostic
+}
+
 function Get-StalePrWriteDiagnostic {
     param(
         [Parameter(Mandatory)]
@@ -871,6 +910,30 @@ function New-StalePrAzureDevOpsProvider {
     $tokenState = [pscustomobject]@{
         AccessToken = ''
     }
+    $newBudgetFailure = {
+        param(
+            [string]$Reason,
+            [string]$Kind,
+            $Budget,
+            [AllowNull()][object]$ResponseBytes
+        )
+        $failure =
+            [InvalidOperationException]::new($Reason)
+        $failure.Data['stalePrReason'] = $Reason
+        $failure.Data['stalePrBudgetKind'] = $Kind
+        $failure.Data['stalePrReadCount'] =
+            [int]$Budget.Count
+        $failure.Data['stalePrReadCeiling'] =
+            $readCeiling
+        if ($null -ne $ResponseBytes) {
+            $failure.Data['stalePrResponseBytes'] =
+                [long]$ResponseBytes
+        }
+        $failure.Data['stalePrDeadlineUtc'] =
+            ([DateTime]$Budget.DeadlineUtc).
+                ToString('o')
+        return $failure
+    }.GetNewClosure()
     $getAccessToken = {
         param([DateTime]$DeadlineUtc)
         if (-not [string]::IsNullOrWhiteSpace(
@@ -881,7 +944,10 @@ function New-StalePrAzureDevOpsProvider {
             ($DeadlineUtc - (& $getUtcNow)).
                 TotalMilliseconds)
         if ($remainingMilliseconds -le 0) {
-            throw 'stale-pr-deadline-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-deadline-exhausted' `
+                    -Kind 'deadline' -Budget $runBudget `
+                    -ResponseBytes $null)
         }
         $response = if ($null -ne $TokenInvoker) {
             & $boundedTokenInvokerCommand `
@@ -923,11 +989,17 @@ function New-StalePrAzureDevOpsProvider {
         }
         if ($Method -ceq 'GET' -and
             [int]$Budget.Count -ge $readCeiling) {
-            throw 'stale-pr-read-budget-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-read-budget-exhausted' `
+                    -Kind 'read-count' -Budget $Budget `
+                    -ResponseBytes $null)
         }
         if ((& $getUtcNow) -ge
             [DateTime]$Budget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-deadline-exhausted' `
+                    -Kind 'deadline' -Budget $Budget `
+                    -ResponseBytes $null)
         }
         if ($Method -ceq 'GET') {
             $Budget.Count++
@@ -937,13 +1009,19 @@ function New-StalePrAzureDevOpsProvider {
         $afterTokenUtc = & $getUtcNow
         if ($afterTokenUtc -ge
             [DateTime]$Budget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-deadline-exhausted' `
+                    -Kind 'deadline' -Budget $Budget `
+                    -ResponseBytes $null)
         }
         $remaining =
             ([DateTime]$Budget.DeadlineUtc -
                 $afterTokenUtc).TotalSeconds
         if ($remaining -le 0) {
-            throw 'stale-pr-deadline-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-deadline-exhausted' `
+                    -Kind 'deadline' -Budget $Budget `
+                    -ResponseBytes $null)
         }
         $remainingSeconds = [int][Math]::Max(
             1,
@@ -991,14 +1069,21 @@ function New-StalePrAzureDevOpsProvider {
         }
         if ((& $getUtcNow) -ge
             [DateTime]$Budget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-deadline-exhausted' `
+                    -Kind 'deadline' -Budget $Budget `
+                    -ResponseBytes $null)
         }
         if ($response -is [Collections.IDictionary]) {
             return $response
         }
         if ([long]$response.RawContentLength -lt 0 -or
             [long]$response.RawContentLength -gt 16777216) {
-            throw 'stale-pr-read-budget-exhausted'
+            throw (& $newBudgetFailure `
+                    -Reason 'stale-pr-read-budget-exhausted' `
+                    -Kind 'response-size' -Budget $Budget `
+                    -ResponseBytes (
+                        [long]$response.RawContentLength))
         }
         try {
             return ([string]$response.Content).
@@ -1365,14 +1450,57 @@ function Invoke-StalePrLifecycle {
     $policyDigest = Get-StalePrDigest $Policy
     $results = [Collections.Generic.List[object]]::new()
     $confirmed = [Collections.Generic.List[long]]::new()
+    $reviewEligible =
+        [Collections.Generic.HashSet[long]]::new()
     $events = [Collections.Generic.List[object]]::new()
     $writes = 0
     $unknown = 0
-    foreach ($item in @($Inventory | Sort-Object {
-                [long]$_.pullRequestId
-            } | Select-Object -First (
-                [int]$Policy.authority.maxCandidatesPerRun))) {
+    $oldCandidates =
+        [Collections.Generic.List[object]]::new()
+    foreach ($item in @($Inventory)) {
+        if ([string]$item.status -cne 'active' -or
+            [bool]$item.isDraft -or
+            [string]$item.targetRef -cne
+                [string]$Policy.scope.targetRef) {
+            continue
+        }
         $id = [long]$item.pullRequestId
+        try {
+            $creation = ConvertTo-StalePrUtc `
+                -Value ([string]$item.creationUtc) `
+                -Name creationUtc
+        }
+        catch {
+            [void]$oldCandidates.Add($item)
+            continue
+        }
+        if ($creation -ge $CutoffUtc) {
+            [void]$reviewEligible.Add($id)
+            [void]$results.Add([ordered]@{
+                    pullRequestId = $id
+                    state = 'no-op'
+                    reason = 'creation-within-cutoff'
+                    providerWrites = 0
+                })
+            continue
+        }
+        [void]$oldCandidates.Add($item)
+    }
+    $candidateCount = $oldCandidates.Count
+    $candidateLimit = [Math]::Min(
+        $candidateCount,
+        [int]$Policy.authority.maxCandidatesPerRun)
+    $nextPullRequestId = $null
+    for ($candidateIndex = 0;
+        $candidateIndex -lt $candidateLimit;
+        $candidateIndex++) {
+        $item = $oldCandidates[$candidateIndex]
+        $id = [long]$item.pullRequestId
+        if ($candidateCount -gt 0) {
+            $nextPullRequestId = [long]$oldCandidates[
+                ($candidateIndex + 1) % $candidateCount
+            ].pullRequestId
+        }
         if ([string]$item.status -cne 'active' -or
             [bool]$item.isDraft -or
             [string]$item.targetRef -cne
@@ -1398,6 +1526,8 @@ function Invoke-StalePrLifecycle {
                         state = 'deferred'
                         reason = $reason
                         providerWrites = 0
+                        diagnostic =
+                            Get-StalePrBudgetDiagnostic $_
                     })
                 break
             }
@@ -1462,6 +1592,8 @@ function Invoke-StalePrLifecycle {
                         state = 'deferred'
                         reason = $reason
                         providerWrites = 0
+                        diagnostic =
+                            Get-StalePrBudgetDiagnostic $_
                     })
                 break
             }
@@ -1496,13 +1628,28 @@ function Invoke-StalePrLifecycle {
         if ([string]$evidence.status -cne 'active' -or
             [bool]$evidence.isDraft -or
             [string]$evidence.targetRef -cne
-                [string]$Policy.scope.targetRef -or
-            (ConvertTo-StalePrUtc `
+                [string]$Policy.scope.targetRef) {
+            [void]$results.Add([ordered]@{
+                    pullRequestId = $id
+                    state = 'no-op'
+                    reason = 'subject-left-policy'
+                    providerWrites = 0
+                })
+            continue
+        }
+        if ((ConvertTo-StalePrUtc `
                 -Value ([string]$evidence.creationUtc) `
                 -Name creationUtc) -ge $CutoffUtc -or
             (ConvertTo-StalePrUtc `
                 -Value ([string]$evidence.latestActivityUtc) `
                 -Name latestActivityUtc) -gt $CutoffUtc) {
+            [void]$reviewEligible.Add($id)
+            [void]$results.Add([ordered]@{
+                    pullRequestId = $id
+                    state = 'no-op'
+                    reason = 'recent-activity'
+                    providerWrites = 0
+                })
             continue
         }
         $decisionDigest = Get-StalePrDigest (
@@ -1530,6 +1677,8 @@ function Invoke-StalePrLifecycle {
                         state = 'deferred'
                         reason = $reason
                         providerWrites = 0
+                        diagnostic =
+                            Get-StalePrBudgetDiagnostic $_
                     })
                 break
             }
@@ -1708,6 +1857,10 @@ function Invoke-StalePrLifecycle {
         providerWrites = $writes
         modelWrites = 0
         confirmedAbandonedIds = $confirmed.ToArray()
+        reviewEligibleIds = @(
+            $reviewEligible |
+                Sort-Object)
+        nextPullRequestId = $nextPullRequestId
         decisions = $results.ToArray()
         events = $events.ToArray()
     }

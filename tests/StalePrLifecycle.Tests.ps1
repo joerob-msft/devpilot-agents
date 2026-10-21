@@ -1066,6 +1066,8 @@ Describe 'Stale lifecycle acquisition ordering' {
                 providerWrites = 1
                 modelWrites = 0
                 confirmedAbandonedIds = @(1)
+                reviewEligibleIds = @(2)
+                nextPullRequestId = 2
                 decisions = @()
                 events = @()
             }
@@ -1088,6 +1090,259 @@ Describe 'Stale lifecycle acquisition ordering' {
             }).Count | Should -BeGreaterThan 0
         $result.lifecycle.confirmedAbandonedIds |
             Should -Be @(1)
+    }
+
+    It 'withholds old PR comments until lifecycle proves recent activity' {
+        $caseConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $caseConfig.limits.maxHeadsPerRun = 4
+        $calls = [Collections.Generic.List[string]]::new()
+        $rows = @(
+            [ordered]@{
+                pullRequestId = 1
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2023-01-01T00:00:00Z'
+            },
+            [ordered]@{
+                pullRequestId = 2
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2023-01-01T00:00:00Z'
+            },
+            [ordered]@{
+                pullRequestId = 3
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2026-01-01T00:00:00Z'
+            },
+            [ordered]@{
+                pullRequestId = 4
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2023-01-01T00:00:00Z'
+            },
+            [ordered]@{
+                pullRequestId = 5
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2023-01-01T00:00:00Z'
+            })
+        $provider = {
+            param($Operation, $Request)
+            [void]$calls.Add(
+                "$Operation`:$($Request.pullRequestId)")
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{} +
+                        $caseConfig.expectedAccount
+                }
+                ListPage {
+                    $items = @($rows |
+                        Select-Object -Skip ([int]$Request.skip) `
+                            -First ([int]$Request.top))
+                    return @{
+                        items = $items
+                        count = $items.Count
+                        totalCount = $rows.Count
+                    }
+                }
+                Head {
+                    $id = [int]$Request.pullRequestId
+                    return @{
+                        pullRequestId = $id
+                        repositoryId =
+                            $caseConfig.repositoryId
+                        projectId = $caseConfig.projectId
+                        status = 'active'
+                        isDraft = $false
+                        sourceRef =
+                            "refs/heads/feature-$id"
+                        targetRef = 'refs/heads/master'
+                        sourceCommit = ('{0:x40}' -f $id)
+                        targetCommit = 'b' * 40
+                        iterationId = 1
+                    }
+                }
+                Changes {
+                    return @{
+                        changedFiles = 0
+                        changedLines = 0
+                    }
+                }
+                Discussions {
+                    return @{ threads = @(); count = 0 }
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        $lifecycle = {
+            param($Inventory)
+            return [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                runId = 'fixture'
+                cutoffUtc = '2025-10-21T00:00:00.0000000Z'
+                health = 'unknown'
+                providerWrites = 1
+                modelWrites = 0
+                confirmedAbandonedIds = @(5)
+                reviewEligibleIds = @(2, 3)
+                nextPullRequestId = 4
+                decisions = @(
+                    [ordered]@{
+                        pullRequestId = 1
+                        state = 'unknown'
+                        reason = 'prior-ambiguous-write'
+                        providerWrites = 0
+                    },
+                    [ordered]@{
+                        pullRequestId = 2
+                        state = 'no-op'
+                        reason = 'recent-activity'
+                        providerWrites = 0
+                    },
+                    [ordered]@{
+                        pullRequestId = 4
+                        state = 'deferred'
+                        reason =
+                            'stale-pr-read-budget-exhausted'
+                        providerWrites = 0
+                    },
+                    [ordered]@{
+                        pullRequestId = 5
+                        state = 'abandoned'
+                        reason = 'readback-confirmed'
+                        providerWrites = 1
+                    })
+                events = @()
+            }
+        }
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\stale-pr-gating-pester-' +
+            [guid]::NewGuid().ToString('N'))
+        [void]$script:roots.Add($root)
+        $result = Invoke-ActivePrIntake `
+            -Config $caseConfig -Provider $provider `
+            -StateRoot $root -RepositoryRoot $repo `
+            -MaximumHeadsThisRun 4 `
+            -LifecycleEvaluator $lifecycle `
+            -IncludeTransientSnapshots -Run
+
+        @($calls | Where-Object {
+                $_ -like 'Head:*'
+            }) | Should -Be @('Head:2', 'Head:2',
+                'Head:3', 'Head:3') -Because (
+                $result | ConvertTo-Json -Depth 20 -Compress)
+        $result.lifecycle.reviewEligibleIds |
+            Should -Be @(2, 3) -Because (
+                $result.lifecycle |
+                    ConvertTo-Json -Depth 16 -Compress)
+        $result.lifecycle.nextPullRequestId |
+            Should -Be 4
+        @($result.heads | Where-Object {
+                [string]$_.reasonCode -ceq
+                    'lifecycle-activity-unverified'
+            }).pullRequestId | Should -Be @(1, 4)
+        @($result.transientSnapshots.Keys |
+            Sort-Object) | Should -Be @('2', '3')
+        @($result.heads | Where-Object {
+                [long]$_.pullRequestId -eq 5
+            }) | Should -HaveCount 0
+        $artifact = [ordered]@{
+            schemaVersion = 1
+            kind = 'devpilot-shared-review-acquisition'
+            generation = $result.generation
+            configDigest =
+                [string]$result.binding.configDigest
+            intake = $result
+        } | ConvertTo-Json -Depth 100 |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        @($artifact.intake.transientSnapshots.Keys |
+            Sort-Object) | Should -Be @('2', '3')
+        @($artifact.intake.heads | Where-Object {
+                [string]$_.reasonCode -ceq
+                    'lifecycle-activity-unverified'
+            }).pullRequestId | Should -Be @(1, 4)
+    }
+
+    It 'discards partial lifecycle eligibility when the cursor is invalid' {
+        $caseConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $calls = [Collections.Generic.List[string]]::new()
+        $rows = @([ordered]@{
+                pullRequestId = 1
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2023-01-01T00:00:00Z'
+            })
+        $provider = {
+            param($Operation, $Request)
+            [void]$calls.Add(
+                "$Operation`:$($Request.pullRequestId)")
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{} +
+                        $caseConfig.expectedAccount
+                }
+                ListPage {
+                    $items = @($rows |
+                        Select-Object -Skip ([int]$Request.skip) `
+                            -First ([int]$Request.top))
+                    return @{
+                        items = $items
+                        count = $items.Count
+                        totalCount = $rows.Count
+                    }
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        $lifecycle = {
+            param($Inventory)
+            return [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                health = 'healthy'
+                providerWrites = 0
+                modelWrites = 0
+                confirmedAbandonedIds = @()
+                reviewEligibleIds = @(1)
+                nextPullRequestId = 999
+                decisions = @()
+                events = @()
+            }
+        }
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\stale-pr-invalid-cursor-' +
+            [guid]::NewGuid().ToString('N'))
+        [void]$script:roots.Add($root)
+        $result = Invoke-ActivePrIntake `
+            -Config $caseConfig -Provider $provider `
+            -StateRoot $root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle -Run
+
+        $result.lifecycle.reason |
+            Should -BeExactly 'lifecycle-phase-failed'
+        $result.lifecycle.diagnostic |
+            Should -BeExactly 'lifecycle-cursor-invalid'
+        $result.heads[0].reasonCode |
+            Should -BeExactly 'lifecycle-activity-unverified'
+        @($calls | Where-Object {
+                $_ -like 'Head:*'
+            }) | Should -HaveCount 0
     }
 }
 
@@ -1778,17 +2033,159 @@ Describe 'Stale lifecycle provider authority source' {
         }
 
         $result.providerWrites | Should -Be 0
-        @($result.decisions) | Should -HaveCount 1 `
+        @($result.decisions) | Should -HaveCount 2 `
             -Because (
                 $result | ConvertTo-Json -Depth 8 -Compress)
-        $result.decisions[0].pullRequestId | Should -Be 2
-        $result.decisions[0].state | Should -BeExactly deferred
-        $result.decisions[0].reason |
+        $result.reviewEligibleIds | Should -Be @(1)
+        $deferred = @($result.decisions |
+            Where-Object pullRequestId -eq 2)
+        $deferred | Should -HaveCount 1
+        $deferred[0].state | Should -BeExactly deferred
+        $deferred[0].reason |
             Should -BeExactly stale-pr-read-budget-exhausted
+        $deferred[0].diagnostic.kind |
+            Should -BeExactly 'read-count'
+        $deferred[0].diagnostic.readCount |
+            Should -Be 6
+        $deferred[0].diagnostic.readCeiling |
+            Should -Be 6
         @($result.decisions | Where-Object {
                 [long]$_.pullRequestId -eq 3
             }) | Should -HaveCount 0
         $getReads.Value | Should -Be 5
+    }
+
+    It 'distinguishes an oversized response without changing the read bound' {
+        $http = {
+            param($Request)
+            if ([string]$Request.Uri -match
+                '/_apis/connectionData\?') {
+                return [ordered]@{
+                    authenticatedUser = [ordered]@{
+                        id =
+                            '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor =
+                            'aad.synthetic-service-account'
+                    }
+                    authorizedUser = [ordered]@{
+                        id =
+                            '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor =
+                            'aad.synthetic-service-account'
+                    }
+                }
+            }
+            return [pscustomobject]@{
+                RawContentLength = 16777217
+                Content = '{}'
+            }
+        }
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker $http
+        $root = New-LifecycleRoot
+        try {
+            $result = Invoke-StalePrLifecycle `
+                -Inventory @([ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc =
+                            '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider
+        }
+        finally {
+            [Array]::Clear(
+                $root.Key, 0, $root.Key.Length)
+        }
+
+        $result.providerWrites | Should -Be 0
+        $result.decisions[0].reason |
+            Should -BeExactly 'stale-pr-read-budget-exhausted'
+        $result.decisions[0].diagnostic.kind |
+            Should -BeExactly 'response-size'
+        $result.decisions[0].diagnostic.responseBytes |
+            Should -Be 16777217
+        $result.decisions[0].diagnostic.
+            responseByteCeiling | Should -Be 16777216
+    }
+
+    It 'resumes after a budget-deferred candidate without retrying it first' {
+        $provider = New-LifecycleProvider `
+            -EvidenceById @{
+                1 = New-LifecycleEvidence -Id 1
+                2 = New-LifecycleEvidence -Id 2 `
+                    -ActivityUtc '2025-12-01T00:00:00Z'
+                3 = New-LifecycleEvidence -Id 3 `
+                    -ActivityUtc '2025-12-02T00:00:00Z'
+            } `
+            -EvidenceFailureById @{
+                1 = 'stale-pr-read-budget-exhausted'
+            } `
+            -SecondEvidenceFailureById @{
+                1 = 'stale-pr-read-budget-exhausted'
+            }
+        $inventory = @(
+            1..3 | ForEach-Object {
+                [ordered]@{
+                    pullRequestId = $_
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                }
+            })
+        $root = New-LifecycleRoot
+        try {
+            $first = Invoke-StalePrLifecycle `
+                -Inventory $inventory `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider.Handler
+            $rotated = @(
+                $inventory | Where-Object {
+                    [long]$_.pullRequestId -ge
+                        [long]$first.nextPullRequestId
+                }
+            ) + @(
+                $inventory | Where-Object {
+                    [long]$_.pullRequestId -lt
+                        [long]$first.nextPullRequestId
+                }
+            )
+            $second = Invoke-StalePrLifecycle `
+                -Inventory $rotated `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider.Handler
+        }
+        finally {
+            [Array]::Clear(
+                $root.Key, 0, $root.Key.Length)
+        }
+
+        $first.decisions[0].pullRequestId | Should -Be 1
+        $first.decisions[0].reason |
+            Should -BeExactly 'stale-pr-read-budget-exhausted'
+        $first.nextPullRequestId | Should -Be 2
+        $second.reviewEligibleIds | Should -Be @(2, 3)
+        @($second.decisions.pullRequestId) |
+            Should -Be @(2, 3, 1)
+        @($provider.Calls | Where-Object {
+                $_ -ceq 'ReadEvidence:1'
+            }) | Should -HaveCount 2
     }
 
     It 'shares one elapsed deadline across candidates' {
@@ -1850,12 +2247,15 @@ Describe 'Stale lifecycle provider authority source' {
         }
 
         $result.providerWrites | Should -Be 0
-        @($result.decisions) | Should -HaveCount 1 `
+        @($result.decisions) | Should -HaveCount 2 `
             -Because (
                 $result | ConvertTo-Json -Depth 8 -Compress)
-        $result.decisions[0].pullRequestId | Should -Be 2
-        $result.decisions[0].state | Should -BeExactly deferred
-        $result.decisions[0].reason |
+        $result.reviewEligibleIds | Should -Be @(1)
+        $deferred = @($result.decisions |
+            Where-Object pullRequestId -eq 2)
+        $deferred | Should -HaveCount 1
+        $deferred[0].state | Should -BeExactly deferred
+        $deferred[0].reason |
             Should -BeExactly stale-pr-deadline-exhausted
         @($result.decisions | Where-Object {
                 [long]$_.pullRequestId -eq 3
@@ -1995,6 +2395,13 @@ Describe 'Named shared acquisition lifecycle route' {
             Should -BeExactly 'disabled'
         $result.lifecycleConfirmedAbandonedIds |
             Should -HaveCount 0
+        $result.lifecycleReviewEligibleIds |
+            Should -HaveCount 0
+        $result.lifecycleNextPullRequestId |
+            Should -BeNullOrEmpty
+        $result.
+            lifecycleWithheldFromAutomaticComments |
+            Should -HaveCount 0
         $snapshot = Get-Content `
             -LiteralPath $result.acquisitionPath -Raw |
             ConvertFrom-Json -AsHashtable -Depth 100
@@ -2004,6 +2411,8 @@ Describe 'Named shared acquisition lifecycle route' {
             Should -BeExactly 'disabled'
         $snapshot.intake.lifecycle.providerWrites |
             Should -Be 0
+        $snapshot.intake.lifecycle.reviewEligibleIds |
+            Should -HaveCount 0
     }
 
     It 'fails the actual Named host closed for a bare true lifecycle switch' {

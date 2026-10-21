@@ -2023,6 +2023,186 @@ $httpGet = {
         $c.state.headVisits[1] | Should -BeGreaterThan 1
         $e.cursor.nextPullRequestId | Should -Be 2
     }
+    It 'yields incomplete file progress and revisits it after later cohorts' {
+        $c = New-IntakeCase -Count 6 -MaxHeads 2
+        $baseProvider = $c.provider
+        $starts =
+            [Collections.Generic.List[int]]::new()
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes' -or
+                [int]$request.pullRequestId -ne 1) {
+                return & $baseProvider $op $request
+            }
+            $start = [int]$request.fileStartOrdinal
+            [void]$starts.Add($start)
+            $entry = [ordered]@{
+                changeTrackingId = $start + 1
+                path = "src/File$($start + 1).cs"
+                changeType = 'edit'
+                state = 'complete'
+                spans = @([ordered]@{
+                        startLine = 1
+                        endLine = 1
+                        state = 'complete'
+                        sourceDigest =
+                            'v1:sha256:' + ('1' * 64)
+                    })
+                content = "class C$start {}"
+                byteLength =
+                    [Text.Encoding]::UTF8.GetByteCount(
+                        "class C$start {}")
+                sourceDigest =
+                    'v1:sha256:' + ('2' * 64)
+            }
+            return [ordered]@{
+                changedFiles = 1
+                changedLines = $start + 1
+                entries = @($entry)
+                projectContexts = @()
+                inventory = @(
+                    [ordered]@{
+                        changeTrackingId = 1
+                        path = 'src/File1.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition = 'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    },
+                    [ordered]@{
+                        changeTrackingId = 2
+                        path = 'src/File2.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition = 'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    })
+                fileProgress = [ordered]@{
+                    inventoryDigest = '3' * 64
+                    evidencePlanDigest = '4' * 64
+                    totalFiles = 2
+                    totalInventoryFiles = 2
+                    startOrdinal = $start
+                    nextOrdinal = $start + 1
+                    complete = $start -eq 1
+                    cumulativeChangedLines =
+                        $start + 1
+                }
+            }
+        }.GetNewClosure()
+
+        $cycles =
+            [Collections.Generic.List[object]]::new()
+        $results =
+            [Collections.Generic.List[object]]::new()
+        foreach ($ordinal in 1..4) {
+            $result = Invoke-IntakeCase $c
+            [void]$results.Add($result)
+            [void]$cycles.Add(@(
+                    $result.heads |
+                        Where-Object {
+                            $_.declaration -is
+                                [Collections.IDictionary]
+                        } |
+                        ForEach-Object {
+                            [int]$_.pullRequestId
+                        }))
+        }
+
+        @($cycles[0]) | Should -Be @(1, 2)
+        @($cycles[1]) | Should -Be @(3, 4)
+        @($cycles[2]) | Should -Be @(5, 6)
+        @($cycles[3]) | Should -Be @(1, 2)
+        $results[0].heads[0].reasonCode |
+            Should -BeExactly 'file-progress-pending'
+        $results[0].cursor.nextPullRequestId |
+            Should -Be 3
+        @($starts) | Should -Be @(0, 1)
+        $results[3].heads[0].reasonCode |
+            Should -BeExactly 'rules-incomplete'
+    }
+    It 'persists lifecycle traversal order across intake restarts' {
+        $c = New-IntakeCase -Count 4 -MaxHeads 2
+        $orders =
+            [Collections.Generic.List[object]]::new()
+        $lifecycle = {
+            param($Inventory)
+            $ids = @($Inventory | ForEach-Object {
+                    [int]$_.pullRequestId
+                })
+            [void]$orders.Add($ids)
+            return [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                runId = [guid]::NewGuid().ToString('N')
+                cutoffUtc =
+                    '2025-10-21T00:00:00.0000000Z'
+                health = 'healthy'
+                providerWrites = 0
+                modelWrites = 0
+                confirmedAbandonedIds = @()
+                reviewEligibleIds = @($ids)
+                nextPullRequestId = $(if (
+                    $orders.Count -eq 1) {
+                        3
+                    }
+                    else { 1 })
+                decisions = @()
+                events = @()
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle -Run
+        $second = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle -Run
+
+        @($orders[0]) | Should -Be @(1, 2, 3, 4)
+        @($orders[1]) | Should -Be @(3, 4, 1, 2) `
+            -Because ($second |
+                ConvertTo-Json -Depth 20 -Compress)
+        $first.lifecycle.nextPullRequestId | Should -Be 3
+        $second.lifecycle.nextPullRequestId | Should -Be 1
+    }
+    It 'preserves lifecycle and acquisition progress across fresh processes' {
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-fresh-lifecycle-' +
+            [guid]::NewGuid().ToString('N'))
+        [void]$script:roots.Add($root)
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-ActivePrLifecycleGatingFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $firstOutput = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $root 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($firstOutput -join "`n")
+        $first = ($firstOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $secondOutput = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $root 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($secondOutput -join "`n")
+        $second = ($secondOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+
+        $first.lifecycleOrder | Should -Be @(1, 2, 3, 4)
+        $first.selectedPullRequestIds | Should -Be @(1, 2)
+        $first.lifecycleNextPullRequestId | Should -Be 3
+        $second.lifecycleOrder | Should -Be @(3, 4, 1, 2)
+        $second.selectedPullRequestIds | Should -Be @(3, 4)
+        $second.lifecycleNextPullRequestId | Should -Be 1
+        $second.providerWrites | Should -Be 0
+        $second.modelWrites | Should -Be 0
+    }
     It 'marks changed or inaccessible heads unknown, never evaluated' {
         $c = New-IntakeCase -Count 3
         $c.state.drift = 1

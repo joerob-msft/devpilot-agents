@@ -50,8 +50,27 @@ ambiguous required evidence produce `unknown` and zero writes.
 All lifecycle reads in one provider instance share the lower configured read
 ceiling and one deadline. The counters are not reset per PR, prewrite, push
 detail, or readback. Exhaustion before a decision or prewrite defers that PR
-with zero writes and stops the run. Exhaustion after the single PATCH leaves
-the transition ambiguous and never authorizes a retry.
+with zero writes and stops the current run. The result records a bounded
+diagnostic that distinguishes the read-count, response-size, and deadline
+branches without retaining a URI, token, header, or response body. It also
+records the next old candidate, and shared acquisition resumes from that
+candidate on the next compatible run instead of starting with the same
+pathological PR again. Exhaustion after the single PATCH leaves the transition
+ambiguous and never authorizes a retry.
+
+Automatic review comments use a stricter per-PR gate than read-only
+enumeration. A fresh PR created within the cutoff remains reviewable without
+extra lifecycle reads. An older PR is included in automatic-comment snapshots
+only after complete lifecycle evidence proves activity after the cutoff.
+Confirmed abandoned PRs are excluded. Old PRs with permanent write locks,
+budget deferrals, incomplete evidence, or no completed lifecycle decision are
+retained as `lifecycle-activity-unverified` and withheld from every automatic
+comment lane. They are neither treated as abandoned nor marked complete.
+
+Shared acquisition also advances its ordinary head cursor after each selected
+batch even when one head has durable file progress. The progress record remains
+bound to the exact code head and is revisited after later cohorts, preventing a
+large or temporarily unknown PR from pinning all review lanes indefinitely.
 
 The provider obtains the existing Azure DevOps AAD resource token once in
 memory and uses direct HTTPS for connection identity, every lifecycle GET, the

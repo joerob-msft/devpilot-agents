@@ -606,6 +606,9 @@ function Invoke-NamedAreEqualCurrentPrBridge {
     [void]$intake.Remove('transientSnapshots')
     $selected = @($intake.heads | Where-Object {
             [string]$_.targetRef -ceq 'refs/heads/master' -and
+            (-not $_.Contains(
+                    'automaticCommentEligible') -or
+                [bool]$_.automaticCommentEligible) -and
             [string]$_.reasonCode -cnotin @(
                 'not-selected', 'target-out-of-policy')
         })

@@ -998,6 +998,8 @@ function New-IntakeDisabledSummary {
             providerWrites = 0
             modelWrites = 0
             confirmedAbandonedIds = @()
+            reviewEligibleIds = @()
+            nextPullRequestId = $null
             decisions = @()
             events = @()
         }
@@ -1419,6 +1421,8 @@ function Invoke-ActivePrIntake {
                 providerWrites = 0
                 modelWrites = 0
                 confirmedAbandonedIds = @()
+                reviewEligibleIds = @()
+                nextPullRequestId = $null
                 decisions = @()
                 events = @()
             }
@@ -1504,12 +1508,57 @@ function Invoke-ActivePrIntake {
                 }
                 $confirmedAbandoned =
                     [Collections.Generic.HashSet[int]]::new()
+                $lifecycleReviewEligible =
+                    [Collections.Generic.HashSet[int]]::new()
+                $lifecycleGatingActive =
+                    $null -ne $LifecycleEvaluator
                 if ($null -ne $LifecycleEvaluator) {
                     try {
+                        $lifecycleValidationStage =
+                            'inventory-order'
+                        $lifecycleIds = @($ids)
+                        if ($previous -and
+                            $cursorBindingCompatible -and
+                            $previous.lifecycle -is
+                                [Collections.IDictionary] -and
+                            $null -ne $previous.lifecycle.
+                                nextPullRequestId -and
+                            $lifecycleIds.Count -gt 0) {
+                            $previousLifecycleCursor =
+                                $previous.lifecycle[
+                                    'nextPullRequestId']
+                            $lifecycleTarget =
+                                Assert-IntakeNumber `
+                                    -Value $previousLifecycleCursor `
+                                    -Name lifecycleCursor `
+                                    -Minimum 1 `
+                                    -Maximum ([int]::MaxValue)
+                            $lifecycleStart = 0
+                            while ($lifecycleStart -lt
+                                $lifecycleIds.Count -and
+                                $lifecycleIds[$lifecycleStart] -lt
+                                    $lifecycleTarget) {
+                                $lifecycleStart++
+                            }
+                            if ($lifecycleStart -eq
+                                $lifecycleIds.Count) {
+                                $lifecycleStart = 0
+                            }
+                            $lifecycleIds = @(
+                                $lifecycleIds[
+                                    $lifecycleStart..
+                                        ($lifecycleIds.Count - 1)]
+                            ) + @($(if ($lifecycleStart -gt 0) {
+                                    $lifecycleIds[
+                                        0..($lifecycleStart - 1)]
+                                }))
+                        }
                         $lifecycle = & $LifecycleEvaluator @(
-                            $ids | ForEach-Object {
+                            $lifecycleIds | ForEach-Object {
                                 $first.seen[[string]$_].value
                             })
+                        $lifecycleValidationStage =
+                            'result-shape'
                         if (($lifecycle -isnot
                                 [Collections.IDictionary] -and
                             $lifecycle -isnot [pscustomobject]) -or
@@ -1517,9 +1566,13 @@ function Invoke-ActivePrIntake {
                                 'stale-pr-lifecycle-v1-run' -or
                             [int]$lifecycle.providerWrites -lt 0 -or
                             [int]$lifecycle.providerWrites -gt 2 -or
-                            [int]$lifecycle.modelWrites -ne 0) {
+                            [int]$lifecycle.modelWrites -ne 0 -or
+                            $lifecycle.reviewEligibleIds -isnot
+                                [array]) {
                             throw 'lifecycle-result-invalid'
                         }
+                        $lifecycleValidationStage =
+                            'confirmed-abandoned'
                         foreach ($abandonedId in @(
                                 $lifecycle.confirmedAbandonedIds)) {
                             [void]$confirmedAbandoned.Add(
@@ -1531,28 +1584,106 @@ function Invoke-ActivePrIntake {
                             [int]$lifecycle.providerWrites) {
                             throw 'lifecycle-result-invalid'
                         }
+                        $lifecycleValidationStage =
+                            'review-eligibility'
+                        foreach ($reviewEligibleId in @(
+                                $lifecycle.reviewEligibleIds)) {
+                            $normalizedReviewEligible =
+                                Assert-IntakeNumber `
+                                    $reviewEligibleId `
+                                    pullRequestId 1 `
+                                    ([int]::MaxValue)
+                            if (-not $first.seen.ContainsKey(
+                                    [string]$normalizedReviewEligible) -or
+                                $confirmedAbandoned.Contains(
+                                    $normalizedReviewEligible) -or
+                                -not $lifecycleReviewEligible.Add(
+                                    $normalizedReviewEligible)) {
+                                throw (
+                                    'lifecycle-review-' +
+                                    'eligibility-invalid')
+                            }
+                        }
+                        $lifecycleValidationStage =
+                            'next-candidate'
+                        if ($null -ne
+                            $lifecycle.nextPullRequestId) {
+                            $nextLifecycleValue =
+                                $lifecycle[
+                                    'nextPullRequestId']
+                            $nextLifecycleId =
+                                Assert-IntakeNumber `
+                                    -Value $nextLifecycleValue `
+                                    -Name lifecycleCursor `
+                                    -Minimum 1 `
+                                    -Maximum ([int]::MaxValue)
+                            if (-not $first.seen.ContainsKey(
+                                    [string]$nextLifecycleId)) {
+                                throw 'lifecycle-cursor-invalid'
+                            }
+                        }
+                        $lifecycleValidationStage =
+                            'accepted'
                         $envelope.lifecycle = $lifecycle
                     }
                     catch {
+                        $confirmedAbandoned.Clear()
+                        $lifecycleReviewEligible.Clear()
+                        $lifecycleFailureReason =
+                            [string]$_.Exception.Message
                         $envelope.lifecycle = [ordered]@{
                             schemaVersion = 1
                             kind = 'stale-pr-lifecycle-v1-run'
                             health = 'unknown'
                             state = 'unknown'
                             reason = 'lifecycle-phase-failed'
+                            diagnostic = $(if (
+                                $lifecycleFailureReason -cin @(
+                                    'lifecycle-result-invalid',
+                                    'lifecycle-review-eligibility-invalid',
+                                    'lifecycle-cursor-invalid',
+                                    'stale-pr-read-budget-exhausted',
+                                    'stale-pr-deadline-exhausted'
+                                )
+                            ) {
+                                $lifecycleFailureReason
+                            }
+                            else {
+                                'lifecycle-provider-unavailable'
+                            })
+                            diagnosticStage =
+                                $lifecycleValidationStage
                             providerWrites = 0
                             modelWrites = 0
                             confirmedAbandonedIds = @()
+                            reviewEligibleIds = @()
+                            nextPullRequestId = $null
                             decisions = @()
                             events = @()
                         }
                     }
                 }
+                $lifecycleWithheld =
+                    [Collections.Generic.HashSet[int]]::new()
                 $eligible = @($ids | Where-Object {
                         $item = $first.seen[[string]$_].value
-                        -not $item.isDraft -and
-                        $item.targetRef -ceq 'refs/heads/master' -and
-                        -not $confirmedAbandoned.Contains([int]$_)
+                        $baseEligible =
+                            -not $item.isDraft -and
+                            $item.targetRef -ceq
+                                'refs/heads/master' -and
+                            -not $confirmedAbandoned.
+                                Contains([int]$_)
+                        if ($baseEligible -and
+                            $lifecycleGatingActive -and
+                            -not $lifecycleReviewEligible.
+                                Contains([int]$_)) {
+                            [void]$lifecycleWithheld.
+                                Add([int]$_)
+                        }
+                        $baseEligible -and (
+                            -not $lifecycleGatingActive -or
+                            $lifecycleReviewEligible.
+                                Contains([int]$_))
                     })
                 $start = 0
                 if ($previous -and $cursorBindingCompatible -and
@@ -1589,6 +1720,9 @@ function Invoke-ActivePrIntake {
                         declarationDigest = $null
                         state = 'pending'
                         reasonCode = 'not-selected'
+                        automaticCommentEligible =
+                            -not $lifecycleWithheld.
+                                Contains($id)
                         discussion = $null
                         rules = @($Config.rules | ForEach-Object {
                                 [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
@@ -1606,6 +1740,20 @@ function Invoke-ActivePrIntake {
                             $ruleResult.reasonCode = $entry.reasonCode
                         }
                         $envelope.counts.skipped++
+                    }
+                    elseif ($lifecycleWithheld.Contains($id)) {
+                        $entry.state = 'unknown'
+                        $entry.reasonCode =
+                            'lifecycle-activity-unverified'
+                        foreach ($ruleResult in $entry.rules) {
+                            $ruleResult.state = 'unknown'
+                            $ruleResult.reasonCode =
+                                $entry.reasonCode
+                        }
+                        $envelope.counts.error++
+                        $envelope.gaps.unknownHeads++
+                        $envelope.gaps.unknownRules +=
+                            $Config.rules.Count
                     }
                     elseif (-not $selected.Contains($id)) {
                         $envelope.counts.deferred++
@@ -2284,20 +2432,6 @@ function Invoke-ActivePrIntake {
                         }
                     }
                     [void]$heads.Add($entry)
-                }
-                $pendingFileProgress = @(
-                    $heads |
-                        Where-Object {
-                            [string]$_.reasonCode -ceq
-                                'file-progress-pending'
-                        } |
-                        Sort-Object {
-                            [int]$_.pullRequestId
-                        })
-                if ($pendingFileProgress.Count -gt 0) {
-                    $envelope.cursor.nextPullRequestId =
-                        [int]$pendingFileProgress[0].
-                            pullRequestId
                 }
                 $envelope.state = if ($envelope.counts.error -gt 0 -or
                     $envelope.counts.deferred -gt 0 -or

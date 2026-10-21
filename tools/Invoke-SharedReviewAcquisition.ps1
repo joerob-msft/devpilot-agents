@@ -180,5 +180,16 @@ $blobKeys = @($transientSnapshots.GetEnumerator() |
     lifecycleHealth = [string]$intake.lifecycle.health
     lifecycleConfirmedAbandonedIds =
         @($intake.lifecycle.confirmedAbandonedIds)
+    lifecycleReviewEligibleIds =
+        @($intake.lifecycle.reviewEligibleIds)
+    lifecycleNextPullRequestId =
+        $intake.lifecycle.nextPullRequestId
+    lifecycleWithheldFromAutomaticComments =
+        @($intake.heads | Where-Object {
+                [string]$_.reasonCode -ceq
+                    'lifecycle-activity-unverified'
+            } | ForEach-Object {
+                [long]$_.pullRequestId
+            })
     modelWrites = 0
 } | ConvertTo-Json -Depth 32
