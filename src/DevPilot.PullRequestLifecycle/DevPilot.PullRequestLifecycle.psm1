@@ -663,7 +663,7 @@ function New-StalePrAzureDevOpsProvider {
             Uri = $Uri
             Method = $Method
             Headers = @{
-                Authorization = "Bearer $token"
+                Authorization = ('Bearer ' + $token)
             }
             TimeoutSec = $remainingSeconds
             UseBasicParsing = $true

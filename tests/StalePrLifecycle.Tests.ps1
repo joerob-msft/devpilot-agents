@@ -212,7 +212,8 @@ BeforeAll {
                 [AllowNull()][ref]$GetReads,
                 [AllowNull()][ref]$PatchCalls,
                 [AllowNull()]
-                [Collections.Generic.List[object]]$RequestLog
+                [Collections.Generic.List[object]]$RequestLog,
+                [string]$SyntheticToken = ('t' * 120)
             )
             $handler = {
                 param($Request)
@@ -223,11 +224,14 @@ BeforeAll {
                     [void]$RequestLog.Add([ordered]@{
                             uri = $uri.AbsoluteUri
                             method = $method
-                            authorizationPresent =
+                            authorizationExact =
                                 $Request.Headers.Contains(
                                     'Authorization') -and
-                                [string]$Request.Headers.Authorization -clike
-                                    'Bearer *'
+                                [string]$Request.Headers.Authorization -ceq
+                                    ('Bearer ' + $SyntheticToken)
+                            authorizationWasPlaceholder =
+                                [string]$Request.Headers.Authorization -ceq
+                                    ('*' * 6)
                             contentType = $(if (
                                 $Request.Contains('ContentType')
                             ) {
@@ -1128,7 +1132,8 @@ Describe 'Stale lifecycle provider authority source' {
             '_apis/connectionData?connectOptions=1&' +
             'api-version=7.1-preview.1')
         $requests[0].method | Should -BeExactly GET
-        $requests[0].authorizationPresent | Should -BeTrue
+        $requests[0].authorizationExact | Should -BeTrue
+        $requests[0].authorizationWasPlaceholder | Should -BeFalse
         $requests[0].bodyBase64 | Should -BeNullOrEmpty
         $requests[1].uri | Should -BeExactly (
             'https://dev.azure.com/example-org/' +
@@ -1136,7 +1141,8 @@ Describe 'Stale lifecycle provider authority source' {
             '11111111-1111-1111-1111-111111111111/' +
             'pullrequests/1637334?api-version=7.1')
         $requests[1].method | Should -BeExactly PATCH
-        $requests[1].authorizationPresent | Should -BeTrue
+        $requests[1].authorizationExact | Should -BeTrue
+        $requests[1].authorizationWasPlaceholder | Should -BeFalse
         $requests[1].contentType |
             Should -BeExactly 'application/json'
         $bodyBytes = [Convert]::FromBase64String(
@@ -1149,6 +1155,14 @@ Describe 'Stale lifecycle provider authority source' {
             Should -Not -Be @(0xEF, 0xBB, 0xBF)
         (ConvertTo-Json $requests -Depth 16) |
             Should -Not -Match ('t' * 120)
+        $source = Get-Content -LiteralPath (
+            Join-Path $repo `
+                'src\DevPilot.PullRequestLifecycle\DevPilot.PullRequestLifecycle.psm1') `
+            -Raw
+        $placeholderPattern =
+            'Authorization\s*=\s*"' +
+            [regex]::Escape(('*' * 6)) + '"'
+        $source | Should -Not -Match $placeholderPattern
     }
 
     It 'constructs every lifecycle GET URI with one cached token' {
@@ -1218,7 +1232,8 @@ Describe 'Stale lifecycle provider authority source' {
         }
         @($requests | Where-Object {
                 [string]$_.method -cne 'GET' -or
-                -not [bool]$_.authorizationPresent -or
+                -not [bool]$_.authorizationExact -or
+                [bool]$_.authorizationWasPlaceholder -or
                 $null -ne $_.bodyBase64
             }) | Should -HaveCount 0
     }
