@@ -14,7 +14,7 @@ Import-Module (Join-Path $PSScriptRoot `
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:615f82cb1eff222d280ba43ace7ee6676da99a5c104578f82946442f3a8d8a54'
+    'v1:sha256:68d1531034df27601914e302ed61d58e2b87a1ec9b5fb95e30d1b2e9482ac362'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
@@ -470,11 +470,22 @@ function Get-ContextualBridgeRelevantChangeSet {
             }
         }
     }
+    $bindingEntries = @($ChangeSet.entries | Where-Object {
+            $path = ([string]$_.path).Replace('\', '/')
+            $path -imatch '(?:\.g|\.designer)\.cs$|(^|/)generated/' -and
+            $path -inotmatch '(^|/)(?:obj|Ignore-AddedForReferenceOnly)(/|$)' -and
+            [IO.Path]::GetExtension($path) -ieq '.cs'
+        } | ForEach-Object {
+            $context = [ordered]@{} + $_
+            $context.spans = @()
+            $context['contextOnly'] = $true
+            $context
+        })
     return [ordered]@{
         changedFiles = $entries.Count
         changedLines = $changedLines
-        entries = $entries
-        projectContexts = @($entries | ForEach-Object {
+        entries = @($entries) + $bindingEntries
+        projectContexts = @((@($entries) + $bindingEntries) | ForEach-Object {
                 if ($_ -is
                         [Collections.IDictionary] -and
                     $_.Contains('projectContext') -and

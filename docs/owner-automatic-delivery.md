@@ -102,10 +102,15 @@ is anchored to an actual changed token in the catch declaration, not a changed
 filter/body beneath an old declaration, and asks the author to update all uses.
 The identifier line is preferred when changed; delimiter-only edits do not
 make an unchanged type/identifier eligible. Generated paths, auto-generated
-banners, and generated-attributed declarations are excluded from both targets
-and binding inputs. Conditional method bodies or unrelated snapshot directives
+banners, and generated-attributed ancestors exclude catch findings. Generated
+snapshot files retain their compiled types, imports, and declaration structure
+for binding; only generated executable block interiors are masked with original
+coordinates preserved. Noncompiled `obj` and reference-only paths are ignored.
+Conditional method bodies or unrelated snapshot directives
 do not withhold resolved catches. Changed inactive catches and conditional
-imports/type declarations that can affect binding remain unknown.
+imports/type declarations that can affect binding remain unknown. Inactive catch
+relevance is checked at its catch keyword line, not an unrelated edited line
+elsewhere in the same disabled block.
 No source edits are performed. Missing/ambiguous type binding, conditional
 binding, or malformed syntax is unknown, not compliant or a violation.
 Resolution uses the bounded current-source snapshot and the framework reference,
