@@ -1741,6 +1741,8 @@ function Invoke-AutomaticOwnerV2Comments {
                 }
                 else {
                     @($freshState.Anchors | Where-Object {
+                            ([string](Get-ApprovedOwnerV2Value $_ 'scope' 'changed-line') -ceq
+                                [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')) -and
                             [string]$_.path -ieq [string]$selection.path -and
                             [int]$selection.line -ge [int]$_.startLine -and
                             [int]$selection.line -le [int]$_.endLine

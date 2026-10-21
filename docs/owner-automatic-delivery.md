@@ -54,7 +54,8 @@ or authorize this phase.
 
 When a deterministic reviewer upgrade changes its current marker or formatter,
 an earlier contextual comment can remain `noOp` only through authenticated
-delivery history. The reader verifies the lane key on the signed create event,
+delivery history, including when only its body changes and its marker stays
+the same. The reader verifies the lane key on the signed create event,
 intent, and outcome, links their run/event/state identities, requires the same
 immutable PR source and target, rule content hash, construct identity, path,
 line, and symbol, and then requires the exact live reviewer-owned comment,
@@ -63,6 +64,117 @@ The rule commit and implementation may advance while the authoritative rule
 hash and construct remain identical. Copied, edited, deleted, moved, duplicate,
 foreign-identity, stale-head, or changed-rule evidence remains unknown and
 cannot authorize a create, update, or rewrite.
+
+## Finding presentation
+
+Contextual, named-assertion, and Owner findings use actionable bold titles,
+readable rule names, a concise explanation, and a **Changed-line occurrences**
+list. With a configured subject provider, every displayed occurrence has its
+own source-commit-pinned link;
+named-assertion groups still show at most the first twelve calls and explicitly
+report truncation. This changes neither the method grouping nor the full
+typed call list used by preflight.
+
+Source links are built from the existing subject provider's HTTPS organization
+and the contract's project/repository IDs. A mismatching provider scope is
+rejected; rule-reference URLs cannot change finding anchors or write scope.
+Both current-PR bridges and approved-evidence reconstruction use that same
+presentation context, including completed-observation discussion refresh.
+Custom acquisition providers can pass the same context through
+`New-OwnerAzureDevOpsReadOnlyProviderAdapter -CommentPresentation`, with
+`subjectProvider`, `ruleReferences`, and `ruleRepository` members.
+An existing source-artifact slot records the render-mode discriminator, not
+new authority. Reconstruction applies linked context only when the observation
+declares that mode; custom Owner providers that omit it retain their plain
+locations and matching body digests. Unknown or duplicate mode artifacts are
+rejected. The existing exact body digest binds the actual rendered citations.
+The dot-sourced approved writer imports its canonical harness dependency
+directly; provider preflight does not rely on a prior wrapper or test-suite
+import to make canonical digest helpers available.
+
+The integrated contextual policy has **26 rules**: the prior 22 definitions
+are unchanged, with `block-body-indentation`, `generic-exception-naming`,
+`reused-string-literals`, and `file-copyright-header` added. Readable
+presentation adds no rule. The sample remains disabled; source integration
+does not install a toolkit, authorize a policy, or enable production delivery.
+
+Shared acquisition remains hosted by the Named-only roster and its existing
+`includePullRequestTemplateAuthority` flag. The producer retains already-read
+comparison bodies within the same 16,777,216-byte source-plus-comparison budget,
+including resumed progress. The contextual consumer validates that comparison
+against the immutable heads, paths, lengths, and digests before deriving missing
+header authority. It never requires Named to host contextual rule definitions or
+fetch unchanged contextual reference files. A withheld newness check remains
+UNKNOWN while independently proven findings still receive discussion
+reconciliation; an incomplete evaluation is not relabeled completed.
+
+Historical compatibility retains four explicit signed unchanged-ID maps:
+18 IDs for the original 18-rule bundle, 20 IDs for the pre-nuance 21-rule
+bundle (excluding `named-call-arguments`), 21 IDs for the post-nuance bundle,
+and 22 IDs for the template bundle. All four new IDs are excluded from every
+prior binding. The original 18-rule map includes `test-class-code-coverage`;
+do not replace these maps with a current-roster count or an inferred blanket
+compatibility grant.
+
+File-header locations and related source occurrences use distinct labels;
+neither implies an unchanged line was changed. PR description findings remain
+top-level. All four new rules have independently rooted, commit-pinned sample
+citations to their verified CodingStyle headings.
+
+The optional toolkit-config `commentRuleReferences` map supplies verified,
+human-facing citations without changing source acceptance or rule semantics.
+Keys are contextual rule IDs, `named-areequal`, or `owner`. Each entry has
+`label` (`EngHub rules` or `Rule references`) and one to eight `links`, each
+with `name` and an HTTPS `url` pinned by `version=GC<commit>`, `path`, and
+`line`. Configure the independent `commentRuleRepository` binding alongside
+the map with exactly `organization`, `projectName`, and `repositoryName`.
+The examples pin the verified EngHub repository; a URL never supplies its own
+trusted root. The configured Azure DevOps cloud organization can use
+`https://dev.azure.com/<org>` or an explicitly configured
+`https://<org>.visualstudio.com[/<collection>]` alias. Links must use that
+exact organization/project/repository prefix; unconfigured aliases are not
+inferred to be equivalent.
+
+Both bridges and approved reconstruction validate **all** configured
+references before evaluating or selecting findings, including unused rules.
+Unknown rule IDs, extra/missing object keys, empty/scalar link lists, external
+hosts, user information, URI fragments, duplicate/unexpected query keys,
+unpinned versions, nonpositive lines, and noncanonical rooted paths are
+rejected. Only one each of `version`, `path`, and `line` is allowed; paths
+cannot contain traversal, backslashes, empty segments, or double-encoded
+escapes. Direct standalone formatting also validates the complete map: on an
+invalid citation it emits a warning and the plain readable rule name, never
+a partial or untrusted clickable citation group.
+
+Verify that the named section actually exists at that exact location;
+do not derive line numbers from a different document revision. The sample
+configs include verified named-argument section references. Rules without
+configured citations display their readable names, never fabricated links.
+These citations are presentation metadata, not new evaluation authority.
+
+Exact rule hashes and bindings remain in observations and signed delivery
+records rather than a rule-bundle hash paragraph. PR-template findings stay
+PR-wide: their template link uses the effective default-branch commit, with
+no invented code occurrence. A collapsed template-provenance block retains
+the existing exact template-content evidence needed for missing-section
+subset reconciliation across default-branch advances.
+
+Existing canonical Owner and named-assertion bodies remain recognized as
+`noOp` under their unchanged identity, marker, anchor, and current-context
+checks. Contextual historical bodies require the existing signed history
+proof, whether their marker changed or not. A presentation upgrade never
+rewrites an old comment; conflicting or unverifiable contextual/Named markers
+remain `unknown`. Owner's explicitly approved stale-body update path otherwise
+retains its existing behavior.
+Authenticated contextual history uses the same finding-range boundary as
+normal reconciliation. Ambiguous, cross-rule, or unproven human comments
+elsewhere in a duplicate-constant finding's bound span prevent a history
+no-op; proven coverage and unrelated comments outside the span retain their
+existing behavior. Copies of either the current or authenticated prior marker
+in another comment are conflicts, and the authenticated body itself must
+contain exactly one recognized automation marker.
+
+## Contextual rule behavior
 
 The contextual bundle also enforces EngHub's general named-call convention as
 one rule group. A changed invocation, object construction, or `this`/`base`
@@ -98,12 +210,187 @@ Changed missing requirements require new proof; they are never blindly
 promoted from history. Contextual automatic delivery remains create-only,
 model-free, and capped at two creates per run and five creates per PR.
 
-When authorizing this additive bundle, retain three exact prior bindings:
+The contextual `block-body-indentation` rule implements the demonstrated
+EngHub four-space block-body requirement. Roslyn identifies direct statement
+starts inside C# blocks. A finding anchors to an exactly changed
+statement-start line, or to a changed `try` opening brace when the `try`
+header also changed and its existing body is now under/over-indented.
+The demonstrated PR adds `try`/`{` at lines 105-106 while moving unchanged
+`if` text to line 107: the correct changed anchor is 106, not 107.
+A standalone opening brace with a spaces-only prefix
+establishes the baseline, and the statement must start exactly four spaces
+further right. Tabs in a changed statement prefix, under-indentation, and
+extra increments violate this supported check. Old unmodified indentation is
+not cleanup scope.
+
+This is not a general C# formatter: continuation arguments, fluent chains,
+initializer members, and unbraced embedded bodies are not checked. Literal
+contents, interpolation contents, comments, blank lines, and generated/deleted
+files cannot become statement anchors. Conditional compilation without proven
+configuration, incomplete syntax, labels, inline block layouts, and
+tab-indented baseline braces are explicitly unknown rather than guessed
+compliant. No project language-version or semantic binding is needed to
+measure a syntax-proven block's whitespace.
+
+A current review on the proven opening brace that explicitly requests body
+indentation counts as `humanCovered`, even though the finding remains
+anchored to changed code and binds the measured statement line. Unrelated brace reviews are withheld as
+unknown. Existing exact reviewer markers retain the usual no-op/dedupe
+behavior. The rule uses the existing create-only, model-free delivery path;
+it does not enable or alter live runtime configuration.
+A markerless comment owned by the configured automation actor is not
+relabeled as human coverage: without authentic prior proof or an exact
+current marker, it is unknown and cannot authorize a duplicate create.
+
+When authorizing this additive bundle, retain the exact 18/20/21/22-rule
+bindings, each with its own explicitly unchanged rule-ID set. In particular,
+do not carry named-call semantics from a binding that predates the
+constant-trigger nuance. All 22 immediately prior rule meanings are unchanged
+by this addition. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
+in an 18/20/21-rule binding. `block-body-indentation` is new and is rejected
+in every prior bundle's unchanged-ID list. These proofs are explicit and
+signed per rule; there is no blanket old-bundle compatibility.
+
+The additive `generic-exception-naming` rule requires `ex` only for a catch
+variable bound by Roslyn to the framework's `System.Exception`. It resolves
+qualified types, aliases, and snapshot-local shadowing; it does not infer a
+specialized exception naming convention or flag nested test helpers. A finding
+is anchored to an actual changed token in the catch declaration, not a changed
+filter/body beneath an old declaration, and asks the author to update all uses.
+The identifier line is preferred when changed; delimiter-only edits do not
+make an unchanged type/identifier eligible. Generated paths, auto-generated
+banners, and generated-attributed ancestors exclude catch findings. Generated
+snapshot files retain their compiled types, imports, and declaration structure
+for binding; only generated executable block interiors are masked with original
+coordinates preserved. Noncompiled `obj` and reference-only paths are ignored.
+Conditional method bodies or unrelated snapshot directives
+do not withhold resolved catches. Changed inactive catches and conditional
+imports/type declarations that can affect binding remain unknown. Inactive catch
+relevance is checked at its catch keyword line, not an unrelated edited line
+elsewhere in the same disabled block.
+No source edits are performed. Missing/ambiguous type binding, conditional
+binding, or malformed syntax is unknown, not compliant or a violation.
+Resolution uses the bounded current-source snapshot and the framework reference,
+not a full repository build; unrelated compilation diagnostics do not veto a
+resolved catch type. A current human naming request must mention the same
+variable and request `ex` at the exact current anchor to suppress a duplicate.
+Unrelated or stale discussion does not establish naming coverage.
+
+When authorizing this additive bundle, retain four exact prior bindings:
+the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
+only its 20 unchanged IDs, the 21-rule bundle with its 21 existing IDs, and
+the prior 22-rule bundle with its 22 existing IDs. Preserve the prior signed
+unchanged-ID sets, including the general named-call semantics distinction:
+do not promote a rule into a bundle that did not accept it. Use `-PreviousRule*`,
+`-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and `-FourthPreviousRule*`
+respectively. Never include `generic-exception-naming` in any prior bundle's
+unchanged IDs; `pr-template-compliance` belongs only to the prior 22-rule set.
+The existing schema-v2 signed compatibility format, create-only authority,
+zero model starts, two total contextual creates per run, five per PR, and four
+heads per scheduled run are unchanged. Adding the rule does not deploy it,
+rewrite installed configuration, authorize a policy, or change scheduled tasks.
+
+The additive `file-copyright-header` rule checks C# files in the current
+changed-file inventory, including modified existing test files. It implements
+the canonical EngHub CodingStyle.md **Copyright header** section at line 929
+(commit `7cbaf3ef94e3bec3af10875b7c6a2690d111416b`): two dash-separator
+comments around `// Copyright (c) Microsoft Corporation.  All rights reserved.`
+before any code. BOM, LF/CRLF, and horizontal whitespace are supported. The
+same notice may include a four-digit year or hyphen-separated year range;
+historical years are accepted without annual rollover.
+The rule does not require a year, inspect unchanged files, or
+claim other languages are implemented. Generated, vendored, deleted, and
+context-only files are excluded; unavailable source or comparison authority
+is unknown, not compliance.
+
+The finding uses a typed `file-header` anchor at the physical start of the
+changed file, not a changed-line claim. Existing canonical path/span binding
+is retained; separate header evidence binds source and comparison commits,
+content digests, change type, and original rename path. The actual intake and
+every provider create preflight derive that evidence from source and target.
+Missing headers on new files or after header removal are introduced; a missing
+header on both sides is explicitly **pre-existing and nonblocking**, not a
+regression. Both kinds are nonblocking comments only. A current distinct human
+copyright request anywhere in the same file suppresses a duplicate; a
+markerless automation/reviewer-owned request or unproven prior context remains
+unknown. Exact current reviewer-owned marker/body readback is a no-op.
+
+When authorizing this additive bundle, retain four exact prior bindings:
 the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
 only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
-`-ThirdPreviousRule*` respectively. Never include
-`pr-template-compliance` in a prior bundle's unchanged IDs.
+21 existing IDs, plus the 22-rule bundle with all 22 existing IDs. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `file-copyright-header`
+in an old bundle's unchanged IDs, or `pr-template-compliance` in the 18/20/21
+bundles. Existing create ceilings, run/PR history, idempotency, Owner behavior,
+and model-free/create-only authority are unchanged. This source change does
+not enable a live policy or perform any provider writes.
+
+The separate `reused-string-literals` rule implements the canonical
+**Declare constants for re-used strings** section. It compares Roslyn-decoded
+string literal expressions, not raw text counts or constant declarations.
+Only a changed literal use can own a finding; unchanged repetitions by
+themselves do not trigger cleanup. Existing constant member references,
+comments, attributes, generated sources, localized resource member references,
+and repetitions confined to a proved test project are not candidates.
+Escaped, verbatim, and supported raw string spellings share their decoded
+value identity; comparisons are ordinal and case-sensitive.
+
+New reuse requires an increased count of eligible decoded literal uses relative
+to the exact comparison revision, not merely a line marked changed. A moved or
+rewritten six-use value that remains six uses is not new reuse. This is bounded
+occurrence evidence, not a general semantic diff: equal/decreased counts are
+not reported. Every participating C# baseline must be available and parseable.
+Missing, malformed, conditional, wrong-path, wrong-head, or tampered comparison
+evidence is unknown and cannot be substituted with an empty target.
+
+The shared producer retains the already-read comparison text with source and
+target commits, current/old path, both content digests, absence state for added
+files, and byte length. It adds no read or roster flag. Both source and target
+text count against the existing file/package/progress byte ceilings; persisted
+progress retains the baseline under the existing code-head binding. The
+hash-pinned shared generation is checked at the consumer, and its provider and
+adapter revalidate the comparison binding before the analyzer can use it.
+Old progress lacking this evidence remains usable by other rules, but cannot
+prove this rule's newness. Source-only cited peers without comparison evidence
+likewise do not prove a clean or newly reused result.
+
+The rule consumes the existing bounded, accumulated full-PR snapshot and each
+file's source-pinned `projectContext`. Cross-file and context-only peers remain
+visible through the capability adapter. One deterministic changed-use anchor
+owns each decoded value independently, regardless of acquisition ordering. A
+class-local value is never merged with a cross-project value to select
+placement, ranges, or advice. A uniquely proved accessible constant is
+recommended for reuse rather than another declaration. The finding
+retains its exact changed start/end range and related literal uses. A class-local
+cluster calls for `private const string` atop that class; cross-class reuse calls
+for `public const string` in a common project Constants class; cross-project reuse
+calls for the lowest common project dependency without inventing its identity
+or dependency direction. Unproved project/syntax/conditional evidence is
+`unknown`, not a clean pass or a deliverable finding. The existing
+`duplicate-constant-declarations` rule keeps its separate semantics.
+
+A current human request covering every literal value at a related use prevents
+a duplicate comment. When a provider exposes only a range's first line, an
+explicit citation to a related use at the exact source commit can establish the
+same coverage. Partial, stale, unrelated, or ambiguous coverage cannot authorize
+delivery. Quotas, signed history, Owner behavior, model-free evaluation, and
+create-only delivery are unchanged.
+An existing markerless comment from the configured reviewer is not human
+coverage: without authenticated prior delivery proof, it stays unknown and
+cannot authorize another create.
+
+When authorizing this additive bundle, retain four exact prior bindings:
+the 18-rule bundle with its 18 unchanged IDs, the pre-nuance bundle with only
+its 20 unchanged IDs (excluding `named-call-arguments`, whose constant-only
+semantics changed), the post-nuance 21-rule bundle with its 21 existing IDs,
+and the immediately prior 22-rule bundle with all 22 existing IDs. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
+in the older 18/20/21-rule sets, or `reused-string-literals` in any prior set.
+This source change does not enable or deploy the additional rule.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a

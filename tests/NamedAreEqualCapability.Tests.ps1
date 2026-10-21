@@ -343,6 +343,78 @@ class Checks {
         $observation.effects.dedupe.wouldCreate | Should -Be 0
     }
 
+    It 'keeps the exact canonical old body noOp but rejects edited old bodies' {
+        foreach ($edited in @($false, $true)) {
+            $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
+            $contract = New-NamedTestContract -Entry $result.Entry
+            $finding = $result.Observation.findings[0]
+            $marker = Get-NamedAreEqualMarkerKey -Contract $contract -Finding $finding
+            $body = @(
+                '**Use named arguments for Assert.AreEqual in this test method**'
+                ''
+                'Method `Checks.Verify` contains 2 changed positional `Assert.AreEqual` call(s) at `/tests/Checks.cs` (lines 6, 7). This comment is anchored at the first changed call, line 6.'
+                ''
+                'Name every supplied argument according to the selected overload. For MSTest, this commonly includes `expected:` and `actual:` (and further supplied arguments such as `delta:` or `message:`). Preserve the existing argument order and values.'
+                ''
+                "Convention: ``/$($contract.Request.RulePath)`` / ``bpm-named-areequal-arguments@1`` at ``$($contract.Request.RuleCommit)`` (SHA-256 ``$($contract.Request.RuleHash.Substring(10))``)."
+                ''
+                "<!-- devpilot-named-areequal:v1:$marker -->"
+            ) -join "`n"
+            (Format-NamedAreEqualComment -Contract $contract -Finding $finding `
+                -MarkerKey $marker -Legacy) | Should -BeExactly $body
+            if ($edited) { $body += "`nEdited." }
+            $thread = New-NamedTestThread -Contract $contract -Finding $finding -Body $body
+            $thread.anchor.line = $finding.anchor.line
+            $observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $result.Observation -Contract $contract `
+                -Snapshot (New-NamedTestDiscussion -Contract $contract -Threads @($thread))
+            $observation.findings[0].reconciliation.classification |
+                Should -BeExactly $(if ($edited) { 'unknown' } else { 'noOp' })
+            $observation.effects.dedupe.wouldCreate | Should -Be 0
+            $observation.effects.providerWrites | Should -Be 0
+        }
+    }
+
+    It 'renders every displayed call as a separate commit-pinned occurrence' {
+        $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
+        $contract = New-NamedTestContract -Entry $result.Entry
+        $contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+            subjectProvider = @{
+                organization = 'https://dev.azure.com/example-org'
+                projectId = $contract.Request.ProjectId
+                repositoryId = $contract.Request.RepositoryId
+            }
+        }
+        $finding = $result.Observation.findings[0]
+        $marker = Get-NamedAreEqualMarkerKey -Contract $contract -Finding $finding
+        $body = Format-NamedAreEqualComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $base = 'https://dev.azure.com/example-org/' +
+            [uri]::EscapeDataString($contract.Request.ProjectId) + '/_git/' +
+            [uri]::EscapeDataString($contract.Request.RepositoryId) +
+            '?version=GC' + $contract.Request.SourceCommit + '&path=%2Ftests%2FChecks.cs&line='
+        $expectedBody = @"
+**Use named arguments for Assert.AreEqual in this test method**
+
+**Rule:** Name every supplied Assert.AreEqual argument.
+
+Method ``Checks.Verify`` contains 2 changed positional ``Assert.AreEqual`` call(s). Name every supplied argument according to the selected overload, commonly ``expected:`` and ``actual:`` (and ``delta:`` or ``message:`` when supplied). Preserve argument order and values.
+
+**Changed-line occurrences:**
+- [tests/Checks.cs:6](${base}6)
+- [tests/Checks.cs:7](${base}7)
+
+<!-- devpilot-named-areequal:v1:$marker -->
+"@
+        $body | Should -BeExactly $expectedBody.Replace("`r`n", "`n")
+        $finding.affectedCallCount = 13
+        $finding.affectedCallLines = @(6..18)
+        $finding.callListTruncated = $true
+        $body = Format-NamedAreEqualComment -Contract $contract -Finding $finding -MarkerKey $marker
+        ([regex]::Matches($body, '\[tests/Checks.cs:\d+\]')).Count | Should -Be 12
+        $body | Should -Match 'Showing the first 12 of 13 changed calls\.'
+        $body | Should -Not -Match 'SHA-256|Convention:|bpm-named-areequal-arguments'
+    }
+
     It 'keeps duplicate, foreign, and badly anchored exact markers unknown' {
         $result = Invoke-NamedTestReplay -Manifest (New-NamedTestManifest)
         $contract = New-NamedTestContract -Entry $result.Entry
