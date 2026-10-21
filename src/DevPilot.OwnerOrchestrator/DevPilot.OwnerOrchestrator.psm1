@@ -1874,6 +1874,8 @@ function Invoke-NamedAreEqualLive {
         return New-OwnerV2LiveOutcome `
             -Entry $Entry -Reason 'acquisition-provider-unavailable'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
     $parserBinding = Get-NamedAreEqualParserBinding
     $acquisition = New-OwnerProductionAcquisitionAdapter `
         -Contract $Entry.Contract -Provider $AcquisitionProvider
@@ -2076,6 +2078,8 @@ function Invoke-OwnerV2Live {
     if ($null -eq $AcquisitionProvider) {
         return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'acquisition-provider-unavailable'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
 
     $provider = $ModelProvider
     if ($null -eq $provider) {
@@ -2360,6 +2364,8 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
         }
         $Observation.implementation.version = '0.5.0'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
     $snapshot = $null
     $failureReason = $null
     try {
