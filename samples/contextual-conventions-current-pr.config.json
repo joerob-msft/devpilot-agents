@@ -23,8 +23,8 @@
     "repositoryId": "devpilot-agents",
     "path": "src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json",
     "section": "bpm-contextual-conventions@1",
-    "hash": "v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac",
-    "length": 6249
+    "hash": "v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938",
+    "length": 10287
   },
   "toolkit": {
     "ref": "refs/heads/example-contextual-rules",
@@ -54,17 +54,78 @@
   },
   "capability": {
     "id": "bpm-contextual-conventions@1",
-    "implementationSha256": "c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5"
+    "implementationSha256": "9c3496bd7a22a5f4cf09fa993e1aaad7f386efd7010e73a5cedf6bbd19de9130"
   },
   "sharedAcquisition": {
     "kind": "devpilot-shared-review-acquisition-v1",
     "includePullRequestTemplateAuthority": true,
-    "activePrIntakeSha256": "e23252242ad3a541f4f9e3a2e1dab304bcc227afe21f33e992dd5f1307a2ccb4",
-    "contextualBridgeSha256": "5ff7904ad6914104ef21ac522d99a7ff3448a61bf7eff7f4f44058dddada26d7",
+    "activePrIntakeSha256": "ca44f1dd2384343839ad4438db5f1ee5eb0c74dd917bcc665f63c9257bcca6cc",
+    "contextualBridgeSha256": "7f835d3aabfc15a837952129b37841546f5f9b54438d640ba49e23a57c53b4ff",
     "toolSha256": "ed7ed6ff7423a78ae1f2dab4d82db9b2c61486fc988b4215e08de32609942cdf"
   },
   "autoCreateContextualConventionComments": false,
   "stalePullRequestLifecycle": false,
+  "commentRuleRepository": {
+    "organization": "https://dev.azure.com/msazure",
+    "projectName": "One",
+    "repositoryName": "AzureUX-BPM-EngHub"
+  },
+  "commentRuleReferences": {
+    "block-body-indentation": {
+      "label": "EngHub rules",
+      "links": [{
+        "name": "White space and indentation rules",
+        "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=18"
+      }]
+    },
+    "generic-exception-naming": {
+      "label": "EngHub rules",
+      "links": [{
+        "name": "Generic exception naming",
+        "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=1225"
+      }]
+    },
+    "reused-string-literals": {
+      "label": "EngHub rules",
+      "links": [{
+        "name": "Declare constants for re-used strings",
+        "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=706"
+      }]
+    },
+    "file-copyright-header": {
+      "label": "EngHub rules",
+      "links": [{
+        "name": "Copyright header",
+        "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=929"
+      }]
+    },
+    "exception-logging": {
+      "label": "EngHub rules",
+      "links": [
+        {
+          "name": "Log at Source or Sink",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingPatterns.md&line=699"
+        }
+      ]
+    },
+    "named-call-arguments": {
+      "label": "EngHub rules",
+      "links": [
+        {
+          "name": "Name same-type parameters",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=547"
+        },
+        {
+          "name": "Name parameters for multi-line method call",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=590"
+        },
+        {
+          "name": "Name constant parameters",
+          "url": "https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=617"
+        }
+      ]
+    }
+  },
   "limits": {
     "pageSize": 50,
     "maxPages": 512,

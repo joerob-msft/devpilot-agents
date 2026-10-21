@@ -2,6 +2,10 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
+
+Import-Module (Join-Path $PSScriptRoot `
+    '..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
@@ -19,6 +23,7 @@ $script:ApprovedContextualRuleIds = @(
     'named-call-arguments',
     'xml-summary-layout',
     'duplicate-constant-declarations',
+    'reused-string-literals',
     'collection-cardinality',
     'cheap-validation',
     'async-all-the-way',
@@ -33,7 +38,10 @@ $script:ApprovedContextualRuleIds = @(
     'secret-redaction',
     'dependency-fanout',
     'test-class-code-coverage',
-    'pr-template-compliance'
+    'pr-template-compliance',
+    'block-body-indentation',
+    'generic-exception-naming',
+    'file-copyright-header'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
@@ -177,6 +185,10 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
         [void](& $assertIds `
                 $Compatibility.unchangedRuleIds `
                 'ruleCompatibility.unchangedRuleIds')
+        if (-not (Test-ContextualConventionPriorRuleIds -Rule $Compatibility.previousRule `
+            -RuleIds @($Compatibility.unchangedRuleIds))) {
+            throw 'ruleCompatibility.unchangedRuleIds is invalid: promotes a rule absent from the prior bundle.'
+        }
         if ([string]$Compatibility.previousRule.hash -ceq
                 [string]$Compatibility.currentRule.hash -and
             [long]$Compatibility.previousRule.length -eq
@@ -218,6 +230,9 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
             [void](& $assertIds `
                     $entry.unchangedRuleIds `
                     'ruleCompatibility.previousRules.unchangedRuleIds')
+            if (-not (Test-ContextualConventionPriorRuleIds -Rule $entry.rule -RuleIds @($entry.unchangedRuleIds))) {
+                throw 'ruleCompatibility.previousRules.unchangedRuleIds is invalid: promotes a rule absent from the prior bundle.'
+            }
             $bindingKey =
                 [string]$entry.rule.hash +
                 '|' +
@@ -363,6 +378,38 @@ function Get-ApprovedOwnerV2SourceArtifacts {
         throw "Owner v2 observation requires bounded unique '$Kind' source artifacts."
     }
     return @($values | Sort-Object)
+}
+
+function Set-ApprovedOwnerV2CommentPresentation {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig
+    )
+    $delivery = switch ([string]$Contract.Request.CapabilityId) {
+        $script:ApprovedNamedAreEqualCapability { 'named-areequal' }
+        $script:ApprovedContextualCapability { 'contextual-conventions' }
+        default { 'owner' }
+    }
+    Assert-OwnerCommentRuleReferences -References $ToolkitConfig['commentRuleReferences'] `
+        -Repository $ToolkitConfig['commentRuleRepository'] -Delivery $delivery
+    $artifacts = @($Observation.sourceArtifacts | Where-Object {
+        [string](Get-ApprovedOwnerV2Value $_ 'kind' '') -ceq
+            'owner-v2-comment-presentation'
+    })
+    if ($artifacts.Count -eq 0) { return }
+    if ($artifacts.Count -ne 1 -or
+        [string]$artifacts[0].sha256 -cne (
+            Get-ApprovedOwnerV2TextSha256 'owner-v2-comment-presentation:subject-provider-links-v1') -or
+        [string]$artifacts[0].signature -cne 'not-applicable') {
+        throw 'Owner v2 observation has an unknown or ambiguous comment presentation mode.'
+    }
+    $Contract | Add-Member -NotePropertyName CommentPresentation `
+        -NotePropertyValue ([ordered]@{
+            subjectProvider = $ToolkitConfig.subjectProvider
+            ruleReferences = $ToolkitConfig['commentRuleReferences']
+            ruleRepository = $ToolkitConfig['commentRuleRepository']
+        })
 }
 
 function Test-ApprovedContextualActionablePartial {
@@ -609,6 +656,8 @@ function Read-ApprovedOwnerV2Evidence {
             'notAttempted'
         } else { 'attempted' })
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
+    Set-ApprovedOwnerV2CommentPresentation -Contract $contract `
+        -Observation $observation -ToolkitConfig $toolkitConfig
     foreach ($entry in ([ordered]@{
             bindingId = $contract.Binding.BindingId
             subjectKey = $contract.Binding.SubjectKey
@@ -940,6 +989,19 @@ function Get-ApprovedOwnerV2Proposal {
             throw 'Only exact allowlisted contextual findings are writer eligible.'
         }
         $source = $Finding.binding.source.representation
+        $fileHeaderScope =
+            [string](Get-ApprovedOwnerV2Value $Finding.anchor 'scope' '') -ceq 'file-header'
+        $findingEndLine = if ($pullRequestScope) { 0 }
+        elseif ([string]$Finding.ruleId -ceq 'reused-string-literals') {
+            [int]$Finding.binding.span.endLine
+        } else { [int]$Finding.anchor.line }
+        if ($fileHeaderScope -and (
+            [string]$Finding.ruleId -cne 'file-copyright-header' -or
+            [int]$Finding.anchor.line -ne 1 -or
+            [string]$Finding.anchor.symbol -cne 'copyright-header' -or
+            $Finding.fileHeader -isnot [Collections.IDictionary])) {
+            throw 'Only copyright findings may use file-header authority.'
+        }
         if ($pullRequestScope) {
             if ([string]$Finding.ruleId -cne
                     'pr-template-compliance' -or
@@ -975,7 +1037,9 @@ function Get-ApprovedOwnerV2Proposal {
             [int]$source.startLine -ne
                 [int]$Finding.anchor.line -or
             [int]$source.endLine -ne
-                [int]$Finding.anchor.line) {
+                $findingEndLine -or
+            [int]$source.endLine -lt
+                [int]$source.startLine) {
             throw 'Contextual finding is not one exact changed anchor.'
         }
         $classification =
@@ -1025,11 +1089,16 @@ function Get-ApprovedOwnerV2Proposal {
                 @($Finding.missingSections)
         }
         else {
-            $proposal['scope'] = 'changed-line'
+            $proposal['scope'] = $(if ($fileHeaderScope) { 'file-header' } else { 'changed-line' })
+            if ($fileHeaderScope) {
+                $proposal['fileHeader'] = $Finding.fileHeader
+            }
             $proposal['path'] =
                 [string]$Finding.anchor.path
             $proposal['line'] =
                 [int]$Finding.anchor.line
+            $proposal['endLine'] =
+                $findingEndLine
             $proposal['symbol'] =
                 [string]$Finding.anchor.symbol
         }
@@ -1449,10 +1518,7 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     semanticKey =
                         [string]$selection.semanticKey
                     ruleId = [string]$selection.ruleId
-                    scope = $(if ($pullRequestScope) {
-                        'pull-request'
-                    }
-                    else { 'changed-line' })
+                    scope = [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')
                 }
                 event = [ordered]@{
                     eventId = [string]$event.eventId
@@ -1710,6 +1776,8 @@ function Assert-ApprovedOwnerV2LiveRead {
         $namedAreEqual = $Delivery -ceq 'named-areequal'
         $contextual = $Delivery -ceq
             'contextual-conventions'
+        $fileHeaderScope =
+            [string](Get-ApprovedOwnerV2Value $selection 'scope' '') -ceq 'file-header'
         $pullRequestScope =
             [string](Get-ApprovedOwnerV2Value `
                 $selection 'scope' '') -ceq
@@ -1748,8 +1816,25 @@ function Assert-ApprovedOwnerV2LiveRead {
                 throw 'Live PR description or effective template binding changed.'
             }
         }
+        elseif ($fileHeaderScope) {
+            $anchors = @($Live.Anchors | Where-Object {
+                [string](Get-ApprovedOwnerV2Value $_ 'scope' '') -ceq 'file-header' -and
+                [string]$_.path -ceq [string]$selection.path
+            })
+            if ($Delivery -cne 'contextual-conventions' -or
+                [string]$selection.ruleId -cne 'file-copyright-header' -or
+                [int]$selection.line -ne 1 -or
+                $anchors.Count -ne 1 -or
+                [int]$anchors[0].changeTrackingId -lt 1 -or
+                [int]$anchors[0].iterationId -ne [int]$Live.Snapshot.CurrentIterationId -or
+                (Get-ApprovedOwnerV2Digest $anchors[0].fileHeader) -cne
+                    (Get-ApprovedOwnerV2Digest $selection.fileHeader)) {
+                throw 'Live copyright changed-file or source/target header binding changed.'
+            }
+        }
         else {
             $anchors = @($Live.Anchors | Where-Object {
+                    [string](Get-ApprovedOwnerV2Value $_ 'scope' '') -cne 'file-header' -and
                     [string]$_.path -ieq [string]$selection.path -and
                     [int]$selection.line -ge [int]$_.startLine -and
                     [int]$selection.line -le [int]$_.endLine
@@ -2013,6 +2098,8 @@ function Invoke-ApprovedOwnerV2Comments {
                 }
                 else {
                     @($freshState.Anchors | Where-Object {
+                            ([string](Get-ApprovedOwnerV2Value $_ 'scope' 'changed-line') -ceq
+                                [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')) -and
                             [string]$_.path -ieq [string]$selection.path -and
                             [int]$selection.line -ge [int]$_.startLine -and
                             [int]$selection.line -le [int]$_.endLine

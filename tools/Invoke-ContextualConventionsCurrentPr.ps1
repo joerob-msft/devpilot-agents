@@ -54,6 +54,9 @@ if ($AcquisitionPath) {
         ConvertFrom-Json -AsHashtable -Depth 100
     if ([string]$acquisition.kind -cne
             'devpilot-shared-review-acquisition' -or
+        [int]$acquisition.schemaVersion -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$acquisition.generation) -or
+        [string]$acquisition.generation -cne [string]$acquisition.intake.generation -or
         [string]$acquisition.configDigest -cne
             [string]$acquisition.intake.binding.configDigest) {
         throw 'Shared acquisition binding is invalid.'

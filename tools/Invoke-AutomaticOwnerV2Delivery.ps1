@@ -31,6 +31,10 @@ param(
     [string]$ThirdPreviousRuleHash = '',
     [long]$ThirdPreviousRuleLength = 0,
     [string[]]$ThirdUnchangedRuleId = @(),
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$FourthPreviousRuleHash = '',
+    [long]$FourthPreviousRuleLength = 0,
+    [string[]]$FourthUnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -221,6 +225,11 @@ if ($Command -ceq 'authorize-policy') {
             $ThirdPreviousRuleHash) -or
         $ThirdPreviousRuleLength -ne 0 -or
         $ThirdUnchangedRuleId.Count -ne 0
+    $fourthCompatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace(
+            $FourthPreviousRuleHash) -or
+        $FourthPreviousRuleLength -ne 0 -or
+        $FourthUnchangedRuleId.Count -ne 0
     if ($compatibilitySpecified -and (
             $Delivery -cne
                 'contextual-conventions' -or
@@ -245,6 +254,14 @@ if ($Command -ceq 'authorize-policy') {
             $ThirdPreviousRuleLength -lt 1 -or
             $ThirdUnchangedRuleId.Count -lt 1)) {
         throw 'Third additive history compatibility requires a third exact prior contextual rule and unchanged rule IDs.'
+    }
+    if ($fourthCompatibilitySpecified -and (
+            -not $thirdCompatibilitySpecified -or
+            [string]::IsNullOrWhiteSpace(
+                $FourthPreviousRuleHash) -or
+            $FourthPreviousRuleLength -lt 1 -or
+            $FourthUnchangedRuleId.Count -lt 1)) {
+        throw 'Fourth additive history compatibility requires a fourth exact prior contextual rule and unchanged rule IDs.'
     }
     $policyArguments = @{
         Evidence = $evidence
@@ -296,6 +313,19 @@ if ($Command -ceq 'authorize-policy') {
                         }
                         unchangedRuleIds =
                             @($ThirdUnchangedRuleId)
+                    }
+            }
+            if ($fourthCompatibilitySpecified) {
+                $previousRules +=
+                    [ordered]@{
+                        rule = [ordered]@{
+                            hash =
+                                $FourthPreviousRuleHash
+                            length =
+                                $FourthPreviousRuleLength
+                        }
+                        unchangedRuleIds =
+                            @($FourthUnchangedRuleId)
                     }
             }
             [ordered]@{

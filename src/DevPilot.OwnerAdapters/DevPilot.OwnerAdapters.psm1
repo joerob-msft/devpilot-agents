@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
+Import-Module "$PSScriptRoot\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1"
 
 $adapterRequestTypeName = 'DevPilot.OwnerAdapters.OwnerAcquisitionRequest'
 if (-not ($adapterRequestTypeName -as [type])) {
@@ -1135,7 +1136,8 @@ function New-OwnerAzureDevOpsReadOnlyProviderAdapter {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]
         [DevPilot.OwnerAdapters.OwnerAzureDevOpsReviewerIdentity]$ReviewerIdentity,
-        [Parameter(Mandatory)][scriptblock]$Handler
+        [Parameter(Mandatory)][scriptblock]$Handler,
+        [AllowNull()][Collections.IDictionary]$CommentPresentation
     )
 
     $provider = New-OwnerReadOnlyProviderAdapter -Name $Name -Handler $Handler
@@ -1145,6 +1147,10 @@ function New-OwnerAzureDevOpsReadOnlyProviderAdapter {
         -NotePropertyValue (
             Get-OwnerAzureDevOpsReviewerIdentityDigest -ReviewerIdentity $ReviewerIdentity
         )
+    if ($null -ne $CommentPresentation) {
+        $provider | Add-Member -NotePropertyName CommentPresentation `
+            -NotePropertyValue $CommentPresentation
+    }
     return $provider
 }
 
@@ -1840,6 +1846,11 @@ function Get-OwnerLivePackage {
         }
         if ($null -ne $content) {
             $contentBytes = [Text.Encoding]::UTF8.GetByteCount([string]$content)
+            $comparison = Get-OwnerAdapterMember -Value $file -Name comparison
+            if ($comparison -is [Collections.IDictionary] -and
+                $comparison.Contains('content') -and $comparison.content -is [string]) {
+                $contentBytes += [Text.Encoding]::UTF8.GetByteCount([string]$comparison.content)
+            }
             if ($bytesRead + $contentBytes -gt $limits.MaximumBytes) {
                 [void]$files.Add((New-OwnerSyntheticFileResponse -Request $request -Path $path `
                         -State unknown -Reason oversize -SourceDigest $changeDigest))
@@ -1867,6 +1878,44 @@ function Get-OwnerLivePackage {
         files = @($files)
         subjectAfter = $subjectAfter
     })
+}
+
+function ConvertTo-OwnerComparisonEvidence {
+    param(
+        [AllowNull()]$Value,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$ChangeType,
+        [AllowNull()]$Content
+    )
+    $unknown = [ordered]@{state='unknown';reason='comparison-baseline-unavailable'}
+    $keys = @('schemaVersion','state','path','targetPath','sourceCommit','targetCommit',
+        'sourceDigest','targetDigest','byteLength','content','targetState')
+    if ($Value -isnot [Collections.IDictionary] -or
+        @($keys | Where-Object { -not $Value.Contains($_) }).Count -gt 0) {
+        return $unknown
+    }
+    if (($Value.schemaVersion -isnot [int] -and $Value.schemaVersion -isnot [long]) -or
+        ($Value.byteLength -isnot [int] -and $Value.byteLength -isnot [long]) -or
+        [long]$Value.schemaVersion -ne 1 -or
+        [string]$Value.state -cne 'complete' -or
+        $Value.content -isnot [string] -or $Content -isnot [string] -or
+        [string]$Value.path -cne $Path -or
+        [string]$Value.targetPath -cne $TargetPath -or
+        [string]$Value.sourceCommit -cne [string]$Request.SourceCommit -or
+        [string]$Value.targetCommit -cne [string]$Request.TargetCommit -or
+        [string]$Value.sourceDigest -cne (Get-OwnerAdapterDigest -Value $Content) -or
+        [string]$Value.targetDigest -cne (Get-OwnerAdapterDigest -Value ([string]$Value.content)) -or
+        [long]$Value.byteLength -ne [Text.Encoding]::UTF8.GetByteCount([string]$Value.content) -or
+        ($ChangeType -ceq 'added' -and (
+            [string]$Value.targetState -cne 'absent' -or [string]$Value.content -cne '')) -or
+        ($ChangeType -cne 'added' -and [string]$Value.targetState -cne 'present')) {
+        return $unknown
+    }
+    $normalized = [ordered]@{}
+    foreach ($key in $keys) { $normalized[$key] = $Value[$key] }
+    return $normalized
 }
 
 function ConvertTo-OwnerSpanData {
@@ -2297,6 +2346,18 @@ function ConvertTo-OwnerAcquisitionResponse {
                 spans = $spans
                 projectContext = $projectContext
             }
+        $fileHeader = Get-OwnerAdapterMember -Value $change -Name fileHeader
+        if ($null -ne $fileHeader) {
+            if ($fileHeader -isnot [Collections.IDictionary] -or
+                [string]$fileHeader.path -cne $path -or
+                [string]$fileHeader.changeType -cne $changeType -or
+                [string]$fileHeader.oldPath -cne [string]$oldPath -or
+                [string]$fileHeader.sourceCommit -cne [string]$request.SourceCommit -or
+                [string]$fileHeader.targetCommit -cne [string]$request.TargetCommit) {
+                throw 'Copyright header evidence does not match the changed-file identity.'
+            }
+            $normalizedChange['fileHeader'] = $fileHeader
+        }
         if ($contextOnly) {
             $normalizedChange['contextOnly'] =
                 $true
@@ -2441,8 +2502,29 @@ function ConvertTo-OwnerAcquisitionResponse {
         if ($change['changeType'] -ceq 'deleted' -and $null -ne $content) {
             throw 'Deleted file evidence cannot contain current content.'
         }
+        $rawComparison = Get-OwnerAdapterMember -Value $file -Name comparison
+        if ($rawComparison -is [Collections.IDictionary] -and
+            $rawComparison.Contains('content') -and $rawComparison.content -is [string]) {
+            $totalContentBytes += [Text.Encoding]::UTF8.GetByteCount([string]$rawComparison.content)
+        }
+        $comparison = ConvertTo-OwnerComparisonEvidence -Value $rawComparison `
+            -Request $request -Path $path -TargetPath $(if ($change['changeType'] -ceq 'renamed') {
+                [string]$change['oldPath']
+            } else { $path }) -ChangeType ([string]$change['changeType']) -Content $content
+        if ($null -ne $rawComparison -and [string]$comparison.state -cne 'complete') {
+            Add-OwnerAdapterDiagnostic -Diagnostics $diagnostics -Limits $limits `
+                -Code comparison-baseline-unknown -Message 'Comparison baseline identity or content did not match the current file and immutable heads.'
+        }
         if ($totalContentBytes -gt $limits.MaximumBytes) {
             throw 'File package exceeded the configured byte cap.'
+        }
+        if (-not $change.Contains('fileHeader') -and
+            $path.EndsWith('.cs', [StringComparison]::OrdinalIgnoreCase) -and
+            [string]$comparison.state -ceq 'complete') {
+            $change['fileHeader'] = Get-ContextualCopyrightHeaderEvidence -Path $path `
+                -OldPath ([string]$change['oldPath']) -ChangeType ([string]$change['changeType']) `
+                -Content $content -TargetContent ([string]$comparison.content) `
+                -SourceCommit ([string]$request.SourceCommit) -TargetCommit ([string]$request.TargetCommit)
         }
         $spanStates = @($change['spans'] | ForEach-Object { $_['state'] })
         $contextOnly =
@@ -2518,6 +2600,7 @@ function ConvertTo-OwnerAcquisitionResponse {
                     byteLength = $byteLength
                     truncated = $truncated
                     content = $content
+                    comparison = $comparison
                     projectContext =
                         $change['projectContext']
                 }
@@ -2525,6 +2608,9 @@ function ConvertTo-OwnerAcquisitionResponse {
         if ($contextOnly) {
             $unit.data['contextOnly'] =
                 $true
+        }
+        if ($change.Contains('fileHeader')) {
+            $unit.data['fileHeader'] = $change.fileHeader
         }
         [void]$units.Add($unit)
         $ordinal++

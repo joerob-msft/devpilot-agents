@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
 . (Join-Path $PSScriptRoot `
     '..\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 . (Join-Path $PSScriptRoot 'DevPilot.ChangeDerivation.ps1')
@@ -1943,6 +1944,13 @@ function Invoke-ActivePrIntake {
                                         $totalBytes +=
                                             [long]$progressEntry.
                                                 byteLength
+                                        if ($progressEntry.Contains('comparison') -and
+                                            $progressEntry.comparison -is [Collections.IDictionary] -and
+                                            $progressEntry.comparison.Contains('content') -and
+                                            $progressEntry.comparison.content -is [string]) {
+                                            $totalBytes += [Text.Encoding]::UTF8.GetByteCount(
+                                                [string]$progressEntry.comparison.content)
+                                        }
                                     }
                                     if ([long]$totalBytes -gt
                                         16777216) {
@@ -2705,6 +2713,8 @@ function New-ActivePrAzureDevOpsProvider {
         ${function:Get-ApprovedOwnerV2ChangedSpans}
     $changeDerivationCommand =
         ${function:New-DevPilotChangeDerivation}
+    $copyrightHeaderEvidenceCommand =
+        Get-Command Get-ContextualCopyrightHeaderEvidence -CommandType Function
     $newTransportFailureCommand =
         ${function:New-IntakeTransportFailure}
     $copyFailureDataCommand =
@@ -4048,18 +4058,21 @@ print(json.dumps({
                     $withinLineBudget =
                         $changedLines + $entryChangedLines -le
                             [int]$Config.limits.maxChangedLines
-                    if ($withinLineBudget) {
-                        $changedLines += $entryChangedLines
-                    }
                     $bytes = [Text.Encoding]::UTF8.GetByteCount($sourceContent)
-                    if ($totalBytes + $bytes -gt
+                    $comparisonBytes = if ($isCSharp -and -not $deleted) {
+                        [Text.Encoding]::UTF8.GetByteCount($targetContent)
+                    } else { 0 }
+                    if ($totalBytes + $bytes + $comparisonBytes -gt
                         16777216) {
                         if ($normalized.Count -eq 0) {
                             throw 'read-budget'
                         }
                         break
                     }
-                    $totalBytes += $bytes
+                    $totalBytes += $bytes + $comparisonBytes
+                    if ($withinLineBudget) {
+                        $changedLines += $entryChangedLines
+                    }
                     $normalizedChange = [ordered]@{
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
@@ -4098,6 +4111,25 @@ print(json.dumps({
                                             $sourceContent))).
                                     ToLowerInvariant()
                         }
+                    if ($isCSharp -and -not $deleted) {
+                        $normalizedChange['comparison'] = [ordered]@{
+                            schemaVersion = 1
+                            state = 'complete'
+                            path = [string]$entry.path
+                            targetPath = $(if ($changeType -match '(?i)rename') {
+                                [string]$entry.originalPath
+                            } else { [string]$entry.path })
+                            sourceCommit = $sourceCommit
+                            targetCommit = $targetCommit
+                            sourceDigest = [string]$normalizedChange.sourceDigest
+                            targetDigest = & $textDigestCommand $targetContent
+                            byteLength = $comparisonBytes
+                            content = $targetContent
+                            targetState = $(if ($changeType -match '(?i)^add') {
+                                'absent'
+                            } else { 'present' })
+                        }
+                    }
                     $derivationSpans =
                         [object[]]@()
                     if ($withinLineBudget) {
@@ -4118,6 +4150,13 @@ print(json.dumps({
                             -SourceCommit $sourceCommit `
                             -TargetCommit $targetCommit
                     if ($isCSharp) {
+                        $normalizedChange['fileHeader'] =
+                            & $copyrightHeaderEvidenceCommand `
+                                -Path ([string]$entry.path) `
+                                -OldPath ([string]$entry.originalPath) `
+                                -ChangeType $changeType `
+                                -Content $sourceContent -TargetContent $targetContent `
+                                -SourceCommit $sourceCommit -TargetCommit $targetCommit
                         $sourceDirectory =
                             [IO.Path]::GetDirectoryName(
                                 ([string]$entry.path).Replace(

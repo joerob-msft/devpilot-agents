@@ -1000,11 +1000,19 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'named-call-arguments')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @('pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
+                length = 10287
             }
         }
 
@@ -1021,7 +1029,7 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -Be 2
         @($proofs[0].
                 ruleCompatibility.previousRules) |
-            Should -HaveCount 3
+            Should -HaveCount 4
     }
 
     It 'binds additive history compatibility into the signed contextual policy' {
@@ -1034,8 +1042,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-        $evidence.Declaration.rule.length = 6249
+            'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
+        $evidence.Declaration.rule.length = 10287
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1121,6 +1129,53 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -Evidence $evidence `
                 -Policy $policy
         } | Should -Not -Throw
+
+        $priorBindings = @(
+            @{ hash = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'; length = 3706; count = 18 },
+            @{ hash = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'; length = 5205; count = 20 },
+            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 21 },
+            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 22 }
+        )
+        $previousRules = @(foreach ($prior in $priorBindings) {
+            $unchanged = @($script:ApprovedContextualRuleIds | Where-Object {
+                    $_ -cnotin @('block-body-indentation', 'generic-exception-naming',
+                        'reused-string-literals', 'file-copyright-header') -and
+                    ($prior.count -ge 22 -or $_ -cne 'pr-template-compliance') -and
+                    ($prior.count -ge 21 -or $_ -cne 'named-call-arguments') -and
+                    ($prior.count -ge 20 -or $_ -cnotin @(
+                        'xml-summary-layout', 'duplicate-constant-declarations'))
+                })
+            $unchanged | Should -HaveCount $prior.count
+            [ordered]@{
+                rule = [ordered]@{ hash = $prior.hash; length = $prior.length }
+                unchangedRuleIds = $unchanged
+            }
+        })
+        $fourPrior = [ordered]@{
+            schemaVersion = 2
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRules = $previousRules
+            currentRule = $compatibility.currentRule
+        }
+        $fourPolicy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $evidence -PolicyId contextual-four-prior-policy `
+            -MaxCreatesPerRun 2 -MaxCreatesPerPullRequest 5 `
+            -HistoryCompatibility $fourPrior -CreatedUtc '20261021T000000Z'
+        $key = [byte[]](1..32)
+        $signedPath = Join-Path $TestDrive 'contextual-four-prior-signed.json'
+        [void](Write-AutomaticOwnerV2ServicePolicy `
+            -Path $signedPath -Policy $fourPolicy -Key $key)
+        $readback = Read-ApprovedOwnerV2SignedRecord -Path $signedPath -Key $key
+        (Get-ApprovedOwnerV2Digest $readback.historyCompatibility) |
+            Should -BeExactly (Get-ApprovedOwnerV2Digest $fourPrior)
+        $readback.historyCompatibility.previousRules | Should -HaveCount 4
+        $readback.limits.maxCreatesPerRun | Should -Be 2
+        $readback.limits.maxCreatesPerPullRequest | Should -Be 5
+        $readback.authority.action | Should -BeExactly create
+        $readback.authority.modelAuthorization | Should -BeFalse
+        $readback.authority.updates | Should -BeFalse
+        { Assert-AutomaticOwnerV2ServicePolicy -Evidence $evidence -Policy $readback } |
+            Should -Not -Throw
     }
 
     It 'validates multiple exact prior bundles with rule-specific unchanged sets' {
@@ -1155,11 +1210,19 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'named-call-arguments')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @('pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
+                length = 10287
             }
         }
         $validated =
@@ -1170,9 +1233,25 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
-                    'named-call-arguments')
+                    'named-call-arguments',
+                    'pr-template-compliance',
+                    'block-body-indentation')
         @($validated.previousRules) |
-            Should -HaveCount 3
+            Should -HaveCount 4
+        foreach ($index in 0..3) {
+            $invalid = $compatibility | ConvertTo-Json -Depth 16 |
+                ConvertFrom-Json -AsHashtable -Depth 16
+            $invalid.previousRules[$index].unchangedRuleIds +=
+                'block-body-indentation'
+            {
+                Assert-ApprovedOwnerV2RuleCompatibility `
+                    -Compatibility $invalid -CurrentRule $compatibility.currentRule `
+                    -AllowedRuleIds @(
+                        'explicit-string-comparison', 'http-client-lifetime',
+                        'named-call-arguments', 'pr-template-compliance',
+                        'block-body-indentation')
+            } | Should -Throw '*is invalid*'
+        }
 
         $duplicate = $compatibility |
             ConvertTo-Json -Depth 16 |
@@ -1188,8 +1267,30 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
-                    'named-call-arguments')
+                    'named-call-arguments',
+                    'pr-template-compliance')
         } | Should -Throw '*duplicate or current*'
+    }
+
+    It 'rejects the new indentation rule in a schema-v1 prior bundle unchanged list' {
+        $compatibility = [ordered]@{
+            schemaVersion = 1
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRule = @{ hash = 'v1:sha256:' + ('a' * 64); length = 6249 }
+            currentRule = @{ hash = 'v1:sha256:' + ('b' * 64); length = 10287 }
+            unchangedRuleIds = @('block-body-indentation')
+        }
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $compatibility -CurrentRule $compatibility.currentRule `
+                -AllowedRuleIds @('block-body-indentation')
+        } | Should -Throw '*is invalid*'
+        $command = Get-Command (Join-Path $repoRoot 'tools\Invoke-AutomaticOwnerV2Delivery.ps1')
+        foreach ($parameter in @(
+                'FourthPreviousRuleHash', 'FourthPreviousRuleLength',
+                'FourthUnchangedRuleId')) {
+            $command.Parameters.Keys | Should -Contain $parameter
+        }
     }
 
     It 'refuses prior history signed by a foreign key' {
@@ -1370,7 +1471,55 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -BeTrue
     }
 
-    It 'exports the exact V1-compatible marker, body, anchor, and body digest' {
+    It 'reconstructs plain and linked Owner presentation without requiring existing providers to opt in' {
+        foreach ($linked in @($false, $true)) {
+            $evidence = New-TestOwnerV2Evidence
+            $config = [ordered]@{ subjectProvider = $evidence.Provider }
+            if ($linked) {
+                $evidence.Contract | Add-Member -NotePropertyName CommentPresentation `
+                    -NotePropertyValue ([ordered]@{ subjectProvider = $evidence.Provider; ruleReferences = $null })
+            }
+            $evidence.Observation = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $evidence.Observation -Contract $evidence.Contract `
+                -Snapshot (New-TestOwnerV2Snapshot -Evidence $evidence)
+            $evidence.Contract = New-ApprovedOwnerV2Contract -Declaration $evidence.Declaration
+            Set-ApprovedOwnerV2CommentPresentation -Contract $evidence.Contract `
+                -Observation $evidence.Observation -ToolkitConfig $config
+            $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+                -Finding $evidence.Observation.findings[0]
+            $proposal.body | Should -Match '\*\*Changed-line occurrences:\*\*'
+            if ($linked) {
+                $proposal.body | Should -Match '\[tests/WidgetTests.cs:12\]\(https://'
+            } else {
+                $proposal.body | Should -Match '- `/tests/WidgetTests.cs:12`'
+                $proposal.body | Should -Not -Match 'https://'
+            }
+            $proposal.bodySha256 | Should -BeExactly (
+                Get-ApprovedOwnerV2TextSha256 $proposal.body)
+        }
+    }
+
+    It 'rejects unknown or duplicate persisted presentation modes' {
+        foreach ($variant in @('unknown', 'duplicate')) {
+            $evidence = New-TestOwnerV2Evidence
+            $mode = [ordered]@{
+                kind = 'owner-v2-comment-presentation'
+                sha256 = Get-ApprovedOwnerV2TextSha256 'owner-v2-comment-presentation:subject-provider-links-v1'
+                signature = 'not-applicable'
+            }
+            if ($variant -ceq 'unknown') { $mode.sha256 = '0' * 64 }
+            $evidence.Observation.sourceArtifacts += $mode
+            if ($variant -ceq 'duplicate') { $evidence.Observation.sourceArtifacts += $mode }
+            {
+                Set-ApprovedOwnerV2CommentPresentation -Contract $evidence.Contract `
+                    -Observation $evidence.Observation -ToolkitConfig @{
+                        subjectProvider = $evidence.Provider
+                    }
+            } | Should -Throw '*unknown or ambiguous comment presentation mode*'
+        }
+    }
+
+    It 'exports the unchanged V1 marker and anchor with the exact current body digest' {
         $evidence = New-TestOwnerV2Evidence
         $package = New-ApprovedOwnerV2ReviewPackage -Evidence $evidence
 
@@ -1378,7 +1527,7 @@ Describe 'Approved Owner v2 review and approval packages' {
         $proposal = $package.proposals[0]
         $proposal.markerComment | Should -BeExactly (
             "<!-- devpilot-owner-comment:v1:$($proposal.marker) -->")
-        $proposal.body | Should -Match '\*\*Owner attribute missing\*\*'
+        $proposal.body | Should -Match '\*\*Add an Owner attribute to this changed test method\*\*'
         $proposal.path | Should -BeExactly 'tests/WidgetTests.cs'
         $proposal.line | Should -Be 12
         (Get-ApprovedOwnerV2TextSha256 $proposal.body) |
@@ -1647,6 +1796,25 @@ Describe 'Approved Owner v2 live safety boundary' {
             Should -Contain ThirdPreviousRuleLength
         $automaticTool.Parameters.Keys |
             Should -Contain ThirdUnchangedRuleId
+        $automaticTool.Parameters.Keys | Should -Contain FourthPreviousRuleHash
+        $automaticTool.Parameters.Keys | Should -Contain FourthPreviousRuleLength
+        $automaticTool.Parameters.Keys | Should -Contain FourthUnchangedRuleId
+    }
+
+    It 'never promotes the new reused literal rule from an older signed bundle' {
+        $compatibility = @{
+            schemaVersion = 2
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRules = @(@{
+                    rule = @{hash='v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac';length=6249}
+                    unchangedRuleIds = @('reused-string-literals')
+                })
+            currentRule = @{hash='v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938';length=10287}
+        }
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility -Compatibility $compatibility `
+                -CurrentRule $compatibility.currentRule -AllowedRuleIds @('reused-string-literals')
+        } | Should -Throw '*unchangedRuleIds*invalid*'
     }
 }
 

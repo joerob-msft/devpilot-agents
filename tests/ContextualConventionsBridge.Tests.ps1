@@ -1,5 +1,194 @@
 #requires -Version 7.0
 
+Describe 'Copyright header bridge and create-only preflight' {
+    BeforeAll {
+        function New-CopyrightBridgeCase {
+            param([switch]$NoCurrentSpans)
+            $config = New-ContextualTestConfig
+            $config.enabled = $true
+            $content = "namespace Tests`n{`n    class C`n    {`n        int M() => 2;`n    }`n}"
+            $prepared = New-ContextualPreparedIntake -Content $content
+            $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+            $entry.spans[0].startLine = 5
+            $entry.spans[0].endLine = 5
+            $entry['fileHeader'] = Get-ContextualCopyrightHeaderEvidence `
+                -Path $entry.path -ChangeType edit -Content $content `
+                -TargetContent ($content.Replace('=> 2', '=> 1')) `
+                -SourceCommit $prepared.Head.sourceCommit -TargetCommit $prepared.Head.targetCommit
+            if ($NoCurrentSpans) {
+                $entry.spans = @()
+                $prepared.Intake.transientSnapshots['42'].changes.changedLines = 0
+            }
+            return [pscustomobject]@{ Config = $config; Prepared = $prepared }
+        }
+
+        function Get-CopyrightObservation {
+            param($Case, [string]$Name)
+            $prepared = [pscustomobject]@{
+                Head = $Case.Prepared.Head
+                Intake = $Case.Prepared.Intake | ConvertTo-Json -Depth 64 | ConvertFrom-Json -AsHashtable -Depth 64
+            }
+            $result = Invoke-SyntheticContextualBridge -Config $Case.Config -Prepared $prepared -Name $Name
+            $result.providerWrites | Should -Be 0
+            $result.modelWrites | Should -Be 0
+            $result.records | Should -HaveCount 1
+            return Get-Content -LiteralPath $result.outcomes[0].observationPath -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+        }
+    }
+
+    It 'carries a pre-existing header finding through the full bridge without pretending line 1 changed' {
+        $case = New-CopyrightBridgeCase
+        $observation = Get-CopyrightObservation $case copyright-pre-existing
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.anchor.scope | Should -BeExactly file-header
+        $finding.anchor.line | Should -Be 1
+        $finding.fileHeader.origin | Should -BeExactly pre-existing
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $observation | ConvertTo-Json -Depth 64 |
+            Test-Json -SchemaFile "$repoRoot\src\OwnerObserver\schemas\owner-observation.v1.json" |
+            Should -BeTrue
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $evidence = [pscustomobject]@{
+            Contract = $contract
+            Declaration = @{ capability = @{ id = 'bpm-contextual-conventions@1' } }
+        }
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+        $proposal.scope | Should -BeExactly file-header
+        $proposal.fileHeader.origin | Should -BeExactly pre-existing
+        $proposal.body | Should -Match 'pre-existing, nonblocking convention issue'
+        $proposal.body | Should -Match '\*\*File-header location:\*\*'
+        $proposal.body | Should -Not -Match '\*\*Changed-line occurrences:\*\*'
+        $proposal.body | Should -Not -Match 'Changed code:'
+        $upgrade = New-ContextualUpgradeRecognitionCase
+        $evidence | Add-Member -NotePropertyName Observation -NotePropertyValue $observation
+        $live = [pscustomobject]@{
+            PullRequest = $case.Prepared.Head
+            ProviderBinding = @{}
+            Reviewer = $case.Config.expectedAccount
+            Snapshot = $upgrade.Snapshot
+            Anchors = @([ordered]@{
+                scope = 'file-header'
+                path = $proposal.path
+                startLine = 1
+                endLine = 1
+                changeTrackingId = 7
+                iterationId = $upgrade.Snapshot.CurrentIterationId
+                fileHeader = $proposal.fileHeader
+            })
+        }
+        $approval = @{
+            subject = $case.Prepared.Head
+            provider = @{}
+            operator = $case.Config.expectedAccount
+        }
+        $preflight = @{
+            Evidence = $evidence
+            Approval = $approval
+            Live = $live
+            Selections = @($proposal)
+            ExpectedSnapshotSha256 = $upgrade.Snapshot.Digest.Substring(10)
+            Delivery = 'contextual-conventions'
+        }
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Not -Throw
+        $live.Anchors[0].fileHeader =
+            $proposal.fileHeader | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable
+        $live.Anchors[0].fileHeader.targetDigest = 'v1:sha256:' + ('0' * 64)
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Throw '*source/target header binding changed*'
+        $live.Anchors = @()
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Throw
+    }
+
+    It 'handles a changed file with no current-line span without enabling any old rule at line 1' {
+        $case = New-CopyrightBridgeCase -NoCurrentSpans
+        $observation = Get-CopyrightObservation $case copyright-no-current-lines
+        $observation.findings | Should -HaveCount 1
+        $observation.findings[0].ruleId | Should -BeExactly file-copyright-header
+        $observation.findings[0].anchor.scope | Should -BeExactly file-header
+    }
+
+    It 'treats a markerless reviewer-owned copyright request at lines 2-4 as UNKNOWN, never humanCovered or a duplicate create' {
+        $case = New-CopyrightBridgeCase
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity reviewer `
+            -Path src/Checks.cs -Line 2 `
+            -Body 'Add the standard copyright header to this test file. This omission is pre-existing and nonblocking.'
+        $observation = Get-CopyrightObservation $case copyright-markerless-reviewer
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly unknown
+        $observation.effects.dedupe.wouldCreate | Should -Be 0
+        $observation.effects.dedupe.humanCovered | Should -Be 0
+    }
+
+    It 'recognizes a disclosed distinct human copyright request on the same changed file' {
+        $case = New-CopyrightBridgeCase
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity human `
+            -Path src/Checks.cs -Line 2 -Body 'Please add the standard copyright header before the namespace.'
+        $observation = Get-CopyrightObservation $case copyright-distinct-human
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly humanCovered `
+            -Because ($finding.reconciliation | ConvertTo-Json -Depth 16 -Compress)
+    }
+
+    It 'reconciles an exact current reviewer comment as noOp without a second create' {
+        $case = New-CopyrightBridgeCase
+        $first = Get-CopyrightObservation $case copyright-first
+        $finding = @($first.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $typed = New-ContextualUpgradeRecognitionCase
+        $typed.Thread.anchor.line = 1
+        $typed.Thread.comments[0].body = $body
+        $resolved = Resolve-OwnerV2DiscussionReconciliation -Observation $first -Contract $contract `
+            -Snapshot $typed.Snapshot
+        $resolved.findings[0].reconciliation.classification | Should -BeExactly noOp
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity reviewer `
+            -Path src/Checks.cs -Line 1 -Body $body
+        $second = Get-CopyrightObservation $case copyright-second
+        $finding = @($second.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly noOp `
+            -Because ($finding.reconciliation | ConvertTo-Json -Depth 16 -Compress)
+        $second.effects.dedupe.wouldCreate | Should -Be 0
+    }
+
+    It 'evaluates multiple files independently and does not scan outside the changed inventory' {
+        $case = New-CopyrightBridgeCase
+        $changes = $case.Prepared.Intake.transientSnapshots['42'].changes
+        $second = $changes.entries[0] | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable
+        $second.path = 'src/Second.cs'
+        $second.changeTrackingId = 8
+        $second.fileHeader.path = $second.path
+        $changes.entries += $second
+        $changes.changedFiles = 2
+        $changes.changedLines = 2
+        $observation = Get-CopyrightObservation $case copyright-multiple
+        @($observation.findings | Where-Object ruleId -CEQ file-copyright-header) | Should -HaveCount 2
+        @($observation.findings.anchor.path | Sort-Object -Unique) -join ',' |
+            Should -BeExactly 'src/Checks.cs,src/Second.cs'
+    }
+
+    It 'refuses <Case> header marker evidence without creating a duplicate' -TestCases @(
+        @{ Case = 'a foreign copied'; Identity = 'human'; Path = 'src/Checks.cs'; Suffix = '' },
+        @{ Case = 'an edited reviewer'; Identity = 'reviewer'; Path = 'src/Checks.cs'; Suffix = ' edited' },
+        @{ Case = 'a moved reviewer'; Identity = 'reviewer'; Path = 'src/Elsewhere.cs'; Suffix = '' }
+    ) {
+        param($Case, $Identity, $Path, $Suffix)
+        $fixture = New-CopyrightBridgeCase
+        $first = Get-CopyrightObservation $fixture "copyright-negative-first-$Identity-$($Path.GetHashCode())-$($Suffix.Length)"
+        $finding = @($first.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        Add-SyntheticDiscussion -Prepared $fixture.Prepared -Config $fixture.Config -Identity $Identity `
+            -Path $Path -Line 1 -Body ($body + $Suffix)
+        $second = Get-CopyrightObservation $fixture "copyright-negative-second-$Identity-$($Path.GetHashCode())-$($Suffix.Length)"
+        $finding = @($second.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly unknown
+        $second.effects.dedupe.wouldCreate | Should -Be 0
+        $second.effects.dedupe.humanCovered | Should -Be 0
+    }
+}
+
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     Import-Module (Join-Path $repoRoot `
@@ -12,6 +201,8 @@ BeforeAll {
         'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1') -Force
     . (Join-Path $repoRoot `
         'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
 
@@ -322,6 +513,73 @@ Describe what validations are needed:
             -PreparedIntake $Prepared.Intake -Run
     }
 
+    function New-ReusedStringPreparedIntake {
+        param([switch]$Reverse, [switch]$SameProject, [switch]$ContextOnlyPeer)
+        $prepared = New-ContextualPreparedIntake
+        $entries = @(
+            @{ path = 'src/A/Reader.cs'; content = @'
+class Reader {
+    string Old(Exception ex) => ex.Data["LegacyKey"] as string;
+    string Credential(Exception ex) => ex.Data["CredentialHandle"] as string;
+    string Group(Exception ex) => ex.Data["GroupIdentity"] as string;
+    string Endpoint(Exception ex) => ex.Data["EndpointUri"] as string;
+}
+'@ },
+            @{ path = 'src/B/Writer.cs'; content = @'
+class Writer {
+    void Old(Exception ex) { ex.Data["LegacyKey"] = null; }
+    void Credential(Exception ex) { ex.Data["CredentialHandle"] = null; }
+    void Group(Exception ex) { ex.Data["GroupIdentity"] = null; }
+    void Endpoint(Exception ex) { ex.Data["EndpointUri"] = null; }
+}
+'@ }
+        )
+        $ordinal = 0
+        foreach ($entry in $entries) {
+            $ordinal++
+            $projectContent = '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+            $entry.changeTrackingId = $ordinal
+            $entry.changeType = 'edit'
+            $entry.state = 'complete'
+            $entry.sourceDigest = Get-ContextualTestTextDigest $entry.content
+            $entry.byteLength = [Text.Encoding]::UTF8.GetByteCount($entry.content)
+            $entry.spans = @(@{
+                    startLine = 3; endLine = 5; state = 'complete'
+                    sourceDigest = $entry.sourceDigest
+                })
+            $entry.projectContext = @{
+                state = 'complete'
+                path = $(if ($SameProject) { 'src/App.csproj' } else {
+                    'src/' + $(if ($ordinal -eq 1) { 'A' } else { 'B' }) + '/App.csproj'
+                })
+                content = $projectContent
+                byteLength = [Text.Encoding]::UTF8.GetByteCount($projectContent)
+                sourceDigest = Get-ContextualTestTextDigest $projectContent
+            }
+            $target = $(if ($ordinal -eq 1) {
+                'class Reader { string Old(Exception ex) => ex.Data["LegacyKey"] as string; }'
+            } else {
+                'class Writer { void Old(Exception ex) { ex.Data["LegacyKey"] = null; } }'
+            })
+            $entry.comparison=@{
+                schemaVersion=1;state='complete';path=$entry.path;targetPath=$entry.path
+                sourceCommit=$prepared.Head.sourceCommit;targetCommit=$prepared.Head.targetCommit
+                sourceDigest=$entry.sourceDigest;targetDigest=(Get-ContextualTestTextDigest $target)
+                byteLength=[Text.Encoding]::UTF8.GetByteCount($target);content=$target;targetState='present'
+            }
+            if ($ContextOnlyPeer -and $ordinal -eq 2) {
+                $entry.spans = @()
+                $entry.contextOnly = $true
+            }
+        }
+        if ($Reverse) { [array]::Reverse($entries) }
+        $changes = $prepared.Intake.transientSnapshots['42'].changes
+        $changes.entries = $entries
+        $changes.changedFiles = 2
+        $changes.changedLines = $(if ($ContextOnlyPeer) { 3 } else { 6 })
+        return $prepared
+    }
+
     function New-SyntheticPrTemplateReviewerComment {
         param(
             [Parameter(Mandatory)]
@@ -594,6 +852,11 @@ Describe what validations are needed:
                     'v1:sha256:' +
                     $Config.capability.
                         implementationSha256)
+        $contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+            subjectProvider = $Config.subjectProvider
+            ruleReferences = $Config['commentRuleReferences']
+            ruleRepository = $Config['commentRuleRepository']
+        }
         $finding = $observation.findings[0]
         $marker =
             Get-ContextualConventionMarkerKey `
@@ -648,6 +911,11 @@ Describe what validations are needed:
                     -MaximumFiles 64 `
                     -MaximumBytes 16777216 `
                     -MaximumReads 128)
+        $contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+            subjectProvider = $config.subjectProvider
+            ruleReferences = $config['commentRuleReferences']
+            ruleRepository = $config['commentRuleRepository']
+        }
         $finding = [ordered]@{
             identity =
                 'contextual-v1:' + ('2' * 64)
@@ -828,6 +1096,554 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'carries the generic catch rule through acquisition, exact source binding, formatter, and reviewer readback' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            'class C { void M() { try {} catch (System.Exception cleanupScheduleException) when (!cleanupScheduleException.IsFatal()) {} } }')
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name generic-catch
+        $result.state | Should -BeExactly completed
+        $configPath = Join-Path $TestDrive 'generic-catch-config.json'
+        $config | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath $configPath
+        $evidence = Read-ApprovedOwnerV2Evidence `
+            -StateRoot (Join-Path $TestDrive 'generic-catch-state') `
+            -Identity $result.records[0].identity -RepoRoot $repoRoot `
+            -ToolkitConfigPath $configPath -Delivery contextual-conventions
+        $finding = @($evidence.Observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming)[0]
+        $finding.anchor.path | Should -BeExactly src/Checks.cs
+        $finding.anchor.line | Should -Be 1
+        $finding.anchor.symbol | Should -BeExactly cleanupScheduleException
+        $finding.binding.source.representation.path |
+            Should -BeExactly src/Checks.cs
+        $finding.binding.source.representation.startLine | Should -Be 1
+        $finding.binding.source.sha256 | Should -Match '^[0-9a-f]{64}$'
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+            -Finding $finding -Delivery contextual-conventions
+        $proposal.classification | Should -BeExactly wouldCreate
+        $proposal.body | Should -Match 'System\.Exception'
+        $proposal.body | Should -Match 'update its uses'
+        $proposal.body | Should -Match 'Name proven System.Exception catch variables ex'
+        $proposal.scope | Should -BeExactly changed-line
+        $readback = New-ContextualUpgradeRecognitionCase
+        $readback.Thread.anchor.path = $finding.anchor.path
+        $readback.Thread.anchor.line = $finding.anchor.line
+        $readback.Thread.comments[0].body = $proposal.body
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $evidence.Observation -Contract $evidence.Contract `
+            -Snapshot $readback.Snapshot
+        $current = @($observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming)[0]
+        $current.reconciliation.classification | Should -BeExactly noOp
+        $current.reconciliation.reason | Should -BeExactly exact-current-comment
+        $observation.effects.providerWrites | Should -Be 0
+        $observation.execution.modelStarts | Should -Be 0
+    }
+
+    It 'requires naming-specific current human coverage for <Mode>' -TestCases @(
+        @{ Mode = 'covered'; Expected = 'humanCovered' }
+        @{ Mode = 'unrelated'; Expected = 'unknown' }
+        @{ Mode = 'wrong-variable'; Expected = 'unknown' }
+        @{ Mode = 'negated'; Expected = 'unknown' }
+        @{ Mode = 'reviewer-unmarked'; Expected = 'unknown' }
+        @{ Mode = 'ambiguous-author'; Expected = 'unknown' }
+        @{ Mode = 'wrong-line'; Expected = 'wouldCreate' }
+        @{ Mode = 'wrong-head'; Expected = 'wouldCreate' }
+        @{ Mode = 'outdated'; Expected = 'wouldCreate' }
+        @{ Mode = 'resolved'; Expected = 'wouldCreate' }
+        @{ Mode = 'deleted'; Expected = 'wouldCreate' }
+        @{ Mode = 'cross-rule-marker'; Expected = 'unknown' }
+    ) {
+        param($Mode, $Expected)
+        $case = New-ContextualUpgradeRecognitionCase
+        $case.Observation.findings[0].ruleId = 'generic-exception-naming'
+        $case.Observation.findings[0].anchor.symbol = 'cleanupScheduleException'
+        $comment = $case.Thread.comments[0]
+        $comment.body = 'Rename the new generic catch variable cleanupScheduleException to ex and update its uses.'
+        $comment.reviewerOwned = $false
+        $comment.reviewerIdentityState = 'foreign'
+        switch ($Mode) {
+            unrelated { $comment.body = 'Log cleanupScheduleException once in this catch.' }
+            wrong-variable { $comment.body = 'Rename the generic catch variable otherException to ex.' }
+            negated { $comment.body = "Do not rename generic catch variable cleanupScheduleException to ex." }
+            reviewer-unmarked {
+                $comment.reviewerOwned = $true
+                $comment.reviewerIdentityState = 'matched'
+            }
+            ambiguous-author { $comment.reviewerIdentityState = 'ambiguous' }
+            wrong-line { $case.Thread.anchor.line++ }
+            wrong-head { $case.Thread.sourceCommit = '0' * 40 }
+            outdated { $case.Thread.isOutdated = $true }
+            resolved { $case.Thread.status = 'fixed' }
+            deleted { $case.Thread.isDeleted = $true }
+            cross-rule-marker {
+                $comment.body += "`n<!-- devpilot-named-areequal:v1:$('9' * 64) -->"
+            }
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract -Snapshot $case.Snapshot
+        $result.findings[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.effects.providerWrites | Should -Be 0
+    }
+
+    It 'does not turn unsupported catch binding into a complete compliant evaluation' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            'class C { void M() { try {} catch (UnknownException other) {} } }')
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name generic-catch-unknown
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath `
+            -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming) | Should -HaveCount 0
+        @($observation.outcomes | Where-Object {
+                $_.ruleId -ceq 'generic-exception-naming' -and $_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
+        $observation.counts.unknown | Should -BeGreaterThan 0
+        $observation.effects.providerWrites | Should -Be 0
+    }
+
+    It 'keeps independent contextual findings deliverable beside <Mode>' -TestCases @(
+        @{ Mode = 'unrelated-source-condition'; Catch = $false; Helper = '' }
+        @{ Mode = 'unrelated-snapshot-condition'; Catch = $true; Helper = "#if DEBUG`n#endif`nclass Helper {}" }
+        @{ Mode = 'generated-snapshot-condition'; Catch = $true; Helper = "// <auto-generated>`nclass Helper { void M() {`n#if DEBUG`nSystem.Console.WriteLine(0);`n#endif`n} }" }
+        @{ Mode = 'attributed-snapshot-condition'; Catch = $true; Helper = "[CompilerGenerated] class Helper { void M() {`n#if DEBUG`nSystem.Console.WriteLine(0);`n#endif`n} }" }
+    ) {
+        param($Mode, $Catch, $Helper)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $content = if ($Catch) {
+            'class C { void M() { try {} catch (System.Exception cleanup) when (!cleanup.IsFatal()) {} } }'
+        }
+        else {
+            @'
+class C { bool Equal(string a, string b) { return a == b; } void Trace() {
+#if DEBUG
+    System.Console.WriteLine(0);
+#endif
+} }
+'@
+        }
+        $prepared = New-ContextualPreparedIntake -Content $content
+        if ($Helper) {
+            $helperDigest = Get-ContextualTestTextDigest $Helper
+            $prepared.Intake.transientSnapshots['42'].changes.entries += [ordered]@{
+                changeTrackingId = 8
+                path = 'src/Helper.cs'
+                changeType = 'edit'
+                state = 'complete'
+                spans = @(@{ startLine = 1; endLine = 1; state = 'complete'; sourceDigest = $helperDigest })
+                content = $Helper
+                byteLength = [Text.Encoding]::UTF8.GetByteCount($Helper)
+                sourceDigest = $helperDigest
+            }
+            $prepared.Intake.transientSnapshots['42'].changes.changedFiles = 2
+            $prepared.Intake.transientSnapshots['42'].changes.changedLines = 2
+        }
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name "review-$Mode"
+        $result.state | Should -BeExactly $(if ($Mode -ceq 'generated-snapshot-condition') { 'completed' } else { 'partial' })
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath `
+            -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.outcomes | Where-Object {
+            $_.ruleId -ceq 'generic-exception-naming' -and $_.state -ceq 'unknown'
+        }) | Should -HaveCount 0
+        $ruleId = if ($Catch) { 'generic-exception-naming' } else { 'explicit-string-comparison' }
+        $finding = @($observation.findings | Where-Object ruleId -CEQ $ruleId)[0]
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $observation.execution.modelStarts | Should -Be 0
+        $observation.effects.providerWrites | Should -Be 0
+    }
+
+    It 'preserves binding evidence without blocking independent findings for <Mode>' -TestCases @(
+        @{ Mode = 'generated-shadow'; Type = 'Exception'; Helper = 'class Exception : System.Exception {}'; Path = 'src/Helper.g.cs' }
+        @{ Mode = 'generated-specialized'; Type = 'ApiException'; Helper = '[GeneratedCode("tool", "1")] class ApiException : System.Exception {}'; Path = 'src/Helper.cs' }
+        @{ Mode = 'conditional-body-record'; Type = 'System.InvalidOperationException'; Helper = "class Helper { void M() {`n#if DEBUG`nvar record = 1; System.Action a = delegate {};`n#endif`n} }"; Path = 'src/Helper.cs' }
+    ) {
+        param($Mode, $Type, $Helper, $Path)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $content = "using System; class C { bool Equal(string a, string b) { return a == b; } void M() { try {} catch ($Type customException) when (!customException.IsFatal()) {} } }"
+        $prepared = New-ContextualPreparedIntake -Content $content
+        $helperDigest = Get-ContextualTestTextDigest $Helper
+        $prepared.Intake.transientSnapshots['42'].changes.entries += [ordered]@{
+            changeTrackingId = 8
+            path = $Path
+            changeType = 'edit'
+            state = 'complete'
+            spans = @(@{ startLine = 1; endLine = 1; state = 'complete'; sourceDigest = $helperDigest })
+            content = $Helper
+            byteLength = [Text.Encoding]::UTF8.GetByteCount($Helper)
+            sourceDigest = $helperDigest
+        }
+        $prepared.Intake.transientSnapshots['42'].changes.changedFiles = 2
+        $prepared.Intake.transientSnapshots['42'].changes.changedLines = 2
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name "residual-$Mode"
+        $result.state | Should -BeExactly $(if ($Mode -ceq 'conditional-body-record') { 'partial' } else { 'completed' })
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath `
+            -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.outcomes | Where-Object {
+            $_.ruleId -ceq 'generic-exception-naming' -and $_.state -ceq 'unknown'
+        }) | Should -HaveCount 0
+        @($observation.findings | Where-Object ruleId -CEQ generic-exception-naming) |
+            Should -HaveCount 0
+        $finding = @($observation.findings | Where-Object ruleId -CEQ explicit-string-comparison)[0]
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $observation.execution.modelStarts | Should -Be 0
+        $observation.effects.providerWrites | Should -Be 0
+    }
+
+    It 'preserves the authenticated history conflict boundary for <Mode>' -TestCases @(
+        @{ Mode = 'ranged-ambiguous'; Expected = 'unknown' },
+        @{ Mode = 'ranged-cross-rule'; Expected = 'unknown' },
+        @{ Mode = 'ranged-unproven-human'; Expected = 'unknown' },
+        @{ Mode = 'duplicate-prior-marker'; Expected = 'unknown' },
+        @{ Mode = 'foreign-prior-marker'; Expected = 'unknown' },
+        @{ Mode = 'extra-signed-marker'; Expected = 'unknown' },
+        @{ Mode = 'ranged-proven-human'; Expected = 'noOp' },
+        @{ Mode = 'outside-range-ambiguous'; Expected = 'noOp' },
+        @{ Mode = 'prior-only'; Expected = 'noOp' }
+    ) {
+        param($Mode, $Expected)
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'duplicate-constant-declarations'
+        $finding.evidence = 'Consolidate duplicated constants WriterKey="writer", ReaderKey="reader" for the proven shared contract.'
+        $finding.binding['span'] = @{ startLine = 32; endLine = 40 }
+        $case.Proof.selection.ruleId = $finding.ruleId
+        if ($Mode -like 'ranged-*') {
+            $marker = Get-ContextualConventionMarkerKey -Contract $case.Contract -Finding $finding
+            $case.Proof.selection.marker = $marker
+            $case.Proof.selection.body = "Legacy body.`n<!-- devpilot-contextual-convention:v1:$marker -->"
+        }
+        if ($Mode -ceq 'extra-signed-marker') {
+            $case.Proof.selection.body += "`n<!-- devpilot-other-rule:v1:$('8' * 64) -->"
+        }
+        $case.Proof.selection.bodySha256 = (
+            Get-ContextualTestTextDigest $case.Proof.selection.body).Substring(10)
+        $case.Thread.comments[0].body = $case.Proof.selection.body
+        if ($Mode -cnotin @('extra-signed-marker', 'prior-only')) {
+            $copy = $case.Thread | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
+            $copy.threadId = 200
+            $copy.comments[0].commentId = 201
+            $copy.anchor.line = $(if ($Mode -like 'ranged-*') { 36 } else { 55 })
+            switch ($Mode) {
+                ranged-ambiguous {
+                    $copy.comments[0].body = 'Unproven current request.'
+                    $copy.comments[0].reviewerIdentityState = 'ambiguous'
+                }
+                ranged-cross-rule { $copy.comments[0].body = "<!-- devpilot-other-rule:v1:$('8' * 64) -->" }
+                ranged-unproven-human {
+                    $copy.comments[0].body = 'Please consider refactoring.'
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+                ranged-proven-human {
+                    $copy.comments[0].body = 'Consolidate shared constant WriterKey.'
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+                outside-range-ambiguous {
+                    $copy.comments[0].body = 'Unrelated request.'
+                    $copy.comments[0].reviewerIdentityState = 'ambiguous'
+                }
+                foreign-prior-marker {
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+            }
+            $old = $case.Snapshot
+            $case.Snapshot = [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+                $old.State, $old.Reason, $old.PageCount, 2, 2, $old.ByteCount,
+                $old.Digest, $old.SourceDigests, [object[]]@($case.Thread, $copy))
+            foreach ($name in @('RawProvenanceDigests', 'MappingDigest', 'ReviewerIdentityDigest', 'CurrentIterationId')) {
+                $case.Snapshot | Add-Member -NotePropertyName $name -NotePropertyValue $old.$name
+            }
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot -AuthenticatedPriorComments @($case.Proof)
+        $result.findings[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.findings[0].providerMarker.integrity |
+            Should -BeExactly $(if ($Expected -ceq 'unknown') { 'invalid' } else { 'verified' })
+        $result.effects.dedupe.noOp | Should -Be $(if ($Expected -ceq 'noOp') { 1 } else { 0 })
+        $result.effects.dedupe.unknown | Should -Be $(if ($Expected -ceq 'unknown') { 1 } else { 0 })
+        if ($Expected -ceq 'unknown' -and $Mode -cne 'extra-signed-marker') {
+            $result.findings[0].reconciliation.reason | Should -BeExactly authenticated-prior-comment-conflict
+        }
+        $result.effects.dedupe.wouldCreate | Should -Be 0
+        $result.effects.providerWrites | Should -Be 0
+    }
+
+    It 'preserves configured citations through acquisition, completed refresh, and approved reconstruction' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $config['commentRuleReferences'] = (
+            Get-Content -LiteralPath (
+                Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
+                ConvertFrom-Json -AsHashtable).commentRuleReferences
+        $config['commentRuleRepository'] = (
+            Get-Content -LiteralPath (
+                Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
+                ConvertFrom-Json -AsHashtable).commentRuleRepository
+        $configPath = Join-Path $TestDrive 'presentation-config.json'
+        [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 64))
+        $bodies = @(
+            foreach ($attempt in 1..2) {
+                $prepared = New-ContextualPreparedIntake
+                $result = Invoke-SyntheticContextualBridge -Config $config `
+                    -Prepared $prepared -Name presentation-roundtrip
+                @($result.records) | Should -HaveCount 1 -Because (
+                    $result | ConvertTo-Json -Depth 16 -Compress)
+                $evidence = Read-ApprovedOwnerV2Evidence `
+                    -StateRoot (Join-Path $TestDrive 'presentation-roundtrip-state') `
+                    -Identity $result.records[0].identity -RepoRoot $repoRoot `
+                    -ToolkitConfigPath $configPath -Delivery contextual-conventions
+                $finding = @($evidence.Observation.findings |
+                    Where-Object { $_.ruleId -ceq 'exception-logging' })[0]
+                $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+                    -Finding $finding -Delivery contextual-conventions
+                $proposal.body | Should -Match '\*\*EngHub rules:\*\* \[Log at Source or Sink\]'
+                $proposal.body | Should -Match (
+                    'version=GC' + $prepared.Head.sourceCommit + '&path=%2Fsrc%2FChecks.cs&line=1')
+                $proposal.bodySha256 | Should -BeExactly (
+                    Get-ApprovedOwnerV2TextSha256 $proposal.body)
+                $proposal.body
+            }
+        )
+        $bodies | Should -HaveCount 2
+        $bodies[0] | Should -BeExactly $bodies[1]
+    }
+
+    It 'withholds the new rule but preserves old findings for a <Mode> comparison binding' -TestCases @(
+        @{Mode='missing'},@{Mode='tampered'},@{Mode='wrong-source'},@{Mode='wrong-target'},
+        @{Mode='wrong-path'},@{Mode='wrong-length'}
+    ) {
+        param($Mode)
+        $config=New-ContextualTestConfig; $config.enabled=$true
+        $prepared=New-ReusedStringPreparedIntake
+        $entry=$prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.content += "`nclass Logging { void M() { try { X(); } catch (Exception ex) { Logger.Error(ex.Message); } } }"
+        $entry.sourceDigest=Get-ContextualTestTextDigest $entry.content
+        $entry.byteLength=[Text.Encoding]::UTF8.GetByteCount($entry.content)
+        $entry.spans[0].endLine=7
+        $entry.spans[0].sourceDigest=$entry.sourceDigest
+        $entry.comparison.sourceDigest=$entry.sourceDigest
+        switch($Mode) {
+            missing {$entry.Remove('comparison')}
+            tampered {$entry.comparison.content='class Other {}'}
+            wrong-source {$entry.comparison.sourceCommit='a'*40}
+            wrong-target {$entry.comparison.targetCommit='b'*40}
+            wrong-path {$entry.comparison.path='src/Other.cs'}
+            wrong-length {$entry.comparison.byteLength++}
+        }
+        $name="comparison-binding-$Mode"
+        $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1
+        $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+            -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+        $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings | Where-Object ruleId -CEQ reused-string-literals) | Should -HaveCount 0
+        @($observation.findings | Where-Object ruleId -CEQ exception-logging) | Should -HaveCount 1
+        @($observation.outcomes | Where-Object {
+            $_.Contains('ruleId') -and $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'unknown'
+        }) | Should -HaveCount 1
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
+    It 'rejects a shared acquisition whose generation does not match its intake' {
+        $prepared=New-ContextualPreparedIntake
+        $prepared.Intake['generation']='a'*32
+        $envelope=@{
+            schemaVersion=1;kind='devpilot-shared-review-acquisition';generation=('b'*32)
+            configDigest=('c'*64);intake=$prepared.Intake
+        }
+        $envelope.intake['binding']=@{configDigest=('c'*64)}
+        $path=Join-Path $TestDrive 'wrong-generation.json'
+        $envelope | ConvertTo-Json -Depth 100 | Set-Content $path
+        $configPath=Join-Path $TestDrive 'wrong-generation-config.json'
+        (New-ContextualTestConfig) | ConvertTo-Json -Depth 64 | Set-Content $configPath
+        {
+            & (Join-Path $repoRoot 'tools\Invoke-ContextualConventionsCurrentPr.ps1') `
+                -ConfigPath $configPath -StateRoot (Join-Path $TestDrive 'wrong-generation-state') `
+                -ManifestPath (Join-Path $TestDrive 'wrong-generation-manifest.json') `
+                -AcquisitionPath $path -AcquisitionSha256 ((Get-FileHash $path).Hash.ToLowerInvariant()) `
+                -AzureCliPath 'must-not-be-invoked' -Run
+        } | Should -Throw '*Shared acquisition binding is invalid*'
+    }
+
+    It 'carries both literal contract sides through acquisition and capability in <Mode> order' -TestCases @(
+        @{ Mode = 'reader-first'; Reverse = $false; SameProject = $false; ContextOnlyPeer = $false }
+        @{ Mode = 'writer-first'; Reverse = $true; SameProject = $false; ContextOnlyPeer = $false }
+        @{ Mode = 'same-project'; Reverse = $false; SameProject = $true; ContextOnlyPeer = $false }
+        @{ Mode = 'context-only-peer'; Reverse = $false; SameProject = $false; ContextOnlyPeer = $true }
+    ) {
+        param($Mode, $Reverse, $SameProject, $ContextOnlyPeer)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake -Reverse:$Reverse `
+            -SameProject:$SameProject -ContextOnlyPeer:$ContextOnlyPeer
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name "literal-$Mode"
+        $result.records | Should -HaveCount 1 -Because ($result | ConvertTo-Json -Depth 16 -Compress)
+        $observationPath = @(Get-ChildItem (Join-Path $TestDrive "literal-$Mode-state") `
+            -Recurse -File -Filter "$($result.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
+        $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $findings = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+        $findings | Should -HaveCount 3 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $finding = @($findings | Where-Object { 'CredentialHandle' -cin $_.literalValues })[0]
+        $finding.anchor.path | Should -BeExactly 'src/A/Reader.cs'
+        $finding.binding.span.startLine | Should -Be 3
+        $finding.binding.span.endLine | Should -Be 3
+        @($findings | ForEach-Object {$_.literalValues} | Sort-Object) |
+            Should -Be @('CredentialHandle', 'EndpointUri', 'GroupIdentity')
+        @($findings | ForEach-Object {$_.literalValues}) | Should -Not -Contain LegacyKey
+        @($findings | ForEach-Object {$_.relatedUses}) | Should -HaveCount 6
+        $finding.occurrenceCounts.source | Should -Be 2
+        $finding.occurrenceCounts.target | Should -Be 0
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $finding.evidence | Should -Match $(if ($SameProject) {
+            'common Constants class for the project'
+        } else { 'lowest common project dependency' })
+        $finding.evidence | Should -Not -Match 'src/A/App|src/B/App'
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $request = & (Get-Module DevPilot.OwnerOrchestrator) {
+            param($Path)
+            (Read-OwnerV2Manifest -ManifestPath $Path).Entries[0].Contract
+        } $result.manifestPath
+        $request | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+            subjectProvider = $config.subjectProvider
+            ruleReferences = $config['commentRuleReferences']
+            ruleRepository = $config['commentRuleRepository']
+        }
+        $evidence = @{Declaration=@{capability=@{id=$config.capability.id}};Contract=$request}
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+        $proposal.line | Should -Be 3
+        $proposal.endLine | Should -Be 3
+        $proposal.body | Should -Match 'Declare constants'
+    }
+
+    It 'keeps one stable marker for the same literal cluster under reversed snapshot acquisition' {
+        $markers=@()
+        foreach($reverse in @($false,$true)) {
+            $config=New-ContextualTestConfig; $config.enabled=$true
+            $prepared=New-ReusedStringPreparedIntake -Reverse:$reverse
+            $name="literal-stable-$reverse"
+            $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+            $result.records | Should -HaveCount 1
+            $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+                -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+            $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+            $finding=@($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+            $markers += (@($finding.providerMarker.sha256 | Sort-Object) -join '|')
+        }
+        $markers[0] | Should -BeExactly $markers[1]
+    }
+
+    It 'reconciles the shared literal contract with <Coverage> human evidence' -TestCases @(
+        @{ Coverage = 'peer anchor'; Line = 3; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused by writer and reader.'; Expected = 'humanCovered' }
+        @{ Coverage = 'range-start with pinned use citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'humanCovered' }
+        @{ Coverage = 'unrelated same-anchor review'; Line = 3; Body = 'Please improve error handling.'; Expected = 'unknown' }
+        @{ Coverage = 'only one covered value'; Line = 3; Body = 'Declare a shared constant for CredentialHandle.'; Expected = 'humanCovered' }
+        @{ Coverage = 'stale citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC0000000000000000000000000000000000000000&path=/src/B/Writer.cs&line=3'; Expected = 'unknown' }
+        @{ Coverage = 'markerless configured reviewer'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'unknown' }
+    ) {
+        param($Coverage, $Line, $Body, $Expected)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake
+        $prepared.Intake.transientSnapshots['42'].discussions = @{
+            count = 1
+            threads = @(@{
+                    id = 100; status = 'active'; isDeleted = $false
+                    threadContext = @{
+                        filePath = '/src/B/Writer.cs'
+                        rightFileStart = @{line=$Line;offset=1}
+                        rightFileEnd = @{line=5;offset=1}
+                    }
+                    pullRequestThreadContext = @{
+                        changeTrackingId = 2
+                        iterationContext = @{firstComparingIteration=3;secondComparingIteration=3}
+                    }
+                    comments = @(@{
+                            id=1;commentType='text';content=($Body -f $prepared.Head.sourceCommit)
+                            author = $(if ($Coverage -ceq 'markerless configured reviewer') {
+                                @{
+                                    id=$config.expectedAccount.id
+                                    descriptor=$config.expectedAccount.descriptor
+                                    uniqueName=$config.expectedAccount.uniqueName
+                                }
+                            } else {
+                                @{id='44444444-4444-4444-4444-444444444444';descriptor='aad.human';uniqueName='human@example.invalid'}
+                            })
+                        })
+                })
+        }
+        $name = 'human-literal-' + ($Coverage -replace '[^a-z]', '-')
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1 -Because ($result | ConvertTo-Json -Depth 16 -Compress)
+        $observationPath = @(Get-ChildItem (Join-Path $TestDrive "$name-state") `
+            -Recurse -File -Filter "$($result.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
+        $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $finding = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+        $finding | Should -HaveCount 3 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $credential=@($finding | Where-Object { 'CredentialHandle' -cin $_.literalValues })[0]
+        $credential.reconciliation.classification | Should -BeExactly $Expected
+        if ($Coverage -ceq 'markerless configured reviewer') {
+            @($finding | Where-Object { $_.reconciliation.classification -cne 'unknown' }) | Should -HaveCount 0
+        }
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'does not deliver a reused literal for the <Control> full-PR negative' -TestCases @(
+        @{Control='single occurrence'}
+        @{Control='constant member references'}
+        @{Control='old code'}
+        @{Control='unproved project'}
+    ) {
+        param($Control)
+        $config=New-ContextualTestConfig
+        $config.enabled=$true
+        $prepared=New-ReusedStringPreparedIntake
+        $changes=$prepared.Intake.transientSnapshots['42'].changes
+        if ($Control -ceq 'single occurrence') {
+            $changes.entries=@($changes.entries[0]); $changes.changedFiles=1; $changes.changedLines=3
+        }
+        foreach($entry in $changes.entries) {
+            switch($Control) {
+                'constant member references' {
+                    $entry.content=$entry.content.Replace('["CredentialHandle"]','[Keys.CredentialHandle]').
+                        Replace('["GroupIdentity"]','[Keys.GroupIdentity]').Replace('["EndpointUri"]','[Keys.EndpointUri]')
+                    $entry.sourceDigest=Get-ContextualTestTextDigest $entry.content
+                    $entry.byteLength=[Text.Encoding]::UTF8.GetByteCount($entry.content)
+                    $entry.spans[0].sourceDigest=$entry.sourceDigest
+                }
+                'old code' { $entry.spans[0].startLine=6; $entry.spans[0].endLine=6; $changes.changedLines=2 }
+                'unproved project' { $entry.projectContext=@{state='unknown';reason='project-context-ambiguous'} }
+            }
+        }
+        $name='negative-literal-' + ($Control -replace ' ','-')
+        $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1
+        $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+            -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+        $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings | Where-Object ruleId -CEQ reused-string-literals) | Should -HaveCount 0
+        if($Control -ceq 'unproved project') {
+            @($observation.outcomes | Where-Object {
+                $_.Contains('ruleId') -and $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
+        }
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
     It 'requires the contextual shared acquisition template authority switch to be literal true' {
         foreach ($value in @(
                 $false,
@@ -949,6 +1765,55 @@ Describe 'Contextual convention current PR bridge' {
             Should -Be 0
     }
 
+    It 'recognizes a signed historical body at the unchanged current marker without rewriting it' {
+        foreach ($variant in @('authentic', 'edited', 'duplicate', 'unsigned')) {
+            $case = New-ContextualUpgradeRecognitionCase
+            $finding = $case.Observation.findings[0]
+            $marker = Get-ContextualConventionMarkerKey -Contract $case.Contract -Finding $finding
+            $body = @(
+                '**explicit-string-comparison**'
+                ''
+                'Use explicit StringComparison semantics.'
+                ''
+                'Changed code: `FilterByTag` at `/src/Checks.cs`:32.'
+                ''
+                "Rule bundle: ``/$($case.Contract.Request.RulePath)`` at ``$($case.Contract.Request.RuleCommit)`` (SHA-256 ``$($case.Contract.Request.RuleHash.Substring(10))``)."
+                ''
+                "<!-- devpilot-contextual-convention:v1:$marker -->"
+            ) -join "`n"
+            $case.Proof.selection.marker = $marker
+            $case.Proof.selection.body = $body
+            $case.Proof.selection.bodySha256 =
+                (Get-ContextualTestTextDigest $body).Substring(10)
+            $case.Thread.comments[0].body = $body
+            if ($variant -ceq 'edited') { $case.Thread.comments[0].body += "`nEdited." }
+            if ($variant -ceq 'duplicate') {
+                $case.Thread.comments += [ordered]@{
+                    commentId = 102
+                    commentType = 'text'
+                    isDeleted = $false
+                    reviewerOwned = $true
+                    reviewerIdentityState = 'matched'
+                    body = $body
+                }
+            }
+            $proofs = if ($variant -ceq 'unsigned') { @() } else { @($case.Proof) }
+            $result = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation -Contract $case.Contract `
+                -Snapshot $case.Snapshot -AuthenticatedPriorComments $proofs
+            $result.findings[0].reconciliation.classification |
+                Should -BeExactly $(if ($variant -ceq 'authentic') { 'noOp' } else { 'unknown' })
+            $result.effects.dedupe.wouldCreate | Should -Be 0
+            $result.effects.dedupe.wouldUpdate | Should -Be 0
+            $result.effects.providerWrites | Should -Be 0
+            if ($variant -ceq 'authentic') {
+                $result.findings[0].reconciliation.reason |
+                    Should -BeExactly authenticated-prior-reviewer-comment
+                $case.Thread.comments[0].body | Should -BeExactly $body
+            }
+        }
+    }
+
     It 'supports exact multiple prior bundles without carrying changed rule meaning' {
         $priorTwentyOne = @(
             (Get-Content -LiteralPath (
@@ -958,8 +1823,12 @@ Describe 'Contextual convention current PR bridge' {
                 ConvertFrom-Json -AsHashtable `
                     -Depth 32).rules.id |
                     Where-Object {
-                        [string]$_ -cne
-                            'pr-template-compliance'
+                        [string]$_ -cnotin @(
+                            'pr-template-compliance',
+                            'block-body-indentation',
+                            'generic-exception-naming',
+                            'file-copyright-header',
+                            'reused-string-literals')
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -973,7 +1842,10 @@ Describe 'Contextual convention current PR bridge' {
                         length = 3706
                     }
                     unchangedRuleIds = @(
-                        'explicit-string-comparison')
+                        $priorTwentyOne | Where-Object {
+                            $_ -cnotin @('named-call-arguments',
+                                'xml-summary-layout', 'duplicate-constant-declarations')
+                        })
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -982,7 +1854,9 @@ Describe 'Contextual convention current PR bridge' {
                         length = 5205
                     }
                     unchangedRuleIds = @(
-                        'http-client-lifetime')
+                        $priorTwentyOne | Where-Object {
+                            $_ -cne 'named-call-arguments'
+                        })
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -992,13 +1866,28 @@ Describe 'Contextual convention current PR bridge' {
                     }
                     unchangedRuleIds =
                         $priorTwentyOne
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @(
+                        $priorTwentyOne +
+                        'pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    (New-ContextualTestConfig).contextualRule.hash
+                length =
+                    (New-ContextualTestConfig).contextualRule.length
             }
         }
+        @($compatibility.previousRules[0].unchangedRuleIds) | Should -HaveCount 18
+        @($compatibility.previousRules[1].unchangedRuleIds) | Should -HaveCount 20
+        @($compatibility.previousRules[2].unchangedRuleIds) | Should -HaveCount 21
+        @($compatibility.previousRules[3].unchangedRuleIds) | Should -HaveCount 22
         $cases = @(
             [ordered]@{
                 ruleId =
@@ -1025,6 +1914,16 @@ Describe 'Contextual convention current PR bridge' {
                 expected = 'unknown'
             },
             [ordered]@{
+                ruleId = 'pr-template-compliance'
+                prior = $compatibility.previousRules[3].rule
+                expected = 'noOp'
+            },
+            [ordered]@{
+                ruleId = 'reused-string-literals'
+                prior = $compatibility.previousRules[3].rule
+                expected = 'unknown'
+            },
+            [ordered]@{
                 ruleId =
                     'named-call-arguments'
                 prior =
@@ -1039,7 +1938,19 @@ Describe 'Contextual convention current PR bridge' {
                     $compatibility.
                         previousRules[2].rule
                 expected = 'unknown'
+            },
+            [ordered]@{
+                ruleId = 'pr-template-compliance'
+                prior = $compatibility.previousRules[3].rule
+                expected = 'noOp'
             })
+        foreach ($entry in $compatibility.previousRules) {
+            $cases += [ordered]@{
+                ruleId = 'block-body-indentation'
+                prior = $entry.rule
+                expected = 'unknown'
+            }
+        }
         foreach ($control in $cases) {
             $case =
                 New-ContextualUpgradeRecognitionCase
@@ -1074,6 +1985,7 @@ Describe 'Contextual convention current PR bridge' {
         @{ Mode = 'malformed-sibling' }
         @{ Mode = 'extra-top-key' }
         @{ Mode = 'unregistered-rule' }
+        @{ Mode = 'new-rule-in-prior-bundle' }
     ) {
         param($Mode)
         $case =
@@ -1111,8 +2023,9 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    $case.Config.contextualRule.hash
+                length =
+                    $case.Config.contextualRule.length
             }
         }
         switch ($Mode) {
@@ -1139,6 +2052,11 @@ Describe 'Contextual convention current PR bridge' {
                 $compatibility.previousRules[1].
                     unchangedRuleIds = @(
                         'not-a-registered-rule')
+            }
+            new-rule-in-prior-bundle {
+                $compatibility.previousRules[1].
+                    unchangedRuleIds = @(
+                        'block-body-indentation')
             }
         }
         $case.Proof['ruleCompatibility'] =
@@ -1347,6 +2265,49 @@ Describe 'Contextual convention current PR bridge' {
             Should -BeExactly unknown
         $result.findingsComplete |
             Should -BeFalse
+    }
+
+    It 'recognizes an indentation request on the proven block brace without changing the statement anchor' {
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'block-body-indentation'
+        $finding['indentationContext'] = [ordered]@{
+            blockStartLine = 31
+            blockEndLine = 40
+            statementLine = 32
+        }
+        $case.Thread.anchor.line = 31
+        $case.Thread.comments[0].body =
+            'Indent the try body one level (four spaces).'
+        $case.Thread.comments[0].reviewerOwned = $false
+        $case.Thread.comments[0].reviewerIdentityState = 'foreign'
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot
+        $result.findings[0].anchor.line | Should -Be 32
+        $result.findings[0].reconciliation.classification |
+            Should -BeExactly humanCovered
+    }
+
+    It 'recognizes the exact current indentation reviewer marker as a no-op' {
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'block-body-indentation'
+        $finding['indentationContext'] = [ordered]@{
+            blockStartLine = 31
+            blockEndLine = 40
+            statementLine = 32
+        }
+        $marker = Get-ContextualConventionMarkerKey `
+            -Contract $case.Contract -Finding $finding
+        $case.Thread.comments[0].body =
+            Format-ContextualConventionComment -Contract $case.Contract `
+                -Finding $finding -MarkerKey $marker
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot
+        $result.findings[0].reconciliation.classification |
+            Should -BeExactly noOp
     }
 
     It 'treats the existing ranged duplicate-constant human review as coverage' {
@@ -1638,7 +2599,9 @@ internal const string Protocol = "http";
         $result.changedFiles | Should -Be 1
         $result.changedLines | Should -Be 1
         @($result.entries.path) |
-            Should -Be @('src/Real.cs')
+            Should -Be @('src/Real.cs', 'src/Auto.g.cs')
+        $result.entries[1].contextOnly | Should -BeTrue
+        @($result.entries[1].spans) | Should -HaveCount 0
     }
 
     It 'is default-off with no reads or durable state' {
@@ -1910,6 +2873,163 @@ internal const string Value = "wire-value";
         @($observation.sourceArtifacts.kind) |
             Should -Contain `
                 owner-v2-discussion-snapshot
+    }
+
+    It 'evaluates block indentation through the bridge and suppresses current coverage for <Mode>' -TestCases @(
+        @{ Mode = 'uncovered'; Expected = 'wouldCreate' }
+        @{ Mode = 'human-at-brace'; Expected = 'humanCovered' }
+        @{ Mode = 'unrelated-at-brace'; Expected = 'unknown' }
+        @{ Mode = 'reviewer-at-statement'; Expected = 'noOp' }
+        @{ Mode = 'copied-marker'; Expected = 'unknown' }
+        @{ Mode = 'outdated-human'; Expected = 'wouldCreate' }
+        @{ Mode = 'deleted-human'; Expected = 'wouldCreate' }
+        @{ Mode = 'changed-try-covered'; Expected = 'humanCovered' }
+        @{ Mode = 'reviewer-markerless'; Expected = 'unknown' }
+    ) {
+        param($Mode, $Expected)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $content = @'
+class C
+{
+    void M()
+    {
+        try
+        {
+        Work();
+        }
+        finally { }
+    }
+}
+'@
+        $prepared = New-ContextualPreparedIntake -Content $content
+        $prepared.Intake.transientSnapshots['42'].
+            changes.entries[0].spans[0].startLine = 7
+        $prepared.Intake.transientSnapshots['42'].
+            changes.entries[0].spans[0].endLine = 7
+        if ($Mode -ceq 'changed-try-covered') {
+            $prepared.Intake.transientSnapshots['42'].
+                changes.entries[0].spans[0].startLine = 5
+            $prepared.Intake.transientSnapshots['42'].
+                changes.entries[0].spans[0].endLine = 6
+            $prepared.Intake.transientSnapshots['42'].changes.changedLines = 2
+        }
+        if ($Mode -cin @(
+                'human-at-brace', 'unrelated-at-brace',
+                'outdated-human', 'deleted-human', 'changed-try-covered',
+                'reviewer-markerless')) {
+            $body = if ($Mode -ceq 'unrelated-at-brace') {
+                'Please improve the error handling.'
+            }
+            else {
+                'Indent the new try body one level (four spaces).'
+            }
+            $identity = if ($Mode -ceq 'reviewer-markerless') { 'reviewer' } else { 'human' }
+            Add-SyntheticDiscussion -Prepared $prepared -Config $config `
+                -Body $body -Identity $identity -Path 'src/Checks.cs' -Line 6
+            $thread = $prepared.Intake.transientSnapshots['42'].
+                discussions.threads[0]
+            $thread.threadContext.rightFileEnd.line = 8
+            if ($Mode -ceq 'outdated-human') {
+                $thread.pullRequestThreadContext.iterationContext.
+                    secondComparingIteration = 2
+            }
+            if ($Mode -ceq 'deleted-human') {
+                $thread.isDeleted = $true
+            }
+        }
+        elseif ($Mode -cin @('reviewer-at-statement', 'copied-marker')) {
+            $first = $prepared | ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $comment = Get-SyntheticCurrentPrTemplateComment `
+                -Config $config -Prepared $first -Name "indentation-$Mode-first"
+            $identity = if ($Mode -ceq 'copied-marker') { 'human' } else { 'reviewer' }
+            Add-SyntheticDiscussion -Prepared $prepared -Config $config `
+                -Body $comment.Body -Identity $identity `
+                -Path 'src/Checks.cs' -Line 7
+        }
+        $result = Invoke-SyntheticContextualBridge `
+            -Config $config -Prepared $prepared -Name "indentation-$Mode"
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $observation = Get-Content -LiteralPath (
+            $result.outcomes[0].observationPath) -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings) | Should -HaveCount 1
+        $finding = $observation.findings[0]
+        $finding.ruleId | Should -BeExactly block-body-indentation
+        $anchorLine = if ($Mode -ceq 'changed-try-covered') { 6 } else { 7 }
+        $finding.anchor.line | Should -Be $anchorLine
+        $finding.binding.span.startLine | Should -Be $anchorLine
+        $finding.indentationContext.blockStartLine | Should -Be 6
+        $finding.indentationContext.statementLine | Should -Be 7
+        $finding.reconciliation.classification | Should -BeExactly $Expected -Because (
+            $observation | ConvertTo-Json -Depth 32 -Compress)
+        if ($Mode -ceq 'reviewer-markerless') {
+            $finding.reconciliation.reason |
+                Should -BeExactly unmarked-current-reviewer-comment
+        }
+        $result.state | Should -BeExactly $(if ($Expected -ceq 'unknown') {
+                'partial'
+            } else { 'completed' })
+    }
+
+    It 'refuses indentation evaluation on source or target drift for <Field>' -TestCases @(
+        @{ Field = 'sourceCommit' }
+        @{ Field = 'targetCommit' }
+    ) {
+        param($Field)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            "class C`n{`n    void M()`n    {`n    Work();`n    }`n}")
+        $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.spans[0].startLine = 5
+        $entry.spans[0].endLine = 5
+        $fieldName = $Field
+        $headProvider = {
+            param($Head)
+            $current = [ordered]@{} + $Head
+            $current[$fieldName] = '9' * 40
+            return $current
+        }.GetNewClosure()
+        $result = Invoke-SyntheticContextualBridge `
+            -Config $config -Prepared $prepared `
+            -Name "indentation-drift-$Field" -HeadProvider $headProvider
+        $result.state | Should -BeExactly partial
+        $result.providerWrites | Should -Be 0
+        @($result.outcomes | Where-Object reason -CEQ post-evaluation-head-refused) |
+            Should -HaveCount 1
+    }
+
+    It 'excludes deleted and generated source evidence from indentation findings' {
+        foreach ($mode in @('deleted', 'generated')) {
+            $config = New-ContextualTestConfig
+            $config.enabled = $true
+            $prepared = New-ContextualPreparedIntake -Content (
+                "class C`n{`n    void M()`n    {`n    Work();`n    }`n}")
+            $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+            $entry.spans[0].startLine = 5
+            $entry.spans[0].endLine = 5
+            if ($mode -ceq 'deleted') {
+                $entry.changeType = 'delete'
+                $entry.spans = @()
+                $entry.content = ''
+                $entry.sourceDigest = 'v1:sha256:' + ('0' * 64)
+                $entry.byteLength = 0
+            }
+            else { $entry.path = 'generated/Checks.cs' }
+            $result = Invoke-SyntheticContextualBridge `
+                -Config $config -Prepared $prepared -Name "indentation-$mode"
+            $result.state | Should -BeExactly completed -Because (
+                $result | ConvertTo-Json -Depth 16 -Compress)
+            $result.providerWrites | Should -Be 0
+            $observation = Get-Content -LiteralPath (
+                $result.outcomes[0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            @($observation.findings | Where-Object ruleId -CEQ block-body-indentation) |
+                Should -HaveCount 0
+        }
     }
 
     It 'evaluates one synthetic PR-wide template violation with zero writes' {
@@ -2969,5 +4089,155 @@ Synthetic problem is filled.
         @($result.outcomes |
             Where-Object state -CEQ unknown).Count |
             Should -BeGreaterThan 0
+    }
+}
+
+Describe 'Integrated reviewed contextual rules' {
+    It 'carries four new rules and an old rule together with typed linked presentation' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $sample = Get-Content (Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $config['commentRuleReferences'] = $sample.commentRuleReferences
+        $config['commentRuleRepository'] = $sample.commentRuleRepository
+        $content = @'
+using System;
+class C
+{
+    bool Equal(string left, string right) { return left == right; }
+    void M()
+    {
+        try
+        {
+        Work("Shared");
+        Work("Shared");
+        }
+        catch (System.Exception cleanup) { }
+    }
+}
+'@
+        $target = $content.Replace('Work("Shared");', 'Work("Before");')
+        $prepared = New-ContextualPreparedIntake -Content $content
+        $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.spans[0].startLine = 2
+        $entry.spans[0].endLine = 14
+        $entry['projectContext'] = @{
+            state = 'complete'; path = 'src/App.csproj'
+            content = '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+        }
+        $entry.projectContext['byteLength'] = [Text.Encoding]::UTF8.GetByteCount($entry.projectContext.content)
+        $entry.projectContext['sourceDigest'] = Get-ContextualTestTextDigest $entry.projectContext.content
+        $entry['comparison'] = @{
+            schemaVersion = 1; state = 'complete'; path = $entry.path; targetPath = $entry.path
+            sourceCommit = $prepared.Head.sourceCommit; targetCommit = $prepared.Head.targetCommit
+            sourceDigest = $entry.sourceDigest; targetDigest = Get-ContextualTestTextDigest $target
+            content = $target; byteLength = [Text.Encoding]::UTF8.GetByteCount($target); targetState = 'present'
+        }
+        $entry['fileHeader'] = Get-ContextualCopyrightHeaderEvidence -Path $entry.path -ChangeType edit `
+            -Content $content -TargetContent $target -SourceCommit $prepared.Head.sourceCommit `
+            -TargetCommit $prepared.Head.targetCommit
+        $prepared.Intake.transientSnapshots['42'].changes.changedLines = 13
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name integrated-four
+        $result.state | Should -BeExactly completed -Because ($result | ConvertTo-Json -Depth 12 -Compress)
+        $configPath = Join-Path $TestDrive 'integrated-four-config.json'
+        $config | ConvertTo-Json -Depth 64 | Set-Content $configPath
+        $evidence = Read-ApprovedOwnerV2Evidence -StateRoot (Join-Path $TestDrive 'integrated-four-state') `
+            -Identity $result.records[0].identity -RepoRoot $repoRoot `
+            -ToolkitConfigPath $configPath -Delivery contextual-conventions
+        $expected = @('block-body-indentation', 'generic-exception-naming', 'reused-string-literals',
+            'file-copyright-header', 'explicit-string-comparison')
+        $findings = @($evidence.Observation.findings | Where-Object { $_.ruleId -cin $expected })
+        $findings | Should -HaveCount 5
+        foreach ($finding in $findings) {
+            $finding.reconciliation.classification | Should -BeExactly wouldCreate
+            $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+            $proposal.body | Should -Not -Match 'Rule bundle:|Dobby|model discovery'
+            if ($finding.ruleId -cne 'explicit-string-comparison') {
+                $line = @{ 'block-body-indentation' = 18; 'generic-exception-naming' = 1225
+                    'reused-string-literals' = 706; 'file-copyright-header' = 929 }[$finding.ruleId]
+                $proposal.body | Should -Match "&line=$line\b"
+                $proposal.body | Should -Match '\*\*EngHub rules:\*\*'
+            }
+            if ($finding.ruleId -ceq 'file-copyright-header') {
+                $proposal.scope | Should -BeExactly file-header
+                $proposal.line | Should -Be 1
+                $proposal.fileHeader.origin | Should -BeExactly pre-existing
+                $proposal.body | Should -Not -Match 'Changed-line occurrences'
+                $proposal.body | Should -Match 'File-header location'
+            }
+            if ($finding.ruleId -ceq 'reused-string-literals') {
+                $proposal.body | Should -Match 'Related source occurrences'
+                $proposal.body | Should -Not -Match 'System.Object\[\]'
+            }
+        }
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
+    It 'derives Named header authority only from a validated <Mode> comparison' -TestCases @(
+        @{Mode='complete';Expected=1},
+        @{Mode='missing';Expected=0},
+        @{Mode='tampered';Expected=0},
+        @{Mode='wrong-target';Expected=0}
+    ) {
+        param($Mode, $Expected)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake
+        $reader = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $reader.ContainsKey('fileHeader') | Should -BeFalse
+        switch ($Mode) {
+            missing { $reader.Remove('comparison') }
+            tampered { $reader.comparison.targetDigest = 'v1:sha256:' + ('0' * 64) }
+            wrong-target { $reader.comparison.targetCommit = '0' * 40 }
+        }
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name "header-comparison-$Mode"
+        $observation = Get-Content $result.outcomes[0].observationPath -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $headers = @($observation.findings | Where-Object {
+            $_.ruleId -ceq 'file-copyright-header' -and $_.anchor.path -ceq $reader.path
+        })
+        $headers | Should -HaveCount $Expected
+        if ($Expected -eq 1) {
+            $headers[0].anchor.scope | Should -BeExactly file-header
+            $headers[0].anchor.line | Should -Be 1
+            $headers[0].fileHeader.origin | Should -BeExactly pre-existing
+            $headers[0].fileHeader.targetDigest | Should -BeExactly $reader.comparison.targetDigest
+            @($reader.spans | Where-Object { $_.startLine -le 1 }) | Should -HaveCount 0
+        }
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
+    It 'applies the expanded indentation range to authenticated-current conflict checks' {
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'block-body-indentation'
+        $finding['indentationContext'] = @{ blockStartLine = 30; blockEndLine = 40; statementLine = 32 }
+        $case.Proof.selection.ruleId = $finding.ruleId
+        $marker = Get-ContextualConventionMarkerKey -Contract $case.Contract -Finding $finding
+        $case.Proof.selection.marker = $marker
+        $case.Proof.selection.body = "Authenticated old presentation.`n<!-- devpilot-contextual-convention:v1:$marker -->"
+        $case.Proof.selection.bodySha256 = (Get-ContextualTestTextDigest $case.Proof.selection.body).Substring(10)
+        $case.Thread.comments[0].body = $case.Proof.selection.body
+        $copy = $case.Thread | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $copy.threadId = 200
+        $copy.comments[0].commentId = 201
+        $copy.anchor.line = 30
+        $copy.comments[0].body = 'Please improve this unrelated detail.'
+        $copy.comments[0].reviewerOwned = $false
+        $copy.comments[0].reviewerIdentityState = 'foreign'
+        $old = $case.Snapshot
+        $snapshot = [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+            $old.State, $old.Reason, $old.PageCount, 2, 2, $old.ByteCount,
+            $old.Digest, $old.SourceDigests, [object[]]@($case.Thread, $copy))
+        foreach ($name in @('RawProvenanceDigests', 'MappingDigest', 'ReviewerIdentityDigest', 'CurrentIterationId')) {
+            $snapshot | Add-Member -NotePropertyName $name -NotePropertyValue $old.$name
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $snapshot -AuthenticatedPriorComments @($case.Proof)
+        $result.findings[0].reconciliation.classification | Should -BeExactly unknown
+        $result.findings[0].reconciliation.reason | Should -BeExactly authenticated-prior-comment-conflict
+        $result.effects.dedupe.wouldCreate | Should -Be 0
     }
 }

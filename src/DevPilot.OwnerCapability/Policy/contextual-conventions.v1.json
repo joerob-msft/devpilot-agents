@@ -27,10 +27,52 @@
       "requiredSections": ["Problem", "Solution", "Validation"],
       "optionalSectionsAndChecks": "Release notes, full-test-pass, bundle/settings conditions, and unchecked checklist items are not required by this rule."
     },
+    "copyrightHeader": {
+      "authorityState": "canonical EngHub coding style and user-directed review example",
+      "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "lines": [929, 932, 936, 937, 938],
+      "reference": "https://msazure.visualstudio.com/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=929",
+      "clause": "Start all code files with copyright header",
+      "scope": "C# files in the current changed-file inventory, including modified existing files",
+      "preExisting": "nonblocking convention finding, not a regression",
+      "yearRequirement": false
+    },
     "duplicateConstantDeclarations": {
       "authorityState": "user-directed Azure DevOps review comment",
       "pullRequestId": 17562908,
       "threadId": 266816420
+    },
+    "blockBodyIndentation": {
+      "authorityState": "user-directed current EngHub coding style and demonstrated review",
+      "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "lines": [18, 22, 25],
+      "pullRequestId": 17431492,
+      "threadId": 267231374
+    },
+    "genericExceptionNaming": {
+      "authorityState": "canonical coding style and user-directed review example",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "headingLine": 1225,
+      "summary": "Name generic exception in catch blocks ex",
+      "pullRequestId": 17431492,
+      "threadId": 267231965
+    },
+    "reusedStringLiterals": {
+      "authorityState": "user-directed canonical coding style and review example",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "heading": "Declare constants for re-used strings",
+      "lines": [706, 711],
+      "pullRequestId": 17431492,
+      "threadId": 267231842
     },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
@@ -70,6 +112,13 @@
       "id": "duplicate-constant-declarations",
       "name": "Consolidate duplicated constants for one proven shared contract",
       "sourceSection": "User-directed review thread 266816420"
+    },
+    {
+      "id": "reused-string-literals",
+      "name": "Declare constants for reused literal strings at their shared ownership scope",
+      "sourceSection": "Declare constants for re-used strings",
+      "scope": "changed literal uses with exact decoded C# string identity in the bounded full-PR snapshot",
+      "placement": "private const string atop one class; public const string in a common project Constants class across classes; lowest common project dependency across projects without guessing an unproven dependency"
     },
     {
       "id": "collection-cardinality",
@@ -147,6 +196,27 @@
       "sourceSection": "Current effective repository pull request template / Problem, Solution, Validation",
       "scope": "pull-request-description",
       "requiredSections": ["Problem", "Solution", "Validation"]
+    },
+    {
+      "id": "block-body-indentation",
+      "name": "Indent direct C# block statements by one four-space increment",
+      "sourceSection": "White space and indentation rules / Indentation",
+      "scope": "changed direct statement starts in syntax-proven blocks, or a changed try header and standalone space-indented opening brace affecting its existing body",
+      "unsupported": "Continuation alignment, embedded unbraced statements, labels, inline block layouts, tab-indented baseline braces, and unproven preprocessor configuration are not guessed."
+    },
+    {
+      "id": "generic-exception-naming",
+      "name": "Name proven System.Exception catch variables ex and update their uses",
+      "sourceSection": "Generic exception naming",
+      "scope": "changed-catch-declaration",
+      "specializedExceptions": "No variable naming convention is inferred for specialized exception types."
+    },
+    {
+      "id": "file-copyright-header",
+      "name": "Start changed C# code files with the standard Microsoft copyright header",
+      "sourceSection": "Code documentation / Copyright header",
+      "scope": "file-header",
+      "severity": "nonblocking"
     }
   ]
 }

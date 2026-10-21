@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+$script:ContextualDigest = 'v1:sha256:9c3496bd7a22a5f4cf09fa993e1aaad7f386efd7010e73a5cedf6bbd19de9130'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+$script:ContextualPolicyDigest = 'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -94,6 +94,202 @@ function ConvertTo-OwnerV1WriterPath {
 function ConvertTo-OwnerV1WriterMarkdownCode {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     return (($Text -replace '[\x00-\x1f\x7f]', ' ') -replace '`', '｀').Trim()
+}
+
+function ConvertTo-OwnerCommentLink {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Url
+    )
+    $uri = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or
+        $Url -match '[\x00-\x20\x7f<>]' -or
+        [string]::IsNullOrWhiteSpace($Name) -or
+        $Name.Length -gt 1024 -or $Name -match '[\x00-\x1f\x7f]') {
+        throw 'Comment references require a bounded label and an absolute HTTPS URL.'
+    }
+    $label = $Name -replace '([\\`*_\[\]<>])', '\$1'
+    $target = $uri.AbsoluteUri.Replace('(', '%28').Replace(')', '%29').
+        Replace('[', '%5B').Replace(']', '%5D')
+    return "[$label]($target)"
+}
+
+function Get-OwnerCommentRepositoryUrl {
+    param([Parameter(Mandatory)][object]$Contract)
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $provider = Get-OwnerV2Member -Value $presentation -Name subjectProvider
+    if ($null -eq $provider) { return $null }
+    if ([string](Get-OwnerV2Member -Value $provider -Name repositoryId) -cne
+            [string]$Contract.Request.RepositoryId -or
+        [string](Get-OwnerV2Member -Value $provider -Name projectId) -cne
+            [string]$Contract.Request.ProjectId) {
+        throw 'Comment source links must use the bound subject repository and project.'
+    }
+    $organization = [string](Get-OwnerV2Member -Value $provider -Name organization)
+    $uri = $null
+    if (-not [uri]::TryCreate($organization, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Query -or
+        $uri.Fragment -or $organization -match '[\x00-\x20\x7f<>]') {
+        throw 'Comment source links require the configured HTTPS organization URL.'
+    }
+    return $uri.AbsoluteUri.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString([string]$Contract.Request.ProjectId) +
+        '/_git/' + [uri]::EscapeDataString([string]$Contract.Request.RepositoryId)
+}
+
+function Assert-OwnerCommentReferenceKeys {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory)][string[]]$Keys
+    )
+    if ($Value -isnot [Collections.IDictionary] -or
+        $Value.Count -ne $Keys.Count -or
+        @($Value.Keys | Where-Object { $_ -cnotin $Keys }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citation metadata has unknown or missing schema keys.')
+    }
+}
+
+function Assert-OwnerCommentRuleReferences {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$References,
+        [AllowNull()][object]$Repository,
+        [Parameter(Mandatory)]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
+        [string]$Delivery
+    )
+    if ($null -eq $References) { return }
+    $allowed = @(switch ($Delivery) {
+        owner { @('owner') }
+        named-areequal { @('named-areequal') }
+        contextual-conventions { @(Get-ContextualConventionRuleIds) }
+    })
+    if ($References -isnot [Collections.IDictionary] -or
+        $References.Count -gt $allowed.Count -or
+        @($References.Keys | Where-Object { $_ -cnotin $allowed }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citations must be keyed by existing delivery rule IDs.')
+    }
+    if ($References.Count -eq 0) { return }
+    Assert-OwnerCommentReferenceKeys -Value $Repository `
+        -Keys @('organization', 'projectName', 'repositoryName')
+    $organization = $Repository.organization
+    if ($organization -isnot [string] -or
+        $organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9][A-Za-z0-9-]*|[A-Za-z0-9][A-Za-z0-9-]*\.visualstudio\.com(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)?)/?$') {
+        throw [ArgumentException]::new('Comment citations require an explicitly configured Azure DevOps organization.')
+    }
+    foreach ($name in @('projectName', 'repositoryName')) {
+        $value = $Repository[$name]
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value) -or
+            $value -cne $value.Trim() -or $value.Length -gt 256 -or
+            $value -match '[\\/?#%\x00-\x1f\x7f]' -or $value -cin @('.', '..')) {
+            throw [ArgumentException]::new('Comment citation repository and project names must be canonical single segments.')
+        }
+    }
+    $expectedBase = $organization.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString($Repository.projectName) + '/_git/' +
+        [uri]::EscapeDataString($Repository.repositoryName)
+    foreach ($reference in $References.Values) {
+        Assert-OwnerCommentReferenceKeys -Value $reference -Keys @('label', 'links')
+        if ($reference.label -isnot [string] -or
+            $reference.label -cnotin @('EngHub rules', 'Rule references') -or
+            $reference.links -isnot [array] -or
+            $reference.links.Count -lt 1 -or $reference.links.Count -gt 8) {
+            throw [ArgumentException]::new('Comment citations require a supported label and one to eight links.')
+        }
+        foreach ($link in $reference.links) {
+            Assert-OwnerCommentReferenceKeys -Value $link -Keys @('name', 'url')
+            $url = $link.url
+            $uri = $null
+            if ($link.name -isnot [string] -or [string]::IsNullOrWhiteSpace($link.name) -or
+                $link.name.Length -gt 1024 -or $link.name -match '[\x00-\x1f\x7f]' -or
+                $url -isnot [string] -or $url.Length -gt 8192 -or
+                $url -match '[\\\x00-\x20\x7f<>]' -or
+                $url -match '%(?![0-9a-fA-F]{2})' -or
+                -not [uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or
+                $uri.Scheme -cne 'https' -or $uri.Fragment -or $uri.UserInfo -or
+                -not $url.StartsWith($expectedBase + '?', [StringComparison]::Ordinal)) {
+                throw [ArgumentException]::new('Comment citation links must use the exact configured Azure DevOps repository and no fragment or user information.')
+            }
+            $query = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $parts = $uri.Query.TrimStart('?').Split('&')
+            if ($parts.Count -ne 3) {
+                throw [ArgumentException]::new('Comment citation queries require exactly one version, path, and line.')
+            }
+            foreach ($part in $parts) {
+                $pair = $part.Split('=', 2)
+                if ($pair.Count -ne 2 -or $pair[0] -cnotin @('version', 'path', 'line') -or
+                    $query.ContainsKey($pair[0])) {
+                    throw [ArgumentException]::new('Comment citation queries contain duplicate or unexpected keys.')
+                }
+                $query.Add($pair[0], [uri]::UnescapeDataString($pair[1]))
+            }
+            $line = 0
+            $path = $query['path']
+            if ($query['version'] -cnotmatch '^GC[0-9a-f]{40}$' -or
+                $query['line'] -cnotmatch '^[1-9][0-9]*$' -or
+                -not [int]::TryParse($query['line'], [ref]$line) -or
+                $path.Length -gt 1024 -or -not $path.StartsWith('/') -or
+                $path -match '[\\%?#`<>|\x00-\x1f\x7f]' -or
+                @($path.Substring(1).Split('/') | Where-Object { $_ -cin @('', '.', '..') }).Count -gt 0) {
+                throw [ArgumentException]::new('Comment citation links require an exact source commit, canonical rooted path, and positive line.')
+            }
+        }
+    }
+}
+
+function Format-OwnerCommentRuleReference {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$RuleId,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $references = Get-OwnerV2Member -Value $presentation -Name ruleReferences
+    $repository = Get-OwnerV2Member -Value $presentation -Name ruleRepository
+    $delivery = if ($RuleId -cin @('owner', 'named-areequal')) { $RuleId } else { 'contextual-conventions' }
+    try {
+        Assert-OwnerCommentRuleReferences -References $references -Repository $repository -Delivery $delivery
+    }
+    catch [ArgumentException] {
+        Write-Warning 'Invalid comment citations were omitted; use the readable rule name and correct the citation configuration.'
+        return "**Rule:** $Name."
+    }
+    $reference = Get-OwnerV2Member -Value $references -Name $RuleId
+    if ($null -eq $reference) { return "**Rule:** $Name." }
+    $label = $reference.label
+    $rendered = foreach ($link in $reference.links) {
+        ConvertTo-OwnerCommentLink -Name $link.name -Url $link.url
+    }
+    return "**${label}:** " + ($rendered -join '; ') + '.'
+}
+
+function Format-OwnerCommentOccurrences {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int[]]$Lines,
+        [ValidateSet('Changed-line occurrences', 'File-header location', 'Related source occurrences')]
+        [string]$Label = 'Changed-line occurrences'
+    )
+    $path = ConvertTo-OwnerV1WriterPath -Path $Path
+    $repositoryUrl = Get-OwnerCommentRepositoryUrl -Contract $Contract
+    $locations = foreach ($line in $Lines) {
+        if ($line -lt 1 -or $line -gt 200000) {
+            throw 'Comment occurrences require exact positive source lines.'
+        }
+        if ($repositoryUrl) {
+            $url = $repositoryUrl + '?version=GC' +
+                [string]$Contract.Request.SourceCommit +
+                '&path=' + [uri]::EscapeDataString($path) + "&line=$line"
+            ConvertTo-OwnerCommentLink -Name "$($path.TrimStart('/')):$line" -Url $url
+        }
+        else {
+            "``$(ConvertTo-OwnerV1WriterMarkdownCode $path):$line``"
+        }
+    }
+    return @("**${Label}:**") +
+        @($locations | ForEach-Object { "- $_" }) -join "`n"
 }
 
 function Get-OwnerV1WriterMarkerKey {
@@ -142,7 +338,8 @@ function Format-OwnerV1WriterComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     $request = $Contract.Request
@@ -159,6 +356,21 @@ function Format-OwnerV1WriterComment {
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath
     )
     $section = ConvertTo-OwnerV1WriterMarkdownCode ([string]$request.RuleSection)
+    if (-not $Legacy) {
+        return @(
+            '**Add an Owner attribute to this changed test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId owner -Name 'Changed MSTest methods require an Owner attribute')
+            ''
+            "Changed MSTest method ``$symbol`` has no ``Owner`` attribute. Add ``[Owner(`"<owner-alias>`")]`` to this test method."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path `
+                -Lines @([int](Get-OwnerV2Member -Value $anchor -Name line)))
+            ''
+            "<!-- ${script:OwnerV1WriterMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
     return @(
         '**Owner attribute missing**'
         ''
@@ -235,7 +447,8 @@ function Format-NamedAreEqualComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     if ($MarkerKey -cne (Get-NamedAreEqualMarkerKey `
@@ -254,6 +467,23 @@ function Format-NamedAreEqualComment {
     }
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    if (-not $Legacy) {
+        return @(
+            '**Use named arguments for Assert.AreEqual in this test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId named-areequal -Name 'Name every supplied Assert.AreEqual argument')
+            ''
+            "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s). Name every supplied argument according to the selected overload, commonly ``expected:`` and ``actual:`` (and ``delta:`` or ``message:`` when supplied). Preserve argument order and values."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path -Lines $sample)
+            $(if ($count -gt $sample.Count) {
+                "Showing the first 12 of $count changed calls."
+            })
+            ''
+            "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
+        ) | Where-Object { $null -ne $_ } | Join-String -Separator "`n"
+    }
     return @(
         '**Use named arguments for Assert.AreEqual in this test method**'
         ''
@@ -284,6 +514,18 @@ function Get-ContextualConventionMarkerKey {
         throw 'Contextual convention finding is not bound to the fixed capability.'
     }
     $anchor = $Finding.anchor
+    $fileHeaderScope = [string](Get-OwnerV2Member -Value $anchor -Name scope) -ceq 'file-header'
+    if (($fileHeaderScope -ne ([string]$Finding.ruleId -ceq 'file-copyright-header')) -or
+        ($fileHeaderScope -and (
+            [int]$anchor.line -ne 1 -or
+            [string]$anchor.symbol -cne 'copyright-header' -or
+            $Finding.fileHeader -isnot [Collections.IDictionary] -or
+            [string]$Finding.fileHeader.path -cne [string]$anchor.path -or
+            [string]$Finding.fileHeader.sourceCommit -cne [string]$request.SourceCommit -or
+            [string]$Finding.fileHeader.targetCommit -cne [string]$request.TargetCommit -or
+            [string]$Finding.fileHeader.origin -cnotin @('introduced', 'pre-existing')))) {
+        throw 'Copyright finding has no exact changed-file header binding.'
+    }
     $pullRequestScope =
         $anchor -is
             [Collections.IDictionary] -and
@@ -347,23 +589,24 @@ function Format-ContextualConventionComment {
             -Contract $Contract -Finding $Finding)) {
         throw 'Contextual convention marker does not match its finding.'
     }
-    $request = $Contract.Request
     $pullRequestScope =
         [string](Get-OwnerV2Member `
             -Value $Finding.anchor `
             -Name scope) -ceq
             'pull-request'
-    $ruleId = ConvertTo-OwnerV1WriterMarkdownCode (
-        [string]$Finding.ruleId)
+    $policy = Get-Content -LiteralPath (
+        Join-Path $PSScriptRoot 'Policy\contextual-conventions.v1.json') -Raw |
+        ConvertFrom-Json -AsHashtable
+    $rule = @($policy.rules | Where-Object { $_.id -ceq [string]$Finding.ruleId })[0]
+    $ruleName = [string]$rule.name
+    $ruleReference = Format-OwnerCommentRuleReference -Contract $Contract `
+        -RuleId ([string]$Finding.ruleId) -Name $ruleName
     $summary = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.evidence)
     if ([string]::IsNullOrWhiteSpace($summary) -or
         $summary.Length -gt 512) {
         throw 'Contextual convention evidence summary is invalid.'
     }
-    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
-        ConvertTo-OwnerV1WriterPath -Path (
-            [string]$request.RulePath))
     if ($pullRequestScope) {
         $source =
             $Finding.binding.source.representation
@@ -385,18 +628,31 @@ function Format-ContextualConventionComment {
             ConvertTo-OwnerV1WriterMarkdownCode (
                 ConvertTo-OwnerV1WriterPath `
                     -Path ([string]$source.template.path))
+        $repositoryUrl = Get-OwnerCommentRepositoryUrl -Contract $Contract
+        $templateLink = if ($repositoryUrl) {
+            ConvertTo-OwnerCommentLink -Name $templatePath -Url (
+                $repositoryUrl + '?version=GC' + [string]$source.template.commit +
+                '&path=' + [uri]::EscapeDataString($templatePath))
+        }
+        else { "``$templatePath``" }
         return @(
             '**Complete the required pull request template sections**'
+            ''
+            $ruleReference
             ''
             "$summary"
             ''
             "Missing or placeholder-only sections: $missing."
             ''
-            "Effective template: ``$templatePath`` from ``$([string]$source.template.ref)`` (blob ``$([string]$source.template.blob)``; SHA-256 ``$([string]$source.template.contentSha256)``)."
+            "**Effective template:** $templateLink"
             ''
             'This is a PR-wide description issue; no code line is implicated.'
             ''
-            "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+            '<details><summary>Template provenance</summary>'
+            ''
+            "Effective template: ``$templatePath`` from ``$([string]$source.template.ref)`` (blob ``$([string]$source.template.blob)``; SHA-256 ``$([string]$source.template.contentSha256)``)."
+            ''
+            '</details>'
             ''
             "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
         ) -join "`n"
@@ -404,16 +660,53 @@ function Format-ContextualConventionComment {
     $path = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path (
             [string]$Finding.anchor.path))
+    if ([string](Get-OwnerV2Member -Value $Finding.anchor -Name scope) -ceq 'file-header') {
+        $origin = if ([string]$Finding.fileHeader.origin -ceq 'pre-existing') {
+            'This omission also exists in the comparison base. It is a **pre-existing, nonblocking convention issue**, not a regression introduced by this PR.'
+        }
+        else {
+            'This PR introduces the omission (a new file or removal of an existing header). This is a nonblocking convention finding.'
+        }
+        return @(
+            '**Add the standard copyright header to this file**'
+            ''
+            $ruleReference
+            ''
+            "Start ``$path`` with the standard three-line Microsoft header before code."
+            ''
+            'Use dash separator comments around `// Copyright (c) Microsoft Corporation.  All rights reserved.` No year or annual rollover is required.'
+            ''
+            $origin
+            ''
+            'File-header anchor: line 1 of a file in the current changed-file inventory; this is not a claim that line 1 changed.'
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path -Lines @(1) `
+                -Label 'File-header location')
+            ''
+            "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
     $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.anchor.symbol)
     return @(
-        "**$ruleId**"
+        "**$ruleName**"
+        ''
+        $ruleReference
         ''
         "$summary"
         ''
-        "Changed code: ``$symbol`` at ``$path``:$([int]$Finding.anchor.line)."
+        "Changed construct: ``$symbol``."
         ''
-        "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        (Format-OwnerCommentOccurrences -Contract $Contract -Path $path `
+            -Lines @([int]$Finding.anchor.line))
+        $(if ([string]$Finding.ruleId -ceq 'reused-string-literals') {
+            ''
+            foreach ($group in @($Finding.relatedUses | Group-Object { [string]$_.path })) {
+                Format-OwnerCommentOccurrences -Contract $Contract -Path $group.Name `
+                    -Lines @($group.Group | ForEach-Object { [int]$_.line } |
+                        Sort-Object -Unique) -Label 'Related source occurrences'
+            }
+        })
         ''
         "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
     ) -join "`n"
@@ -565,6 +858,9 @@ function Test-ContextualPriorRuleCompatibility {
         $values
     }
     foreach ($entry in $previousEntries) {
+        if (-not (Test-ContextualConventionPriorRuleIds -Rule $entry.rule -RuleIds @($entry.unchangedRuleIds))) {
+            return $false
+        }
         $unchanged = @(
             $entry.unchangedRuleIds)
         if ([string]$entry.rule.hash -ceq
@@ -613,6 +909,153 @@ function Test-ContextualDuplicateConstantHumanCoverage {
     return $false
 }
 
+function Test-ContextualExceptionNamingHumanCoverage {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][string]$Variable
+    )
+    $name = '(?<![A-Za-z0-9_])' +
+        [regex]::Escape($Variable) + '(?![A-Za-z0-9_])'
+    return (
+        $Variable -cmatch '^[A-Za-z_][A-Za-z0-9_]{0,127}$' -and
+        $Body -cmatch $name -and
+        $Body -match '(?i)\b(?:catch|generic|System\.Exception)\b' -and
+        $Body -notmatch '(?i)\b(?:do\s+not|don''t|never)\s+(?:rename|name|use)\b' -and
+        ($Body -match (
+                '(?is)\b(?:rename|name)\b[^\r\n.]{0,256}' +
+                $name + '[^\r\n.]{0,80}\b(?:to|as)\s+[`''"]*ex\b') -or
+            $Body -match (
+                '(?i)\buse\s+[`''"]*ex[`''"]*\s+for\b[^\r\n.]{0,128}\b(?:generic|catch)\b')))
+}
+
+function Test-ContextualFindingThreadRange {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][object]$Thread,
+        [string]$Body = '',
+        [string]$SourceCommit = ''
+    )
+    if ([string]$Finding.ruleId -ceq 'reused-string-literals' -and
+        $null -ne $Thread.anchor) {
+        $sameUse = @($Finding.relatedUses | Where-Object {
+            [string]$_.path -ieq [string]$Thread.anchor.path -and
+            [int]$Thread.anchor.line -ge [int]$_.line -and
+            [int]$Thread.anchor.line -le [int]$_.endLine
+        }).Count -gt 0
+        if ($sameUse -or -not $Body) { return $sameUse }
+        return @($Finding.relatedUses | Where-Object {
+            [string]$_.path -ieq [string]$Thread.anchor.path
+        }).Count -gt 0 -and (
+            (Test-ContextualReusedStringHumanCoverage -Body $Body -Finding $Finding) -or
+            (Test-ContextualReusedStringCitation -Body $Body -Finding $Finding -SourceCommit $SourceCommit))
+    }
+    if ($null -eq $Thread.anchor -or
+        [string]$Thread.anchor.path -ine [string]$Finding.anchor.path) {
+        return $false
+    }
+    if ([string]$Finding.ruleId -ceq 'file-copyright-header' -and $Body) {
+        return [regex]::IsMatch($Body,
+            '(?:copyright[\s\S]{0,160}header|header[\s\S]{0,160}copyright)',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+    if ([int]$Thread.anchor.line -eq [int]$Finding.anchor.line) { return $true }
+    $indentation = Get-OwnerV2Member -Value $Finding -Name indentationContext
+    if ([string]$Finding.ruleId -ceq 'block-body-indentation' -and
+        $indentation -is [Collections.IDictionary] -and
+        [int]$indentation.blockStartLine -gt 0 -and
+        [int]$indentation.blockStartLine -lt [int]$indentation.statementLine -and
+        [int]$indentation.blockEndLine -ge [int]$indentation.statementLine -and
+        [int]$Finding.anchor.line -in @(
+            [int]$indentation.statementLine, [int]$indentation.blockStartLine) -and
+        [int]$Thread.anchor.line -eq [int]$indentation.blockStartLine) {
+        return $true
+    }
+    $span = Get-OwnerV2Member -Value (Get-OwnerV2Member -Value $Finding -Name binding) -Name span
+    return [string]$Finding.ruleId -ceq 'duplicate-constant-declarations' -and
+        $span -is [Collections.IDictionary] -and
+        [int]$Thread.anchor.line -ge [int]$span.startLine -and
+        [int]$Thread.anchor.line -le [int]$span.endLine
+}
+
+function Test-ContextualFindingHumanCoverage {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$Body,
+        [bool]$SameAnchor
+    )
+    switch ([string]$Finding.ruleId) {
+        'generic-exception-naming' {
+            return Test-ContextualExceptionNamingHumanCoverage -Body $Body -Variable ([string]$Finding.anchor.symbol)
+        }
+        'reused-string-literals' {
+            return Test-ContextualReusedStringHumanCoverage -Body $Body -Finding $Finding
+        }
+        'block-body-indentation' {
+            return $Body -match '(?i)\bindent(?:ation|ed|ing)?\b' -and
+                $Body -match '(?i)\b(?:body|block|statements)\b'
+        }
+        'duplicate-constant-declarations' {
+            return $SameAnchor -or
+                (Test-ContextualDuplicateConstantHumanCoverage -Body $Body -Evidence ([string]$Finding.evidence))
+        }
+        default { return $true }
+    }
+}
+
+function Test-ContextualReusedStringHumanCoverage {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding
+    )
+    if ($Body -inotmatch '\bconstants?\b' -or
+        $Body -inotmatch '\b(?:re-?us\w*|shar\w*|declar\w*|hardcod\w*)\b' -or
+        @($Finding.literalValues).Count -eq 0) {
+        return $false
+    }
+    foreach ($value in @($Finding.literalValues)) {
+        if ([string]::IsNullOrWhiteSpace([string]$value) -or
+            -not [regex]::IsMatch($Body,
+                '(?<![\p{L}\p{N}_])' + [regex]::Escape([string]$value) + '(?![\p{L}\p{N}_])')) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-ContextualReusedStringCitation {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    foreach ($match in [regex]::Matches($Body, 'https?://[^\s)<>]+')) {
+        $uri = $null
+        if (-not [Uri]::TryCreate($match.Value, [UriKind]::Absolute, [ref]$uri)) {
+            continue
+        }
+        $query = @{}
+        foreach ($part in $uri.Query.TrimStart('?').Split('&')) {
+            $pair = $part.Split('=', 2)
+            if ($pair.Count -eq 2) {
+                $query[[Uri]::UnescapeDataString($pair[0])] =
+                    [Uri]::UnescapeDataString($pair[1])
+            }
+        }
+        [int]$line = 0
+        if ([string]$query.version -cne "GC$SourceCommit" -or
+            -not [int]::TryParse([string]$query.line, [ref]$line)) {
+            continue
+        }
+        if (@($Finding.relatedUses | Where-Object {
+                    [string]$_.path -ieq ([string]$query.path).TrimStart('/') -and
+                    $line -ge [int]$_.line -and $line -le [int]$_.endLine
+                }).Count -gt 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Resolve-ContextualConventionDiscussionReconciliation {
     param(
         [Parameter(Mandatory)]
@@ -646,6 +1089,18 @@ function Resolve-ContextualConventionDiscussionReconciliation {
     $anyMarkerPattern =
         '<!--\s*devpilot-[a-z0-9-]+:v1:[0-9a-f]{64}\s*-->'
     foreach ($finding in @($Observation.findings)) {
+        if ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+            (-not $finding.Contains('literalValues') -or
+                -not $finding.Contains('relatedUses') -or
+                @($finding.literalValues).Count -lt 1 -or
+                @($finding.relatedUses).Count -lt 2)) {
+            $finding.providerMarker = New-OwnerProviderMarker
+            $finding.reconciliation = New-OwnerV2DiscussionReconciliation `
+                -Classification unknown -Reason reused-string-proof-missing `
+                -DiscussionDigest $discussionDigest -BodyDigest unknown
+            $counts.unknown++
+            continue
+        }
         try {
             $marker =
                 Get-ContextualConventionMarkerKey `
@@ -1110,9 +1565,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                 [string]$proof.selection.symbol -cne
                     [string]$finding.anchor.symbol -or
                 [string]$proof.selection.constructIdentity -cne
-                    [string]$finding.binding.constructIdentity -or
-                [string]$proof.selection.marker -ceq
-                    $marker) {
+                    [string]$finding.binding.constructIdentity) {
                 continue
             }
             $priorEntries =
@@ -1134,6 +1587,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     $authenticatedPriorMarkerSeen =
                         $true
                     if ($priorMarkers.Count -eq 1 -and
+                        [regex]::Matches([string]$comment.body, $anyMarkerPattern).Count -eq 1 -and
                         [string]$comment.commentType -ceq
                             'text' -and
                         -not [bool]$comment.isDeleted -and
@@ -1187,7 +1641,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         [string]$finding.anchor.path -and
                     [int]$thread.anchor.line -eq
                         [int]$finding.anchor.line
-                $currentContext = $sameAnchor -and
+                $sameFindingRange = Test-ContextualFindingThreadRange -Finding $finding -Thread $thread
+                $currentThread =
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq
@@ -1209,12 +1664,22 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         [bool]$comment.isDeleted) {
                         continue
                     }
+                    $commentRelevant = Test-ContextualFindingThreadRange -Finding $finding -Thread $thread `
+                        -Body ([string]$comment.body) -SourceCommit ([string]$Contract.Request.SourceCommit)
+                    $currentContext = $currentThread -and $commentRelevant
+                    if ([string]$finding.ruleId -ceq 'file-copyright-header' -and
+                        $commentRelevant -and -not $currentThread) {
+                        $priorConflict = $true
+                        break
+                    }
                     if (@([regex]::Matches(
                             [string]$comment.body,
                             $targetPattern) |
                             Where-Object {
                                 $_.Groups[1].Value -ceq
-                                    $marker
+                                    $marker -or
+                                $_.Groups[1].Value -ceq
+                                    [string]$entry.Proof.selection.marker
                             }).Count -gt 0) {
                         $priorConflict = $true
                         break
@@ -1225,7 +1690,15 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                                 'ambiguous' -or
                             [regex]::IsMatch(
                                 [string]$comment.body,
-                                $anyMarkerPattern))) {
+                                $anyMarkerPattern) -or
+                            ([string]$finding.ruleId -cin @('block-body-indentation', 'generic-exception-naming',
+                                'reused-string-literals', 'file-copyright-header') -and [bool]$comment.reviewerOwned) -or
+                            -not (Test-ContextualFindingHumanCoverage -Finding $finding `
+                                -Body ([string]$comment.body) -SameAnchor $sameAnchor) -or
+                            ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+                                -not $sameFindingRange -and
+                                -not (Test-ContextualReusedStringCitation -Body ([string]$comment.body) `
+                                    -Finding $finding -SourceCommit ([string]$Contract.Request.SourceCommit))))) {
                         $priorConflict = $true
                         break
                     }
@@ -1291,30 +1764,34 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         $humanCurrent = $false
         $crossRule = $false
         $rangedHumanUnknown = $false
+        $unmarkedReviewerCurrent = $false
+        $markerlessReusedStringReviewer = $false
         foreach ($thread in @($Snapshot.Threads)) {
             $sameAnchor = $null -ne $thread.anchor -and
                 [string]$thread.anchor.path -ieq
                     [string]$finding.anchor.path -and
                 [int]$thread.anchor.line -eq
                     [int]$finding.anchor.line
-            $sameFindingRange = $sameAnchor -or (
-                [string]$finding.ruleId -ceq
-                    'duplicate-constant-declarations' -and
-                $null -ne $thread.anchor -and
-                [string]$thread.anchor.path -ieq
-                    [string]$finding.anchor.path -and
-                $finding.binding -is
-                    [Collections.IDictionary] -and
-                $finding.binding.span -is
-                    [Collections.IDictionary] -and
-                [int]$thread.anchor.line -ge
-                    [int]$finding.binding.span.startLine -and
-                [int]$thread.anchor.line -le
-                    [int]$finding.binding.span.endLine)
+            $sameFindingRange = Test-ContextualFindingThreadRange -Finding $finding -Thread $thread
             foreach ($comment in @($thread.comments)) {
                 if ([string]$comment.commentType -cne
                         'text' -or
                     [bool]$comment.isDeleted) {
+                    continue
+                }
+                $copyrightDiscussion =
+                    [string]$finding.ruleId -ceq 'file-copyright-header' -and
+                    $null -ne $thread.anchor -and
+                    [string]$thread.anchor.path -ieq [string]$finding.anchor.path -and
+                    [regex]::IsMatch([string]$comment.body,
+                        '(?:copyright[\s\S]{0,160}header|header[\s\S]{0,160}copyright)',
+                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($copyrightDiscussion -and (
+                    [bool]$thread.isDeleted -or [bool]$thread.isOutdated -or
+                    [string]$thread.status -cne 'active' -or
+                    [string]$thread.contextState -cne 'current' -or
+                    [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit)) {
+                    $ambiguous = $true
                     continue
                 }
                 $markerMatches = [regex]::Matches(
@@ -1326,6 +1803,15 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             $marker
                     })
                 if ($target.Count -gt 0) {
+                    if ([string]$finding.ruleId -ceq 'file-copyright-header' -and (
+                        -not $sameAnchor -or
+                        [bool]$thread.isDeleted -or [bool]$thread.isOutdated -or
+                        [string]$thread.status -cne 'active' -or
+                        [string]$thread.contextState -cne 'current' -or
+                        [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit)) {
+                        $ambiguous = $true
+                        continue
+                    }
                     if ([string]$comment.
                         reviewerIdentityState -ceq
                             'ambiguous') {
@@ -1345,7 +1831,21 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     }
                     continue
                 }
-                if ($sameFindingRange -and
+                $citedReusedString = [string]$finding.ruleId -ceq 'reused-string-literals' -and
+                    $null -ne $thread.anchor -and
+                    @($finding.relatedUses | Where-Object {
+                        [string]$_.path -ieq [string]$thread.anchor.path
+                    }).Count -gt 0 -and
+                    (Test-ContextualReusedStringCitation -Body ([string]$comment.body) `
+                        -Finding $finding -SourceCommit ([string]$Contract.Request.SourceCommit))
+                $namedLiteralRequest = [string]$finding.ruleId -ceq 'reused-string-literals' -and
+                    $null -ne $thread.anchor -and
+                    @($finding.relatedUses | Where-Object {
+                        [string]$_.path -ieq [string]$thread.anchor.path
+                    }).Count -gt 0 -and
+                    (Test-ContextualReusedStringHumanCoverage -Body ([string]$comment.body) -Finding $finding)
+                if ((($sameFindingRange -and [string]$finding.ruleId -cne 'file-copyright-header') -or
+                    $copyrightDiscussion -or $citedReusedString -or $namedLiteralRequest) -and
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq
@@ -1365,17 +1865,51 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             'ambiguous') {
                         $ambiguous = $true
                     }
+                    elseif ([string]$finding.ruleId -ceq
+                            'block-body-indentation' -and
+                        [bool]$comment.reviewerOwned) {
+                        $unmarkedReviewerCurrent = $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq
+                            'generic-exception-naming' -and (
+                            [bool]$comment.reviewerOwned -or
+                            -not (
+                                Test-ContextualFindingHumanCoverage -Finding $finding -SameAnchor $sameAnchor `
+                                    -Body ([string]$comment.body) `
+                                ))) {
+                        $crossRule = $true
+                    }
+                    elseif ($copyrightDiscussion -and [bool]$comment.reviewerOwned) {
+                        $ambiguous = $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+                        [bool]$comment.reviewerOwned) {
+                        $markerlessReusedStringReviewer = $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+                        -not $sameFindingRange -and -not $citedReusedString) {
+                        $rangedHumanUnknown = $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+                        -not (Test-ContextualFindingHumanCoverage -SameAnchor $sameAnchor `
+                            -Body ([string]$comment.body) -Finding $finding)) {
+                        $rangedHumanUnknown = $true
+                    }
                     elseif (-not $sameAnchor -and
                         [string]$finding.ruleId -ceq
                             'duplicate-constant-declarations' -and
                         -not (
-                            Test-ContextualDuplicateConstantHumanCoverage `
+                            Test-ContextualFindingHumanCoverage -Finding $finding -SameAnchor $sameAnchor `
                                 -Body (
-                                    [string]$comment.body) `
-                                -Evidence (
-                                    [string]$finding.evidence))) {
+                                    [string]$comment.body))) {
                         $rangedHumanUnknown =
                             $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq
+                            'block-body-indentation' -and
+                        -not (Test-ContextualFindingHumanCoverage -Finding $finding -SameAnchor $sameAnchor `
+                            -Body ([string]$comment.body))) {
+                        $rangedHumanUnknown = $true
                     }
                     else {
                         $humanCurrent = $true
@@ -1384,7 +1918,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             }
         }
         if ($ambiguous -or $foreign -or
+            $markerlessReusedStringReviewer -or
             $rangedHumanUnknown -or
+            $unmarkedReviewerCurrent -or
             $matches.Count -gt 1 -or
             ($matches.Count -eq 1 -and
                 [int]$matches[0].Count -ne 1)) {
@@ -1395,7 +1931,13 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             $finding.reconciliation =
                 New-OwnerV2DiscussionReconciliation `
                     -Classification unknown `
-                    -Reason $(if (
+                    -Reason $(if ($unmarkedReviewerCurrent) {
+                            'unmarked-current-reviewer-comment'
+                        }
+                        elseif ($markerlessReusedStringReviewer) {
+                            'existing-reviewer-comment-unproven'
+                        }
+                        elseif (
                             $rangedHumanUnknown -and
                             -not $ambiguous -and
                             -not $foreign -and
@@ -1414,8 +1956,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
             $sameBody =
-                Get-OwnerV1WriterSha256 -Text (
-                    [string]$entry.Comment.body) -ceq
+                (Get-OwnerV1WriterSha256 -Text (
+                    [string]$entry.Comment.body)) -ceq
                     $bodyDigest
             $finding.providerMarker =
                 New-OwnerProviderMarker `
@@ -1796,8 +2338,11 @@ function Resolve-NamedAreEqualDiscussionReconciliation {
             [string]$thread.contextState -ceq 'current' -and
             [string]$thread.sourceCommit -ceq
                 [string]$Contract.Request.SourceCommit
-        $classification = if ($trusted -and
-            [string]$comment.body -ceq $body) {
+        $legacyBody = Format-NamedAreEqualComment -Contract $Contract `
+            -Finding $finding -MarkerKey $marker -Legacy
+        $classification = if ($trusted -and (
+            [string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq $legacyBody)) {
             'noOp'
         }
         else { 'unknown' }
@@ -1878,6 +2423,17 @@ function Resolve-OwnerV2DiscussionReconciliation {
         [object[]]$AuthenticatedPriorComments = @()
     )
 
+    $Observation.sourceArtifacts = @($Observation.sourceArtifacts | Where-Object {
+        [string](Get-OwnerV2Member -Value $_ -Name kind) -cne
+            'owner-v2-comment-presentation'
+    })
+    if ($null -ne (Get-OwnerV2Member -Value $Contract -Name CommentPresentation)) {
+        $Observation.sourceArtifacts += [ordered]@{
+            kind = 'owner-v2-comment-presentation'
+            sha256 = Get-OwnerV1WriterSha256 -Text 'owner-v2-comment-presentation:subject-provider-links-v1'
+            signature = 'not-applicable'
+        }
+    }
     if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
         $script:NamedAreEqualCapability) {
         return Resolve-NamedAreEqualDiscussionReconciliation `
@@ -2066,7 +2622,10 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $classification = 'unknown'
             $reason = 'reviewer-marker-thread-status-unknown'
         }
-        elseif ([string]$comment.body -ceq $body) {
+        elseif ([string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq (
+                Format-OwnerV1WriterComment -Contract $Contract `
+                    -Finding $finding -MarkerKey $markerKey -Legacy)) {
             $classification = 'noOp'
             $reason = 'reviewer-marker-body-current'
         }
@@ -3954,16 +4513,32 @@ function Invoke-ContextualConventionsCapabilityResponse {
     foreach ($file in $files) {
         $context = Get-OwnerV2Member `
             -Value $file.data -Name projectContext
+        $sourceState = Get-OwnerV2Member -Value $file.data -Name sourceState
+        if ($null -eq $sourceState) { $sourceState = [string]$file.state }
         $snapshotFile = [ordered]@{
                 path = [string]$file.data.path
                 content = $(if (
-                    [string]$file.state -ceq 'complete' -and
+                    [string]$sourceState -ceq 'complete' -and
                     $file.data.content -is [string]) {
                     [string]$file.data.content
                 } else { '' })
                 state = [string]$file.state
                 spans = @($file.data.spans)
+                sourceState = $(if (
+                    [bool](Get-OwnerV2Member -Value $file.data -Name truncated) -or
+                    [bool](Get-OwnerV2Member -Value $file.data -Name isBinary)) {
+                    'unknown'
+                } else { [string]$sourceState })
+                changeType = [string](Get-OwnerV2Member -Value $file.data -Name changeType)
+                fileHeader = Get-OwnerV2Member -Value $file.data -Name fileHeader
+                sourceCommit = [string]$identityUnits[0].data.sourceCommit
+                targetCommit = [string]$identityUnits[0].data.targetCommit
+                oldPath = Get-OwnerV2Member -Value $file.data -Name oldPath
+                comparison = Get-OwnerV2Member -Value $file.data -Name comparison
             }
+        if ([bool](Get-OwnerV2Member -Value $file.data -Name contextOnly)) {
+            $snapshotFile['contextOnly'] = $true
+        }
         if ($context -is
                 [Collections.IDictionary]) {
             $snapshotFile['projectContext'] =
@@ -3999,28 +4574,34 @@ function Invoke-ContextualConventionsCapabilityResponse {
         $data = $file.data
         $path = [string]$data.path
         $evidenceIds = @('identity', 'rule', $id)
-        if (@($data.spans).Count -eq 0) {
+        if ([bool](Get-OwnerV2Member -Value $data -Name contextOnly)) {
             continue
         }
-        if ([string]$file.state -cne 'complete' -or
-            $data -isnot [Collections.IDictionary] -or
-            $data.content -isnot [string]) {
+        $ordinaryFileComplete = @($data.spans).Count -gt 0 -and
+            [string]$file.state -ceq 'complete' -and
+            $data -is [Collections.IDictionary] -and
+            $data.content -is [string]
+        if (-not $ordinaryFileComplete -and @($data.spans).Count -gt 0) {
             foreach ($ruleId in @(
                     Get-ContextualConventionRuleIds |
                     Where-Object {
                         $_ -cne
-                            'pr-template-compliance'
+                            'pr-template-compliance' -and $_ -cne 'file-copyright-header'
                     })) {
                 [void]$withheldRules.Add(
                     [string]$ruleId)
             }
-            continue
         }
-        $outcomes =
+        $outcomes = if ($ordinaryFileComplete) {
             Get-ContextualConventionOutcomes `
                 -Content ([string]$data.content) `
                 -Path $path -Spans @($data.spans) `
                 -SnapshotFiles $snapshotFiles.ToArray()
+        }
+        else {
+            Get-ContextualCopyrightHeaderOutcome -Content ([string]$data.content) `
+                -Path $path -SnapshotFiles $snapshotFiles.ToArray()
+        }
         foreach ($outcome in $outcomes) {
             $state = [string]$outcome.state
             $ruleId = [string]$outcome.ruleId
@@ -4063,6 +4644,31 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 symbol = [string]$outcome.symbol
                 reason = [string]$outcome.reason
             }
+            if ($ruleId -ceq 'block-body-indentation') {
+                $material['indentationContext'] =
+                    $outcome.indentationContext
+            }
+            if ($ruleId -ceq 'file-copyright-header') {
+                $material['fileHeader'] = $outcome.fileHeader
+            }
+            if ($ruleId -ceq 'reused-string-literals') {
+                # Cluster identity is order-independent; finding data still pins the complete evidence.
+                $material = [ordered]@{
+                    repositoryId = [string]$identityUnits[0].data.repositoryId
+                    sourceCommit = [string]$identityUnits[0].data.sourceCommit
+                    targetCommit = [string]$identityUnits[0].data.targetCommit
+                    ruleHash = [string]$ruleData.hash
+                    ruleId = $ruleId
+                    path = $path
+                    line = [int]$outcome.line
+                    endLine = [int]$outcome.endLine
+                    symbol = [string]$outcome.symbol
+                    reason = [string]$outcome.reason
+                    literalValues = @($outcome.literalValues)
+                    relatedUses = @($outcome.relatedUses)
+                    occurrenceCounts = $outcome.occurrenceCounts
+                }
+            }
             $digest = (Get-OwnerV2Digest `
                     -Value $material).Substring(10)
             $constructRef = "construct:$digest"
@@ -4093,9 +4699,30 @@ function Invoke-ContextualConventionsCapabilityResponse {
                     [string]$outcome.evidence
                 reason = [string]$outcome.reason
             }
+            if ($ruleId -ceq 'block-body-indentation') {
+                $findingData['indentationContext'] =
+                    $outcome.indentationContext
+            }
+            if ($ruleId -ceq 'file-copyright-header') {
+                $findingData.eligibility = 'changed-file-copyright-header'
+                $findingData.anchor['scope'] = 'file-header'
+                $findingData['fileHeader'] = $outcome.fileHeader
+            }
+            if ($ruleId -ceq 'reused-string-literals') {
+                $findingData['literalValues'] = @($outcome.literalValues)
+                $findingData['relatedUses'] = @($outcome.relatedUses)
+                $findingData['occurrenceCounts'] = $outcome.occurrenceCounts
+            }
+            $findingEvidenceIds = $evidenceIds
+            if ($ruleId -ceq 'reused-string-literals') {
+                $findingEvidenceIds = @('identity', 'rule') + @(
+                    $files | Where-Object {
+                        [string]$_.data.path -imatch '\.cs$'
+                    } | ForEach-Object { [string]$_.unitId })
+            }
             [void]$assessments.Add([ordered]@{
                 assessmentId = $assessmentId
-                evidenceUnitIds = $evidenceIds
+                evidenceUnitIds = $findingEvidenceIds
                 state = 'complete'
                 findings = @([ordered]@{
                             findingId =
@@ -4127,9 +4754,15 @@ function Invoke-ContextualConventionsCapabilityResponse {
         [void]$assessments.Add([ordered]@{
                 assessmentId = "method:c:$digest"
                 evidenceUnitIds = @('identity', 'rule')
-                state = 'complete'
+                state = $(if ($ruleId -ceq 'generic-exception-naming') {
+                    'unknown'
+                }
+                else { 'complete' })
                 data = [ordered]@{
-                    state = 'advisory'
+                    state = $(if ($ruleId -cin @('generic-exception-naming', 'reused-string-literals')) {
+                        'unknown'
+                    }
+                    else { 'advisory' })
                     reason =
                         'contextual-proof-withheld'
                     constructRef = "construct:$digest"
@@ -4390,6 +5023,24 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.reason =
                 [string](Get-OwnerV2Member `
                     -Value $data -Name reason)
+            if ($normalizedFinding.ruleId -ceq
+                    'block-body-indentation') {
+                $normalizedFinding.indentationContext =
+                    Get-OwnerV2Member `
+                        -Value $data -Name indentationContext
+            }
+            if ([string](Get-OwnerV2Member -Value $anchor -Name scope) -ceq 'file-header') {
+                $normalizedFinding.anchor['scope'] = 'file-header'
+                $normalizedFinding['fileHeader'] = Get-OwnerV2Member -Value $data -Name fileHeader
+            }
+            if ([string]$normalizedFinding.ruleId -ceq 'reused-string-literals') {
+                $normalizedFinding['literalValues'] =
+                    @(Get-OwnerV2Member -Value $data -Name literalValues)
+                $normalizedFinding['relatedUses'] =
+                    @(Get-OwnerV2Member -Value $data -Name relatedUses)
+                $normalizedFinding['occurrenceCounts'] =
+                    Get-OwnerV2Member -Value $data -Name occurrenceCounts
+            }
             if ($pullRequestScope) {
                 $normalizedFinding.issueIdentity =
                     [string](Get-OwnerV2Member `
@@ -4647,6 +5298,7 @@ function ConvertTo-OwnerV2Observation {
 }
 
 Export-ModuleMember -Function @(
+    'Assert-OwnerCommentRuleReferences',
     'ConvertTo-OwnerV2Observation',
     'Format-ContextualConventionComment',
     'Format-NamedAreEqualComment',

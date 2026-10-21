@@ -53,11 +53,11 @@ $script:NamedAreEqualPolicyDigest =
 $script:ContextualCapabilityId =
     'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+    'v1:sha256:9c3496bd7a22a5f4cf09fa993e1aaad7f386efd7010e73a5cedf6bbd19de9130'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
-    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+    'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
 $script:NamedAreEqualParserPath = Join-Path $PSScriptRoot `
     '..\DevPilot.TestClassCoverage\DevPilot.TestClassCoverage.psm1'
 $script:NamedAreEqualParserManifestPath = Join-Path $PSScriptRoot `
@@ -2043,6 +2043,8 @@ function Invoke-NamedAreEqualLive {
         return New-OwnerV2LiveOutcome `
             -Entry $Entry -Reason 'acquisition-provider-unavailable'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
     $parserBinding = Get-NamedAreEqualParserBinding
     $acquisition = New-OwnerProductionAcquisitionAdapter `
         -Contract $Entry.Contract -Provider $AcquisitionProvider
@@ -2130,6 +2132,8 @@ function Invoke-ContextualConventionsLive {
     }
     $analyzerBinding =
         Get-ContextualAnalyzerBinding
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
     $acquisition =
         New-OwnerProductionAcquisitionAdapter `
             -Contract $Entry.Contract `
@@ -2161,9 +2165,7 @@ function Invoke-ContextualConventionsLive {
     Add-ContextualAnalyzerArtifacts `
         -Observation $observation `
         -Binding $analyzerBinding
-    if (@($observation.findings).Count -gt 0 -and
-        [string]$observation.lifecycle.status -ceq
-            'completed') {
+    if (@($observation.findings).Count -gt 0) {
         $snapshot = $null
         $failure = $null
         try {
@@ -2363,6 +2365,8 @@ function Invoke-OwnerV2Live {
     if ($null -eq $AcquisitionProvider) {
         return New-OwnerV2LiveOutcome -Entry $Entry -Reason 'acquisition-provider-unavailable'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
 
     $provider = $ModelProvider
     if ($null -eq $provider) {
@@ -2649,6 +2653,8 @@ function Resolve-OwnerV2CompletedDiscussionRefresh {
         }
         $Observation.implementation.version = '0.5.0'
     }
+    $Entry.Contract | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue (Get-OwnerV2Member -Value $AcquisitionProvider -Name CommentPresentation)
     $snapshot = $null
     $failureReason = $null
     try {
