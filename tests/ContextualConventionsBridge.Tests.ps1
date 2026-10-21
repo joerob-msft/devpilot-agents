@@ -1,5 +1,193 @@
 #requires -Version 7.0
 
+Describe 'Copyright header bridge and create-only preflight' {
+    BeforeAll {
+        function New-CopyrightBridgeCase {
+            param([switch]$NoCurrentSpans)
+            $config = New-ContextualTestConfig
+            $config.enabled = $true
+            $content = "namespace Tests`n{`n    class C`n    {`n        int M() => 2;`n    }`n}"
+            $prepared = New-ContextualPreparedIntake -Content $content
+            $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+            $entry.spans[0].startLine = 5
+            $entry.spans[0].endLine = 5
+            $entry['fileHeader'] = Get-ContextualCopyrightHeaderEvidence `
+                -Path $entry.path -ChangeType edit -Content $content `
+                -TargetContent ($content.Replace('=> 2', '=> 1')) `
+                -SourceCommit $prepared.Head.sourceCommit -TargetCommit $prepared.Head.targetCommit
+            if ($NoCurrentSpans) {
+                $entry.spans = @()
+                $prepared.Intake.transientSnapshots['42'].changes.changedLines = 0
+            }
+            return [pscustomobject]@{ Config = $config; Prepared = $prepared }
+        }
+
+        function Get-CopyrightObservation {
+            param($Case, [string]$Name)
+            $prepared = [pscustomobject]@{
+                Head = $Case.Prepared.Head
+                Intake = $Case.Prepared.Intake | ConvertTo-Json -Depth 64 | ConvertFrom-Json -AsHashtable -Depth 64
+            }
+            $result = Invoke-SyntheticContextualBridge -Config $Case.Config -Prepared $prepared -Name $Name
+            $result.providerWrites | Should -Be 0
+            $result.modelWrites | Should -Be 0
+            $result.records | Should -HaveCount 1
+            return Get-Content -LiteralPath $result.outcomes[0].observationPath -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+        }
+    }
+
+    It 'carries a pre-existing header finding through the full bridge without pretending line 1 changed' {
+        $case = New-CopyrightBridgeCase
+        $observation = Get-CopyrightObservation $case copyright-pre-existing
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.anchor.scope | Should -BeExactly file-header
+        $finding.anchor.line | Should -Be 1
+        $finding.fileHeader.origin | Should -BeExactly pre-existing
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $observation | ConvertTo-Json -Depth 64 |
+            Test-Json -SchemaFile "$repoRoot\src\OwnerObserver\schemas\owner-observation.v1.json" |
+            Should -BeTrue
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $evidence = [pscustomobject]@{
+            Contract = $contract
+            Declaration = @{ capability = @{ id = 'bpm-contextual-conventions@1' } }
+        }
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+        $proposal.scope | Should -BeExactly file-header
+        $proposal.fileHeader.origin | Should -BeExactly pre-existing
+        $proposal.body | Should -Match 'pre-existing, nonblocking convention issue'
+        $proposal.body | Should -Match 'line=929'
+        $proposal.body | Should -Not -Match 'Changed code:'
+        $upgrade = New-ContextualUpgradeRecognitionCase
+        $evidence | Add-Member -NotePropertyName Observation -NotePropertyValue $observation
+        $live = [pscustomobject]@{
+            PullRequest = $case.Prepared.Head
+            ProviderBinding = @{}
+            Reviewer = $case.Config.expectedAccount
+            Snapshot = $upgrade.Snapshot
+            Anchors = @([ordered]@{
+                scope = 'file-header'
+                path = $proposal.path
+                startLine = 1
+                endLine = 1
+                changeTrackingId = 7
+                iterationId = $upgrade.Snapshot.CurrentIterationId
+                fileHeader = $proposal.fileHeader
+            })
+        }
+        $approval = @{
+            subject = $case.Prepared.Head
+            provider = @{}
+            operator = $case.Config.expectedAccount
+        }
+        $preflight = @{
+            Evidence = $evidence
+            Approval = $approval
+            Live = $live
+            Selections = @($proposal)
+            ExpectedSnapshotSha256 = $upgrade.Snapshot.Digest.Substring(10)
+            Delivery = 'contextual-conventions'
+        }
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Not -Throw
+        $live.Anchors[0].fileHeader =
+            $proposal.fileHeader | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable
+        $live.Anchors[0].fileHeader.targetDigest = 'v1:sha256:' + ('0' * 64)
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Throw '*source/target header binding changed*'
+        $live.Anchors = @()
+        { Assert-ApprovedOwnerV2LiveRead @preflight } | Should -Throw
+    }
+
+    It 'handles a changed file with no current-line span without enabling any old rule at line 1' {
+        $case = New-CopyrightBridgeCase -NoCurrentSpans
+        $observation = Get-CopyrightObservation $case copyright-no-current-lines
+        $observation.findings | Should -HaveCount 1
+        $observation.findings[0].ruleId | Should -BeExactly file-copyright-header
+        $observation.findings[0].anchor.scope | Should -BeExactly file-header
+    }
+
+    It 'treats a markerless reviewer-owned copyright request at lines 2-4 as UNKNOWN, never humanCovered or a duplicate create' {
+        $case = New-CopyrightBridgeCase
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity reviewer `
+            -Path src/Checks.cs -Line 2 `
+            -Body 'Add the standard copyright header to this test file. This omission is pre-existing and nonblocking.'
+        $observation = Get-CopyrightObservation $case copyright-markerless-reviewer
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly unknown
+        $observation.effects.dedupe.wouldCreate | Should -Be 0
+        $observation.effects.dedupe.humanCovered | Should -Be 0
+    }
+
+    It 'recognizes a disclosed distinct human copyright request on the same changed file' {
+        $case = New-CopyrightBridgeCase
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity human `
+            -Path src/Checks.cs -Line 2 -Body 'Please add the standard copyright header before the namespace.'
+        $observation = Get-CopyrightObservation $case copyright-distinct-human
+        $finding = @($observation.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly humanCovered `
+            -Because ($finding.reconciliation | ConvertTo-Json -Depth 16 -Compress)
+    }
+
+    It 'reconciles an exact current reviewer comment as noOp without a second create' {
+        $case = New-CopyrightBridgeCase
+        $first = Get-CopyrightObservation $case copyright-first
+        $finding = @($first.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $typed = New-ContextualUpgradeRecognitionCase
+        $typed.Thread.anchor.line = 1
+        $typed.Thread.comments[0].body = $body
+        $resolved = Resolve-OwnerV2DiscussionReconciliation -Observation $first -Contract $contract `
+            -Snapshot $typed.Snapshot
+        $resolved.findings[0].reconciliation.classification | Should -BeExactly noOp
+        Add-SyntheticDiscussion -Prepared $case.Prepared -Config $case.Config -Identity reviewer `
+            -Path src/Checks.cs -Line 1 -Body $body
+        $second = Get-CopyrightObservation $case copyright-second
+        $finding = @($second.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly noOp `
+            -Because ($finding.reconciliation | ConvertTo-Json -Depth 16 -Compress)
+        $second.effects.dedupe.wouldCreate | Should -Be 0
+    }
+
+    It 'evaluates multiple files independently and does not scan outside the changed inventory' {
+        $case = New-CopyrightBridgeCase
+        $changes = $case.Prepared.Intake.transientSnapshots['42'].changes
+        $second = $changes.entries[0] | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable
+        $second.path = 'src/Second.cs'
+        $second.changeTrackingId = 8
+        $second.fileHeader.path = $second.path
+        $changes.entries += $second
+        $changes.changedFiles = 2
+        $changes.changedLines = 2
+        $observation = Get-CopyrightObservation $case copyright-multiple
+        @($observation.findings | Where-Object ruleId -CEQ file-copyright-header) | Should -HaveCount 2
+        @($observation.findings.anchor.path | Sort-Object -Unique) -join ',' |
+            Should -BeExactly 'src/Checks.cs,src/Second.cs'
+    }
+
+    It 'refuses <Case> header marker evidence without creating a duplicate' -TestCases @(
+        @{ Case = 'a foreign copied'; Identity = 'human'; Path = 'src/Checks.cs'; Suffix = '' },
+        @{ Case = 'an edited reviewer'; Identity = 'reviewer'; Path = 'src/Checks.cs'; Suffix = ' edited' },
+        @{ Case = 'a moved reviewer'; Identity = 'reviewer'; Path = 'src/Elsewhere.cs'; Suffix = '' }
+    ) {
+        param($Case, $Identity, $Path, $Suffix)
+        $fixture = New-CopyrightBridgeCase
+        $first = Get-CopyrightObservation $fixture "copyright-negative-first-$Identity-$($Path.GetHashCode())-$($Suffix.Length)"
+        $finding = @($first.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $contract = (New-ContextualUpgradeRecognitionCase).Contract
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        Add-SyntheticDiscussion -Prepared $fixture.Prepared -Config $fixture.Config -Identity $Identity `
+            -Path $Path -Line 1 -Body ($body + $Suffix)
+        $second = Get-CopyrightObservation $fixture "copyright-negative-second-$Identity-$($Path.GetHashCode())-$($Suffix.Length)"
+        $finding = @($second.findings | Where-Object ruleId -CEQ file-copyright-header)[0]
+        $finding.reconciliation.classification | Should -BeExactly unknown
+        $second.effects.dedupe.wouldCreate | Should -Be 0
+        $second.effects.dedupe.humanCovered | Should -Be 0
+    }
+}
+
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     Import-Module (Join-Path $repoRoot `
@@ -959,7 +1147,8 @@ Describe 'Contextual convention current PR bridge' {
                     -Depth 32).rules.id |
                     Where-Object {
                         [string]$_ -cne
-                            'pr-template-compliance'
+                            'pr-template-compliance' -and
+                        [string]$_ -cne 'file-copyright-header'
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -995,8 +1184,8 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    (New-ContextualTestConfig).contextualRule.hash
+                length = (New-ContextualTestConfig).contextualRule.length
             }
         }
         $cases = @(
@@ -1111,8 +1300,8 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    $case.Config.contextualRule.hash
+                length = $case.Config.contextualRule.length
             }
         }
         switch ($Mode) {

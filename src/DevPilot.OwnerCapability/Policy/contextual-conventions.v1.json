@@ -27,6 +27,18 @@
       "requiredSections": ["Problem", "Solution", "Validation"],
       "optionalSectionsAndChecks": "Release notes, full-test-pass, bundle/settings conditions, and unchecked checklist items are not required by this rule."
     },
+    "copyrightHeader": {
+      "authorityState": "canonical EngHub coding style and user-directed review example",
+      "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "lines": [929, 932, 936, 937, 938],
+      "reference": "https://msazure.visualstudio.com/One/_git/AzureUX-BPM-EngHub?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=929",
+      "clause": "Start all code files with copyright header",
+      "scope": "C# files in the current changed-file inventory, including modified existing files",
+      "preExisting": "nonblocking convention finding, not a regression",
+      "yearRequirement": false
+    },
     "duplicateConstantDeclarations": {
       "authorityState": "user-directed Azure DevOps review comment",
       "pullRequestId": 17562908,
@@ -147,6 +159,13 @@
       "sourceSection": "Current effective repository pull request template / Problem, Solution, Validation",
       "scope": "pull-request-description",
       "requiredSections": ["Problem", "Solution", "Validation"]
+    },
+    {
+      "id": "file-copyright-header",
+      "name": "Start changed C# code files with the standard Microsoft copyright header",
+      "sourceSection": "Code documentation / Copyright header",
+      "scope": "file-header",
+      "severity": "nonblocking"
     }
   ]
 }

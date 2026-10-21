@@ -2297,6 +2297,18 @@ function ConvertTo-OwnerAcquisitionResponse {
                 spans = $spans
                 projectContext = $projectContext
             }
+        $fileHeader = Get-OwnerAdapterMember -Value $change -Name fileHeader
+        if ($null -ne $fileHeader) {
+            if ($fileHeader -isnot [Collections.IDictionary] -or
+                [string]$fileHeader.path -cne $path -or
+                [string]$fileHeader.changeType -cne $changeType -or
+                [string]$fileHeader.oldPath -cne [string]$oldPath -or
+                [string]$fileHeader.sourceCommit -cne [string]$request.SourceCommit -or
+                [string]$fileHeader.targetCommit -cne [string]$request.TargetCommit) {
+                throw 'Copyright header evidence does not match the changed-file identity.'
+            }
+            $normalizedChange['fileHeader'] = $fileHeader
+        }
         if ($contextOnly) {
             $normalizedChange['contextOnly'] =
                 $true
@@ -2525,6 +2537,9 @@ function ConvertTo-OwnerAcquisitionResponse {
         if ($contextOnly) {
             $unit.data['contextOnly'] =
                 $true
+        }
+        if ($change.Contains('fileHeader')) {
+            $unit.data['fileHeader'] = $change.fileHeader
         }
         [void]$units.Add($unit)
         $ordinal++

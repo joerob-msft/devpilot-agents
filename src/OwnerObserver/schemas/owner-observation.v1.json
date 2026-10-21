@@ -160,6 +160,7 @@
                 "additionalProperties": false,
                 "required": ["path", "line", "symbol"],
                 "properties": {
+                  "scope": { "const": "file-header" },
                   "path": { "$ref": "#/$defs/text" },
                   "line": { "type": "integer", "minimum": 1 },
                   "symbol": { "$ref": "#/$defs/knownText" }
@@ -198,6 +199,7 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9-]{2,127}$"
           },
+          "fileHeader": { "$ref": "#/$defs/copyrightHeaderEvidence" },
           "issueIdentity": {
             "type": "string",
             "pattern": "^v1:sha256:[0-9a-f]{64}$"
@@ -374,6 +376,25 @@
             "status": { "$ref": "#/$defs/knownText" }
           }
         }
+      }
+    },
+    "copyrightHeaderEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "path", "oldPath", "changeType", "sourceCommit", "targetCommit", "sourceDigest", "targetDigest", "sourceHeaderState", "targetHeaderState", "origin"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "contextual-copyright-header-v1" },
+        "path": { "$ref": "#/$defs/repositoryPath" },
+        "oldPath": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/repositoryPath" }] },
+        "changeType": { "enum": ["added", "modified", "renamed"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "targetCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sourceDigest": { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" },
+        "targetDigest": { "type": "string", "pattern": "^v1:sha256:[0-9a-f]{64}$" },
+        "sourceHeaderState": { "const": "missing" },
+        "targetHeaderState": { "enum": ["present", "missing", "absent-added"] },
+        "origin": { "enum": ["introduced", "pre-existing"] }
       }
     },
     "findingBinding": {

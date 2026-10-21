@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
 
 function Get-ApprovedOwnerV2ProviderTextSha256 {
     param(
@@ -340,6 +341,7 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
         ${function:Get-ApprovedOwnerV2ChangedSpans}
     $textSha256Command =
         ${function:Get-ApprovedOwnerV2ProviderTextSha256}
+    $copyrightEvidenceCommand = Get-Command Get-ContextualCopyrightHeaderEvidence -CommandType Function
     $newReviewerIdentityCommand =
         (Get-Command `
             New-OwnerAzureDevOpsReviewerIdentity `
@@ -787,6 +789,43 @@ function New-ApprovedOwnerV2AzureDevOpsProvider {
                         throw "Current iteration change for '$path' is missing or ambiguous."
                     }
                     $change = $matches[0]
+                    $pathSelections = @($selections | Where-Object {
+                        $_.Contains('path') -and [string]$_.path -ceq $path
+                    })
+                    $headerSelections = @($pathSelections | Where-Object {
+                        $_.Contains('scope') -and [string]$_.scope -ceq 'file-header'
+                    })
+                    if ($headerSelections.Count -gt 0) {
+                        if (@($headerSelections | Where-Object {
+                            [string]$_.ruleId -cne 'file-copyright-header'
+                        }).Count -gt 0 -or [string]$change.changeType -match '(?i)^delete') {
+                            throw 'Only current copyright findings may use file-header preflight.'
+                        }
+                        $oldPath = if ([string]$change.changeType -match '(?i)rename') {
+                            ([string]$change.originalPath).TrimStart('/')
+                        } else { $null }
+                        $sourceContent = & $getItemContent $path ([string]$liveHead.sourceCommit)
+                        $targetContent = if ([string]$change.changeType -match '(?i)^add') { '' }
+                            else {
+                                & $getItemContent $(if ($oldPath) { $oldPath } else { $path }) `
+                                    ([string]$liveHead.targetCommit)
+                            }
+                        $header = & $copyrightEvidenceCommand -Path $path -OldPath $oldPath `
+                            -ChangeType ([string]$change.changeType) `
+                            -Content $sourceContent -TargetContent $targetContent `
+                            -SourceCommit ([string]$liveHead.sourceCommit) `
+                            -TargetCommit ([string]$liveHead.targetCommit)
+                        [void]$anchors.Add([ordered]@{
+                            scope = 'file-header'
+                            path = $path
+                            startLine = 1
+                            endLine = 1
+                            changeTrackingId = [int]$change.changeTrackingId
+                            iterationId = [int]$liveHead.iterationId
+                            fileHeader = $header
+                        })
+                        if ($headerSelections.Count -eq $pathSelections.Count) { continue }
+                    }
                     $spans = @(& $getChangedSpans -Path ([string]$path) `
                             -ChangeType ([string]$change.changeType) `
                             -SourceCommit ([string]$liveHead.sourceCommit) `

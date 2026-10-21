@@ -10,6 +10,10 @@
     FunctionsToExport = @(
         'Get-ContextualConventionOutcomes',
         'Get-ContextualConventionRuleIds',
+        'Test-ContextualConventionPriorRuleIds',
+        'Get-ContextualCopyrightHeaderEvidence',
+        'Test-ContextualCopyrightHeaderEvidence',
+        'Get-ContextualCopyrightHeaderOutcome',
         'Get-ContextualPullRequestTemplateOutcome'
     )
     CmdletsToExport = @()

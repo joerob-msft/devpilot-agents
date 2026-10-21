@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+$script:ContextualDigest = 'v1:sha256:5c837b0a30fd932e4c6d6dcee86b1d33efedca11876983e6225a25b2d16fd0f6'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+$script:ContextualPolicyDigest = 'v1:sha256:8e2258d8cff763ed928cc778047c6cef6679ada9e9cbd66c345186b4a3ebb329'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -284,6 +284,18 @@ function Get-ContextualConventionMarkerKey {
         throw 'Contextual convention finding is not bound to the fixed capability.'
     }
     $anchor = $Finding.anchor
+    $fileHeaderScope = [string](Get-OwnerV2Member -Value $anchor -Name scope) -ceq 'file-header'
+    if (($fileHeaderScope -ne ([string]$Finding.ruleId -ceq 'file-copyright-header')) -or
+        ($fileHeaderScope -and (
+            [int]$anchor.line -ne 1 -or
+            [string]$anchor.symbol -cne 'copyright-header' -or
+            $Finding.fileHeader -isnot [Collections.IDictionary] -or
+            [string]$Finding.fileHeader.path -cne [string]$anchor.path -or
+            [string]$Finding.fileHeader.sourceCommit -cne [string]$request.SourceCommit -or
+            [string]$Finding.fileHeader.targetCommit -cne [string]$request.TargetCommit -or
+            [string]$Finding.fileHeader.origin -cnotin @('introduced', 'pre-existing')))) {
+        throw 'Copyright finding has no exact changed-file header binding.'
+    }
     $pullRequestScope =
         $anchor -is
             [Collections.IDictionary] -and
@@ -404,6 +416,31 @@ function Format-ContextualConventionComment {
     $path = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path (
             [string]$Finding.anchor.path))
+    if ([string](Get-OwnerV2Member -Value $Finding.anchor -Name scope) -ceq 'file-header') {
+        $policy = Get-Content -LiteralPath (
+            Join-Path $PSScriptRoot 'Policy\contextual-conventions.v1.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $reference = [string]$policy.sourceAuthority.copyrightHeader.reference
+        $origin = if ([string]$Finding.fileHeader.origin -ceq 'pre-existing') {
+            'This omission also exists in the comparison base. It is a **pre-existing, nonblocking convention issue**, not a regression introduced by this PR.'
+        }
+        else {
+            'This PR introduces the omission (a new file or removal of an existing header). This is a nonblocking convention finding.'
+        }
+        return @(
+            '**Add the standard copyright header to this file**'
+            ''
+            "The [EngHub Copyright header rule]($reference) requires the standard three-line Microsoft header before code in ``$path``."
+            ''
+            'Use dash separator comments around `// Copyright (c) Microsoft Corporation.  All rights reserved.` No year or annual rollover is required.'
+            ''
+            $origin
+            ''
+            'File-header anchor: line 1 of a file in the current changed-file inventory; this is not a claim that line 1 changed.'
+            ''
+            "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
     $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.anchor.symbol)
     return @(
@@ -565,6 +602,9 @@ function Test-ContextualPriorRuleCompatibility {
         $values
     }
     foreach ($entry in $previousEntries) {
+        if (-not (Test-ContextualConventionPriorRuleIds -Rule $entry.rule -RuleIds @($entry.unchangedRuleIds))) {
+            return $false
+        }
         $unchanged = @(
             $entry.unchangedRuleIds)
         if ([string]$entry.rule.hash -ceq
@@ -1317,6 +1357,21 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     [bool]$comment.isDeleted) {
                     continue
                 }
+                $copyrightDiscussion =
+                    [string]$finding.ruleId -ceq 'file-copyright-header' -and
+                    $null -ne $thread.anchor -and
+                    [string]$thread.anchor.path -ieq [string]$finding.anchor.path -and
+                    [regex]::IsMatch([string]$comment.body,
+                        '(?:copyright[\s\S]{0,160}header|header[\s\S]{0,160}copyright)',
+                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($copyrightDiscussion -and (
+                    [bool]$thread.isDeleted -or [bool]$thread.isOutdated -or
+                    [string]$thread.status -cne 'active' -or
+                    [string]$thread.contextState -cne 'current' -or
+                    [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit)) {
+                    $ambiguous = $true
+                    continue
+                }
                 $markerMatches = [regex]::Matches(
                     [string]$comment.body,
                     $targetPattern)
@@ -1326,6 +1381,15 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             $marker
                     })
                 if ($target.Count -gt 0) {
+                    if ([string]$finding.ruleId -ceq 'file-copyright-header' -and (
+                        -not $sameAnchor -or
+                        [bool]$thread.isDeleted -or [bool]$thread.isOutdated -or
+                        [string]$thread.status -cne 'active' -or
+                        [string]$thread.contextState -cne 'current' -or
+                        [string]$thread.sourceCommit -cne [string]$Contract.Request.SourceCommit)) {
+                        $ambiguous = $true
+                        continue
+                    }
                     if ([string]$comment.
                         reviewerIdentityState -ceq
                             'ambiguous') {
@@ -1345,7 +1409,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     }
                     continue
                 }
-                if ($sameFindingRange -and
+                if ((($sameFindingRange -and [string]$finding.ruleId -cne 'file-copyright-header') -or $copyrightDiscussion) -and
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq
@@ -1363,6 +1427,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     elseif ([string]$comment.
                         reviewerIdentityState -ceq
                             'ambiguous') {
+                        $ambiguous = $true
+                    }
+                    elseif ($copyrightDiscussion -and [bool]$comment.reviewerOwned) {
                         $ambiguous = $true
                     }
                     elseif (-not $sameAnchor -and
@@ -1414,8 +1481,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
             $sameBody =
-                Get-OwnerV1WriterSha256 -Text (
-                    [string]$entry.Comment.body) -ceq
+                (Get-OwnerV1WriterSha256 -Text (
+                    [string]$entry.Comment.body)) -ceq
                     $bodyDigest
             $finding.providerMarker =
                 New-OwnerProviderMarker `
@@ -3954,16 +4021,28 @@ function Invoke-ContextualConventionsCapabilityResponse {
     foreach ($file in $files) {
         $context = Get-OwnerV2Member `
             -Value $file.data -Name projectContext
+        $sourceState = Get-OwnerV2Member -Value $file.data -Name sourceState
+        if ($null -eq $sourceState) { $sourceState = [string]$file.state }
         $snapshotFile = [ordered]@{
                 path = [string]$file.data.path
                 content = $(if (
-                    [string]$file.state -ceq 'complete' -and
+                    [string]$sourceState -ceq 'complete' -and
                     $file.data.content -is [string]) {
                     [string]$file.data.content
                 } else { '' })
                 state = [string]$file.state
                 spans = @($file.data.spans)
+                sourceState = $(if (
+                    [bool](Get-OwnerV2Member -Value $file.data -Name truncated) -or
+                    [bool](Get-OwnerV2Member -Value $file.data -Name isBinary)) {
+                    'unknown'
+                } else { [string]$sourceState })
+                changeType = [string](Get-OwnerV2Member -Value $file.data -Name changeType)
+                fileHeader = Get-OwnerV2Member -Value $file.data -Name fileHeader
             }
+        if ([bool](Get-OwnerV2Member -Value $file.data -Name contextOnly)) {
+            $snapshotFile['contextOnly'] = $true
+        }
         if ($context -is
                 [Collections.IDictionary]) {
             $snapshotFile['projectContext'] =
@@ -3999,28 +4078,34 @@ function Invoke-ContextualConventionsCapabilityResponse {
         $data = $file.data
         $path = [string]$data.path
         $evidenceIds = @('identity', 'rule', $id)
-        if (@($data.spans).Count -eq 0) {
+        if ([bool](Get-OwnerV2Member -Value $data -Name contextOnly)) {
             continue
         }
-        if ([string]$file.state -cne 'complete' -or
-            $data -isnot [Collections.IDictionary] -or
-            $data.content -isnot [string]) {
+        $ordinaryFileComplete = @($data.spans).Count -gt 0 -and
+            [string]$file.state -ceq 'complete' -and
+            $data -is [Collections.IDictionary] -and
+            $data.content -is [string]
+        if (-not $ordinaryFileComplete -and @($data.spans).Count -gt 0) {
             foreach ($ruleId in @(
                     Get-ContextualConventionRuleIds |
                     Where-Object {
                         $_ -cne
-                            'pr-template-compliance'
+                            'pr-template-compliance' -and $_ -cne 'file-copyright-header'
                     })) {
                 [void]$withheldRules.Add(
                     [string]$ruleId)
             }
-            continue
         }
-        $outcomes =
+        $outcomes = if ($ordinaryFileComplete) {
             Get-ContextualConventionOutcomes `
                 -Content ([string]$data.content) `
                 -Path $path -Spans @($data.spans) `
                 -SnapshotFiles $snapshotFiles.ToArray()
+        }
+        else {
+            Get-ContextualCopyrightHeaderOutcome -Content ([string]$data.content) `
+                -Path $path -SnapshotFiles $snapshotFiles.ToArray()
+        }
         foreach ($outcome in $outcomes) {
             $state = [string]$outcome.state
             $ruleId = [string]$outcome.ruleId
@@ -4063,6 +4148,9 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 symbol = [string]$outcome.symbol
                 reason = [string]$outcome.reason
             }
+            if ($ruleId -ceq 'file-copyright-header') {
+                $material['fileHeader'] = $outcome.fileHeader
+            }
             $digest = (Get-OwnerV2Digest `
                     -Value $material).Substring(10)
             $constructRef = "construct:$digest"
@@ -4092,6 +4180,11 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 evidence =
                     [string]$outcome.evidence
                 reason = [string]$outcome.reason
+            }
+            if ($ruleId -ceq 'file-copyright-header') {
+                $findingData.eligibility = 'changed-file-copyright-header'
+                $findingData.anchor['scope'] = 'file-header'
+                $findingData['fileHeader'] = $outcome.fileHeader
             }
             [void]$assessments.Add([ordered]@{
                 assessmentId = $assessmentId
@@ -4390,6 +4483,10 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.reason =
                 [string](Get-OwnerV2Member `
                     -Value $data -Name reason)
+            if ([string](Get-OwnerV2Member -Value $anchor -Name scope) -ceq 'file-header') {
+                $normalizedFinding.anchor['scope'] = 'file-header'
+                $normalizedFinding['fileHeader'] = Get-OwnerV2Member -Value $data -Name fileHeader
+            }
             if ($pullRequestScope) {
                 $normalizedFinding.issueIdentity =
                     [string](Get-OwnerV2Member `
