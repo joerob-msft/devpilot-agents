@@ -418,7 +418,7 @@ function Assert-StalePrEvidence {
         [string]$Evidence.targetCommit -cnotmatch '^[0-9a-f]{40}$' -or
         [int]$Evidence.iterationId -lt 0 -or
         [string]$Evidence.activityDigest -cnotmatch
-            '^[0-9a-f]{64}$' -or
+            '^v1:sha256:[0-9a-f]{64}$' -or
         $Evidence.complete -isnot [bool]) {
         throw 'Stale PR lifecycle evidence is malformed.'
     }
@@ -517,6 +517,11 @@ function New-StalePrAzureDevOpsProvider {
     }
     else {
         { [DateTime]::UtcNow }
+    }
+    $runBudget = [pscustomobject]@{
+        Count = 0
+        DeadlineUtc = (& $getUtcNow).
+            AddSeconds($maximumSeconds)
     }
     $convertUtcCommand =
         ${function:ConvertTo-StalePrUtc}
@@ -619,13 +624,8 @@ function New-StalePrAzureDevOpsProvider {
     }.GetNewClosure()
     $readEvidence = {
         param([long]$PullRequestId)
-        $budget = [pscustomobject]@{
-            Count = 0
-            DeadlineUtc = (& $getUtcNow).
-                AddSeconds($maximumSeconds)
-        }
         $pushDates = @{}
-        $pr = & $read 'pullRequests' $PullRequestId $budget
+        $pr = & $read 'pullRequests' $PullRequestId $runBudget
         if ($pr.repository -isnot [Collections.IDictionary] -or
             [string]$pr.repository.id -ine $repositoryId -or
             $pr.repository.project -isnot
@@ -634,9 +634,9 @@ function New-StalePrAzureDevOpsProvider {
             throw 'stale-pr-repository-mismatch'
         }
         $iterations = & $read 'pullRequestIterations' `
-            $PullRequestId $budget
+            $PullRequestId $runBudget
         $threads = & $read 'pullRequestThreads' `
-            $PullRequestId $budget
+            $PullRequestId $runBudget
         if ($null -ne $iterations.continuation_token -or
             [int]$iterations.count -ne @($iterations.value).Count -or
             $null -ne $threads.continuation_token -or
@@ -670,14 +670,14 @@ function New-StalePrAzureDevOpsProvider {
             '^refs/heads/(?<filter>.+)$') {
             throw 'stale-pr-source-ref-invalid'
         }
-        if ([int]$budget.Count -ge $readCeiling) {
+        if ([int]$runBudget.Count -ge $readCeiling) {
             throw 'stale-pr-read-budget-exhausted'
         }
         if ((& $getUtcNow) -ge
-            [DateTime]$budget.DeadlineUtc) {
+            [DateTime]$runBudget.DeadlineUtc) {
             throw 'stale-pr-deadline-exhausted'
         }
-        $budget.Count++
+        $runBudget.Count++
         $refs = & $invoke @(
             'devops', 'invoke',
             '--organization', $organization,
@@ -696,7 +696,7 @@ function New-StalePrAzureDevOpsProvider {
             '--only-show-errors'
         )
         if ((& $getUtcNow) -ge
-            [DateTime]$budget.DeadlineUtc) {
+            [DateTime]$runBudget.DeadlineUtc) {
             throw 'stale-pr-deadline-exhausted'
         }
         $matchingRefs = @($refs.value | Where-Object {
@@ -740,7 +740,7 @@ function New-StalePrAzureDevOpsProvider {
                     }
                     else {
                         try {
-                            $push = & $readPush $pushId $budget
+                            $push = & $readPush $pushId $runBudget
                         }
                         catch {
                             $pushFailure =
@@ -878,14 +878,9 @@ function New-StalePrAzureDevOpsProvider {
                     [long]$Arguments.pullRequestId)
             }
             ReadStatus {
-                $budget = [pscustomobject]@{
-                    Count = 0
-                    DeadlineUtc = (& $getUtcNow).
-                        AddSeconds($maximumSeconds)
-                }
                 $pr = & $read 'pullRequests' `
                     ([long]$Arguments.pullRequestId) `
-                    $budget
+                    $runBudget
                 return [ordered]@{
                     pullRequestId = [long]$pr.pullRequestId
                     status = [string]$pr.status

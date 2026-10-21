@@ -58,6 +58,7 @@ BeforeAll {
             creationUtc = $CreationUtc
             latestActivityUtc = $ActivityUtc
             activityDigest =
+                'v1:sha256:' +
                 $IterationId.ToString('x').PadLeft(64, '0')
             complete = $Complete
         }
@@ -207,7 +208,9 @@ BeforeAll {
                     'mismatched-id', 'mismatched-repository',
                     'mismatched-project')]
                 [string]$PushDetail = 'valid',
-                [AllowNull()][ref]$PushDetailReads
+                [AllowNull()][ref]$PushDetailReads,
+                [AllowNull()][ref]$GetReads,
+                [AllowNull()][ref]$PatchCalls
             )
             $handler = {
                 param($Arguments, $InputPath)
@@ -225,14 +228,47 @@ BeforeAll {
                         '--resource')
                 $resource = [string]$Arguments[
                     $resourceIndex + 1]
+                $method = 'GET'
+                $methodIndex = [Array]::IndexOf(
+                    [object[]]$Arguments,
+                    '--http-method')
+                if ($methodIndex -ge 0) {
+                    $method = [string]$Arguments[
+                        $methodIndex + 1]
+                }
+                if ($method -ceq 'GET' -and
+                    $null -ne $GetReads) {
+                    $GetReads.Value++
+                }
+                if ($method -ceq 'PATCH' -and
+                    $null -ne $PatchCalls) {
+                    $PatchCalls.Value++
+                }
+                $pullRequestId = 1
+                $routeIndex = [Array]::IndexOf(
+                    [object[]]$Arguments,
+                    '--route-parameters')
+                if ($routeIndex -ge 0) {
+                    foreach ($argument in @(
+                            $Arguments |
+                                Select-Object `
+                                    -Skip ($routeIndex + 1))) {
+                        if ([string]$argument -match
+                            '^pullRequestId=(?<id>[0-9]+)$') {
+                            $pullRequestId =
+                                [long]$Matches.id
+                            break
+                        }
+                    }
+                }
                 switch ($resource) {
                     pullRequests {
                         return @{
-                            pullRequestId = 1
+                            pullRequestId = $pullRequestId
                             status = 'active'
                             isDraft = $false
                             sourceRefName =
-                                'refs/heads/feature-1'
+                                "refs/heads/feature-$pullRequestId"
                             targetRefName =
                                 'refs/heads/master'
                             creationDate =
@@ -348,7 +384,7 @@ BeforeAll {
                             continuation_token = $null
                             value = @(@{
                                     name =
-                                        'refs/heads/feature-1'
+                                        "refs/heads/feature-$pullRequestId"
                                     objectId = 'a' * 40
                                 })
                         }
@@ -828,6 +864,97 @@ Describe 'Stale PR lifecycle decision and transition' {
                 [string]$_.reason -ceq 'run-cap-reached'
             }) | Should -HaveCount 1
     }
+
+    It 'consumes actual-provider-shaped canonical evidence through prewrite' {
+        $eligible = New-LifecycleEvidence `
+            -Id 1637334 `
+            -CreationUtc '2019-04-30T22:06:23Z' `
+            -ActivityUtc '2020-01-01T00:00:00Z'
+        $recent118 = New-LifecycleEvidence `
+            -Id 1182097 `
+            -CreationUtc '2018-10-25T00:30:22Z' `
+            -ActivityUtc '2026-10-20T18:30:22Z'
+        $recent120 = New-LifecycleEvidence `
+            -Id 1200303 `
+            -CreationUtc '2018-11-01T18:36:27Z' `
+            -ActivityUtc '2026-10-20T18:45:00Z'
+        $provider = New-LifecycleProvider -EvidenceById @{
+            1637334 = $eligible
+            1182097 = $recent118
+            1200303 = $recent120
+        }
+        $result = Invoke-LifecycleCase `
+            -Provider $provider.Handler `
+            -CutoffUtc ([DateTime]::SpecifyKind(
+                [DateTime]'2025-10-20T16:45:00',
+                [DateTimeKind]::Utc)) `
+            -Inventory @(
+                [ordered]@{
+                    pullRequestId = 1182097
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2018-10-25T00:30:22Z'
+                },
+                [ordered]@{
+                    pullRequestId = 1200303
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2018-11-01T18:36:27Z'
+                },
+                [ordered]@{
+                    pullRequestId = 1637334
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2019-04-30T22:06:23Z'
+                })
+
+        $eligible.activityDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $result.providerWrites | Should -Be 1
+        $result.confirmedAbandonedIds | Should -Be @(1637334)
+        @($provider.Calls | Where-Object {
+                $_ -ceq 'ReadEvidence:1637334'
+            }) | Should -HaveCount 2
+        @($provider.Calls | Where-Object {
+                $_ -ceq 'AbandonStatus:1637334'
+            }) | Should -HaveCount 1
+        @($provider.Calls | Where-Object {
+                $_ -like 'AbandonStatus:1182097' -or
+                $_ -like 'AbandonStatus:1200303'
+            }) | Should -HaveCount 0
+    }
+
+    It 'fails closed for a missing or malformed canonical activity prefix' `
+        -TestCases @(
+            @{ Digest = 'a' * 64 }
+            @{ Digest = 'sha256:' + ('a' * 64) }
+            @{ Digest = $null }
+        ) {
+        param($Digest)
+        $evidence = New-LifecycleEvidence -Id 1637334
+        $evidence.activityDigest = $Digest
+        $provider = New-LifecycleProvider -EvidenceById @{
+            1637334 = $evidence
+        }
+        $result = Invoke-LifecycleCase `
+            -Provider $provider.Handler `
+            -Inventory @([ordered]@{
+                    pullRequestId = 1637334
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2019-04-30T22:06:23Z'
+                })
+
+        $result.providerWrites | Should -Be 0
+        @($result.decisions) | Should -HaveCount 1
+        $result.decisions[0].state | Should -BeExactly unknown
+        $result.decisions[0].reason |
+            Should -BeExactly activity-evidence-unknown
+    }
 }
 
 Describe 'Stale lifecycle acquisition ordering' {
@@ -1087,6 +1214,195 @@ Describe 'Stale lifecycle provider authority source' {
                 pullRequestId = 1
             }
         } | Should -Throw "*$expected*"
+    }
+
+    It 'shares one read budget across candidates and stops the second' {
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $boundedConfig.subjectProvider.maximumReads = 6
+        $boundedConfig.limits.maxReads = 100
+        $getReads = [ref]0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $boundedConfig -Invoker (
+                New-AzLifecycleInvoker `
+                    -ActualCommentUtc '2026-01-02T00:00:00Z' `
+                    -GetReads $getReads)
+        $root = New-LifecycleRoot
+        try {
+            $result = Invoke-StalePrLifecycle `
+                -Inventory @(
+                    [ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    },
+                    [ordered]@{
+                        pullRequestId = 2
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    },
+                    [ordered]@{
+                        pullRequestId = 3
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider
+        }
+        finally {
+            [Array]::Clear(
+                $root.Key, 0, $root.Key.Length)
+        }
+
+        $result.providerWrites | Should -Be 0
+        @($result.decisions) | Should -HaveCount 1 `
+            -Because (
+                $result | ConvertTo-Json -Depth 8 -Compress)
+        $result.decisions[0].pullRequestId | Should -Be 2
+        $result.decisions[0].state | Should -BeExactly deferred
+        $result.decisions[0].reason |
+            Should -BeExactly stale-pr-read-budget-exhausted
+        @($result.decisions | Where-Object {
+                [long]$_.pullRequestId -eq 3
+            }) | Should -HaveCount 0
+        $getReads.Value | Should -Be 6
+    }
+
+    It 'shares one elapsed deadline across candidates' {
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $start = [DateTime]::SpecifyKind(
+            [DateTime]'2026-01-01T00:00:00',
+            [DateTimeKind]::Utc)
+        $clockCalls = [ref]0
+        $clock = {
+            $clockCalls.Value++
+            if ($clockCalls.Value -lt 12) {
+                return $start
+            }
+            return $start.AddSeconds(
+                [int]$boundedConfig.limits.maxSeconds + 1)
+        }.GetNewClosure()
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $boundedConfig `
+            -UtcNowProvider $clock -Invoker (
+                New-AzLifecycleInvoker `
+                    -ActualCommentUtc '2026-01-02T00:00:00Z')
+        $root = New-LifecycleRoot
+        try {
+            $result = Invoke-StalePrLifecycle `
+                -Inventory @(
+                    [ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    },
+                    [ordered]@{
+                        pullRequestId = 2
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    },
+                    [ordered]@{
+                        pullRequestId = 3
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider
+        }
+        finally {
+            [Array]::Clear(
+                $root.Key, 0, $root.Key.Length)
+        }
+
+        $result.providerWrites | Should -Be 0
+        @($result.decisions) | Should -HaveCount 1 `
+            -Because (
+                $result | ConvertTo-Json -Depth 8 -Compress)
+        $result.decisions[0].pullRequestId | Should -Be 2
+        $result.decisions[0].state | Should -BeExactly deferred
+        $result.decisions[0].reason |
+            Should -BeExactly stale-pr-deadline-exhausted
+        @($result.decisions | Where-Object {
+                [long]$_.pullRequestId -eq 3
+            }) | Should -HaveCount 0
+    }
+
+    It 'keeps readback exhaustion ambiguous with one PATCH and no retry' {
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $boundedConfig.subjectProvider.maximumReads = 128
+        $patchCalls = [ref]0
+        $start = [DateTime]::SpecifyKind(
+            [DateTime]'2026-01-01T00:00:00',
+            [DateTimeKind]::Utc)
+        $clock = {
+            if ($patchCalls.Value -eq 0) {
+                return $start
+            }
+            return $start.AddSeconds(
+                [int]$boundedConfig.limits.maxSeconds + 1)
+        }.GetNewClosure()
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $boundedConfig `
+            -UtcNowProvider $clock -Invoker (
+                New-AzLifecycleInvoker `
+                    -PatchCalls $patchCalls)
+        $root = New-LifecycleRoot
+        try {
+            $result = Invoke-StalePrLifecycle `
+                -Inventory @([ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc ([DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)) `
+                -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $provider
+        }
+        finally {
+            [Array]::Clear(
+                $root.Key, 0, $root.Key.Length)
+        }
+
+        $result.providerWrites | Should -Be 1
+        @($result.decisions) | Should -HaveCount 1
+        $result.decisions[0].reason |
+            Should -BeExactly ambiguous-post-write
+        $result.confirmedAbandonedIds |
+            Should -BeNullOrEmpty
+        @($result.events) | Should -HaveCount 1
+        $result.events[0].providerWriteCount | Should -Be 1
+        $result.events[0].providerWriteState |
+            Should -BeExactly unknown
     }
 
     It 'fails closed for unavailable malformed or mismatched push detail' `

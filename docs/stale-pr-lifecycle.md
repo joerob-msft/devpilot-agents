@@ -47,6 +47,12 @@ Missing continuation proof, count mismatches, malformed timestamps, unknown
 comment types, inconsistent source refs, unavailable endpoints, or any other
 ambiguous required evidence produce `unknown` and zero writes.
 
+All lifecycle reads in one provider instance share the lower configured read
+ceiling and one deadline. The counters are not reset per PR, prewrite, push
+detail, or readback. Exhaustion before a decision or prewrite defers that PR
+with zero writes and stops the run. Exhaustion after the single PATCH leaves
+the transition ambiguous and never authorizes a retry.
+
 ## Checked transition
 
 The initial decision is read-only. Immediately before a write, the lifecycle
