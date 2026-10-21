@@ -32,6 +32,16 @@
       "pullRequestId": 17562908,
       "threadId": 266816420
     },
+    "reusedStringLiterals": {
+      "authorityState": "user-directed canonical coding style and review example",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "heading": "Declare constants for re-used strings",
+      "lines": [706, 711],
+      "pullRequestId": 17431492,
+      "threadId": 267231842
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -70,6 +80,13 @@
       "id": "duplicate-constant-declarations",
       "name": "Consolidate duplicated constants for one proven shared contract",
       "sourceSection": "User-directed review thread 266816420"
+    },
+    {
+      "id": "reused-string-literals",
+      "name": "Declare constants for reused literal strings at their shared ownership scope",
+      "sourceSection": "Declare constants for re-used strings",
+      "scope": "changed literal uses with exact decoded C# string identity in the bounded full-PR snapshot",
+      "placement": "private const string atop one class; public const string in a common project Constants class across classes; lowest common project dependency across projects without guessing an unproven dependency"
     },
     {
       "id": "collection-cardinality",

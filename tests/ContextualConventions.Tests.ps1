@@ -211,9 +211,13 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed twenty-two-rule allow set' {
+    It 'exports the fixed twenty-three-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 22
+            Should -HaveCount 23
+        $policy = Get-Content "$PSScriptRoot\..\src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json" -Raw |
+            ConvertFrom-Json -AsHashtable
+        @($policy.rules.id | Sort-Object) |
+            Should -Be @(Get-ContextualConventionRuleIds | Sort-Object)
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -223,6 +227,142 @@ Describe 'Contextual convention analyzer' {
         $result.state | Should -BeExactly 'violation'
         $result.line | Should -BeGreaterThan 0
         $result.evidence | Should -Not -BeNullOrEmpty
+    }
+
+    It 'declares reused string constants within one class without comparing constant declarations' {
+        $content = @'
+class C {
+    string First() => "wire";
+    string Second() => "wire";
+}
+'@
+        $result = Invoke-ConventionCase -RuleId reused-string-literals -Content $content
+        $result.state | Should -BeExactly violation
+        $result.line | Should -Be 2
+        $result.endLine | Should -Be 3
+        $result.evidence | Should -Match 'private const string atop the class'
+        $result.literalValues | Should -Be @('wire')
+        $result.relatedUses | Should -HaveCount 2
+        (Invoke-ConventionCase -RuleId duplicate-constant-declarations -Content $content).state |
+            Should -BeExactly compliant
+    }
+
+    It 'uses decoded identity for <Literal> rather than raw spelling' -TestCases @(
+        @{ Literal = '"wire"' }
+        @{ Literal = '"\u0077ire"' }
+        @{ Literal = '@"wire"' }
+        @{ Literal = '"""wire"""' }
+    ) {
+        param($Literal)
+        $content = 'class C { string First() => "wire"; string Second() => ' + $Literal + '; }'
+        $files = @(@{
+            path='src/Changed.cs';state='complete';content=$content
+            projectContext=@{state='complete';path='src/App.csproj';content='<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'}
+        })
+        $result = Invoke-ConventionCase -RuleId reused-string-literals -Content $content -SnapshotFiles $files
+        $result.state | Should -BeExactly violation
+        $result.literalValues | Should -Be @('wire')
+        $result.relatedUses | Should -HaveCount 2
+    }
+
+    It 'selects project constants across types including types in the same file' {
+        $result = Invoke-ConventionCase -RuleId reused-string-literals -Content @'
+namespace N {
+class First { string Value => "shared"; }
+class Second { string Value => "shared"; }
+}
+'@
+        $result.state | Should -BeExactly violation
+        $result.evidence | Should -Match 'common Constants class for the project'
+        $result.line | Should -Be 2
+        $result.relatedUses | Should -HaveCount 2
+    }
+
+    It 'keeps canonically equivalent Unicode strings ordinally distinct' {
+        $content='class C { string A => "\u00e9"; string B => "\u00e9"; string Cc => "e\u0301"; string D => "e\u0301"; }'
+        $result=Invoke-ConventionCase -RuleId reused-string-literals -Content $content
+        $result.state | Should -BeExactly violation
+        $result.literalValues | Should -HaveCount 2
+        $result.relatedUses | Should -HaveCount 4
+    }
+
+    It 'keeps case-distinct C# types in separate ownership scopes' {
+        $result=Invoke-ConventionCase -RuleId reused-string-literals `
+            -Content 'class C { string A => "wire"; } class c { string B => "wire"; }'
+        $result.state | Should -BeExactly violation
+        $result.evidence | Should -Match 'common Constants class for the project'
+    }
+
+    It 'does not treat <Case> as reused changed literal strings' -TestCases @(
+        @{ Case = 'unique values'; Content = 'class C { string A => "one"; string B => "two"; }'; Path = 'src/C.cs' }
+        @{ Case = 'case-different values'; Content = 'class C { string A => "wire"; string B => "WIRE"; }'; Path = 'src/C.cs' }
+        @{ Case = 'constant member uses'; Content = 'class C { private const string Key = "wire"; string A => Key; string B => C.Key; }'; Path = 'src/C.cs' }
+        @{ Case = 'duplicate constant declarations'; Content = 'class C { const string A = "wire"; const string B = "wire"; }'; Path = 'src/C.cs' }
+        @{ Case = 'comments and attributes'; Content = '[Description("wire")] class C { /* "wire" */ string A => "wire"; }'; Path = 'src/C.cs' }
+        @{ Case = 'localized resources'; Content = 'class C { string A => Resources.Message.ToLocalizedMessage(); string B => Resources.Message.ToLocalizedMessage(); }'; Path = 'src/C.cs' }
+        @{ Case = 'generated files'; Content = 'class C { string A => "wire"; string B => "wire"; }'; Path = 'src/C.g.cs' }
+        @{ Case = 'generated headers'; Content = "// <auto-generated>`nclass C { string A => `"wire`"; string B => `"wire`"; }"; Path = 'src/C.cs' }
+    ) {
+        param($Case, $Content, $Path)
+        (Invoke-ConventionCase -RuleId reused-string-literals -Content $Content -Path $Path).state |
+            Should -BeExactly compliant
+    }
+
+    It 'keeps old repetitions outside the changed use anchor' {
+        $content = @'
+class C {
+    string A => "old";
+    string B => "old";
+    string Added => "new";
+}
+'@
+        $file = [ordered]@{
+            path = 'src/C.cs'; content = $content; state = 'complete'
+            spans = @(@{ startLine = 4; endLine = 4 })
+            projectContext = @{ state = 'complete'; path = 'src/App.csproj'; content = '<Project />' }
+        }
+        $result = @(Get-ContextualConventionOutcomes -Content $content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object ruleId -CEQ reused-string-literals)
+        $result | Should -HaveCount 1
+        $result[0].state | Should -BeExactly compliant
+    }
+
+    It 'excludes only proved test project repetitions and withholds <Proof>' -TestCases @(
+        @{ Proof = 'test'; Project = @{state='complete';path='src/App.csproj';content='<Project><PropertyGroup><IsTestProject>true</IsTestProject></PropertyGroup></Project>'}; Expected = 'compliant' }
+        @{ Proof = 'explicit non-test'; Project = @{state='complete';path='src/App.csproj';content='<Project><PropertyGroup><IsTestProject>false</IsTestProject></PropertyGroup></Project>'}; Expected = 'violation' }
+        @{ Proof = 'missing project'; Project = @{state='unknown';reason='missing'}; Expected = 'unknown' }
+        @{ Proof = 'malformed project'; Project = @{state='complete';path='src/App.csproj';content='<Project>'}; Expected = 'unknown' }
+        @{ Proof = 'conditional project'; Project = @{state='complete';path='src/App.csproj';content='<Project><PropertyGroup><LangVersion Condition="unproved">latest</LangVersion></PropertyGroup></Project>'}; Expected = 'unknown' }
+        @{ Proof = 'stale project'; Project = @{state='complete';path='src/App.csproj';content='<Project />';sourceDigest=('v1:sha256:' + ('0' * 64))}; Expected = 'unknown' }
+        @{ Proof = 'foreign project'; Project = @{state='complete';path='other/App.csproj';content='<Project />'}; Expected = 'unknown' }
+        @{ Proof = 'conditional test membership'; Project = @{state='complete';path='src/App.csproj';content='<Project><PropertyGroup Condition="unproved"><IsTestProject>true</IsTestProject></PropertyGroup></Project>'}; Expected = 'unknown' }
+    ) {
+        param($Proof, $Project, $Expected)
+        $content = 'class C { string A => "wire"; string B => "wire"; }'
+        $files = @(@{ path = 'src/C.cs'; state = 'complete'; content = $content; projectContext = $Project })
+        (Invoke-ConventionCase -RuleId reused-string-literals -Content $content -Path 'src/C.cs' -SnapshotFiles $files).state |
+            Should -BeExactly $Expected
+    }
+
+    It 'withholds conditional and incomplete peer evidence instead of claiming a clean result' {
+        foreach ($content in @(
+                "#if FEATURE`nclass C { string A => `"wire`"; string B => `"wire`"; }`n#endif",
+                'class C { string A => "wire"; }')) {
+            $files = @(
+                @{path='src/C.cs';state='complete';content=$content;projectContext=@{state='complete';path='src/App.csproj';content='<Project />'}},
+                @{path='src/Peer.cs';state='unknown';content=''}
+            )
+            (Invoke-ConventionCase -RuleId reused-string-literals -Content $content -Path 'src/C.cs' -SnapshotFiles $files).state |
+                Should -BeExactly unknown
+        }
+
+    }
+
+    It 'withholds raw literal equality under a project language version that cannot compile it' {
+        (Invoke-ConventionCase -RuleId reused-string-literals `
+            -Content 'class C { string A => "wire"; string B => """wire"""; }').state |
+            Should -BeExactly unknown
     }
 
     It 'honors the documented <Rule> exemption' -TestCases $script:Cases {
@@ -1073,11 +1213,11 @@ internal const string Value = "same";
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 22
+            $outcomes | Should -HaveCount 23
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 21
+                }) | Should -HaveCount 22
         }
     }
 

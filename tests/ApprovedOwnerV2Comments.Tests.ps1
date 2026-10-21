@@ -1647,6 +1647,25 @@ Describe 'Approved Owner v2 live safety boundary' {
             Should -Contain ThirdPreviousRuleLength
         $automaticTool.Parameters.Keys |
             Should -Contain ThirdUnchangedRuleId
+        $automaticTool.Parameters.Keys | Should -Contain FourthPreviousRuleHash
+        $automaticTool.Parameters.Keys | Should -Contain FourthPreviousRuleLength
+        $automaticTool.Parameters.Keys | Should -Contain FourthUnchangedRuleId
+    }
+
+    It 'never promotes the new reused literal rule from an older signed bundle' {
+        $compatibility = @{
+            schemaVersion = 2
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRules = @(@{
+                    rule = @{hash='v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac';length=6249}
+                    unchangedRuleIds = @('reused-string-literals')
+                })
+            currentRule = @{hash='v1:sha256:da54847775d5db88d0c2f5e760db3edafd855bc624bdd67d341900cded9e211e';length=7266}
+        }
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility -Compatibility $compatibility `
+                -CurrentRule $compatibility.currentRule -AllowedRuleIds @('reused-string-literals')
+        } | Should -Throw '*unchangedRuleIds*invalid*'
     }
 }
 

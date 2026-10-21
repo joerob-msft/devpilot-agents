@@ -12,6 +12,8 @@ BeforeAll {
         'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psd1') -Force
     Import-Module (Join-Path $repoRoot `
         'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
+        'src\DevPilot.OwnerOrchestrator\DevPilot.OwnerOrchestrator.psd1') -Force
     . (Join-Path $repoRoot `
         'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
 
@@ -320,6 +322,62 @@ Describe what validations are needed:
                 Join-Path $TestDrive "$Name-manifest.json") `
             -RepositoryRoot $repoRoot `
             -PreparedIntake $Prepared.Intake -Run
+    }
+
+    function New-ReusedStringPreparedIntake {
+        param([switch]$Reverse, [switch]$SameProject, [switch]$ContextOnlyPeer)
+        $prepared = New-ContextualPreparedIntake
+        $entries = @(
+            @{ path = 'src/A/Reader.cs'; content = @'
+class Reader {
+    string Old(Exception ex) => ex.Data["LegacyKey"] as string;
+    string Credential(Exception ex) => ex.Data["CredentialHandle"] as string;
+    string Group(Exception ex) => ex.Data["GroupIdentity"] as string;
+    string Endpoint(Exception ex) => ex.Data["EndpointUri"] as string;
+}
+'@ },
+            @{ path = 'src/B/Writer.cs'; content = @'
+class Writer {
+    void Old(Exception ex) { ex.Data["LegacyKey"] = null; }
+    void Credential(Exception ex) { ex.Data["CredentialHandle"] = null; }
+    void Group(Exception ex) { ex.Data["GroupIdentity"] = null; }
+    void Endpoint(Exception ex) { ex.Data["EndpointUri"] = null; }
+}
+'@ }
+        )
+        $ordinal = 0
+        foreach ($entry in $entries) {
+            $ordinal++
+            $projectContent = '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+            $entry.changeTrackingId = $ordinal
+            $entry.changeType = 'edit'
+            $entry.state = 'complete'
+            $entry.sourceDigest = Get-ContextualTestTextDigest $entry.content
+            $entry.byteLength = [Text.Encoding]::UTF8.GetByteCount($entry.content)
+            $entry.spans = @(@{
+                    startLine = 3; endLine = 5; state = 'complete'
+                    sourceDigest = $entry.sourceDigest
+                })
+            $entry.projectContext = @{
+                state = 'complete'
+                path = $(if ($SameProject) { 'src/App.csproj' } else {
+                    'src/' + $(if ($ordinal -eq 1) { 'A' } else { 'B' }) + '/App.csproj'
+                })
+                content = $projectContent
+                byteLength = [Text.Encoding]::UTF8.GetByteCount($projectContent)
+                sourceDigest = Get-ContextualTestTextDigest $projectContent
+            }
+            if ($ContextOnlyPeer -and $ordinal -eq 2) {
+                $entry.spans = @()
+                $entry.contextOnly = $true
+            }
+        }
+        if ($Reverse) { [array]::Reverse($entries) }
+        $changes = $prepared.Intake.transientSnapshots['42'].changes
+        $changes.entries = $entries
+        $changes.changedFiles = 2
+        $changes.changedLines = $(if ($ContextOnlyPeer) { 3 } else { 6 })
+        return $prepared
     }
 
     function New-SyntheticPrTemplateReviewerComment {
@@ -828,6 +886,162 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'carries both literal contract sides through acquisition and capability in <Mode> order' -TestCases @(
+        @{ Mode = 'reader-first'; Reverse = $false; SameProject = $false; ContextOnlyPeer = $false }
+        @{ Mode = 'writer-first'; Reverse = $true; SameProject = $false; ContextOnlyPeer = $false }
+        @{ Mode = 'same-project'; Reverse = $false; SameProject = $true; ContextOnlyPeer = $false }
+        @{ Mode = 'context-only-peer'; Reverse = $false; SameProject = $false; ContextOnlyPeer = $true }
+    ) {
+        param($Mode, $Reverse, $SameProject, $ContextOnlyPeer)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake -Reverse:$Reverse `
+            -SameProject:$SameProject -ContextOnlyPeer:$ContextOnlyPeer
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name "literal-$Mode"
+        $result.records | Should -HaveCount 1 -Because ($result | ConvertTo-Json -Depth 16 -Compress)
+        $observationPath = @(Get-ChildItem (Join-Path $TestDrive "literal-$Mode-state") `
+            -Recurse -File -Filter "$($result.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
+        $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $findings = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+        $findings | Should -HaveCount 1 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $finding = $findings[0]
+        $finding.anchor.path | Should -BeExactly 'src/A/Reader.cs'
+        $finding.binding.span.startLine | Should -Be 3
+        $finding.binding.span.endLine | Should -Be 5
+        $finding.literalValues | Should -Be @('CredentialHandle', 'EndpointUri', 'GroupIdentity')
+        $finding.literalValues | Should -Not -Contain LegacyKey
+        $finding.relatedUses | Should -HaveCount 6
+        $finding.reconciliation.classification | Should -BeExactly wouldCreate
+        $finding.evidence | Should -Match $(if ($SameProject) {
+            'common Constants class for the project'
+        } else { 'lowest common project dependency' })
+        $finding.evidence | Should -Not -Match 'src/A/App|src/B/App'
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $request = & (Get-Module DevPilot.OwnerOrchestrator) {
+            param($Path)
+            (Read-OwnerV2Manifest -ManifestPath $Path).Entries[0].Contract
+        } $result.manifestPath
+        $evidence = @{Declaration=@{capability=@{id=$config.capability.id}};Contract=$request}
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+        $proposal.line | Should -Be 3
+        $proposal.endLine | Should -Be 5
+        $proposal.body | Should -Match 'Declare constants'
+    }
+
+    It 'keeps one stable marker for the same literal cluster under reversed snapshot acquisition' {
+        $markers=@()
+        foreach($reverse in @($false,$true)) {
+            $config=New-ContextualTestConfig; $config.enabled=$true
+            $prepared=New-ReusedStringPreparedIntake -Reverse:$reverse
+            $name="literal-stable-$reverse"
+            $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+            $result.records | Should -HaveCount 1
+            $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+                -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+            $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+            $finding=@($observation.findings | Where-Object ruleId -CEQ reused-string-literals)[0]
+            $markers += $finding.providerMarker.sha256
+        }
+        $markers[0] | Should -BeExactly $markers[1]
+    }
+
+    It 'reconciles the shared literal contract with <Coverage> human evidence' -TestCases @(
+        @{ Coverage = 'peer anchor'; Line = 3; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused by writer and reader.'; Expected = 'humanCovered' }
+        @{ Coverage = 'range-start with pinned use citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'humanCovered' }
+        @{ Coverage = 'unrelated same-anchor review'; Line = 3; Body = 'Please improve error handling.'; Expected = 'unknown' }
+        @{ Coverage = 'only one covered value'; Line = 3; Body = 'Declare a shared constant for CredentialHandle.'; Expected = 'unknown' }
+        @{ Coverage = 'stale citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC0000000000000000000000000000000000000000&path=/src/B/Writer.cs&line=3'; Expected = 'wouldCreate' }
+        @{ Coverage = 'markerless configured reviewer'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'unknown' }
+    ) {
+        param($Coverage, $Line, $Body, $Expected)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake
+        $prepared.Intake.transientSnapshots['42'].discussions = @{
+            count = 1
+            threads = @(@{
+                    id = 100; status = 'active'; isDeleted = $false
+                    threadContext = @{
+                        filePath = '/src/B/Writer.cs'
+                        rightFileStart = @{line=$Line;offset=1}
+                        rightFileEnd = @{line=5;offset=1}
+                    }
+                    pullRequestThreadContext = @{
+                        changeTrackingId = 2
+                        iterationContext = @{firstComparingIteration=3;secondComparingIteration=3}
+                    }
+                    comments = @(@{
+                            id=1;commentType='text';content=($Body -f $prepared.Head.sourceCommit)
+                            author = $(if ($Coverage -ceq 'markerless configured reviewer') {
+                                @{
+                                    id=$config.expectedAccount.id
+                                    descriptor=$config.expectedAccount.descriptor
+                                    uniqueName=$config.expectedAccount.uniqueName
+                                }
+                            } else {
+                                @{id='44444444-4444-4444-4444-444444444444';descriptor='aad.human';uniqueName='human@example.invalid'}
+                            })
+                        })
+                })
+        }
+        $name = 'human-literal-' + ($Coverage -replace '[^a-z]', '-')
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1 -Because ($result | ConvertTo-Json -Depth 16 -Compress)
+        $observationPath = @(Get-ChildItem (Join-Path $TestDrive "$name-state") `
+            -Recurse -File -Filter "$($result.records[0].identity).json" |
+            Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
+        $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $finding = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+        $finding | Should -HaveCount 1 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $finding[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.providerWrites | Should -Be 0
+    }
+
+    It 'does not deliver a reused literal for the <Control> full-PR negative' -TestCases @(
+        @{Control='single occurrence'}
+        @{Control='constant member references'}
+        @{Control='old code'}
+        @{Control='unproved project'}
+    ) {
+        param($Control)
+        $config=New-ContextualTestConfig
+        $config.enabled=$true
+        $prepared=New-ReusedStringPreparedIntake
+        $changes=$prepared.Intake.transientSnapshots['42'].changes
+        if ($Control -ceq 'single occurrence') {
+            $changes.entries=@($changes.entries[0]); $changes.changedFiles=1; $changes.changedLines=3
+        }
+        foreach($entry in $changes.entries) {
+            switch($Control) {
+                'constant member references' {
+                    $entry.content=$entry.content.Replace('["CredentialHandle"]','[Keys.CredentialHandle]').
+                        Replace('["GroupIdentity"]','[Keys.GroupIdentity]').Replace('["EndpointUri"]','[Keys.EndpointUri]')
+                    $entry.sourceDigest=Get-ContextualTestTextDigest $entry.content
+                    $entry.byteLength=[Text.Encoding]::UTF8.GetByteCount($entry.content)
+                    $entry.spans[0].sourceDigest=$entry.sourceDigest
+                }
+                'old code' { $entry.spans[0].startLine=6; $entry.spans[0].endLine=6; $changes.changedLines=2 }
+                'unproved project' { $entry.projectContext=@{state='unknown';reason='project-context-ambiguous'} }
+            }
+        }
+        $name='negative-literal-' + ($Control -replace ' ','-')
+        $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1
+        $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+            -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+        $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings | Where-Object ruleId -CEQ reused-string-literals) | Should -HaveCount 0
+        if($Control -ceq 'unproved project') {
+            @($observation.outcomes | Where-Object {
+                $_.Contains('ruleId') -and $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
+        }
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
     It 'requires the contextual shared acquisition template authority switch to be literal true' {
         foreach ($value in @(
                 $false,
@@ -958,8 +1172,8 @@ Describe 'Contextual convention current PR bridge' {
                 ConvertFrom-Json -AsHashtable `
                     -Depth 32).rules.id |
                     Where-Object {
-                        [string]$_ -cne
-                            'pr-template-compliance'
+                        [string]$_ -cnotin @(
+                            'pr-template-compliance', 'reused-string-literals')
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -992,11 +1206,20 @@ Describe 'Contextual convention current PR bridge' {
                     }
                     unchangedRuleIds =
                         $priorTwentyOne
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @(
+                        $priorTwentyOne + @('pr-template-compliance') |
+                        Where-Object { $_ -cne 'reused-string-literals' })
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:da54847775d5db88d0c2f5e760db3edafd855bc624bdd67d341900cded9e211e'
+                length = 7266
             }
         }
         $cases = @(
@@ -1022,6 +1245,16 @@ Describe 'Contextual convention current PR bridge' {
                 prior =
                     $compatibility.
                         previousRules[1].rule
+                expected = 'unknown'
+            },
+            [ordered]@{
+                ruleId = 'pr-template-compliance'
+                prior = $compatibility.previousRules[3].rule
+                expected = 'noOp'
+            },
+            [ordered]@{
+                ruleId = 'reused-string-literals'
+                prior = $compatibility.previousRules[3].rule
                 expected = 'unknown'
             },
             [ordered]@{
@@ -1111,8 +1344,8 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:da54847775d5db88d0c2f5e760db3edafd855bc624bdd67d341900cded9e211e'
+                length = 7266
             }
         }
         switch ($Mode) {

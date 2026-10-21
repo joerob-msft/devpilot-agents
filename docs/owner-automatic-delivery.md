@@ -94,12 +94,47 @@ Changed missing requirements require new proof; they are never blindly
 promoted from history. Contextual automatic delivery remains create-only,
 model-free, and capped at two creates per run and five creates per PR.
 
-When authorizing this additive bundle, retain three exact prior bindings:
-the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
-`-ThirdPreviousRule*` respectively. Never include
-`pr-template-compliance` in a prior bundle's unchanged IDs.
+The separate `reused-string-literals` rule implements the canonical
+**Declare constants for re-used strings** section. It compares Roslyn-decoded
+string literal expressions, not raw text counts or constant declarations.
+Only a changed literal use can own a finding; unchanged repetitions by
+themselves do not trigger cleanup. Existing constant member references,
+comments, attributes, generated sources, localized resource member references,
+and repetitions confined to a proved test project are not candidates.
+Escaped, verbatim, and supported raw string spellings share their decoded
+value identity; comparisons are ordinal and case-sensitive.
+
+The rule consumes the existing bounded, accumulated full-PR snapshot and each
+file's source-pinned `projectContext`. Cross-file and context-only peers remain
+visible through the capability adapter. One deterministic changed-use anchor
+owns a shared cluster, independent of acquisition ordering. The finding
+retains its exact changed start/end range and related literal uses. A class-local
+cluster calls for `private const string` atop that class; cross-class reuse calls
+for `public const string` in a common project Constants class; cross-project reuse
+calls for the lowest common project dependency without inventing its identity
+or dependency direction. Unproved project/syntax/conditional evidence is
+`unknown`, not a clean pass or a deliverable finding. The existing
+`duplicate-constant-declarations` rule keeps its separate semantics.
+
+A current human request covering every literal value at a related use prevents
+a duplicate comment. When a provider exposes only a range's first line, an
+explicit citation to a related use at the exact source commit can establish the
+same coverage. Partial, stale, unrelated, or ambiguous coverage cannot authorize
+delivery. Quotas, signed history, Owner behavior, model-free evaluation, and
+create-only delivery are unchanged.
+An existing markerless comment from the configured reviewer is not human
+coverage: without authenticated prior delivery proof, it stays unknown and
+cannot authorize another create.
+
+When authorizing this additive bundle, retain four exact prior bindings:
+the 18-rule bundle with its 18 unchanged IDs, the pre-nuance bundle with only
+its 20 unchanged IDs (excluding `named-call-arguments`, whose constant-only
+semantics changed), the post-nuance 21-rule bundle with its 21 existing IDs,
+and the immediately prior 22-rule bundle with all 22 existing IDs. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
+in the older 18/20/21-rule sets, or `reused-string-literals` in any prior set.
+This source change does not enable or deploy the additional rule.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
