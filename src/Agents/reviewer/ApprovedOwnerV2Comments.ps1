@@ -33,7 +33,8 @@ $script:ApprovedContextualRuleIds = @(
     'secret-redaction',
     'dependency-fanout',
     'test-class-code-coverage',
-    'pr-template-compliance'
+    'pr-template-compliance',
+    'block-body-indentation'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
@@ -143,6 +144,8 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
             @($ids | Where-Object {
                     [string]$_ -cnotmatch
                         '^[a-z][a-z0-9-]{0,127}$' -or
+                    [string]$_ -ceq
+                        'block-body-indentation' -or
                     [string]$_ -cnotin
                         $AllowedRuleIds
                 }).Count -ne 0) {

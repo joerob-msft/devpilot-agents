@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+$script:ContextualDigest = 'v1:sha256:8c219ec8f6c2ecc22d2fa5a170365ad79bad40cd9076d07e91650c7dd53427e7'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+$script:ContextualPolicyDigest = 'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -451,6 +451,8 @@ function Test-ContextualRuleIdSet {
         @($ids | Where-Object {
                 [string]$_ -cnotmatch
                     '^[a-z][a-z0-9-]{0,127}$' -or
+                [string]$_ -ceq
+                    'block-body-indentation' -or
                 [string]$_ -cnotin
                     $registered
             }).Count -eq 0)
@@ -1291,6 +1293,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         $humanCurrent = $false
         $crossRule = $false
         $rangedHumanUnknown = $false
+        $unmarkedReviewerCurrent = $false
         foreach ($thread in @($Snapshot.Threads)) {
             $sameAnchor = $null -ne $thread.anchor -and
                 [string]$thread.anchor.path -ieq
@@ -1311,6 +1314,27 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     [int]$finding.binding.span.startLine -and
                 [int]$thread.anchor.line -le
                     [int]$finding.binding.span.endLine)
+            $indentation = Get-OwnerV2Member `
+                -Value $finding -Name indentationContext
+            $sameIndentationBlock =
+                [string]$finding.ruleId -ceq
+                    'block-body-indentation' -and
+                $indentation -is [Collections.IDictionary] -and
+                $null -ne $thread.anchor -and
+                [string]$thread.anchor.path -ieq
+                    [string]$finding.anchor.path -and
+                [int]$indentation.blockStartLine -gt 0 -and
+                [int]$indentation.blockStartLine -lt
+                    [int]$indentation.statementLine -and
+                [int]$indentation.blockEndLine -ge
+                    [int]$indentation.statementLine -and
+                [int]$finding.anchor.line -in @(
+                    [int]$indentation.statementLine,
+                    [int]$indentation.blockStartLine) -and
+                [int]$thread.anchor.line -eq
+                    [int]$indentation.blockStartLine
+            $sameFindingRange =
+                $sameFindingRange -or $sameIndentationBlock
             foreach ($comment in @($thread.comments)) {
                 if ([string]$comment.commentType -cne
                         'text' -or
@@ -1365,6 +1389,11 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             'ambiguous') {
                         $ambiguous = $true
                     }
+                    elseif ([string]$finding.ruleId -ceq
+                            'block-body-indentation' -and
+                        [bool]$comment.reviewerOwned) {
+                        $unmarkedReviewerCurrent = $true
+                    }
                     elseif (-not $sameAnchor -and
                         [string]$finding.ruleId -ceq
                             'duplicate-constant-declarations' -and
@@ -1377,6 +1406,16 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         $rangedHumanUnknown =
                             $true
                     }
+                    elseif ([string]$finding.ruleId -ceq
+                            'block-body-indentation' -and
+                        (-not [regex]::IsMatch(
+                            [string]$comment.body,
+                            '(?i)\bindent(?:ation|ed|ing)?\b') -or
+                         -not [regex]::IsMatch(
+                            [string]$comment.body,
+                            '(?i)\b(?:body|block|statements)\b'))) {
+                        $rangedHumanUnknown = $true
+                    }
                     else {
                         $humanCurrent = $true
                     }
@@ -1385,6 +1424,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         }
         if ($ambiguous -or $foreign -or
             $rangedHumanUnknown -or
+            $unmarkedReviewerCurrent -or
             $matches.Count -gt 1 -or
             ($matches.Count -eq 1 -and
                 [int]$matches[0].Count -ne 1)) {
@@ -1395,7 +1435,10 @@ function Resolve-ContextualConventionDiscussionReconciliation {
             $finding.reconciliation =
                 New-OwnerV2DiscussionReconciliation `
                     -Classification unknown `
-                    -Reason $(if (
+                    -Reason $(if ($unmarkedReviewerCurrent) {
+                            'unmarked-current-reviewer-comment'
+                        }
+                        elseif (
                             $rangedHumanUnknown -and
                             -not $ambiguous -and
                             -not $foreign -and
@@ -1414,8 +1457,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
             $sameBody =
-                Get-OwnerV1WriterSha256 -Text (
-                    [string]$entry.Comment.body) -ceq
+                (Get-OwnerV1WriterSha256 -Text (
+                    [string]$entry.Comment.body)) -ceq
                     $bodyDigest
             $finding.providerMarker =
                 New-OwnerProviderMarker `
@@ -4063,6 +4106,10 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 symbol = [string]$outcome.symbol
                 reason = [string]$outcome.reason
             }
+            if ($ruleId -ceq 'block-body-indentation') {
+                $material['indentationContext'] =
+                    $outcome.indentationContext
+            }
             $digest = (Get-OwnerV2Digest `
                     -Value $material).Substring(10)
             $constructRef = "construct:$digest"
@@ -4092,6 +4139,10 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 evidence =
                     [string]$outcome.evidence
                 reason = [string]$outcome.reason
+            }
+            if ($ruleId -ceq 'block-body-indentation') {
+                $findingData['indentationContext'] =
+                    $outcome.indentationContext
             }
             [void]$assessments.Add([ordered]@{
                 assessmentId = $assessmentId
@@ -4390,6 +4441,12 @@ function ConvertTo-OwnerV2Observation {
             $normalizedFinding.reason =
                 [string](Get-OwnerV2Member `
                     -Value $data -Name reason)
+            if ($normalizedFinding.ruleId -ceq
+                    'block-body-indentation') {
+                $normalizedFinding.indentationContext =
+                    Get-OwnerV2Member `
+                        -Value $data -Name indentationContext
+            }
             if ($pullRequestScope) {
                 $normalizedFinding.issueIdentity =
                     [string](Get-OwnerV2Member `

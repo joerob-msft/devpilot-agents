@@ -210,10 +210,180 @@ Describe what validations are needed:
 
 }
 
+Describe 'C# block-body indentation' {
+    BeforeAll {
+        function New-BlockIndentationSource {
+            param([string]$Indent = '        ')
+            return @"
+class C
+{
+    void M()
+    {
+        try
+        {
+${Indent}if (ready)
+${Indent}{
+${Indent}    Work();
+${Indent}}
+${Indent}return;
+        }
+        finally
+        {
+        }
+    }
+}
+"@
+        }
+
+        function Invoke-BlockIndentationCase {
+            param(
+                [string]$Content = (New-BlockIndentationSource),
+                [object[]]$Spans = @(@{ startLine = 7; endLine = 7 }),
+                [string]$Path = 'src/Example.cs'
+            )
+            return @(Get-ContextualConventionOutcomes `
+                -Content $Content -Path $Path -Spans $Spans `
+                -SnapshotFiles @(@{
+                        path = $Path
+                        content = $Content
+                        state = 'complete'
+                    }) |
+                Where-Object ruleId -CEQ block-body-indentation)[0]
+        }
+    }
+
+    It 'anchors the under-indented try body to the exact changed if statement' {
+        $outcome = Invoke-BlockIndentationCase
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 7
+        $outcome.endLine | Should -Be 7
+        $outcome.symbol | Should -BeExactly 'TryStatement body'
+        $outcome.indentationContext.blockStartLine | Should -Be 6
+        $outcome.indentationContext.blockEndLine | Should -Be 12
+        $outcome.indentationContext.statementLine | Should -Be 7
+        $outcome.evidence | Should -Match 'expected 12 leading spaces, found 8'
+    }
+
+    It 'measures four-space increment boundaries and tabs for <Name>' -TestCases @(
+        @{ Name = 'zero increment'; Indent = '        '; State = 'violation' }
+        @{ Name = 'three spaces'; Indent = '           '; State = 'violation' }
+        @{ Name = 'four spaces'; Indent = '            '; State = 'compliant' }
+        @{ Name = 'five spaces'; Indent = '             '; State = 'violation' }
+        @{ Name = 'double increment'; Indent = '                '; State = 'violation' }
+        @{ Name = 'tab'; Indent = "`t`t`t"; State = 'violation' }
+        @{ Name = 'mixed spaces and tab'; Indent = "        `t"; State = 'violation' }
+    ) {
+        param($Name, $Indent, $State)
+        $outcome = Invoke-BlockIndentationCase `
+            -Content (New-BlockIndentationSource -Indent $Indent)
+        $outcome.state | Should -BeExactly $State
+    }
+
+    It 'does not turn an unchanged old body or a changed brace into cleanup' {
+        foreach ($line in @(1, 6, 9, 12)) {
+            $outcome = Invoke-BlockIndentationCase `
+                -Spans @(@{ startLine = $line; endLine = $line })
+            $outcome.state | Should -BeExactly compliant
+        }
+    }
+
+    It 'detects an unchanged body affected by the changed try header and brace at an actual changed anchor' {
+        $outcome = Invoke-BlockIndentationCase `
+            -Spans @(@{ startLine = 5; endLine = 6 })
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 6
+        $outcome.endLine | Should -Be 6
+        $outcome.indentationContext.statementLine | Should -Be 7
+        $outcome.evidence | Should -Match 'statement at line 7'
+        $outcome = Invoke-BlockIndentationCase `
+            -Content (New-BlockIndentationSource -Indent '            ') `
+            -Spans @(@{ startLine = 5; endLine = 6 })
+        $outcome.state | Should -BeExactly compliant
+        (Invoke-BlockIndentationCase `
+            -Spans @(@{ startLine = 5; endLine = 5 })).state |
+            Should -BeExactly compliant
+    }
+
+    It 'also checks changed return statements and other block kinds without file-specific matching' {
+        $outcome = Invoke-BlockIndentationCase `
+            -Spans @(@{ startLine = 11; endLine = 11 }) `
+            -Path 'Other/Unrelated.cs'
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 11
+        $content = "class C`n{`n    void M()`n    {`n    Work();`n    }`n}"
+        $outcome = Invoke-BlockIndentationCase -Content $content `
+            -Spans @(@{ startLine = 5; endLine = 5 })
+        $outcome.state | Should -BeExactly violation
+        $outcome.line | Should -Be 5
+    }
+
+    It 'ignores literal contents, comments, blank lines, initializer members, and continuation layouts' {
+        $content = @'
+class C
+{
+    void M()
+    {
+        // { Work();
+        /*
+Work(); }
+        */
+
+        var raw = """
+Work(); {
+""";
+        var verbatim = @"
+Work(); {
+";
+        var interpolated = $@"literal {{
+Work(); }} {value}";
+        var escaped = "Work(); { \"quoted\" }";
+        var value = new C
+        {
+P = 1,
+        };
+        Call(
+first,
+second);
+        service
+.Call();
+    }
+}
+'@
+        $outcome = Invoke-BlockIndentationCase -Content $content `
+            -Spans @(@{ startLine = 1; endLine = 30 })
+        $outcome.state | Should -BeExactly compliant
+    }
+
+    It 'reports unproven syntax, conditional configuration, baseline tabs, and layouts as unknown' -TestCases @(
+        @{ Content = "class C`n{`nvoid M() {"; First = 3 }
+        @{ Content = "#if FEATURE`nclass C { void M() { Work(); } }`n#endif"; First = 2 }
+        @{ Content = "class C`n{`n    void M()`n`t{`n        Work();`n    }`n}"; First = 5 }
+        @{ Content = 'class C { void M() { Work(); } }'; First = 1 }
+        @{ Content = "class C`n{`n    void M()`n    {`nlabel: Work();`n    }`n}"; First = 5 }
+    ) {
+        param($Content, $First)
+        $outcome = Invoke-BlockIndentationCase -Content $Content `
+            -Spans @(@{ startLine = $First; endLine = $First })
+        $outcome.state | Should -BeExactly unknown
+        $outcome.evidence | Should -BeNullOrEmpty
+    }
+
+    It 'does not inspect generated sources' {
+        foreach ($path in @('obj/Example.cs', 'src/Example.g.cs', 'generated\Example.cs')) {
+            (Invoke-BlockIndentationCase -Path $path).reason |
+                Should -BeExactly generated-code-excluded
+        }
+        (Invoke-BlockIndentationCase -Content (
+            "// <auto-generated>`n" + (New-BlockIndentationSource)) `
+            -Spans @(@{ startLine = 8; endLine = 8 })).reason |
+            Should -BeExactly generated-code-excluded
+    }
+}
+
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed twenty-two-rule allow set' {
+    It 'exports the fixed twenty-three-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 22
+            Should -HaveCount 23
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -1073,11 +1243,11 @@ internal const string Value = "same";
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 22
+            $outcomes | Should -HaveCount 23
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 21
+                }) | Should -HaveCount 22
         }
     }
 
