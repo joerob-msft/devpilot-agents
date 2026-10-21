@@ -65,6 +65,41 @@ function Get-StalePrFailureReason {
     return [string]$ErrorRecord.Exception.Message
 }
 
+function Get-StalePrWriteDiagnostic {
+    param(
+        [Parameter(Mandatory)]
+        [Management.Automation.ErrorRecord]$ErrorRecord
+    )
+    $kind = 'provider-write-failed'
+    $exitCode = $null
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        if ($exception.Data.Contains('stalePrFailureKind')) {
+            $candidate = [string]$exception.Data[
+                'stalePrFailureKind']
+            if ($candidate -cin @(
+                    'azure-cli-nonzero-exit',
+                    'provider-write-failed')) {
+                $kind = $candidate
+            }
+        }
+        if ($exception.Data.Contains('stalePrCliExitCode')) {
+            $candidateExit = 0
+            if ([int]::TryParse(
+                    [string]$exception.Data[
+                        'stalePrCliExitCode'],
+                    [ref]$candidateExit)) {
+                $exitCode = $candidateExit
+            }
+        }
+        $exception = $exception.InnerException
+    }
+    return [ordered]@{
+        kind = $kind
+        cliExitCode = $exitCode
+    }
+}
+
 function Get-StalePrLifecycleConfiguration {
     [CmdletBinding()]
     param(
@@ -529,6 +564,8 @@ function New-StalePrAzureDevOpsProvider {
         ${function:Get-StalePrDigest}
     $failureReasonCommand =
         ${function:Get-StalePrFailureReason}
+    $canonicalJsonCommand =
+        ${function:ConvertTo-ApprovedOwnerV2CanonicalJson}
     $invoke = {
         param([string[]]$Arguments, [string]$InputPath = '')
         if ($null -ne $Invoker) {
@@ -538,7 +575,13 @@ function New-StalePrAzureDevOpsProvider {
         if ($InputPath) { $args += @('--in-file', $InputPath) }
         $output = @(& $AzureCliPath @args 2>$null)
         if ($LASTEXITCODE -ne 0) {
-            throw 'stale-pr-provider-inaccessible'
+            $failure = [InvalidOperationException]::new(
+                'stale-pr-provider-inaccessible')
+            $failure.Data['stalePrFailureKind'] =
+                'azure-cli-nonzero-exit'
+            $failure.Data['stalePrCliExitCode'] =
+                [int]$LASTEXITCODE
+            throw $failure
         }
         $text = $output -join "`n"
         if ([string]::IsNullOrWhiteSpace($text)) { return $null }
@@ -899,7 +942,7 @@ function New-StalePrAzureDevOpsProvider {
                 try {
                     [IO.File]::WriteAllText(
                         $temp,
-                        (ConvertTo-ApprovedOwnerV2CanonicalJson `
+                        (& $canonicalJsonCommand `
                             $Arguments.body),
                         [Text.UTF8Encoding]::new($false))
                     return & $invoke @(
@@ -1197,6 +1240,10 @@ function Invoke-StalePrLifecycle {
             } else { 'abandoned-confirmed-after-error' }
         }
         else { 'ambiguous-post-write' }
+        $writeDiagnostic = if ($null -ne $writeError) {
+            Get-StalePrWriteDiagnostic $writeError
+        }
+        else { $null }
         $event = [ordered]@{
             schemaVersion = 1
             kind = 'stale-pr-lifecycle-v1-event'
@@ -1215,6 +1262,7 @@ function Invoke-StalePrLifecycle {
             request = $request
             readback = $readback
             outcome = $outcome
+            diagnostic = $writeDiagnostic
             providerWriteCount = 1
             providerWriteState = $(if ($confirmedWrite) {
                     'confirmed'
@@ -1231,6 +1279,7 @@ function Invoke-StalePrLifecycle {
                 ToString('yyyyMMddTHHmmssfffffffZ')
             eventId = [string]$event.eventId
             outcome = $outcome
+            diagnostic = $writeDiagnostic
             providerWriteCount = 1
             providerWriteState = $(if ($confirmedWrite) {
                     'confirmed'
