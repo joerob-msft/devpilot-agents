@@ -104,10 +104,32 @@ and repetitions confined to a proved test project are not candidates.
 Escaped, verbatim, and supported raw string spellings share their decoded
 value identity; comparisons are ordinal and case-sensitive.
 
+New reuse requires an increased count of eligible decoded literal uses relative
+to the exact comparison revision, not merely a line marked changed. A moved or
+rewritten six-use value that remains six uses is not new reuse. This is bounded
+occurrence evidence, not a general semantic diff: equal/decreased counts are
+not reported. Every participating C# baseline must be available and parseable.
+Missing, malformed, conditional, wrong-path, wrong-head, or tampered comparison
+evidence is unknown and cannot be substituted with an empty target.
+
+The shared producer retains the already-read comparison text with source and
+target commits, current/old path, both content digests, absence state for added
+files, and byte length. It adds no read or roster flag. Both source and target
+text count against the existing file/package/progress byte ceilings; persisted
+progress retains the baseline under the existing code-head binding. The
+hash-pinned shared generation is checked at the consumer, and its provider and
+adapter revalidate the comparison binding before the analyzer can use it.
+Old progress lacking this evidence remains usable by other rules, but cannot
+prove this rule's newness. Source-only cited peers without comparison evidence
+likewise do not prove a clean or newly reused result.
+
 The rule consumes the existing bounded, accumulated full-PR snapshot and each
 file's source-pinned `projectContext`. Cross-file and context-only peers remain
 visible through the capability adapter. One deterministic changed-use anchor
-owns a shared cluster, independent of acquisition ordering. The finding
+owns each decoded value independently, regardless of acquisition ordering. A
+class-local value is never merged with a cross-project value to select
+placement, ranges, or advice. A uniquely proved accessible constant is
+recommended for reuse rather than another declaration. The finding
 retains its exact changed start/end range and related literal uses. A class-local
 cluster calls for `private const string` atop that class; cross-class reuse calls
 for `public const string` in a common project Constants class; cross-project reuse

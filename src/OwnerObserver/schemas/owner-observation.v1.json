@@ -195,6 +195,15 @@
             "uniqueItems": true,
             "items": { "type": "string", "maxLength": 16777216 }
           },
+          "occurrenceCounts": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "target"],
+            "properties": {
+              "source": { "type": "integer", "minimum": 2, "maximum": 1024 },
+              "target": { "type": "integer", "minimum": 0 }
+            }
+          },
           "relatedUses": {
             "type": "array",
             "minItems": 1,

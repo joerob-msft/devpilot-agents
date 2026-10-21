@@ -110,6 +110,33 @@ public string Value { get; set; }
 BeforeAll {
     Import-Module "$PSScriptRoot\..\src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1" -Force
 
+    function New-LiteralComparisonFile {
+        param(
+            [string]$Content,
+            [AllowEmptyString()][string]$Target = '',
+            [string]$Path = 'src/C.cs',
+            [string]$Project = 'src/App.csproj'
+        )
+        $digest = {
+            param([string]$Text)
+            'v1:sha256:' + [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+        }
+        return @{
+            path=$Path;content=$Content;state='complete';changeType='modified'
+            sourceCommit=('a'*40);targetCommit=('b'*40)
+            spans=@(@{startLine=1;endLine=([regex]::Split($Content, '\r?\n').Count)})
+            projectContext=@{state='complete';path=$Project;content='<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'}
+            comparison=@{
+                schemaVersion=1;state='complete';path=$Path;targetPath=$Path
+                sourceCommit=('a'*40);targetCommit=('b'*40);sourceDigest=(& $digest $Content)
+                targetDigest=(& $digest $Target);byteLength=[Text.Encoding]::UTF8.GetByteCount($Target)
+                content=$Target;targetState='present'
+            }
+        }
+    }
+
     function Invoke-ConventionCase {
         param(
             [Parameter(Mandatory)][string]$RuleId,
@@ -138,6 +165,17 @@ BeforeAll {
                             endLine = $lines
                         })
                 })
+        }
+        if ($RuleId -ceq 'reused-string-literals') {
+            foreach ($file in $files) {
+                if ([string]$file.path -imatch '\.cs$' -and
+                    $file.content -is [string] -and -not $file.Contains('comparison')) {
+                    $file.sourceCommit='a'*40
+                    $file.targetCommit='b'*40
+                    $file.changeType='modified'
+                    $file.comparison=(New-LiteralComparisonFile -Content $file.content -Path $file.path).comparison
+                }
+            }
         }
         return @(
             Get-ContextualConventionOutcomes `
@@ -211,6 +249,134 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention analyzer' {
+    It 'does not turn moved or rewritten existing repetitions into newly reused strings' {
+        $file=New-LiteralComparisonFile -Content @'
+class C {
+ string First() { return "Failed"; }
+ string Second() { return "Failed"; }
+}
+'@ -Target 'class C { string First() => "Failed"; string Second() => "Failed"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) | Where-Object ruleId -CEQ reused-string-literals)
+        @($result | Where-Object state -CEQ violation) | Should -HaveCount 0
+        $result[0].state | Should -BeExactly compliant
+    }
+
+    It 'keeps independent class-local and cross-project literal ownership separate' {
+        $reader=New-LiteralComparisonFile -Path 'src/A/Reader.cs' -Project 'src/A/App.csproj' -Content @'
+class Reader {
+ string LocalA => "local";
+ string LocalB => "local";
+ string Shared => "contract";
+}
+'@
+        $writer=New-LiteralComparisonFile -Path 'src/B/Writer.cs' -Project 'src/B/App.csproj' `
+            -Content 'class Writer { string Shared => "contract"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $reader.content -Path $reader.path `
+            -Spans $reader.spans -SnapshotFiles @($reader,$writer) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 2
+        $local=@($result | Where-Object { 'local' -cin $_.literalValues })[0]
+        $shared=@($result | Where-Object { 'contract' -cin $_.literalValues })[0]
+        $local.evidence | Should -Match 'private const string'
+        $local.line | Should -Be 2
+        $local.endLine | Should -Be 3
+        $shared.evidence | Should -Match 'lowest common project dependency'
+        $shared.line | Should -Be 4
+        $shared.endLine | Should -Be 4
+    }
+
+    It 'withholds newly reused literals when the target baseline is <Mode>' -TestCases @(
+        @{Mode='missing'},@{Mode='tampered'},@{Mode='wrong-source'},@{Mode='wrong-target'},
+        @{Mode='wrong-path'},@{Mode='wrong-target-path'},@{Mode='wrong-length'},@{Mode='invalid-syntax'}
+    ) {
+        param($Mode)
+        $file=New-LiteralComparisonFile -Content 'class C { string A => "wire"; string B => "wire"; }'
+        switch($Mode) {
+            missing { $file.Remove('comparison') }
+            tampered { $file.comparison.content='class C {}' }
+            wrong-source { $file.comparison.sourceCommit='c'*40 }
+            wrong-target { $file.comparison.targetCommit='c'*40 }
+            wrong-path { $file.comparison.path='src/Other.cs' }
+            wrong-target-path { $file.comparison.targetPath='src/Other.cs' }
+            wrong-length { $file.comparison.byteLength=1 }
+            invalid-syntax {
+                $other=New-LiteralComparisonFile -Content $file.content -Target 'class C {'
+                $file.comparison=$other.comparison
+            }
+        }
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) | Where-Object ruleId -CEQ reused-string-literals)
+        @($result | Where-Object state -CEQ violation) | Should -HaveCount 0
+        $result[0].state | Should -BeExactly unknown
+    }
+
+    It 'reuses a uniquely proved existing class constant instead of declaring another' {
+        $file=New-LiteralComparisonFile -Content @'
+class C {
+ private const string Key = "wire";
+ string A => "wire";
+ string B => "wire";
+}
+'@ -Target 'class C { private const string Key = "wire"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].evidence | Should -Match 'Reuse.*C.*Key'
+        $result[0].evidence | Should -Not -Match 'Declare constants'
+    }
+
+    It 'does not invent an existing constant value from part of a constant expression' {
+        $file=New-LiteralComparisonFile -Content 'class C { const string Key = "wi" + "re"; string A => "wi"; string B => "wi"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].evidence | Should -Not -Match 'Reuse C.Key'
+    }
+
+    It 'detects a genuine increase from one literal use to repeated uses' {
+        $file=New-LiteralComparisonFile -Content 'class C { string A => "wire"; string B => "wire"; }' `
+            -Target 'class C { string A => "wire"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].occurrenceCounts.source | Should -Be 2
+        $result[0].occurrenceCounts.target | Should -Be 1
+    }
+
+    It 'does not assume a public field in a private nested type is accessible to a sibling' {
+        $file=New-LiteralComparisonFile -Content @'
+class Hidden { private class Keys { public const string Key = "wire"; } }
+class C { string A => "wire"; string B => "wire"; }
+'@
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].evidence | Should -Not -Match 'Reuse Hidden.Keys.Key'
+    }
+
+    It 'charges source and comparison content against the unchanged analyzer byte ceiling' {
+        $file=New-LiteralComparisonFile -Content (' ' * (8MB + 1)) -Target (' ' * 8MB)
+        {
+            Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+                -Spans $file.spans -SnapshotFiles @($file)
+        } | Should -Throw '*bounded limits*'
+    }
+
+    It 'does not add another declaration when several existing constants are accessible' {
+        $file=New-LiteralComparisonFile -Content 'class C { const string A = "wire"; const string B = "wire"; string X => "wire"; string Y => "wire"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].evidence | Should -Match '^Reuse an existing accessible constant'
+        $result[0].evidence | Should -Not -Match 'Declare constants'
+    }
+
     It 'exports the fixed twenty-three-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
             Should -HaveCount 23
@@ -280,10 +446,13 @@ class Second { string Value => "shared"; }
 
     It 'keeps canonically equivalent Unicode strings ordinally distinct' {
         $content='class C { string A => "\u00e9"; string B => "\u00e9"; string Cc => "e\u0301"; string D => "e\u0301"; }'
-        $result=Invoke-ConventionCase -RuleId reused-string-literals -Content $content
-        $result.state | Should -BeExactly violation
-        $result.literalValues | Should -HaveCount 2
-        $result.relatedUses | Should -HaveCount 4
+        $file=New-LiteralComparisonFile -Content $content
+        $result=@(Get-ContextualConventionOutcomes -Content $content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 2
+        @($result | ForEach-Object {$_.literalValues}) | Should -HaveCount 2
+        @($result | ForEach-Object {$_.relatedUses}) | Should -HaveCount 4
     }
 
     It 'keeps case-distinct C# types in separate ownership scopes' {

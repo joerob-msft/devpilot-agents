@@ -367,6 +367,17 @@ class Writer {
                 byteLength = [Text.Encoding]::UTF8.GetByteCount($projectContent)
                 sourceDigest = Get-ContextualTestTextDigest $projectContent
             }
+            $target = $(if ($ordinal -eq 1) {
+                'class Reader { string Old(Exception ex) => ex.Data["LegacyKey"] as string; }'
+            } else {
+                'class Writer { void Old(Exception ex) { ex.Data["LegacyKey"] = null; } }'
+            })
+            $entry.comparison=@{
+                schemaVersion=1;state='complete';path=$entry.path;targetPath=$entry.path
+                sourceCommit=$prepared.Head.sourceCommit;targetCommit=$prepared.Head.targetCommit
+                sourceDigest=$entry.sourceDigest;targetDigest=(Get-ContextualTestTextDigest $target)
+                byteLength=[Text.Encoding]::UTF8.GetByteCount($target);content=$target;targetState='present'
+            }
             if ($ContextOnlyPeer -and $ordinal -eq 2) {
                 $entry.spans = @()
                 $entry.contextOnly = $true
@@ -886,6 +897,64 @@ class Writer {
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'withholds the new rule but preserves old findings for a <Mode> comparison binding' -TestCases @(
+        @{Mode='missing'},@{Mode='tampered'},@{Mode='wrong-source'},@{Mode='wrong-target'},
+        @{Mode='wrong-path'},@{Mode='wrong-length'}
+    ) {
+        param($Mode)
+        $config=New-ContextualTestConfig; $config.enabled=$true
+        $prepared=New-ReusedStringPreparedIntake
+        $entry=$prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.content += "`nclass Logging { void M() { try { X(); } catch (Exception ex) { Logger.Error(ex.Message); } } }"
+        $entry.sourceDigest=Get-ContextualTestTextDigest $entry.content
+        $entry.byteLength=[Text.Encoding]::UTF8.GetByteCount($entry.content)
+        $entry.spans[0].endLine=7
+        $entry.spans[0].sourceDigest=$entry.sourceDigest
+        $entry.comparison.sourceDigest=$entry.sourceDigest
+        switch($Mode) {
+            missing {$entry.Remove('comparison')}
+            tampered {$entry.comparison.content='class Other {}'}
+            wrong-source {$entry.comparison.sourceCommit='a'*40}
+            wrong-target {$entry.comparison.targetCommit='b'*40}
+            wrong-path {$entry.comparison.path='src/Other.cs'}
+            wrong-length {$entry.comparison.byteLength++}
+        }
+        $name="comparison-binding-$Mode"
+        $result=Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name $name
+        $result.records | Should -HaveCount 1
+        $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
+            -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
+        $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings | Where-Object ruleId -CEQ reused-string-literals) | Should -HaveCount 0
+        @($observation.findings | Where-Object ruleId -CEQ exception-logging) | Should -HaveCount 1
+        @($observation.outcomes | Where-Object {
+            $_.Contains('ruleId') -and $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'unknown'
+        }) | Should -HaveCount 1
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+    }
+
+    It 'rejects a shared acquisition whose generation does not match its intake' {
+        $prepared=New-ContextualPreparedIntake
+        $prepared.Intake['generation']='a'*32
+        $envelope=@{
+            schemaVersion=1;kind='devpilot-shared-review-acquisition';generation=('b'*32)
+            configDigest=('c'*64);intake=$prepared.Intake
+        }
+        $envelope.intake['binding']=@{configDigest=('c'*64)}
+        $path=Join-Path $TestDrive 'wrong-generation.json'
+        $envelope | ConvertTo-Json -Depth 100 | Set-Content $path
+        $configPath=Join-Path $TestDrive 'wrong-generation-config.json'
+        (New-ContextualTestConfig) | ConvertTo-Json -Depth 64 | Set-Content $configPath
+        {
+            & (Join-Path $repoRoot 'tools\Invoke-ContextualConventionsCurrentPr.ps1') `
+                -ConfigPath $configPath -StateRoot (Join-Path $TestDrive 'wrong-generation-state') `
+                -ManifestPath (Join-Path $TestDrive 'wrong-generation-manifest.json') `
+                -AcquisitionPath $path -AcquisitionSha256 ((Get-FileHash $path).Hash.ToLowerInvariant()) `
+                -AzureCliPath 'must-not-be-invoked' -Run
+        } | Should -Throw '*Shared acquisition binding is invalid*'
+    }
+
     It 'carries both literal contract sides through acquisition and capability in <Mode> order' -TestCases @(
         @{ Mode = 'reader-first'; Reverse = $false; SameProject = $false; ContextOnlyPeer = $false }
         @{ Mode = 'writer-first'; Reverse = $true; SameProject = $false; ContextOnlyPeer = $false }
@@ -904,14 +973,17 @@ Describe 'Contextual convention current PR bridge' {
             Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
         $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $findings = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
-        $findings | Should -HaveCount 1 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
-        $finding = $findings[0]
+        $findings | Should -HaveCount 3 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $finding = @($findings | Where-Object { 'CredentialHandle' -cin $_.literalValues })[0]
         $finding.anchor.path | Should -BeExactly 'src/A/Reader.cs'
         $finding.binding.span.startLine | Should -Be 3
-        $finding.binding.span.endLine | Should -Be 5
-        $finding.literalValues | Should -Be @('CredentialHandle', 'EndpointUri', 'GroupIdentity')
-        $finding.literalValues | Should -Not -Contain LegacyKey
-        $finding.relatedUses | Should -HaveCount 6
+        $finding.binding.span.endLine | Should -Be 3
+        @($findings | ForEach-Object {$_.literalValues} | Sort-Object) |
+            Should -Be @('CredentialHandle', 'EndpointUri', 'GroupIdentity')
+        @($findings | ForEach-Object {$_.literalValues}) | Should -Not -Contain LegacyKey
+        @($findings | ForEach-Object {$_.relatedUses}) | Should -HaveCount 6
+        $finding.occurrenceCounts.source | Should -Be 2
+        $finding.occurrenceCounts.target | Should -Be 0
         $finding.reconciliation.classification | Should -BeExactly wouldCreate
         $finding.evidence | Should -Match $(if ($SameProject) {
             'common Constants class for the project'
@@ -926,7 +998,7 @@ Describe 'Contextual convention current PR bridge' {
         $evidence = @{Declaration=@{capability=@{id=$config.capability.id}};Contract=$request}
         $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
         $proposal.line | Should -Be 3
-        $proposal.endLine | Should -Be 5
+        $proposal.endLine | Should -Be 3
         $proposal.body | Should -Match 'Declare constants'
     }
 
@@ -941,8 +1013,8 @@ Describe 'Contextual convention current PR bridge' {
             $path=@(Get-ChildItem (Join-Path $TestDrive "$name-state") -Recurse -File `
                 -Filter "$($result.records[0].identity).json" | Where-Object {$_.Directory.Name -ceq 'observations'})[0].FullName
             $observation=Get-Content $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
-            $finding=@($observation.findings | Where-Object ruleId -CEQ reused-string-literals)[0]
-            $markers += $finding.providerMarker.sha256
+            $finding=@($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
+            $markers += (@($finding.providerMarker.sha256 | Sort-Object) -join '|')
         }
         $markers[0] | Should -BeExactly $markers[1]
     }
@@ -951,8 +1023,8 @@ Describe 'Contextual convention current PR bridge' {
         @{ Coverage = 'peer anchor'; Line = 3; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused by writer and reader.'; Expected = 'humanCovered' }
         @{ Coverage = 'range-start with pinned use citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'humanCovered' }
         @{ Coverage = 'unrelated same-anchor review'; Line = 3; Body = 'Please improve error handling.'; Expected = 'unknown' }
-        @{ Coverage = 'only one covered value'; Line = 3; Body = 'Declare a shared constant for CredentialHandle.'; Expected = 'unknown' }
-        @{ Coverage = 'stale citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC0000000000000000000000000000000000000000&path=/src/B/Writer.cs&line=3'; Expected = 'wouldCreate' }
+        @{ Coverage = 'only one covered value'; Line = 3; Body = 'Declare a shared constant for CredentialHandle.'; Expected = 'humanCovered' }
+        @{ Coverage = 'stale citation'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC0000000000000000000000000000000000000000&path=/src/B/Writer.cs&line=3'; Expected = 'unknown' }
         @{ Coverage = 'markerless configured reviewer'; Line = 2; Body = 'Share constants for CredentialHandle, GroupIdentity, and EndpointUri reused across projects. https://example.invalid/repo?version=GC{0}&path=/src/B/Writer.cs&line=3'; Expected = 'unknown' }
     ) {
         param($Coverage, $Line, $Body, $Expected)
@@ -994,8 +1066,12 @@ Describe 'Contextual convention current PR bridge' {
             Where-Object { $_.Directory.Name -ceq 'observations' })[0].FullName
         $observation = Get-Content $observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $finding = @($observation.findings | Where-Object ruleId -CEQ reused-string-literals)
-        $finding | Should -HaveCount 1 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
-        $finding[0].reconciliation.classification | Should -BeExactly $Expected
+        $finding | Should -HaveCount 3 -Because ($result.outcomes | ConvertTo-Json -Depth 8 -Compress)
+        $credential=@($finding | Where-Object { 'CredentialHandle' -cin $_.literalValues })[0]
+        $credential.reconciliation.classification | Should -BeExactly $Expected
+        if ($Coverage -ceq 'markerless configured reviewer') {
+            @($finding | Where-Object { $_.reconciliation.classification -cne 'unknown' }) | Should -HaveCount 0
+        }
         $result.providerWrites | Should -Be 0
     }
 

@@ -3598,6 +3598,44 @@ function Get-ContextualStringLiteralProject {
     }
 }
 
+function Get-ContextualStringComparisonRoot {
+    param([Parameter(Mandatory)]$File)
+    $keys = @('comparison','sourceCommit','targetCommit')
+    if (@($keys | Where-Object { -not $File.Contains($_) }).Count -gt 0 -or
+        $File.comparison -isnot [Collections.IDictionary]) { return $null }
+    $baseline = $File.comparison
+    $required = @('schemaVersion','state','path','targetPath','sourceCommit','targetCommit',
+        'sourceDigest','targetDigest','byteLength','content','targetState')
+    if (@($required | Where-Object { -not $baseline.Contains($_) }).Count -gt 0 -or
+        [string]$File.sourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$File.targetCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        [string]$baseline.schemaVersion -cne '1' -or [string]$baseline.state -cne 'complete' -or
+        $baseline.content -isnot [string] -or
+        [string]$baseline.path -cne [string]$File.path -or
+        [string]$baseline.targetPath -cne $(if ($File.Contains('oldPath') -and $File.oldPath) {
+            [string]$File.oldPath
+        } else { [string]$File.path }) -or
+        [string]$baseline.sourceCommit -cne [string]$File.sourceCommit -or
+        [string]$baseline.targetCommit -cne [string]$File.targetCommit -or
+        [string]$baseline.sourceDigest -cne (Get-ContextualTextDigest ([string]$File.content)) -or
+        [string]$baseline.targetDigest -cne (Get-ContextualTextDigest ([string]$baseline.content)) -or
+        [string]$baseline.byteLength -cne [string][Text.Encoding]::UTF8.GetByteCount([string]$baseline.content) -or
+        ([string]$baseline.targetState -ceq 'absent' -and (
+            -not $File.Contains('changeType') -or [string]$File.changeType -cne 'added' -or
+            [string]$baseline.content -cne '')) -or
+        ($File.Contains('changeType') -and [string]$File.changeType -ceq 'added' -and
+            [string]$baseline.targetState -cne 'absent') -or
+        [string]$baseline.targetState -cnotin @('present','absent') -or
+        [string]$baseline.content -match '(?m)^[ \t]*#(?:if|elif|else|endif)\b') {
+        return $null
+    }
+    $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText([string]$baseline.content)
+    if (@($tree.GetDiagnostics() | Where-Object {
+        $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+    }).Count -gt 0) { return $null }
+    return $tree.GetRoot()
+}
+
 function Get-ContextualReusedStringOutcomes {
     param(
         [Parameter(Mandatory)]$Root,
@@ -3609,6 +3647,9 @@ function Get-ContextualReusedStringOutcomes {
     $uses = [Collections.Generic.List[object]]::new()
     $byValue = [Collections.Generic.Dictionary[string,object]]::new(
         [StringComparer]::Ordinal)
+    $targetCounts = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $constants = [Collections.Generic.List[object]]::new()
+    $baselineUnknown = $false
     $incompletePeer = $false
     $conditionalCurrent = $false
     $currentFiles = @($SnapshotFiles | Where-Object {
@@ -3630,6 +3671,11 @@ function Get-ContextualReusedStringOutcomes {
             [string]$_.path -ine $Path -and
             [string]$_.path -imatch '\.cs$'
         })
+    foreach ($key in @('comparison','sourceCommit','targetCommit','changeType','oldPath')) {
+        if ($null -ne $currentFile -and $currentFile.Contains($key)) {
+            $sources[0][$key] = $currentFile[$key]
+        }
+    }
     foreach ($file in $sources) {
         $filePath = ([string]$file.path).Replace('\', '/')
         $current = $filePath -ieq $Path.Replace('\', '/')
@@ -3642,6 +3688,7 @@ function Get-ContextualReusedStringOutcomes {
         if ([string]$file.state -cne 'complete' -or
             $file.content -isnot [string]) {
             $incompletePeer = $true
+            $baselineUnknown = $true
             continue
         }
         $tree = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
@@ -3651,6 +3698,7 @@ function Get-ContextualReusedStringOutcomes {
                         [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
                 }).Count -gt 0) {
             $incompletePeer = $true
+            $baselineUnknown = $true
             continue
         }
         $project = Get-ContextualStringLiteralProject -File $file
@@ -3660,8 +3708,13 @@ function Get-ContextualReusedStringOutcomes {
         $conditional = [regex]::IsMatch(
             [string]$file.content, '(?m)^[ \t]*#(?:if|elif|else|endif)\b')
         if ($current -and $conditional) { $conditionalCurrent = $true }
+        $targetRoot = Get-ContextualStringComparisonRoot -File $file
+        if ($null -eq $targetRoot) { $baselineUnknown = $true }
+        $scans = @(@{Root=$tree.GetRoot();Target=$false})
+        if ($null -ne $targetRoot) { $scans += @{Root=$targetRoot;Target=$true} }
         $fileSpans = @(if ($file.Contains('spans')) { $file.spans })
-        foreach ($literal in @($tree.GetRoot().DescendantNodes() |
+        foreach ($scan in $scans) {
+        foreach ($literal in @($scan.Root.DescendantNodes() |
                 Where-Object {
                     $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.LiteralExpressionSyntax] -and
                     [int]$_.RawKind -eq
@@ -3669,11 +3722,21 @@ function Get-ContextualReusedStringOutcomes {
                 })) {
             $ancestors = @($literal.Ancestors())
             if (@($ancestors | Where-Object {
-                        $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.AttributeSyntax] -or
-                        (($_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -or
-                            $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.LocalDeclarationStatementSyntax]) -and
-                            'const' -cin @($_.Modifiers | ForEach-Object { $_.Text }))
+                        $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.AttributeSyntax]
                     }).Count -gt 0) {
+                continue
+            }
+            $constant = @($ancestors | Where-Object {
+                ($_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -or
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.LocalDeclarationStatementSyntax]) -and
+                'const' -cin @($_.Modifiers | ForEach-Object { $_.Text })
+            })
+            if ([bool]$scan.Target) {
+                if ($constant.Count -eq 0) {
+                    $value = [string]$literal.Token.ValueText
+                    if (-not $targetCounts.ContainsKey($value)) { $targetCounts[$value] = 0 }
+                    $targetCounts[$value]++
+                }
                 continue
             }
             $type = @($ancestors | Where-Object {
@@ -3691,6 +3754,33 @@ function Get-ContextualReusedStringOutcomes {
                     } else { $_.Name.ToString() }
                 })
             [array]::Reverse($names)
+            if ($constant.Count -gt 0) {
+                $field = $constant[0]
+                $variable = @($ancestors | Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.VariableDeclaratorSyntax]
+                } | Select-Object -First 1)
+                if ($field -is [Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax] -and
+                    $field.Declaration.Type.ToString() -cin @('string','System.String') -and
+                    $variable.Count -eq 1 -and $null -ne $variable[0].Initializer -and
+                    $variable[0].Initializer.Value -eq $literal -and
+                    -not $conditional -and @($ancestors | Where-Object {
+                        $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax] -and $_.Arity -gt 0
+                    }).Count -eq 0) {
+                    $visibility = @($field.Modifiers | ForEach-Object { $_.Text })
+                    $constantNames = @($names | ForEach-Object { $_ -replace '`0$', '' })
+                    $constants.Add([pscustomobject]@{
+                        Value=[string]$literal.Token.ValueText
+                        Symbol=($names -join '.')
+                        Name=($constantNames -join '.') + '.' + $variable[0].Identifier.ValueText
+                        Project=$project
+                        Shared=(('public' -cin $visibility -or 'internal' -cin $visibility) -and
+                            @($type[0].Ancestors() | Where-Object {
+                                $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax]
+                            }).Count -eq 0)
+                    })
+                }
+                continue
+            }
             $line = Get-ContextualNodeLine $literal
             $use = [pscustomobject]@{
                 Path = $filePath
@@ -3712,60 +3802,43 @@ function Get-ContextualReusedStringOutcomes {
             }
             [void]$byValue[$use.Value].Add($use)
         }
+        }
     }
     $outcomes = [Collections.Generic.List[object]]::new()
-    $groups = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
-    foreach ($use in @($uses | Where-Object { $_.Current -and $_.Changed })) {
-        if (-not $groups.ContainsKey($use.Symbol)) {
-            $groups[$use.Symbol] = [Collections.Generic.List[object]]::new()
+    $values = [string[]]@($byValue.Keys)
+    [array]::Sort($values, [StringComparer]::Ordinal)
+    foreach ($value in $values) {
+        $peers = @($byValue[$value] | Sort-Object Path, Line, Column -CaseSensitive)
+        $changed = @($peers | Where-Object { $_.Current -and $_.Changed })
+        if ($changed.Count -eq 0) { continue }
+        if ($peers.Count -lt 2) {
+            if ($incompletePeer) {
+                $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                    -Reason reused-string-scope-unproven -Path $Path))
+            }
+            continue
         }
-        [void]$groups[$use.Symbol].Add($use)
-    }
-    $symbols = [string[]]@($groups.Keys)
-    [array]::Sort($symbols, [StringComparer]::Ordinal)
-    foreach ($symbol in $symbols) {
-        $related = [Collections.Generic.List[object]]::new()
-        $changed = [Collections.Generic.List[object]]::new()
-        $uncertain = $false
-        foreach ($candidate in $groups[$symbol]) {
-            $matches = @($byValue[$candidate.Value] | Where-Object {
-                    $_ -ne $candidate
-                })
-            if ($matches.Count -eq 0) {
-                if ($incompletePeer) { $uncertain = $true }
-                continue
-            }
-            $proven = @($matches | Where-Object {
-                    -not $_.Unsupported -and
-                    -not $candidate.Unsupported -and
-                    [string]$_.Project.State -ceq 'complete' -and
-                    [string]$candidate.Project.State -ceq 'complete' -and
-                    ([string]$_.Project.Path -ine [string]$candidate.Project.Path -or
-                        [string]$_.Project.Digest -ceq [string]$candidate.Project.Digest)
-                })
-            if ($proven.Count -eq 0) {
-                $uncertain = $true
-                continue
-            }
-            $all = @($candidate) + $proven
-            $leader = @($all | Where-Object Changed |
-                Sort-Object Path, Line)[0]
-            if ([string]$leader.Path -ine $Path -or
-                [string]$leader.Symbol -cne [string]$candidate.Symbol) {
-                continue
-            }
-            [void]$changed.Add($candidate)
-            foreach ($use in $all) { [void]$related.Add($use) }
+        if ($baselineUnknown -or @($peers | Where-Object {
+            $_.Unsupported -or [string]$_.Project.State -cne 'complete'
+        }).Count -gt 0) {
+            $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason reused-string-baseline-unproven -Path $Path))
+            continue
         }
-        if ($changed.Count -gt 0) {
-            $ordered = @($changed | Sort-Object Line)
-            $peers = @($related | Sort-Object Path, Line, Column, EndLine, Symbol, Value -Unique -CaseSensitive)
+        $priorCount = if ($targetCounts.ContainsKey($value)) { $targetCounts[$value] } else { 0 }
+        if ($peers.Count -le $priorCount) { continue }
+        $leader = @($peers | Where-Object Changed | Sort-Object Path, Line, Column -CaseSensitive)[0]
+        if ([string]$leader.Path -ine $Path) { continue }
+        $ordered = @($changed | Where-Object Symbol -CEQ $leader.Symbol | Sort-Object Line, Column)
+        if ($peers.Count -gt 1024) {
+            $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason reused-string-evidence-cap-exhausted -Path $Path))
+            continue
+        }
             $projects = @($peers.Project.Path | Sort-Object -Unique)
             $types = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            $valueSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             foreach ($peer in $peers) {
                 [void]$types.Add($peer.Symbol)
-                [void]$valueSet.Add($peer.Value)
             }
             $placement = if ($projects.Count -gt 1) {
                 'Use public const string in a shared Constants class in the lowest common project dependency; the exact dependency is not proven here.'
@@ -3774,23 +3847,27 @@ function Get-ContextualReusedStringOutcomes {
             } else {
                 'Use private const string atop the class.'
             }
-            $values = [string[]]@($valueSet)
-            [array]::Sort($values, [StringComparer]::Ordinal)
-            if ($peers.Count -gt 1024 -or $values.Count -gt 1024) {
-                [void]$outcomes.Add((New-ContextualOutcome -RuleId $ruleId `
-                    -State unknown -Reason reused-string-evidence-cap-exhausted -Path $Path))
-                continue
+            $existing = @($constants | Where-Object {
+                $_.Value -ceq $value -and [string]$_.Project.State -ceq 'complete' -and
+                $projects.Count -eq 1 -and [string]$_.Project.Path -ieq $projects[0] -and
+                [string]$_.Project.Digest -ceq [string]$leader.Project.Digest -and
+                ($_.Shared -or ($types.Count -eq 1 -and $_.Symbol -ceq $leader.Symbol))
+            })
+            $escaped = ConvertTo-Json -InputObject $value -Compress
+            $display = if ($escaped.Length -le 64) { $escaped } else { $escaped.Substring(0,61) + '...' }
+            $advice = if ($existing.Count -eq 1) {
+                "Reuse $($existing[0].Name) for $display instead of declaring another constant."
+            } elseif ($existing.Count -gt 1) {
+                "Reuse an existing accessible constant for $display; do not declare another."
+            } else {
+                "Declare constants for reused string $display. $placement Reuse an existing accessible constant instead of duplicating its declaration."
             }
-            $display = @($values | Select-Object -First 3 | ForEach-Object {
-                    $escaped = ConvertTo-Json -InputObject ([string]$_) -Compress
-                    if ($escaped.Length -le 64) { $escaped } else { $escaped.Substring(0, 61) + '...' }
-                }) -join ', '
             $outcome = New-ContextualOutcome -RuleId $ruleId -State violation `
                 -Reason reused-string-requires-constant -Path $Path `
                 -Line $ordered[0].Line -EndLine ([int]($ordered.EndLine | Measure-Object -Maximum).Maximum) `
-                -Symbol $symbol `
-                -Evidence ("Declare constants for $($values.Count) reused string value(s): $display. $placement Replace literal uses rather than adding duplicate private constants.")
-            $outcome['literalValues'] = $values
+                -Symbol ([string]$leader.Symbol) -Evidence $advice
+            $outcome['literalValues'] = @($value)
+            $outcome['occurrenceCounts'] = [ordered]@{source=$peers.Count;target=$priorCount}
             $outcome['relatedUses'] = @($peers | ForEach-Object {
                     [ordered]@{
                         path = $_.Path
@@ -3802,11 +3879,6 @@ function Get-ContextualReusedStringOutcomes {
                     }
                 })
             [void]$outcomes.Add($outcome)
-        }
-        if ($uncertain) {
-            [void]$outcomes.Add((New-ContextualOutcome -RuleId $ruleId `
-                -State unknown -Reason reused-string-scope-unproven -Path $Path))
-        }
     }
     if ($outcomes.Count -eq 0) {
         if ($conditionalCurrent) {
@@ -5117,7 +5189,19 @@ function Get-ContextualConventionOutcomes {
         [AllowEmptyCollection()]
         [object[]]$SnapshotFiles
     )
-    if ([Text.Encoding]::UTF8.GetByteCount($Content) -gt
+    $snapshotBytes = 0L
+    foreach ($file in $SnapshotFiles) {
+        if ($file.content -is [string]) {
+            $snapshotBytes += [Text.Encoding]::UTF8.GetByteCount([string]$file.content)
+        }
+        if ($file -is [Collections.IDictionary] -and $file.Contains('comparison') -and
+            $file.comparison -is [Collections.IDictionary] -and
+            $file.comparison.Contains('content') -and $file.comparison.content -is [string]) {
+            $snapshotBytes += [Text.Encoding]::UTF8.GetByteCount([string]$file.comparison.content)
+        }
+    }
+    if ($snapshotBytes -gt 16MB -or
+        [Text.Encoding]::UTF8.GetByteCount($Content) -gt
             16MB -or
         $Spans.Count -gt 4096 -or
         $SnapshotFiles.Count -gt 64) {

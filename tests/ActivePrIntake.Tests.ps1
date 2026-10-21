@@ -741,6 +741,16 @@ Describe 'Active PR read-only intake' {
                 [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($entry.content))).ToLowerInvariant()
             $entry.spans=@(@{startLine=1;endLine=1;state='complete';sourceDigest=$entry.sourceDigest})
             $entry.projectContext=$context
+            $entry.sourceCommit='a'*40
+            $entry.targetCommit='b'*40
+            $target=$(if($entry.changeTrackingId -eq 1){$entry.content}else{''})
+            $entry.comparison=@{
+                schemaVersion=1;state='complete';path=$entry.path;targetPath=$entry.path
+                sourceCommit=('a'*40);targetCommit=('b'*40);sourceDigest=$entry.sourceDigest
+                targetDigest=('v1:sha256:'+ [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($target))).ToLowerInvariant())
+                byteLength=[Text.Encoding]::UTF8.GetByteCount($target);content=$target;targetState='present'
+            }
         }
         $c.provider = {
             param($op, $request)
@@ -766,6 +776,11 @@ Describe 'Active PR read-only intake' {
             -StateRoot $c.root -RepositoryRoot $repo -IncludeTransientSnapshots -Run
         $snapshot = $second.transientSnapshots['1'].changes
         $snapshot.entries | Should -HaveCount 2
+        $progress=Get-Content (Join-Path $c.root 'active-pr-intake-v1\file-progress\1.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $progress.entries[0].comparison.content | Should -BeExactly $entries[0].content
+        $progress.totalBytes | Should -Be (
+            $entries[0].byteLength + $entries[1].byteLength + $entries[0].comparison.byteLength)
         Import-Module (Join-Path $repo 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1') -Force
         $outcomes = @($snapshot.entries | ForEach-Object {
             Get-ContextualConventionOutcomes -Content $_.content -Path $_.path `
@@ -776,6 +791,18 @@ Describe 'Active PR read-only intake' {
         $violations | Should -HaveCount 1
         $violations[0].path | Should -BeExactly 'src/Reader.cs'
         $violations[0].relatedUses | Should -HaveCount 2
+        $progress.entries[0].comparison.Remove('content')
+        $progress | ConvertTo-Json -Depth 64 | Set-Content (
+            Join-Path $c.root 'active-pr-intake-v1\file-progress\1.json')
+        $resumed=Invoke-ActivePrIntake -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo -IncludeTransientSnapshots -Run
+        $retained=$resumed.transientSnapshots['1'].changes.entries
+        $retained | Should -HaveCount 2
+        $outcomes=@(Get-ContextualConventionOutcomes -Content $retained[0].content `
+            -Path $retained[0].path -Spans $retained[0].spans -SnapshotFiles $retained |
+            Where-Object ruleId -CEQ reused-string-literals)
+        @($outcomes | Where-Object state -CEQ violation) | Should -HaveCount 0
+        @($outcomes | Where-Object state -CEQ unknown) | Should -HaveCount 1
     }
 
     It 'continues 32-file progress across metadata-only template commit drift and resets on a code head change' {

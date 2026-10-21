@@ -52,7 +52,7 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:24c15c8d600b5792a15cc9e65864579a06096746d6d7397ecc6a4c41c6327c9d'
+$script:ContextualDigest = 'v1:sha256:46ac564623f3e84ad2c5f0b869d745c38259af4a221233f874549d27d576ca28'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
 $script:ContextualPolicyDigest = 'v1:sha256:da54847775d5db88d0c2f5e760db3edafd855bc624bdd67d341900cded9e211e'
 $script:OwnerV2AttributePattern = (
@@ -1430,7 +1430,13 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     }).Count -gt 0 -and
                     (Test-ContextualReusedStringCitation -Body ([string]$comment.body) `
                         -Finding $finding -SourceCommit ([string]$Contract.Request.SourceCommit))
-                if (($sameFindingRange -or $citedReusedString) -and
+                $namedLiteralRequest = [string]$finding.ruleId -ceq 'reused-string-literals' -and
+                    $null -ne $thread.anchor -and
+                    @($finding.relatedUses | Where-Object {
+                        [string]$_.path -ieq [string]$thread.anchor.path
+                    }).Count -gt 0 -and
+                    (Test-ContextualReusedStringHumanCoverage -Body ([string]$comment.body) -Finding $finding)
+                if (($sameFindingRange -or $citedReusedString -or $namedLiteralRequest) -and
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq
@@ -1453,6 +1459,10 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
                         [bool]$comment.reviewerOwned) {
                         $markerlessReusedStringReviewer = $true
+                    }
+                    elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
+                        -not $sameFindingRange -and -not $citedReusedString) {
+                        $rangedHumanUnknown = $true
                     }
                     elseif ([string]$finding.ruleId -ceq 'reused-string-literals' -and
                         -not (Test-ContextualReusedStringHumanCoverage `
@@ -4062,6 +4072,11 @@ function Invoke-ContextualConventionsCapabilityResponse {
                 } else { '' })
                 state = [string]$file.state
                 spans = @($file.data.spans)
+                sourceCommit = [string]$identityUnits[0].data.sourceCommit
+                targetCommit = [string]$identityUnits[0].data.targetCommit
+                changeType = [string](Get-OwnerV2Member -Value $file.data -Name changeType)
+                oldPath = Get-OwnerV2Member -Value $file.data -Name oldPath
+                comparison = Get-OwnerV2Member -Value $file.data -Name comparison
             }
         if ($context -is
                 [Collections.IDictionary]) {
@@ -4177,6 +4192,7 @@ function Invoke-ContextualConventionsCapabilityResponse {
                     reason = [string]$outcome.reason
                     literalValues = @($outcome.literalValues)
                     relatedUses = @($outcome.relatedUses)
+                    occurrenceCounts = $outcome.occurrenceCounts
                 }
             }
             $digest = (Get-OwnerV2Digest `
@@ -4212,13 +4228,13 @@ function Invoke-ContextualConventionsCapabilityResponse {
             if ($ruleId -ceq 'reused-string-literals') {
                 $findingData['literalValues'] = @($outcome.literalValues)
                 $findingData['relatedUses'] = @($outcome.relatedUses)
+                $findingData['occurrenceCounts'] = $outcome.occurrenceCounts
             }
             $findingEvidenceIds = $evidenceIds
             if ($ruleId -ceq 'reused-string-literals') {
-                $relatedPaths = @($outcome.relatedUses.path)
                 $findingEvidenceIds = @('identity', 'rule') + @(
                     $files | Where-Object {
-                        [string]$_.data.path -iin $relatedPaths
+                        [string]$_.data.path -imatch '\.cs$'
                     } | ForEach-Object { [string]$_.unitId })
             }
             [void]$assessments.Add([ordered]@{
@@ -4525,6 +4541,8 @@ function ConvertTo-OwnerV2Observation {
                     @(Get-OwnerV2Member -Value $data -Name literalValues)
                 $normalizedFinding['relatedUses'] =
                     @(Get-OwnerV2Member -Value $data -Name relatedUses)
+                $normalizedFinding['occurrenceCounts'] =
+                    Get-OwnerV2Member -Value $data -Name occurrenceCounts
             }
             if ($pullRequestScope) {
                 $normalizedFinding.issueIdentity =
