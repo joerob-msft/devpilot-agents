@@ -45,6 +45,18 @@ Import-Module (Join-Path $RepoRoot `
 . (Join-Path $RepoRoot `
     'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 
+$toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
+Assert-OwnerCommentRuleReferences -References $toolkit['commentRuleReferences'] `
+    -Repository $toolkit['commentRuleRepository'] -Delivery owner
+if ($null -ne $LiveAcquisitionProvider) {
+    $LiveAcquisitionProvider | Add-Member -Force -NotePropertyName CommentPresentation `
+        -NotePropertyValue ([ordered]@{
+            subjectProvider = $toolkit.subjectProvider
+            ruleReferences = $toolkit['commentRuleReferences']
+            ruleRepository = $toolkit['commentRuleRepository']
+        })
+}
+
 $manifest = Read-ApprovedOwnerV2Json -Path $ManifestPath
 if ([string]$manifest.kind -cne 'owner-v2-preview-cohort') {
     throw 'Scheduled automatic Owner delivery accepts only the Owner cohort.'
@@ -68,7 +80,6 @@ if ($null -ne $LiveModelProvider) {
 $observation = Invoke-OwnerV2PreviewRun -StateRoot $StateRoot `
     -ManifestPath $ManifestPath -LeaseSeconds $LeaseSeconds @liveArguments
 
-$toolkit = Read-ApprovedOwnerV2Json -Path $ToolkitConfigPath
 $automatic = Get-AutomaticOwnerV2Configuration -ToolkitConfig $toolkit
 $completed = @($observation.records | Where-Object {
         [string]$_.state -ceq 'completed'
