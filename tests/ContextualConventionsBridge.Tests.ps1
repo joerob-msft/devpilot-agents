@@ -828,6 +828,88 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'preserves the authenticated history conflict boundary for <Mode>' -TestCases @(
+        @{ Mode = 'ranged-ambiguous'; Expected = 'unknown' },
+        @{ Mode = 'ranged-cross-rule'; Expected = 'unknown' },
+        @{ Mode = 'ranged-unproven-human'; Expected = 'unknown' },
+        @{ Mode = 'duplicate-prior-marker'; Expected = 'unknown' },
+        @{ Mode = 'foreign-prior-marker'; Expected = 'unknown' },
+        @{ Mode = 'extra-signed-marker'; Expected = 'unknown' },
+        @{ Mode = 'ranged-proven-human'; Expected = 'noOp' },
+        @{ Mode = 'outside-range-ambiguous'; Expected = 'noOp' },
+        @{ Mode = 'prior-only'; Expected = 'noOp' }
+    ) {
+        param($Mode, $Expected)
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'duplicate-constant-declarations'
+        $finding.evidence = 'Consolidate duplicated constants WriterKey="writer", ReaderKey="reader" for the proven shared contract.'
+        $finding.binding['span'] = @{ startLine = 32; endLine = 40 }
+        $case.Proof.selection.ruleId = $finding.ruleId
+        if ($Mode -like 'ranged-*') {
+            $marker = Get-ContextualConventionMarkerKey -Contract $case.Contract -Finding $finding
+            $case.Proof.selection.marker = $marker
+            $case.Proof.selection.body = "Legacy body.`n<!-- devpilot-contextual-convention:v1:$marker -->"
+        }
+        if ($Mode -ceq 'extra-signed-marker') {
+            $case.Proof.selection.body += "`n<!-- devpilot-other-rule:v1:$('8' * 64) -->"
+        }
+        $case.Proof.selection.bodySha256 = (
+            Get-ContextualTestTextDigest $case.Proof.selection.body).Substring(10)
+        $case.Thread.comments[0].body = $case.Proof.selection.body
+        if ($Mode -cnotin @('extra-signed-marker', 'prior-only')) {
+            $copy = $case.Thread | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
+            $copy.threadId = 200
+            $copy.comments[0].commentId = 201
+            $copy.anchor.line = $(if ($Mode -like 'ranged-*') { 36 } else { 55 })
+            switch ($Mode) {
+                ranged-ambiguous {
+                    $copy.comments[0].body = 'Unproven current request.'
+                    $copy.comments[0].reviewerIdentityState = 'ambiguous'
+                }
+                ranged-cross-rule { $copy.comments[0].body = "<!-- devpilot-other-rule:v1:$('8' * 64) -->" }
+                ranged-unproven-human {
+                    $copy.comments[0].body = 'Please consider refactoring.'
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+                ranged-proven-human {
+                    $copy.comments[0].body = 'Consolidate shared constant WriterKey.'
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+                outside-range-ambiguous {
+                    $copy.comments[0].body = 'Unrelated request.'
+                    $copy.comments[0].reviewerIdentityState = 'ambiguous'
+                }
+                foreign-prior-marker {
+                    $copy.comments[0].reviewerOwned = $false
+                    $copy.comments[0].reviewerIdentityState = 'foreign'
+                }
+            }
+            $old = $case.Snapshot
+            $case.Snapshot = [DevPilot.OwnerAdapters.OwnerDiscussionSnapshot]::new(
+                $old.State, $old.Reason, $old.PageCount, 2, 2, $old.ByteCount,
+                $old.Digest, $old.SourceDigests, [object[]]@($case.Thread, $copy))
+            foreach ($name in @('RawProvenanceDigests', 'MappingDigest', 'ReviewerIdentityDigest', 'CurrentIterationId')) {
+                $case.Snapshot | Add-Member -NotePropertyName $name -NotePropertyValue $old.$name
+            }
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot -AuthenticatedPriorComments @($case.Proof)
+        $result.findings[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.findings[0].providerMarker.integrity |
+            Should -BeExactly $(if ($Expected -ceq 'unknown') { 'invalid' } else { 'verified' })
+        $result.effects.dedupe.noOp | Should -Be $(if ($Expected -ceq 'noOp') { 1 } else { 0 })
+        $result.effects.dedupe.unknown | Should -Be $(if ($Expected -ceq 'unknown') { 1 } else { 0 })
+        if ($Expected -ceq 'unknown' -and $Mode -cne 'extra-signed-marker') {
+            $result.findings[0].reconciliation.reason | Should -BeExactly authenticated-prior-comment-conflict
+        }
+        $result.effects.dedupe.wouldCreate | Should -Be 0
+        $result.effects.providerWrites | Should -Be 0
+    }
+
     It 'preserves configured citations through acquisition, completed refresh, and approved reconstruction' {
         $config = New-ContextualTestConfig
         $config.enabled = $true
@@ -835,6 +917,10 @@ Describe 'Contextual convention current PR bridge' {
             Get-Content -LiteralPath (
                 Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
                 ConvertFrom-Json -AsHashtable).commentRuleReferences
+        $config['commentRuleRepository'] = (
+            Get-Content -LiteralPath (
+                Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
+                ConvertFrom-Json -AsHashtable).commentRuleRepository
         $configPath = Join-Path $TestDrive 'presentation-config.json'
         [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 64))
         $bodies = @(

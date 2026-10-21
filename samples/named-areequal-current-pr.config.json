@@ -57,6 +57,11 @@
     "implementationSha256": "7ed3583591b43dbb351292ea9a37a53fc32fc9f0fd3403c821e3209310598e3a"
   },
   "autoCreateNamedAreEqualComments": false,
+  "commentRuleRepository": {
+    "organization": "https://dev.azure.com/msazure",
+    "projectName": "One",
+    "repositoryName": "AzureUX-BPM-EngHub"
+  },
   "commentRuleReferences": {
     "named-areequal": {
       "label": "EngHub rules",

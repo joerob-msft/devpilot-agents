@@ -666,12 +666,14 @@ Describe 'Named AreEqual automatic delivery' {
             $sample = if ($delivery -ceq 'named-areequal') {
                 'named-areequal-current-pr.config.json'
             } else { 'contextual-conventions-current-pr.config.json' }
-            $references = (Get-Content -LiteralPath (
+            $config = Get-Content -LiteralPath (
                 Join-Path $repoRoot "samples\$sample") -Raw |
-                ConvertFrom-Json -AsHashtable).commentRuleReferences
+                ConvertFrom-Json -AsHashtable
+            $references = $config.commentRuleReferences
             $evidence.Contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
                 subjectProvider = $evidence.Provider
                 ruleReferences = $references
+                ruleRepository = $config.commentRuleRepository
             }
             $finding = $evidence.Observation.findings[0]
             $body = if ($delivery -ceq 'named-areequal') {

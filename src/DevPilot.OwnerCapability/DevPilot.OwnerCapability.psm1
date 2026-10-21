@@ -138,6 +138,106 @@ function Get-OwnerCommentRepositoryUrl {
         '/_git/' + [uri]::EscapeDataString([string]$Contract.Request.RepositoryId)
 }
 
+function Assert-OwnerCommentReferenceKeys {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory)][string[]]$Keys
+    )
+    if ($Value -isnot [Collections.IDictionary] -or
+        $Value.Count -ne $Keys.Count -or
+        @($Value.Keys | Where-Object { $_ -cnotin $Keys }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citation metadata has unknown or missing schema keys.')
+    }
+}
+
+function Assert-OwnerCommentRuleReferences {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$References,
+        [AllowNull()][object]$Repository,
+        [Parameter(Mandatory)]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
+        [string]$Delivery
+    )
+    if ($null -eq $References) { return }
+    $allowed = @(switch ($Delivery) {
+        owner { @('owner') }
+        named-areequal { @('named-areequal') }
+        contextual-conventions { @(Get-ContextualConventionRuleIds) }
+    })
+    if ($References -isnot [Collections.IDictionary] -or
+        $References.Count -gt $allowed.Count -or
+        @($References.Keys | Where-Object { $_ -cnotin $allowed }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citations must be keyed by existing delivery rule IDs.')
+    }
+    if ($References.Count -eq 0) { return }
+    Assert-OwnerCommentReferenceKeys -Value $Repository `
+        -Keys @('organization', 'projectName', 'repositoryName')
+    $organization = $Repository.organization
+    if ($organization -isnot [string] -or
+        $organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9][A-Za-z0-9-]*|[A-Za-z0-9][A-Za-z0-9-]*\.visualstudio\.com(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)?)/?$') {
+        throw [ArgumentException]::new('Comment citations require an explicitly configured Azure DevOps organization.')
+    }
+    foreach ($name in @('projectName', 'repositoryName')) {
+        $value = $Repository[$name]
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value) -or
+            $value -cne $value.Trim() -or $value.Length -gt 256 -or
+            $value -match '[\\/?#%\x00-\x1f\x7f]' -or $value -cin @('.', '..')) {
+            throw [ArgumentException]::new('Comment citation repository and project names must be canonical single segments.')
+        }
+    }
+    $expectedBase = $organization.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString($Repository.projectName) + '/_git/' +
+        [uri]::EscapeDataString($Repository.repositoryName)
+    foreach ($reference in $References.Values) {
+        Assert-OwnerCommentReferenceKeys -Value $reference -Keys @('label', 'links')
+        if ($reference.label -isnot [string] -or
+            $reference.label -cnotin @('EngHub rules', 'Rule references') -or
+            $reference.links -isnot [array] -or
+            $reference.links.Count -lt 1 -or $reference.links.Count -gt 8) {
+            throw [ArgumentException]::new('Comment citations require a supported label and one to eight links.')
+        }
+        foreach ($link in $reference.links) {
+            Assert-OwnerCommentReferenceKeys -Value $link -Keys @('name', 'url')
+            $url = $link.url
+            $uri = $null
+            if ($link.name -isnot [string] -or [string]::IsNullOrWhiteSpace($link.name) -or
+                $link.name.Length -gt 1024 -or $link.name -match '[\x00-\x1f\x7f]' -or
+                $url -isnot [string] -or $url.Length -gt 8192 -or
+                $url -match '[\\\x00-\x20\x7f<>]' -or
+                $url -match '%(?![0-9a-fA-F]{2})' -or
+                -not [uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or
+                $uri.Scheme -cne 'https' -or $uri.Fragment -or $uri.UserInfo -or
+                -not $url.StartsWith($expectedBase + '?', [StringComparison]::Ordinal)) {
+                throw [ArgumentException]::new('Comment citation links must use the exact configured Azure DevOps repository and no fragment or user information.')
+            }
+            $query = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $parts = $uri.Query.TrimStart('?').Split('&')
+            if ($parts.Count -ne 3) {
+                throw [ArgumentException]::new('Comment citation queries require exactly one version, path, and line.')
+            }
+            foreach ($part in $parts) {
+                $pair = $part.Split('=', 2)
+                if ($pair.Count -ne 2 -or $pair[0] -cnotin @('version', 'path', 'line') -or
+                    $query.ContainsKey($pair[0])) {
+                    throw [ArgumentException]::new('Comment citation queries contain duplicate or unexpected keys.')
+                }
+                $query.Add($pair[0], [uri]::UnescapeDataString($pair[1]))
+            }
+            $line = 0
+            $path = $query['path']
+            if ($query['version'] -cnotmatch '^GC[0-9a-f]{40}$' -or
+                $query['line'] -cnotmatch '^[1-9][0-9]*$' -or
+                -not [int]::TryParse($query['line'], [ref]$line) -or
+                $path.Length -gt 1024 -or -not $path.StartsWith('/') -or
+                $path -match '[\\%?#`<>|\x00-\x1f\x7f]' -or
+                @($path.Substring(1).Split('/') | Where-Object { $_ -cin @('', '.', '..') }).Count -gt 0) {
+                throw [ArgumentException]::new('Comment citation links require an exact source commit, canonical rooted path, and positive line.')
+            }
+        }
+    }
+}
+
 function Format-OwnerCommentRuleReference {
     param(
         [Parameter(Mandatory)][object]$Contract,
@@ -146,29 +246,20 @@ function Format-OwnerCommentRuleReference {
     )
     $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
     $references = Get-OwnerV2Member -Value $presentation -Name ruleReferences
-    if ($null -ne $references -and $references -isnot [Collections.IDictionary]) {
-        throw 'Comment rule references must be a map keyed by the existing rule identity.'
+    $repository = Get-OwnerV2Member -Value $presentation -Name ruleRepository
+    $delivery = if ($RuleId -cin @('owner', 'named-areequal')) { $RuleId } else { 'contextual-conventions' }
+    try {
+        Assert-OwnerCommentRuleReferences -References $references -Repository $repository -Delivery $delivery
+    }
+    catch [ArgumentException] {
+        Write-Warning 'Invalid comment citations were omitted; use the readable rule name and correct the citation configuration.'
+        return "**Rule:** $Name."
     }
     $reference = Get-OwnerV2Member -Value $references -Name $RuleId
     if ($null -eq $reference) { return "**Rule:** $Name." }
-    if ($reference -isnot [Collections.IDictionary]) {
-        throw 'Comment rule reference entries must contain a label and pinned links.'
-    }
-    $label = [string](Get-OwnerV2Member -Value $reference -Name label)
-    $links = @(Get-OwnerV2Member -Value $reference -Name links)
-    if ($label -cnotin @('EngHub rules', 'Rule references') -or
-        $links.Count -lt 1 -or $links.Count -gt 8) {
-        throw 'Comment rule references require a supported label and one to eight pinned links.'
-    }
-    $rendered = foreach ($link in $links) {
-        $url = [string](Get-OwnerV2Member -Value $link -Name url)
-        if ($url -cnotmatch '[?&]version=GC[0-9a-f]{40}(?:&|$)' -or
-            $url -cnotmatch '[?&]path=[^&#]+' -or
-            $url -cnotmatch '[?&]line=[1-9][0-9]*(?:&|$)') {
-            throw 'Comment rule links must identify an exact source commit, path, and line.'
-        }
-        ConvertTo-OwnerCommentLink `
-            -Name ([string](Get-OwnerV2Member -Value $link -Name name)) -Url $url
+    $label = $reference.label
+    $rendered = foreach ($link in $reference.links) {
+        ConvertTo-OwnerCommentLink -Name $link.name -Url $link.url
     }
     return "**${label}:** " + ($rendered -join '; ') + '.'
 }
@@ -767,6 +858,23 @@ function Test-ContextualDuplicateConstantHumanCoverage {
     return $false
 }
 
+function Test-ContextualFindingThreadRange {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Finding,
+        [Parameter(Mandatory)][object]$Thread
+    )
+    if ($null -eq $Thread.anchor -or
+        [string]$Thread.anchor.path -ine [string]$Finding.anchor.path) {
+        return $false
+    }
+    if ([int]$Thread.anchor.line -eq [int]$Finding.anchor.line) { return $true }
+    $span = Get-OwnerV2Member -Value (Get-OwnerV2Member -Value $Finding -Name binding) -Name span
+    return [string]$Finding.ruleId -ceq 'duplicate-constant-declarations' -and
+        $span -is [Collections.IDictionary] -and
+        [int]$Thread.anchor.line -ge [int]$span.startLine -and
+        [int]$Thread.anchor.line -le [int]$span.endLine
+}
+
 function Resolve-ContextualConventionDiscussionReconciliation {
     param(
         [Parameter(Mandatory)]
@@ -1286,6 +1394,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     $authenticatedPriorMarkerSeen =
                         $true
                     if ($priorMarkers.Count -eq 1 -and
+                        [regex]::Matches([string]$comment.body, $anyMarkerPattern).Count -eq 1 -and
                         [string]$comment.commentType -ceq
                             'text' -and
                         -not [bool]$comment.isDeleted -and
@@ -1339,7 +1448,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         [string]$finding.anchor.path -and
                     [int]$thread.anchor.line -eq
                         [int]$finding.anchor.line
-                $currentContext = $sameAnchor -and
+                $sameFindingRange = Test-ContextualFindingThreadRange -Finding $finding -Thread $thread
+                $currentContext = $sameFindingRange -and
                     -not [bool]$thread.isDeleted -and
                     -not [bool]$thread.isOutdated -and
                     [string]$thread.status -ceq
@@ -1366,7 +1476,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             $targetPattern) |
                             Where-Object {
                                 $_.Groups[1].Value -ceq
-                                    $marker
+                                    $marker -or
+                                $_.Groups[1].Value -ceq
+                                    [string]$entry.Proof.selection.marker
                             }).Count -gt 0) {
                         $priorConflict = $true
                         break
@@ -1377,7 +1489,11 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                                 'ambiguous' -or
                             [regex]::IsMatch(
                                 [string]$comment.body,
-                                $anyMarkerPattern))) {
+                                $anyMarkerPattern) -or
+                            (-not $sameAnchor -and
+                                [string]$finding.ruleId -ceq 'duplicate-constant-declarations' -and
+                                -not (Test-ContextualDuplicateConstantHumanCoverage `
+                                    -Body ([string]$comment.body) -Evidence ([string]$finding.evidence))))) {
                         $priorConflict = $true
                         break
                     }
@@ -1449,20 +1565,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                     [string]$finding.anchor.path -and
                 [int]$thread.anchor.line -eq
                     [int]$finding.anchor.line
-            $sameFindingRange = $sameAnchor -or (
-                [string]$finding.ruleId -ceq
-                    'duplicate-constant-declarations' -and
-                $null -ne $thread.anchor -and
-                [string]$thread.anchor.path -ieq
-                    [string]$finding.anchor.path -and
-                $finding.binding -is
-                    [Collections.IDictionary] -and
-                $finding.binding.span -is
-                    [Collections.IDictionary] -and
-                [int]$thread.anchor.line -ge
-                    [int]$finding.binding.span.startLine -and
-                [int]$thread.anchor.line -le
-                    [int]$finding.binding.span.endLine)
+            $sameFindingRange = Test-ContextualFindingThreadRange -Finding $finding -Thread $thread
             foreach ($comment in @($thread.comments)) {
                 if ([string]$comment.commentType -cne
                         'text' -or
@@ -4816,6 +4919,7 @@ function ConvertTo-OwnerV2Observation {
 }
 
 Export-ModuleMember -Function @(
+    'Assert-OwnerCommentRuleReferences',
     'ConvertTo-OwnerV2Observation',
     'Format-ContextualConventionComment',
     'Format-NamedAreEqualComment',

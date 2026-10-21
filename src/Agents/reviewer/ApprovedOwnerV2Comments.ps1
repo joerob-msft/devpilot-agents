@@ -374,6 +374,13 @@ function Set-ApprovedOwnerV2CommentPresentation {
         [Parameter(Mandatory)][Collections.IDictionary]$Observation,
         [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig
     )
+    $delivery = switch ([string]$Contract.Request.CapabilityId) {
+        $script:ApprovedNamedAreEqualCapability { 'named-areequal' }
+        $script:ApprovedContextualCapability { 'contextual-conventions' }
+        default { 'owner' }
+    }
+    Assert-OwnerCommentRuleReferences -References $ToolkitConfig['commentRuleReferences'] `
+        -Repository $ToolkitConfig['commentRuleRepository'] -Delivery $delivery
     $artifacts = @($Observation.sourceArtifacts | Where-Object {
         [string](Get-ApprovedOwnerV2Value $_ 'kind' '') -ceq
             'owner-v2-comment-presentation'
@@ -389,6 +396,7 @@ function Set-ApprovedOwnerV2CommentPresentation {
         -NotePropertyValue ([ordered]@{
             subjectProvider = $ToolkitConfig.subjectProvider
             ruleReferences = $ToolkitConfig['commentRuleReferences']
+            ruleRepository = $ToolkitConfig['commentRuleRepository']
         })
 }
 

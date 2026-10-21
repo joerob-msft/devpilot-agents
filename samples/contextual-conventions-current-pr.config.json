@@ -64,6 +64,11 @@
     "toolSha256": "8fea7715e47ce0d01634d1e56dcf78cbb18345dd38985198a2940efede71157f"
   },
   "autoCreateContextualConventionComments": false,
+  "commentRuleRepository": {
+    "organization": "https://dev.azure.com/msazure",
+    "projectName": "One",
+    "repositoryName": "AzureUX-BPM-EngHub"
+  },
   "commentRuleReferences": {
     "exception-logging": {
       "label": "EngHub rules",

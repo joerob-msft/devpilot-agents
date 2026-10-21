@@ -1008,8 +1008,70 @@ Changed MSTest method ``NeedsOwner`` has no ``Owner`` attribute. Add ``[Owner("<
 }
 
 Describe 'Owner capability module surface' {
+    It 'omits the entire clickable citation group for invalid <Mode> presentation' -TestCases @(
+        @{ Mode = 'external-host' }, @{ Mode = 'fragment' }, @{ Mode = 'duplicate-version' },
+        @{ Mode = 'duplicate-path' }, @{ Mode = 'duplicate-line' }, @{ Mode = 'extra-query' },
+        @{ Mode = 'traversal' }, @{ Mode = 'encoded-traversal' }, @{ Mode = 'backslash' },
+        @{ Mode = 'empty-path-segment' }, @{ Mode = 'unrooted-path' }, @{ Mode = 'wrong-repository' },
+        @{ Mode = 'wrong-project' }, @{ Mode = 'userinfo' }, @{ Mode = 'unknown-rule' },
+        @{ Mode = 'entry-key' }, @{ Mode = 'link-key' }, @{ Mode = 'invalid-unfired-rule' }
+    ) {
+        param($Mode)
+        $config = Get-Content -LiteralPath (
+            Join-Path $PSScriptRoot '..\samples\contextual-conventions-current-pr.config.json'
+        ) -Raw | ConvertFrom-Json -AsHashtable
+        $references = $config.commentRuleReferences
+        $link = $references['named-call-arguments'].links[0]
+        switch ($Mode) {
+            external-host { $link.url = $link.url -replace 'https://dev.azure.com/msazure/One/_git/AzureUX-BPM-EngHub', 'https://evil.example.com/phish' }
+            fragment { $link.url = $link.url.Replace('?version=', '#?version=') }
+            duplicate-version { $link.url = $link.url.Replace('?version=', '?version=GBmaster&version=') }
+            duplicate-path { $link.url += '&path=/other.md' }
+            duplicate-line { $link.url += '&line=1' }
+            extra-query { $link.url += '&view=contents' }
+            traversal { $link.url = $link.url -replace 'path=[^&]+', 'path=/../../secret.md' }
+            encoded-traversal { $link.url = $link.url -replace 'path=[^&]+', 'path=/%2e%2e/secret.md' }
+            backslash { $link.url = $link.url -replace 'path=[^&]+', 'path=/%5csecret.md' }
+            empty-path-segment { $link.url = $link.url -replace 'path=[^&]+', 'path=/docs//rule.md' }
+            unrooted-path { $link.url = $link.url -replace 'path=[^&]+', 'path=docs/rule.md' }
+            wrong-repository { $link.url = $link.url.Replace('_git/AzureUX-BPM-EngHub', '_git/Other') }
+            wrong-project { $link.url = $link.url.Replace('/One/_git/', '/Other/_git/') }
+            userinfo { $link.url = $link.url.Replace('https://', 'https://person@') }
+            unknown-rule { $references['invented-rule'] = $references['exception-logging'] }
+            entry-key { $references['named-call-arguments']['authority'] = 'invented' }
+            link-key { $link['trusted'] = $true }
+            invalid-unfired-rule { $references['exception-logging'].links[0].url = 'https://evil.example.com/unfired' }
+        }
+        $contract = [pscustomobject]@{
+            Request = [pscustomobject]@{
+                CapabilityId = 'bpm-contextual-conventions@1'
+                RuleSection = 'bpm-contextual-conventions@1'
+                RepositoryId = 'repo'
+                PullRequestId = 42
+                SourceCommit = 'a' * 40
+                RuleHash = 'v1:sha256:' + ('b' * 64)
+            }
+            CommentPresentation = @{
+                ruleReferences = $references
+                ruleRepository = $config['commentRuleRepository']
+            }
+        }
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'named-call-arguments'
+            constructRef = 'construct:' + ('d' * 64)
+            evidence = 'Name arguments without changing values.'
+            anchor = @{ path = 'src/Request.cs'; line = 93; symbol = 'C.Run' }
+        }
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $body | Should -Match '\*\*Rule:\*\* Name arguments required by each documented call-site trigger\.'
+        $body | Should -Not -Match '\*\*EngHub rules:\*\*|https://'
+    }
+
     It 'exports only the preview contract, exact writer formatter, and adapter seam' {
         @((Get-Command -Module DevPilot.OwnerCapability).Name | Sort-Object) | Should -Be @(
+            'Assert-OwnerCommentRuleReferences',
             'ConvertTo-OwnerV2Observation',
             'Format-ContextualConventionComment',
             'Format-NamedAreEqualComment',
@@ -1159,9 +1221,10 @@ Describe 'Owner capability module surface' {
     }
 
     It 'renders verified descriptive rule links and rejects unpinned or foreign-scope presentation' {
-        $references = (Get-Content -LiteralPath (
+        $config = Get-Content -LiteralPath (
             Join-Path $PSScriptRoot '..\samples\contextual-conventions-current-pr.config.json'
-        ) -Raw | ConvertFrom-Json -AsHashtable).commentRuleReferences
+        ) -Raw | ConvertFrom-Json -AsHashtable
+        $references = $config.commentRuleReferences
         $contract = [pscustomobject]@{
             Request = [pscustomobject]@{
                 CapabilityId = 'bpm-contextual-conventions@1'
@@ -1179,6 +1242,7 @@ Describe 'Owner capability module surface' {
                     repositoryId = 'repo'
                 }
                 ruleReferences = $references
+                ruleRepository = $config.commentRuleRepository
             }
         }
         $finding = [ordered]@{
@@ -1225,7 +1289,8 @@ Changed construct: ``C.Run``.
             Should -BeExactly $marker
         $contract.CommentPresentation.subjectProvider.repositoryId = 'repo'
         $links[0].url = $links[0].url -replace 'version=GC[0-9a-f]{40}', 'version=GBmaster'
-        { Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker } |
-            Should -Throw '*exact source commit*'
+        $fallback = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $fallback | Should -Match '\*\*Rule:\*\* Name arguments required by each documented call-site trigger\.'
+        $fallback | Should -Not -Match '\*\*EngHub rules:\*\*'
     }
 }

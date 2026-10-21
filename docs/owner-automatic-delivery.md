@@ -78,7 +78,7 @@ Both current-PR bridges and approved-evidence reconstruction use that same
 presentation context, including completed-observation discussion refresh.
 Custom acquisition providers can pass the same context through
 `New-OwnerAzureDevOpsReadOnlyProviderAdapter -CommentPresentation`, with
-`subjectProvider` and `ruleReferences` members.
+`subjectProvider`, `ruleReferences`, and `ruleRepository` members.
 An existing source-artifact slot records the render-mode discriminator, not
 new authority. Reconstruction applies linked context only when the observation
 declares that mode; custom Owner providers that omit it retain their plain
@@ -93,7 +93,27 @@ human-facing citations without changing source acceptance or rule semantics.
 Keys are contextual rule IDs, `named-areequal`, or `owner`. Each entry has
 `label` (`EngHub rules` or `Rule references`) and one to eight `links`, each
 with `name` and an HTTPS `url` pinned by `version=GC<commit>`, `path`, and
-`line`. Verify that the named section actually exists at that exact location;
+`line`. Configure the independent `commentRuleRepository` binding alongside
+the map with exactly `organization`, `projectName`, and `repositoryName`.
+The examples pin the verified EngHub repository; a URL never supplies its own
+trusted root. The configured Azure DevOps cloud organization can use
+`https://dev.azure.com/<org>` or an explicitly configured
+`https://<org>.visualstudio.com[/<collection>]` alias. Links must use that
+exact organization/project/repository prefix; unconfigured aliases are not
+inferred to be equivalent.
+
+Both bridges and approved reconstruction validate **all** configured
+references before evaluating or selecting findings, including unused rules.
+Unknown rule IDs, extra/missing object keys, empty/scalar link lists, external
+hosts, user information, URI fragments, duplicate/unexpected query keys,
+unpinned versions, nonpositive lines, and noncanonical rooted paths are
+rejected. Only one each of `version`, `path`, and `line` is allowed; paths
+cannot contain traversal, backslashes, empty segments, or double-encoded
+escapes. Direct standalone formatting also validates the complete map: on an
+invalid citation it emits a warning and the plain readable rule name, never
+a partial or untrusted clickable citation group.
+
+Verify that the named section actually exists at that exact location;
 do not derive line numbers from a different document revision. The sample
 configs include verified named-argument section references. Rules without
 configured citations display their readable names, never fabricated links.
@@ -113,6 +133,13 @@ proof, whether their marker changed or not. A presentation upgrade never
 rewrites an old comment; conflicting or unverifiable contextual/Named markers
 remain `unknown`. Owner's explicitly approved stale-body update path otherwise
 retains its existing behavior.
+Authenticated contextual history uses the same finding-range boundary as
+normal reconciliation. Ambiguous, cross-rule, or unproven human comments
+elsewhere in a duplicate-constant finding's bound span prevent a history
+no-op; proven coverage and unrelated comments outside the span retain their
+existing behavior. Copies of either the current or authenticated prior marker
+in another comment are conflicts, and the authenticated body itself must
+contain exactly one recognized automation marker.
 
 ## Contextual rule behavior
 
