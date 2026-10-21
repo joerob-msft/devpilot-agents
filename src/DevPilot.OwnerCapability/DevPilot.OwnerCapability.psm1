@@ -137,7 +137,8 @@ function Format-OwnerV1WriterComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     $request = $Contract.Request
@@ -154,6 +155,21 @@ function Format-OwnerV1WriterComment {
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath
     )
     $section = ConvertTo-OwnerV1WriterMarkdownCode ([string]$request.RuleSection)
+    if (-not $Legacy) {
+        return @(
+            '**Add an Owner attribute to this changed test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId owner -Name 'Changed MSTest methods require an Owner attribute')
+            ''
+            "Changed MSTest method ``$symbol`` has no ``Owner`` attribute. Add ``[Owner(`"<owner-alias>`")]`` to this test method."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path `
+                -Lines @([int](Get-OwnerV2Member -Value $anchor -Name line)))
+            ''
+            "<!-- ${script:OwnerV1WriterMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
     return @(
         '**Owner attribute missing**'
         ''
@@ -230,7 +246,8 @@ function Format-NamedAreEqualComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     if ($MarkerKey -cne (Get-NamedAreEqualMarkerKey `
@@ -249,6 +266,23 @@ function Format-NamedAreEqualComment {
     }
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    if (-not $Legacy) {
+        return @(
+            '**Use named arguments for Assert.AreEqual in this test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId named-areequal -Name 'Name every supplied Assert.AreEqual argument')
+            ''
+            "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s). Name every supplied argument according to the selected overload, commonly ``expected:`` and ``actual:`` (and ``delta:`` or ``message:`` when supplied). Preserve argument order and values."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path -Lines $sample)
+            $(if ($count -gt $sample.Count) {
+                "Showing the first 12 of $count changed calls."
+            })
+            ''
+            "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
+        ) | Where-Object { $null -ne $_ } | Join-String -Separator "`n"
+    }
     return @(
         '**Use named arguments for Assert.AreEqual in this test method**'
         ''
@@ -519,8 +553,11 @@ function Resolve-NamedAreEqualDiscussionReconciliation {
             [string]$thread.contextState -ceq 'current' -and
             [string]$thread.sourceCommit -ceq
                 [string]$Contract.Request.SourceCommit
-        $classification = if ($trusted -and
-            [string]$comment.body -ceq $body) {
+        $legacyBody = Format-NamedAreEqualComment -Contract $Contract `
+            -Finding $finding -MarkerKey $marker -Legacy
+        $classification = if ($trusted -and (
+            [string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq $legacyBody)) {
             'noOp'
         }
         else { 'unknown' }
@@ -599,6 +636,17 @@ function Resolve-OwnerV2DiscussionReconciliation {
         [string]$FailureReason = 'discussion-acquisition-unavailable'
     )
 
+    $Observation.sourceArtifacts = @($Observation.sourceArtifacts | Where-Object {
+        [string](Get-OwnerV2Member -Value $_ -Name kind) -cne
+            'owner-v2-comment-presentation'
+    })
+    if ($null -ne (Get-OwnerV2Member -Value $Contract -Name CommentPresentation)) {
+        $Observation.sourceArtifacts += [ordered]@{
+            kind = 'owner-v2-comment-presentation'
+            sha256 = Get-OwnerV1WriterSha256 -Text 'owner-v2-comment-presentation:subject-provider-links-v1'
+            signature = 'not-applicable'
+        }
+    }
     if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
         $script:NamedAreEqualCapability) {
         return Resolve-NamedAreEqualDiscussionReconciliation `
@@ -780,7 +828,10 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $classification = 'unknown'
             $reason = 'reviewer-marker-thread-status-unknown'
         }
-        elseif ([string]$comment.body -ceq $body) {
+        elseif ([string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq (
+                Format-OwnerV1WriterComment -Contract $Contract `
+                    -Finding $finding -MarkerKey $markerKey -Legacy)) {
             $classification = 'noOp'
             $reason = 'reviewer-marker-body-current'
         }
@@ -2730,7 +2781,202 @@ function ConvertTo-OwnerV2Observation {
     }
 }
 
+
+function ConvertTo-OwnerCommentLink {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Url
+    )
+    $uri = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or
+        $Url -match '[\x00-\x20\x7f<>]' -or
+        [string]::IsNullOrWhiteSpace($Name) -or
+        $Name.Length -gt 1024 -or $Name -match '[\x00-\x1f\x7f]') {
+        throw 'Comment references require a bounded label and an absolute HTTPS URL.'
+    }
+    $label = $Name -replace '([\\`*_\[\]<>])', '\$1'
+    $target = $uri.AbsoluteUri.Replace('(', '%28').Replace(')', '%29').
+        Replace('[', '%5B').Replace(']', '%5D')
+    return "[$label]($target)"
+}
+
+function Get-OwnerCommentRepositoryUrl {
+    param([Parameter(Mandatory)][object]$Contract)
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $provider = Get-OwnerV2Member -Value $presentation -Name subjectProvider
+    if ($null -eq $provider) { return $null }
+    if ([string](Get-OwnerV2Member -Value $provider -Name repositoryId) -cne
+            [string]$Contract.Request.RepositoryId -or
+        [string](Get-OwnerV2Member -Value $provider -Name projectId) -cne
+            [string]$Contract.Request.ProjectId) {
+        throw 'Comment source links must use the bound subject repository and project.'
+    }
+    $organization = [string](Get-OwnerV2Member -Value $provider -Name organization)
+    $uri = $null
+    if (-not [uri]::TryCreate($organization, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Query -or
+        $uri.Fragment -or $organization -match '[\x00-\x20\x7f<>]') {
+        throw 'Comment source links require the configured HTTPS organization URL.'
+    }
+    return $uri.AbsoluteUri.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString([string]$Contract.Request.ProjectId) +
+        '/_git/' + [uri]::EscapeDataString([string]$Contract.Request.RepositoryId)
+}
+
+function Assert-OwnerCommentReferenceKeys {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory)][string[]]$Keys
+    )
+    if ($Value -isnot [Collections.IDictionary] -or
+        $Value.Count -ne $Keys.Count -or
+        @($Value.Keys | Where-Object { $_ -cnotin $Keys }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citation metadata has unknown or missing schema keys.')
+    }
+}
+
+function Assert-OwnerCommentRuleReferences {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$References,
+        [AllowNull()][object]$Repository,
+        [Parameter(Mandatory)]
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
+        [string]$Delivery
+    )
+    if ($null -eq $References) { return }
+    $allowed = @(switch ($Delivery) {
+        owner { @('owner') }
+        named-areequal { @('named-areequal') }
+        contextual-conventions { @(Get-ContextualConventionRuleIds) }
+    })
+    if ($References -isnot [Collections.IDictionary] -or
+        $References.Count -gt $allowed.Count -or
+        @($References.Keys | Where-Object { $_ -cnotin $allowed }).Count -gt 0) {
+        throw [ArgumentException]::new('Comment citations must be keyed by existing delivery rule IDs.')
+    }
+    if ($References.Count -eq 0) { return }
+    Assert-OwnerCommentReferenceKeys -Value $Repository `
+        -Keys @('organization', 'projectName', 'repositoryName')
+    $organization = $Repository.organization
+    if ($organization -isnot [string] -or
+        $organization -cnotmatch '^https://(?:dev\.azure\.com/[A-Za-z0-9][A-Za-z0-9-]*|[A-Za-z0-9][A-Za-z0-9-]*\.visualstudio\.com(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)?)/?$') {
+        throw [ArgumentException]::new('Comment citations require an explicitly configured Azure DevOps organization.')
+    }
+    foreach ($name in @('projectName', 'repositoryName')) {
+        $value = $Repository[$name]
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value) -or
+            $value -cne $value.Trim() -or $value.Length -gt 256 -or
+            $value -match '[\\/?#%\x00-\x1f\x7f]' -or $value -cin @('.', '..')) {
+            throw [ArgumentException]::new('Comment citation repository and project names must be canonical single segments.')
+        }
+    }
+    $expectedBase = $organization.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString($Repository.projectName) + '/_git/' +
+        [uri]::EscapeDataString($Repository.repositoryName)
+    foreach ($reference in $References.Values) {
+        Assert-OwnerCommentReferenceKeys -Value $reference -Keys @('label', 'links')
+        if ($reference.label -isnot [string] -or
+            $reference.label -cnotin @('EngHub rules', 'Rule references') -or
+            $reference.links -isnot [array] -or
+            $reference.links.Count -lt 1 -or $reference.links.Count -gt 8) {
+            throw [ArgumentException]::new('Comment citations require a supported label and one to eight links.')
+        }
+        foreach ($link in $reference.links) {
+            Assert-OwnerCommentReferenceKeys -Value $link -Keys @('name', 'url')
+            $url = $link.url
+            $uri = $null
+            if ($link.name -isnot [string] -or [string]::IsNullOrWhiteSpace($link.name) -or
+                $link.name.Length -gt 1024 -or $link.name -match '[\x00-\x1f\x7f]' -or
+                $url -isnot [string] -or $url.Length -gt 8192 -or
+                $url -match '[\\\x00-\x20\x7f<>]' -or
+                $url -match '%(?![0-9a-fA-F]{2})' -or
+                -not [uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or
+                $uri.Scheme -cne 'https' -or $uri.Fragment -or $uri.UserInfo -or
+                -not $url.StartsWith($expectedBase + '?', [StringComparison]::Ordinal)) {
+                throw [ArgumentException]::new('Comment citation links must use the exact configured Azure DevOps repository and no fragment or user information.')
+            }
+            $query = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+            $parts = $uri.Query.TrimStart('?').Split('&')
+            if ($parts.Count -ne 3) {
+                throw [ArgumentException]::new('Comment citation queries require exactly one version, path, and line.')
+            }
+            foreach ($part in $parts) {
+                $pair = $part.Split('=', 2)
+                if ($pair.Count -ne 2 -or $pair[0] -cnotin @('version', 'path', 'line') -or
+                    $query.ContainsKey($pair[0])) {
+                    throw [ArgumentException]::new('Comment citation queries contain duplicate or unexpected keys.')
+                }
+                $query.Add($pair[0], [uri]::UnescapeDataString($pair[1]))
+            }
+            $line = 0
+            $path = $query['path']
+            if ($query['version'] -cnotmatch '^GC[0-9a-f]{40}$' -or
+                $query['line'] -cnotmatch '^[1-9][0-9]*$' -or
+                -not [int]::TryParse($query['line'], [ref]$line) -or
+                $path.Length -gt 1024 -or -not $path.StartsWith('/') -or
+                $path -match '[\\%?#`<>|\x00-\x1f\x7f]' -or
+                @($path.Substring(1).Split('/') | Where-Object { $_ -cin @('', '.', '..') }).Count -gt 0) {
+                throw [ArgumentException]::new('Comment citation links require an exact source commit, canonical rooted path, and positive line.')
+            }
+        }
+    }
+}
+
+function Format-OwnerCommentRuleReference {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$RuleId,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $references = Get-OwnerV2Member -Value $presentation -Name ruleReferences
+    $repository = Get-OwnerV2Member -Value $presentation -Name ruleRepository
+    $delivery = if ($RuleId -cin @('owner', 'named-areequal')) { $RuleId } else { 'contextual-conventions' }
+    try {
+        Assert-OwnerCommentRuleReferences -References $references -Repository $repository -Delivery $delivery
+    }
+    catch [ArgumentException] {
+        Write-Warning 'Invalid comment citations were omitted; use the readable rule name and correct the citation configuration.'
+        return "**Rule:** $Name."
+    }
+    $reference = Get-OwnerV2Member -Value $references -Name $RuleId
+    if ($null -eq $reference) { return "**Rule:** $Name." }
+    $label = $reference.label
+    $rendered = foreach ($link in $reference.links) {
+        ConvertTo-OwnerCommentLink -Name $link.name -Url $link.url
+    }
+    return "**${label}:** " + ($rendered -join '; ') + '.'
+}
+
+function Format-OwnerCommentOccurrences {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int[]]$Lines
+    )
+    $path = ConvertTo-OwnerV1WriterPath -Path $Path
+    $repositoryUrl = Get-OwnerCommentRepositoryUrl -Contract $Contract
+    $locations = foreach ($line in $Lines) {
+        if ($line -lt 1 -or $line -gt 200000) {
+            throw 'Comment occurrences require exact positive source lines.'
+        }
+        if ($repositoryUrl) {
+            $url = $repositoryUrl + '?version=GC' +
+                [string]$Contract.Request.SourceCommit +
+                '&path=' + [uri]::EscapeDataString($path) + "&line=$line"
+            ConvertTo-OwnerCommentLink -Name "$($path.TrimStart('/')):$line" -Url $url
+        }
+        else {
+            "``$(ConvertTo-OwnerV1WriterMarkdownCode $path):$line``"
+        }
+    }
+    return @('**Changed-line occurrences:**') +
+        @($locations | ForEach-Object { "- $_" }) -join "`n"
+}
 Export-ModuleMember -Function @(
+    'Assert-OwnerCommentRuleReferences',
     'ConvertTo-OwnerV2Observation',
     'Format-NamedAreEqualComment',
     'Format-OwnerV1WriterComment',

@@ -29,6 +29,47 @@ function Get-IntakeDigest {
     ).ToLowerInvariant()
 }
 
+function Get-IntakeTextDigest {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+    return 'v1:sha256:' + [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData(
+            [Text.UTF8Encoding]::new($false).GetBytes($Value))).
+        ToLowerInvariant()
+}
+
+function Get-IntakeFileProgressBindingDigest {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Head
+    )
+    return Get-IntakeDigest ([ordered]@{
+            repositoryId =
+                [string]$Head.repositoryId
+            projectId =
+                [string]$Head.projectId
+            pullRequestId =
+                [long]$Head.pullRequestId
+            sourceRef =
+                [string]$Head.sourceRef
+            targetRef =
+                [string]$Head.targetRef
+            sourceCommit =
+                [string]$Head.sourceCommit
+            targetCommit =
+                [string]$Head.targetCommit
+            iterationId =
+                [int]$Head.iterationId
+            status =
+                [string]$Head.status
+            isDraft =
+                [bool]$Head.isDraft
+        })
+}
+
 function New-IntakeTransportFailure {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -333,6 +374,18 @@ function Assert-IntakeConfig {
             [string]$rule.capability -cnotmatch '^[a-zA-Z0-9_.@-]{1,100}$' -or
             -not $ids.Add([string]$rule.id)) { throw 'Invalid or repeated rule registry entry.' }
     }
+    if ($Config.Contains('sharedAcquisition')) {
+        $shared = $Config.sharedAcquisition
+        if ($shared -isnot
+                [Collections.IDictionary] -or
+            ($shared.Contains(
+                    'includePullRequestTemplateAuthority') -and
+                $shared.
+                    includePullRequestTemplateAuthority -isnot
+                        [bool])) {
+            throw 'Shared acquisition pull request template authority flag must be a Boolean.'
+        }
+    }
     if ($Config.Contains('cursorCompatibility')) {
         $compatibility = $Config.cursorCompatibility
         if ($compatibility -isnot [Collections.IDictionary] -or
@@ -501,6 +554,9 @@ function Get-IntakePass {
                 status = 'active'
                 isDraft = [bool]$item.isDraft
                 targetRef = [string]$item.targetRef
+                creationUtc = $(if ($item.Contains('creationUtc')) {
+                        [string]$item.creationUtc
+                    } else { $null })
             }
             $key = [string]$id
             $digest = Get-IntakeDigest $value
@@ -544,6 +600,99 @@ function Assert-IntakeHead {
         throw 'invalid-head'
     }
     [void](Assert-IntakeNumber $Head.iterationId iterationId 1 ([int]::MaxValue))
+    $title = if (-not $Head.Contains(
+            'title') -or
+        $null -eq $Head.title) {
+        ''
+    }
+    else { [string]$Head.title }
+    $description = if (-not $Head.Contains(
+            'description') -or
+        $null -eq $Head.description) {
+        ''
+    }
+    else { [string]$Head.description }
+    if ($title.Length -gt 4096 -or
+        $description.Length -gt 131072) {
+        throw 'invalid-head'
+    }
+    $descriptionDigest =
+        Get-IntakeTextDigest -Value $description
+    if ($Head.Contains('descriptionDigest') -and
+        [string]$Head.descriptionDigest -cne
+            $descriptionDigest) {
+        throw 'invalid-head'
+    }
+    $templateAuthority = if (
+        $Head.Contains('templateAuthority') -and
+        $Head.templateAuthority -is
+            [Collections.IDictionary]) {
+        $Head.templateAuthority
+    }
+    else {
+        [ordered]@{
+            state = 'unknown'
+            reason =
+                'template-authority-unavailable'
+        }
+    }
+    if ([string]$templateAuthority.state -cnotin @(
+            'complete', 'unknown')) {
+        throw 'invalid-head'
+    }
+    if ([string]$templateAuthority.state -ceq
+        'complete') {
+        if ([string]$templateAuthority.path -cnotmatch
+                '^/\.azuredevops/pull_request_template\.(?:md|txt)$' -or
+            [string]$templateAuthority.configurationRef -cnotmatch
+                '^refs/heads/[^~^:?*\[\\]+$' -or
+            [string]$templateAuthority.configurationCommit -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$templateAuthority.blob -cnotmatch
+                '^[0-9a-f]{40}$' -or
+            [string]$templateAuthority.contentDigest -cnotmatch
+                '^v1:sha256:[0-9a-f]{64}$' -or
+            $templateAuthority.content -isnot [string] -or
+            [Text.Encoding]::UTF8.GetByteCount(
+                [string]$templateAuthority.content) -gt 65536 -or
+            [string]$templateAuthority.contentDigest -cne
+                (Get-IntakeTextDigest -Value (
+                    [string]$templateAuthority.content))) {
+            throw 'invalid-head'
+        }
+        $templateAuthority =
+            [ordered]@{
+                state = 'complete'
+                path =
+                    [string]$templateAuthority.path
+                configurationRef =
+                    [string]$templateAuthority.configurationRef
+                configurationCommit =
+                    ([string]$templateAuthority.configurationCommit).
+                        ToLowerInvariant()
+                blob =
+                    ([string]$templateAuthority.blob).
+                        ToLowerInvariant()
+                contentDigest =
+                    [string]$templateAuthority.contentDigest
+                content =
+                    [string]$templateAuthority.content
+            }
+    }
+    else {
+        $reason = [string]$templateAuthority.reason
+        if ($reason -cnotin @(
+                'template-authority-unavailable',
+                'template-authority-ambiguous',
+                'template-authority-malformed',
+                'template-authority-stale')) {
+            throw 'invalid-head'
+        }
+        $templateAuthority = [ordered]@{
+            state = 'unknown'
+            reason = $reason
+        }
+    }
     return [ordered]@{
         repositoryId = ([string]$Head.repositoryId).ToLowerInvariant()
         projectId = ([string]$Head.projectId).ToLowerInvariant()
@@ -555,6 +704,12 @@ function Assert-IntakeHead {
         iterationId = [int]$Head.iterationId
         status = [string]$Head.status
         isDraft = [bool]$Head.isDraft
+        title = $title
+        description = $description
+        descriptionDigest =
+            $descriptionDigest
+        templateAuthority =
+            $templateAuthority
     }
 }
 
@@ -836,6 +991,18 @@ function New-IntakeDisabledSummary {
         mode = 'dry-run-read-only'
         writerEligible = $false
         autoPost = $false
+        lifecycleWriterEligible = $false
+        lifecycle = [ordered]@{
+            state = 'disabled'
+            health = 'disabled'
+            providerWrites = 0
+            modelWrites = 0
+            confirmedAbandonedIds = @()
+            reviewEligibleIds = @()
+            nextPullRequestId = $null
+            decisions = @()
+            events = @()
+        }
         state = 'disabled'
         populationKnown = $false
         inventory = [ordered]@{
@@ -884,6 +1051,7 @@ function Invoke-ActivePrIntake {
         [ValidateRange(0, 4)][int]$MaximumHeadsThisRun = 0,
         [ValidateRange(0, 720)]
         [int]$MaximumSecondsThisRun = 0,
+        [AllowNull()][scriptblock]$LifecycleEvaluator,
         [switch]$IncludeTransientSnapshots,
         [switch]$Run
     )
@@ -909,6 +1077,21 @@ function Invoke-ActivePrIntake {
         $previous = $null
         $cursorBindingCompatible = $false
         $cursorTransitionApplied = $false
+        $currentConfigDigest =
+            Get-IntakeDigest $Config
+        $maximumPullRequests =
+            [long]$Config.limits.
+                maxPullRequests
+        if ($maximumPullRequests -gt
+            [long]::MaxValue / 3L) {
+            throw 'Invalid limits.maxPullRequests.'
+        }
+        $maximumMigrationProofs =
+            [Math]::Min(
+                20000L,
+                $maximumPullRequests * 3L)
+        $previousConfigLineage = @()
+        $previousMigrationProofs = @()
         if (Test-Path -LiteralPath $path) {
             $file = Get-Item -LiteralPath $path -Force
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -gt 8388608) {
@@ -945,7 +1128,71 @@ function Invoke-ActivePrIntake {
                 [string]$previous.binding.repositoryId -ine [string]$Config.repositoryId) {
                 throw 'Intake state is bound to a different repository.'
             }
-            $currentConfigDigest = Get-IntakeDigest $Config
+            $previousConfigLineage = @(
+                if ($previous.binding.Contains(
+                        'configLineage')) {
+                    $previous.binding.
+                        configLineage
+                }
+                else {
+                    [string]$previous.binding.
+                        configDigest
+                })
+            if ($previousConfigLineage.Count -lt 1 -or
+                $previousConfigLineage.Count -gt 3 -or
+                @($previousConfigLineage |
+                    Sort-Object -Unique `
+                        -CaseSensitive).Count -ne
+                    $previousConfigLineage.Count -or
+                @($previousConfigLineage |
+                    Where-Object {
+                        [string]$_ -cnotmatch
+                            '^[0-9a-f]{64}$'
+                    }).Count -ne 0 -or
+                [string]$previousConfigLineage[0] -cne
+                    [string]$previous.binding.
+                        configDigest) {
+                throw 'Previous intake config lineage is invalid.'
+            }
+            if ($previous.binding.Contains(
+                    'fileProgressMigrationProofs')) {
+                $previousMigrationProofs =
+                    @($previous.binding.
+                        fileProgressMigrationProofs)
+                $proofKeys =
+                    [Collections.Generic.HashSet[string]]::new(
+                        [StringComparer]::Ordinal)
+                if ([long]$previousMigrationProofs.Count -gt
+                    $maximumMigrationProofs) {
+                    throw 'Previous intake progress migration proofs are invalid.'
+                }
+                foreach ($proof in
+                    $previousMigrationProofs) {
+                    if ($proof -isnot
+                            [Collections.IDictionary] -or
+                        $proof.Count -ne 4 -or
+                        [long]$proof.pullRequestId -lt 1 -or
+                        [string]$proof.configDigest -cnotmatch
+                            '^[0-9a-f]{64}$' -or
+                        [string]$proof.configDigest -cnotin
+                            $previousConfigLineage -or
+                        [string]$proof.declarationDigest -cnotmatch
+                            '^[0-9a-f]{64}$' -or
+                        [string]$proof.
+                            fileProgressBindingDigest -cnotmatch
+                            '^[0-9a-f]{64}$') {
+                        throw 'Previous intake progress migration proofs are invalid.'
+                    }
+                    $proofKey =
+                        "$([long]$proof.pullRequestId)|" +
+                        "$([string]$proof.configDigest)|" +
+                        "$([string]$proof.declarationDigest)"
+                    if (-not $proofKeys.Add(
+                            $proofKey)) {
+                        throw 'Previous intake progress migration proofs are invalid.'
+                    }
+                }
+            }
             $cursorBindingCompatible =
                 [string]$previous.binding.configDigest -ceq
                     $currentConfigDigest
@@ -959,6 +1206,128 @@ function Invoke-ActivePrIntake {
                 $cursorBindingCompatible = $true
                 $cursorTransitionApplied = $true
             }
+        }
+        $lineage =
+            [Collections.Generic.List[string]]::new()
+        [void]$lineage.Add(
+            $currentConfigDigest)
+        if ($previous -and (
+                $cursorBindingCompatible -or
+                $cursorTransitionApplied)) {
+            foreach ($digest in
+                $previousConfigLineage) {
+                if ($lineage.Count -ge 3) {
+                    break
+                }
+                if (-not $lineage.Contains(
+                        [string]$digest)) {
+                    [void]$lineage.Add(
+                        [string]$digest)
+                }
+            }
+        }
+        $migrationProofCandidates =
+            [Collections.Generic.List[object]]::new()
+        foreach ($proof in
+            $previousMigrationProofs) {
+            [void]$migrationProofCandidates.Add(
+                $proof)
+        }
+        if ($previous) {
+            foreach ($head in
+                @($previous.heads)) {
+                if ($head.declaration -is
+                        [Collections.IDictionary] -and
+                    [long]$head.pullRequestId -ge 1 -and
+                    [string]$head.declarationDigest -cmatch
+                        '^[0-9a-f]{64}$') {
+                    $migrationBindingDigest =
+                        Get-IntakeFileProgressBindingDigest `
+                            -Head $head.declaration
+                    [void]$migrationProofCandidates.Add(
+                        [ordered]@{
+                            pullRequestId =
+                                [long]$head.
+                                    pullRequestId
+                            configDigest =
+                                [string]$previous.
+                                    binding.
+                                    configDigest
+                            declarationDigest =
+                                [string]$head.
+                                    declarationDigest
+                            fileProgressBindingDigest =
+                                $migrationBindingDigest
+                        })
+                }
+            }
+        }
+        if ([long]$migrationProofCandidates.Count -gt
+            $maximumMigrationProofs) {
+            throw 'Intake progress migration proof candidates exceed the supported bound.'
+        }
+        $migrationProofs =
+            [Collections.Generic.List[object]]::new()
+        $migrationProofKeys =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
+        foreach ($proof in
+            $migrationProofCandidates) {
+            if ([string]$proof.configDigest -cnotin
+                    $lineage) {
+                continue
+            }
+            $proofProgressPath = Join-Path `
+                $fileProgressRoot `
+                "$([long]$proof.pullRequestId).json"
+            if (-not (Test-Path -LiteralPath `
+                    $proofProgressPath -PathType Leaf)) {
+                continue
+            }
+            $proofProgressFile =
+                Get-Item -LiteralPath `
+                    $proofProgressPath -Force
+            if ($proofProgressFile.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint -or
+                $proofProgressFile.Length -gt
+                    33554432) {
+                throw 'file-progress-invalid'
+            }
+            [void](
+                Assert-AgentTrustedFile `
+                    -Path $proofProgressPath `
+                    -AllowedRoot $fileProgressRoot `
+                    -Private)
+            $proofProgress =
+                Get-Content -LiteralPath `
+                    $proofProgressPath -Raw |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 64
+            if ([int]$proofProgress.schemaVersion -ne
+                    2 -or
+                [string]$proofProgress.kind -cne
+                    'active-pr-file-progress' -or
+                [long]$proofProgress.pullRequestId -ne
+                    [long]$proof.pullRequestId -or
+                [string]$proofProgress.configDigest -cne
+                    [string]$proof.configDigest -or
+                [string]$proofProgress.declarationDigest -cne
+                    [string]$proof.declarationDigest) {
+                continue
+            }
+            $proofKey =
+                "$([long]$proof.pullRequestId)|" +
+                "$([string]$proof.configDigest)|" +
+                "$([string]$proof.declarationDigest)"
+            if ($migrationProofKeys.Add(
+                    $proofKey)) {
+                [void]$migrationProofs.Add(
+                    $proof)
+            }
+        }
+        if ([long]$migrationProofs.Count -gt
+            $maximumMigrationProofs) {
+            throw 'Intake progress migration proofs exceed the supported bound.'
         }
         $effectiveMaximumHeads = if ($MaximumHeadsThisRun -gt 0) {
             $MaximumHeadsThisRun
@@ -999,14 +1368,22 @@ function Invoke-ActivePrIntake {
                 organization = [string]$Config.organization
                 projectId = ([string]$Config.projectId).ToLowerInvariant()
                 repositoryId = ([string]$Config.repositoryId).ToLowerInvariant()
-                configDigest = Get-IntakeDigest $Config
+                configDigest = $currentConfigDigest
+                configLineage =
+                    $lineage.ToArray()
+                fileProgressMigrationProofs =
+                    $migrationProofs.ToArray()
                 cursorSourceConfigDigest = $(if ($previous) {
                         [string]$previous.binding.configDigest
                     } else { $null })
                 cursorTransitionApplied =
                     $cursorTransitionApplied
             }
-            mode = 'dry-run-read-only'
+            mode = $(if ($null -ne $LifecycleEvaluator) {
+                    'review-read-only-plus-stale-status-lifecycle'
+                } else {
+                    'dry-run-read-only'
+                })
             execution = [ordered]@{
                 maximumHeadsThisRun = $effectiveMaximumHeads
                 maximumSecondsThisRun =
@@ -1014,6 +1391,8 @@ function Invoke-ActivePrIntake {
             }
             writerEligible = $false
             autoPost = $false
+            lifecycleWriterEligible =
+                $null -ne $LifecycleEvaluator
             state = 'unknown'
             populationKnown = $false
             inventory = [ordered]@{
@@ -1036,6 +1415,17 @@ function Invoke-ActivePrIntake {
                 staleRules = 0; drift = 0 }
             pages = [ordered]@{ first = 0; second = 0 }
             cursor = [ordered]@{ nextPullRequestId = $null }
+            lifecycle = [ordered]@{
+                state = 'disabled'
+                health = 'disabled'
+                providerWrites = 0
+                modelWrites = 0
+                confirmedAbandonedIds = @()
+                reviewEligibleIds = @()
+                nextPullRequestId = $null
+                decisions = @()
+                events = @()
+            }
             heads = @()
             rules = @()
             unmetCapabilities = @()
@@ -1116,9 +1506,219 @@ function Invoke-ActivePrIntake {
                 if ($envelope.gaps.duplicateEntries -gt 0) {
                     $envelope.inventory.gaps += 'duplicate-list-entries-reconciled'
                 }
+                $confirmedAbandoned =
+                    [Collections.Generic.HashSet[int]]::new()
+                $lifecycleReviewEligible =
+                    [Collections.Generic.HashSet[int]]::new()
+                $lifecycleGatingActive =
+                    $null -ne $LifecycleEvaluator
+                if ($null -ne $LifecycleEvaluator) {
+                    try {
+                        $lifecycleValidationStage =
+                            'inventory-order'
+                        $lifecycleIds = @($ids)
+                        if ($previous -and
+                            $cursorBindingCompatible -and
+                            $previous.lifecycle -is
+                                [Collections.IDictionary] -and
+                            $null -ne $previous.lifecycle.
+                                nextPullRequestId -and
+                            $lifecycleIds.Count -gt 0) {
+                            $previousLifecycleCursor =
+                                $previous.lifecycle[
+                                    'nextPullRequestId']
+                            $lifecycleTarget =
+                                Assert-IntakeNumber `
+                                    -Value $previousLifecycleCursor `
+                                    -Name lifecycleCursor `
+                                    -Minimum 1 `
+                                    -Maximum ([int]::MaxValue)
+                            $lifecycleStart = 0
+                            while ($lifecycleStart -lt
+                                $lifecycleIds.Count -and
+                                $lifecycleIds[$lifecycleStart] -lt
+                                    $lifecycleTarget) {
+                                $lifecycleStart++
+                            }
+                            if ($lifecycleStart -eq
+                                $lifecycleIds.Count) {
+                                $lifecycleStart = 0
+                            }
+                            $lifecycleIds = @(
+                                $lifecycleIds[
+                                    $lifecycleStart..
+                                        ($lifecycleIds.Count - 1)]
+                            ) + @($(if ($lifecycleStart -gt 0) {
+                                    $lifecycleIds[
+                                        0..($lifecycleStart - 1)]
+                                }))
+                        }
+                        $lifecycle = & $LifecycleEvaluator @(
+                            $lifecycleIds | ForEach-Object {
+                                $first.seen[[string]$_].value
+                            })
+                        $lifecycleValidationStage =
+                            'result-shape'
+                        if (($lifecycle -isnot
+                                [Collections.IDictionary] -and
+                            $lifecycle -isnot [pscustomobject]) -or
+                            [string]$lifecycle.kind -cne
+                                'stale-pr-lifecycle-v1-run' -or
+                            [int]$lifecycle.providerWrites -lt 0 -or
+                            [int]$lifecycle.providerWrites -gt 2 -or
+                            [int]$lifecycle.modelWrites -ne 0 -or
+                            $lifecycle.reviewEligibleIds -isnot
+                                [array]) {
+                            throw 'lifecycle-result-invalid'
+                        }
+                        $lifecycleValidationStage =
+                            'confirmed-abandoned'
+                        foreach ($abandonedId in @(
+                                $lifecycle.confirmedAbandonedIds)) {
+                            [void]$confirmedAbandoned.Add(
+                                (Assert-IntakeNumber `
+                                    $abandonedId pullRequestId 1 `
+                                    ([int]::MaxValue)))
+                        }
+                        if ($confirmedAbandoned.Count -gt
+                            [int]$lifecycle.providerWrites) {
+                            throw 'lifecycle-result-invalid'
+                        }
+                        $lifecycleValidationStage =
+                            'review-eligibility'
+                        foreach ($reviewEligibleId in @(
+                                $lifecycle.reviewEligibleIds)) {
+                            $normalizedReviewEligible =
+                                Assert-IntakeNumber `
+                                    $reviewEligibleId `
+                                    pullRequestId 1 `
+                                    ([int]::MaxValue)
+                            if (-not $first.seen.ContainsKey(
+                                    [string]$normalizedReviewEligible) -or
+                                $confirmedAbandoned.Contains(
+                                    $normalizedReviewEligible) -or
+                                -not $lifecycleReviewEligible.Add(
+                                    $normalizedReviewEligible)) {
+                                throw (
+                                    'lifecycle-review-' +
+                                    'eligibility-invalid')
+                            }
+                        }
+                        $lifecycleValidationStage =
+                            'next-candidate'
+                        if ($null -ne
+                            $lifecycle.nextPullRequestId) {
+                            $nextLifecycleValue =
+                                $lifecycle.
+                                    nextPullRequestId
+                            $nextLifecycleId =
+                                Assert-IntakeNumber `
+                                    -Value $nextLifecycleValue `
+                                    -Name lifecycleCursor `
+                                    -Minimum 1 `
+                                    -Maximum ([int]::MaxValue)
+                            if (-not $first.seen.ContainsKey(
+                                    [string]$nextLifecycleId)) {
+                                throw 'lifecycle-cursor-invalid'
+                            }
+                        }
+                        $lifecycleValidationStage =
+                            'accepted'
+                        $envelope.lifecycle = $lifecycle
+                    }
+                    catch {
+                        $preserveConfirmedEffects =
+                            $lifecycleValidationStage -cin @(
+                                'review-eligibility',
+                                'next-candidate',
+                                'accepted')
+                        $reportedProviderWrites = 0
+                        $reportedModelWrites = 0
+                        if ($lifecycle -is
+                                [Collections.IDictionary] -or
+                            $lifecycle -is [pscustomobject]) {
+                            $providerWritesValue =
+                                $lifecycle.providerWrites
+                            $modelWritesValue =
+                                $lifecycle.modelWrites
+                            if ($providerWritesValue -isnot
+                                    [bool] -and
+                                [string]$providerWritesValue -cmatch
+                                    '^(0|1|2)$') {
+                                $reportedProviderWrites =
+                                    [int]$providerWritesValue
+                            }
+                            if ($modelWritesValue -isnot [bool] -and
+                                [string]$modelWritesValue -ceq '0') {
+                                $reportedModelWrites = 0
+                            }
+                        }
+                        if (-not $preserveConfirmedEffects) {
+                            $confirmedAbandoned.Clear()
+                        }
+                        $lifecycleReviewEligible.Clear()
+                        $lifecycleFailureReason =
+                            [string]$_.Exception.Message
+                        $envelope.lifecycle = [ordered]@{
+                            schemaVersion = 1
+                            kind = 'stale-pr-lifecycle-v1-run'
+                            health = 'unknown'
+                            state = 'unknown'
+                            reason = 'lifecycle-phase-failed'
+                            diagnostic = $(if (
+                                $lifecycleFailureReason -cin @(
+                                    'lifecycle-result-invalid',
+                                    'lifecycle-review-eligibility-invalid',
+                                    'lifecycle-cursor-invalid',
+                                    'stale-pr-read-budget-exhausted',
+                                    'stale-pr-deadline-exhausted'
+                                )
+                            ) {
+                                $lifecycleFailureReason
+                            }
+                            else {
+                                'lifecycle-provider-unavailable'
+                            })
+                            diagnosticStage =
+                                $lifecycleValidationStage
+                            providerWrites =
+                                $reportedProviderWrites
+                            modelWrites =
+                                $reportedModelWrites
+                            confirmedAbandonedIds = @(
+                                $confirmedAbandoned |
+                                    Sort-Object)
+                            unknownPossibleEffect =
+                                $reportedProviderWrites -gt
+                                $confirmedAbandoned.Count
+                            reviewEligibleIds = @()
+                            nextPullRequestId = $null
+                            decisions = @()
+                            events = @()
+                        }
+                    }
+                }
+                $lifecycleWithheld =
+                    [Collections.Generic.HashSet[int]]::new()
                 $eligible = @($ids | Where-Object {
                         $item = $first.seen[[string]$_].value
-                        -not $item.isDraft -and $item.targetRef -ceq 'refs/heads/master'
+                        $baseEligible =
+                            -not $item.isDraft -and
+                            $item.targetRef -ceq
+                                'refs/heads/master' -and
+                            -not $confirmedAbandoned.
+                                Contains([int]$_)
+                        if ($baseEligible -and
+                            $lifecycleGatingActive -and
+                            -not $lifecycleReviewEligible.
+                                Contains([int]$_)) {
+                            [void]$lifecycleWithheld.
+                                Add([int]$_)
+                        }
+                        $baseEligible -and (
+                            -not $lifecycleGatingActive -or
+                            $lifecycleReviewEligible.
+                                Contains([int]$_))
                     })
                 $start = 0
                 if ($previous -and $cursorBindingCompatible -and
@@ -1141,7 +1741,10 @@ function Invoke-ActivePrIntake {
                         $eligible[($start + $limit) % $eligible.Count]
                 }
                 $processingOrder = @($selectedOrder.ToArray()) +
-                    @($nonDraftIds | Where-Object { -not $selected.Contains($_) })
+                    @($nonDraftIds | Where-Object {
+                            -not $selected.Contains($_) -and
+                            -not $confirmedAbandoned.Contains([int]$_)
+                        })
                 $selectedOrdinal = 0
                 foreach ($id in $processingOrder) {
                     $item = $first.seen[[string]$id].value
@@ -1152,6 +1755,9 @@ function Invoke-ActivePrIntake {
                         declarationDigest = $null
                         state = 'pending'
                         reasonCode = 'not-selected'
+                        automaticCommentEligible =
+                            -not $lifecycleWithheld.
+                                Contains($id)
                         discussion = $null
                         rules = @($Config.rules | ForEach-Object {
                                 [ordered]@{ id = [string]$_.id; capability = [string]$_.capability
@@ -1169,6 +1775,20 @@ function Invoke-ActivePrIntake {
                             $ruleResult.reasonCode = $entry.reasonCode
                         }
                         $envelope.counts.skipped++
+                    }
+                    elseif ($lifecycleWithheld.Contains($id)) {
+                        $entry.state = 'unknown'
+                        $entry.reasonCode =
+                            'lifecycle-activity-unverified'
+                        foreach ($ruleResult in $entry.rules) {
+                            $ruleResult.state = 'unknown'
+                            $ruleResult.reasonCode =
+                                $entry.reasonCode
+                        }
+                        $envelope.counts.error++
+                        $envelope.gaps.unknownHeads++
+                        $envelope.gaps.unknownRules +=
+                            $Config.rules.Count
                     }
                     elseif (-not $selected.Contains($id)) {
                         $envelope.counts.deferred++
@@ -1200,6 +1820,9 @@ function Invoke-ActivePrIntake {
                             $entry.targetRef = $before.targetRef
                             $entry.declaration = $before
                             $entry.declarationDigest = Get-IntakeDigest $before
+                            $fileProgressBindingDigest =
+                                Get-IntakeFileProgressBindingDigest `
+                                    -Head $before
                             foreach ($ruleResult in $entry.rules) {
                                 $ruleResult.identityDigest = Get-IntakeRuleIdentity `
                                     $before $ruleResult.id $ruleResult.capability `
@@ -1256,22 +1879,63 @@ function Invoke-ActivePrIntake {
                                         ConvertFrom-Json `
                                             -AsHashtable `
                                             -Depth 64
-                                    if (
+                                    $priorProgressBindingDigest =
+                                        if (
+                                            [int]$priorProgress.
+                                                schemaVersion -eq 3 -and
+                                            $priorProgress.Contains(
+                                                'fileProgressBindingDigest') -and
+                                            [string]$priorProgress[
+                                                'fileProgressBindingDigest'] -cmatch
+                                                '^[0-9a-f]{64}$') {
+                                            [string]$priorProgress[
+                                                'fileProgressBindingDigest']
+                                        }
+                                        elseif (
+                                            [int]$priorProgress.
+                                                schemaVersion -eq 2 -and
+                                            [string]$priorProgress.
+                                                declarationDigest -cmatch
+                                                '^[0-9a-f]{64}$') {
+                                            $priorProofs = @(
+                                                $envelope.binding.
+                                                    fileProgressMigrationProofs |
+                                                    Where-Object {
+                                                        [long]$_.
+                                                            pullRequestId -eq
+                                                            $id -and
+                                                        [string]$_.
+                                                            configDigest -ceq
+                                                            [string]$priorProgress.
+                                                                configDigest -and
+                                                        [string]$_.
+                                                            declarationDigest -ceq
+                                                            [string]$priorProgress.
+                                                                declarationDigest
+                                                    })
+                                            if ($priorProofs.Count -eq 1) {
+                                                [string]$priorProofs[0].
+                                                    fileProgressBindingDigest
+                                            }
+                                            else { $null }
+                                        }
+                                        else { $null }
+                                        $priorProgressConfigCompatible =
+                                            [string]$priorProgress.
+                                                configDigest -cin
+                                                @($envelope.
+                                                    binding.
+                                                    configLineage)
+                                        if (
                                         [int]$priorProgress.
-                                            schemaVersion -ne 2 -or
+                                            schemaVersion -notin @(2, 3) -or
                                         [string]$priorProgress.kind -cne
                                             'active-pr-file-progress' -or
                                         [long]$priorProgress.
                                             pullRequestId -ne $id -or
-                                        [string]$priorProgress.
-                                            configDigest -cne
-                                            [string]$envelope.
-                                                binding.
-                                                configDigest -or
-                                        [string]$priorProgress.
-                                            declarationDigest -cne
-                                            [string]$entry.
-                                                declarationDigest -or
+                                        -not $priorProgressConfigCompatible -or
+                                        [string]$priorProgressBindingDigest -cne
+                                            $fileProgressBindingDigest -or
                                         [int]$priorProgress.
                                             nextOrdinal -lt 1 -or
                                         [int]$priorProgress.
@@ -1462,6 +2126,13 @@ function Invoke-ActivePrIntake {
                                         $totalBytes +=
                                             [long]$progressEntry.
                                                 byteLength
+                                        if ($progressEntry.Contains('comparison') -and
+                                            $progressEntry.comparison -is [Collections.IDictionary] -and
+                                            $progressEntry.comparison.Contains('content') -and
+                                            $progressEntry.comparison.content -is [string]) {
+                                            $totalBytes += [Text.Encoding]::UTF8.GetByteCount(
+                                                [string]$progressEntry.comparison.content)
+                                        }
                                     }
                                     if ([long]$totalBytes -gt
                                         16777216) {
@@ -1469,7 +2140,7 @@ function Invoke-ActivePrIntake {
                                     }
                                     $progressRecord =
                                         [ordered]@{
-                                            schemaVersion = 2
+                                            schemaVersion = 3
                                             kind =
                                                 'active-pr-file-progress'
                                             pullRequestId = $id
@@ -1480,6 +2151,8 @@ function Invoke-ActivePrIntake {
                                             declarationDigest =
                                                 [string]$entry.
                                                     declarationDigest
+                                            fileProgressBindingDigest =
+                                                $fileProgressBindingDigest
                                             inventoryDigest =
                                                 [string]$fileProgress.
                                                     inventoryDigest
@@ -1795,20 +2468,6 @@ function Invoke-ActivePrIntake {
                     }
                     [void]$heads.Add($entry)
                 }
-                $pendingFileProgress = @(
-                    $heads |
-                        Where-Object {
-                            [string]$_.reasonCode -ceq
-                                'file-progress-pending'
-                        } |
-                        Sort-Object {
-                            [int]$_.pullRequestId
-                        })
-                if ($pendingFileProgress.Count -gt 0) {
-                    $envelope.cursor.nextPullRequestId =
-                        [int]$pendingFileProgress[0].
-                            pullRequestId
-                }
                 $envelope.state = if ($envelope.counts.error -gt 0 -or
                     $envelope.counts.deferred -gt 0 -or
                     $envelope.gaps.unknownRules -gt 0 -or
@@ -1986,7 +2645,10 @@ function Resolve-ActivePrHeadSnapshot {
         [object[]]$Iterations,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [object[]]$SourceRefs
+        [object[]]$SourceRefs,
+        [AllowNull()]
+        [Collections.IDictionary]$TemplateAuthority =
+            $null
     )
     if ($Iterations.Count -eq 0 -or
         $Iterations.Count -gt 200) {
@@ -2016,17 +2678,47 @@ function Resolve-ActivePrHeadSnapshot {
             $sourceCommit) {
         throw 'head-inconsistent'
     }
+    $description = if (-not $PullRequest.Contains(
+            'description') -or
+        $null -eq $PullRequest.description) {
+        ''
+    }
+    else {
+        [string]$PullRequest.description
+    }
     return [ordered]@{
         pullRequestId = $PullRequest.pullRequestId
         repositoryId = $PullRequest.repository.id
         projectId = $PullRequest.repository.project.id
         status = $PullRequest.status
         isDraft = $PullRequest.isDraft
+        title = $(if (-not $PullRequest.Contains(
+                    'title') -or
+                $null -eq $PullRequest.title) {
+                ''
+            }
+            else {
+                [string]$PullRequest.title
+            })
+        description = $description
+        descriptionDigest =
+            Get-IntakeTextDigest -Value $description
         sourceRef = $sourceRef
         targetRef = $PullRequest.targetRefName
         sourceCommit = $sourceCommit
         targetCommit = $targetCommit
         iterationId = $latest.id
+        templateAuthority = $(if ($null -eq
+                $TemplateAuthority) {
+                [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-unavailable'
+                }
+            }
+            else {
+                $TemplateAuthority
+            })
     }
 }
 
@@ -2171,10 +2863,20 @@ function New-ActivePrAzureDevOpsProvider {
     $project = [string]$Config.projectName
     $projectId = [string]$Config.projectId
     $repo = [string]$Config.repositoryId
+    $requiresPullRequestTemplate =
+        $Config.Contains('sharedAcquisition') -and
+        $Config.sharedAcquisition -is
+            [Collections.IDictionary] -and
+        $Config.sharedAcquisition.Contains(
+            'includePullRequestTemplateAuthority') -and
+        [bool]$Config.sharedAcquisition.
+            includePullRequestTemplateAuthority
     $maxFiles = [int]$Config.limits.maxChangedFiles
     $maxThreads = [int]$Config.limits.maxThreads
     $parseNumber = ${function:Assert-IntakeNumber}
     $digestCommand = ${function:Get-IntakeDigest}
+    $textDigestCommand =
+        ${function:Get-IntakeTextDigest}
     $changedSpansCommand =
         ${function:Get-ApprovedOwnerV2ChangedSpans}
     $changeDerivationCommand =
@@ -2578,12 +3280,35 @@ print(json.dumps({
             throw 'response-invalid'
         }
     }.GetNewClosure()
+    $invokeItemsHttp = {
+        param(
+            [Parameter(Mandatory)][uri]$Uri,
+            [Parameter(Mandatory)][string]$Method,
+            [Parameter(Mandatory)]
+            [Collections.IDictionary]$Headers,
+            [Parameter(Mandatory)][int]$TimeoutSec,
+            [switch]$UseBasicParsing
+        )
+        $request = @{
+            Uri = $Uri
+            Method = $Method
+            Headers = $Headers
+            TimeoutSec = $TimeoutSec
+            UseBasicParsing =
+                [bool]$UseBasicParsing
+        }
+        if ($null -eq $HttpGetInvoker) {
+            return Invoke-WebRequest @request
+        }
+        return & $HttpGetInvoker @request
+    }.GetNewClosure()
     $invokeItemsGet = {
         param(
             [string]$Path,
             [string]$Commit,
             [DateTime]$Deadline,
-            [switch]$Directory
+            [switch]$Directory,
+            [switch]$Recursive
         )
         if ($transportReads.Count -ge $readCeiling) {
             throw 'read-budget'
@@ -2610,7 +3335,12 @@ print(json.dumps({
             $query.Add(
                 'scopePath=' +
                 [Uri]::EscapeDataString($apiPath))
-            $query.Add('recursionLevel=OneLevel')
+            $query.Add($(if ($Recursive) {
+                        'recursionLevel=Full'
+                    }
+                    else {
+                        'recursionLevel=OneLevel'
+                    }))
             $query.Add('includeContentMetadata=true')
         }
         else {
@@ -2632,7 +3362,7 @@ print(json.dumps({
             ($query -join '&'))
         $transportReads.Count++
         try {
-            $response = Invoke-WebRequest `
+            $response = & $invokeItemsHttp `
                 -Uri $uri -Method Get `
                 -Headers @{
                     Authorization = "Bearer $token"
@@ -2707,6 +3437,130 @@ print(json.dumps({
             throw 'item-content-unavailable'
         }
         return $response
+    }.GetNewClosure()
+    $getPullRequestTemplateAuthority = {
+        param([DateTime]$Deadline)
+        try {
+            $repository = & $invoke 'git' 'repositories' @(
+                "project=$project",
+                "repositoryId=$repo"
+            ) @() $Deadline
+            $defaultRef =
+                [string]$repository.defaultBranch
+            if ($defaultRef -cnotmatch
+                    '^refs/heads/(?<filter>[^~^:?*\[\\]+)$') {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            $refs = & $invokeGitJsonGet (
+                'refs?filter=' +
+                [Uri]::EscapeDataString(
+                    "heads/$($Matches.filter)") +
+                '&includeStatuses=false' +
+                '&peelTags=false' +
+                '&api-version=7.1') $Deadline
+            $matches = @($refs.value |
+                Where-Object {
+                    $_ -is
+                        [Collections.IDictionary] -and
+                    [string]$_.name -ceq
+                        $defaultRef -and
+                    [string]$_.objectId -cmatch
+                        '^[0-9a-fA-F]{40}$'
+                })
+            if ($matches.Count -ne 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-stale'
+                }
+            }
+            $commit = ([string]$matches[0].
+                objectId).ToLowerInvariant()
+            $directory = & $invokeItemsGet `
+                '/.azuredevops' $commit $Deadline `
+                -Directory -Recursive
+            $items = if ($directory -is
+                    [Collections.IDictionary] -and
+                $directory.value -is [array]) {
+                @($directory.value)
+            }
+            elseif ($directory -is [array]) {
+                @($directory)
+            }
+            else { @() }
+            $templateRelated = @($items |
+                Where-Object {
+                    $_ -is
+                        [Collections.IDictionary] -and
+                    -not [bool]$_.isFolder -and
+                    [string]$_.path -match
+                        '(?i)^/\.azuredevops/(?:pull_request_template\.(?:md|txt)|pull_request_template/.+)$'
+                })
+            $candidates = @($templateRelated |
+                Where-Object {
+                    [string]$_.path -match
+                        '(?i)^/\.azuredevops/pull_request_template\.(?:md|txt)$'
+                })
+            if ($candidates.Count -ne 1 -or
+                $templateRelated.Count -ne 1) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason = $(if (
+                        $templateRelated.Count -gt 1 -or
+                        $candidates.Count -gt 1) {
+                        'template-authority-ambiguous'
+                    }
+                    else {
+                        'template-authority-unavailable'
+                    })
+                }
+            }
+            $candidate = $candidates[0]
+            $blob =
+                ([string]$candidate.objectId).
+                    ToLowerInvariant()
+            if ($blob -cnotmatch
+                    '^[0-9a-f]{40}$') {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            $item = & $getItem `
+                ([string]$candidate.path) `
+                $commit $Deadline
+            $content = [string]$item.content
+            if ([Text.Encoding]::UTF8.GetByteCount(
+                    $content) -gt 65536) {
+                return [ordered]@{
+                    state = 'unknown'
+                    reason =
+                        'template-authority-malformed'
+                }
+            }
+            return [ordered]@{
+                state = 'complete'
+                path = [string]$candidate.path
+                configurationRef = $defaultRef
+                configurationCommit = $commit
+                blob = $blob
+                contentDigest =
+                    & $textDigestCommand $content
+                content = $content
+            }
+        }
+        catch {
+            return [ordered]@{
+                state = 'unknown'
+                reason =
+                    'template-authority-unavailable'
+            }
+        }
     }.GetNewClosure()
     $getProjectContext = {
         param(
@@ -2918,7 +3772,8 @@ print(json.dumps({
                             throw 'repository-mismatch'
                         }
                         @{ pullRequestId = $_.pullRequestId; status = $_.status
-                            isDraft = $_.isDraft; targetRef = $_.targetRefName }
+                            isDraft = $_.isDraft; targetRef = $_.targetRefName
+                            creationUtc = $_.creationDate }
                     })
                 return @{ items = $items; count = $items.Count }
             }
@@ -2950,7 +3805,13 @@ print(json.dumps({
                 return & $resolveHeadSnapshot `
                     -PullRequest $r `
                     -Iterations $list `
-                    -SourceRefs @($refs.value)
+                    -SourceRefs @($refs.value) `
+                    -TemplateAuthority $(if (
+                        $requiresPullRequestTemplate) {
+                        & $getPullRequestTemplateAuthority `
+                            $deadline
+                    }
+                    else { $null })
             }
             Changes {
                 $id = [int]$Request.pullRequestId
@@ -3363,18 +4224,21 @@ print(json.dumps({
                     $withinLineBudget =
                         $changedLines + $entryChangedLines -le
                             [int]$Config.limits.maxChangedLines
-                    if ($withinLineBudget) {
-                        $changedLines += $entryChangedLines
-                    }
                     $bytes = [Text.Encoding]::UTF8.GetByteCount($sourceContent)
-                    if ($totalBytes + $bytes -gt
+                    $comparisonBytes = if ($isCSharp -and -not $deleted) {
+                        [Text.Encoding]::UTF8.GetByteCount($targetContent)
+                    } else { 0 }
+                    if ($totalBytes + $bytes + $comparisonBytes -gt
                         16777216) {
                         if ($normalized.Count -eq 0) {
                             throw 'read-budget'
                         }
                         break
                     }
-                    $totalBytes += $bytes
+                    $totalBytes += $bytes + $comparisonBytes
+                    if ($withinLineBudget) {
+                        $changedLines += $entryChangedLines
+                    }
                     $normalizedChange = [ordered]@{
                             changeTrackingId = [int]$entry.changeTrackingId
                             path = [string]$entry.path
@@ -3413,6 +4277,25 @@ print(json.dumps({
                                             $sourceContent))).
                                     ToLowerInvariant()
                         }
+                    if ($isCSharp -and -not $deleted) {
+                        $normalizedChange['comparison'] = [ordered]@{
+                            schemaVersion = 1
+                            state = 'complete'
+                            path = [string]$entry.path
+                            targetPath = $(if ($changeType -match '(?i)rename') {
+                                [string]$entry.originalPath
+                            } else { [string]$entry.path })
+                            sourceCommit = $sourceCommit
+                            targetCommit = $targetCommit
+                            sourceDigest = [string]$normalizedChange.sourceDigest
+                            targetDigest = & $textDigestCommand $targetContent
+                            byteLength = $comparisonBytes
+                            content = $targetContent
+                            targetState = $(if ($changeType -match '(?i)^add') {
+                                'absent'
+                            } else { 'present' })
+                        }
+                    }
                     $derivationSpans =
                         [object[]]@()
                     if ($withinLineBudget) {

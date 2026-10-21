@@ -641,24 +641,28 @@ Describe 'Named AreEqual current PR bridge' {
     It 'completes in a fresh process with only bridge imports' `
         -TestCases @(
             @{ Mode = 'empty'; ExpectedExit = 0
-                ExpectedState = 'completed' }
+                ExpectedState = 'completed'; HeadCount = 1 }
             @{ Mode = 'human'; ExpectedExit = 0
-                ExpectedState = 'completed' }
+                ExpectedState = 'completed'; HeadCount = 1 }
             @{ Mode = 'drift'; ExpectedExit = 0
-                ExpectedState = 'partial' }
+                ExpectedState = 'partial'; HeadCount = 1 }
+            @{ Mode = 'empty'; ExpectedExit = 0
+                ExpectedState = 'completed'; HeadCount = 4 }
         ) {
-        param($Mode, $ExpectedExit, $ExpectedState)
+        param($Mode, $ExpectedExit, $ExpectedState, $HeadCount)
         $config = New-BridgeConfig
         $config.enabled = $true
+        $config.limits.maxHeadsPerRun = $HeadCount
         $configPath = Join-Path $TestDrive `
-            "fresh-$Mode-config.json"
+            "fresh-$Mode-$HeadCount-config.json"
         [IO.File]::WriteAllText(
             $configPath,
             (ConvertTo-Json -InputObject $config -Depth 32) + "`n",
             [Text.UTF8Encoding]::new($false))
-        $state = Join-Path $TestDrive "fresh-$Mode-state"
+        $state = Join-Path $TestDrive `
+            "fresh-$Mode-$HeadCount-state"
         $manifest = Join-Path $TestDrive `
-            "fresh-$Mode-manifest.json"
+            "fresh-$Mode-$HeadCount-manifest.json"
         $fixture = Join-Path $PSScriptRoot `
             'fixtures\Invoke-NamedAreEqualBridgeFreshProcess.ps1'
         $pwsh = (Get-Command pwsh -CommandType Application |
@@ -666,7 +670,8 @@ Describe 'Named AreEqual current PR bridge' {
         $output = @(& $pwsh -NoProfile -NonInteractive `
             -File $fixture -ConfigPath $configPath `
             -StateRoot $state -ManifestPath $manifest `
-            -RepoRoot $repoRoot -DiscussionMode $Mode 2>&1)
+            -RepoRoot $repoRoot -DiscussionMode $Mode `
+            -HeadCount $HeadCount 2>&1)
         $LASTEXITCODE | Should -Be $ExpectedExit `
             -Because ($output -join "`n")
         $result = ($output -join "`n") |
@@ -675,7 +680,7 @@ Describe 'Named AreEqual current PR bridge' {
         if ($ExpectedExit -eq 0) {
             $result.providerWrites | Should -Be 0
             $result.modelWrites | Should -Be 0
-            $result.recordCount | Should -Be 1
+            $result.recordCount | Should -Be $HeadCount
             $result.recordState | Should -BeExactly $(if (
                     $Mode -ceq 'drift'
                 ) { 'unknown' } else { 'completed' })
@@ -739,6 +744,49 @@ Describe 'Named AreEqual current PR bridge' {
         $provider.Calls.Count | Should -Be 0
         Test-Path -LiteralPath $state | Should -BeFalse
         Test-Path -LiteralPath $manifest | Should -BeFalse
+    }
+
+    It 'does not evaluate a lifecycle-withheld old PR' {
+        $config = New-BridgeConfig
+        $config.enabled = $true
+        $provider = New-BridgeProvider -Config $config
+        $state = Join-Path $TestDrive `
+            'lifecycle-withheld-state'
+        $manifest = Join-Path $TestDrive `
+            'lifecycle-withheld-manifest.json'
+        $intake = [ordered]@{
+            populationKnown = $true
+            inventory = [ordered]@{
+                state = 'complete'
+                eligible = 1
+            }
+            counts = [ordered]@{
+                error = 1
+            }
+            heads = @([ordered]@{
+                    pullRequestId = 42
+                    targetRef = 'refs/heads/master'
+                    state = 'unknown'
+                    reasonCode =
+                        'lifecycle-activity-unverified'
+                    automaticCommentEligible = $false
+                    declaration = [ordered]@{
+                        pullRequestId = 42
+                    }
+                })
+            transientSnapshots = [ordered]@{}
+        }
+        $result = Invoke-NamedAreEqualCurrentPrBridge `
+            -Config $config -Provider $provider.Handler `
+            -StateRoot $state -ManifestPath $manifest `
+            -RepositoryRoot $repoRoot `
+            -PreparedIntake $intake -Run
+
+        $result.state | Should -BeExactly 'unknown'
+        @($result.records) | Should -HaveCount 0
+        $provider.Calls.Count | Should -Be 0
+        Test-Path -LiteralPath $manifest |
+            Should -BeFalse
     }
 
     It 'discovers a current head and writes one completed model-free observation' {

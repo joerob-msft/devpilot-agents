@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory)][string]$ManifestPath,
     [Parameter(Mandatory)][string]$RepoRoot,
     [ValidateSet('empty', 'human', 'drift')]
-    [string]$DiscussionMode = 'empty'
+    [string]$DiscussionMode = 'empty',
+    [ValidateRange(1, 4)][int]$HeadCount = 1
 )
 
 Set-StrictMode -Version Latest
@@ -29,19 +30,10 @@ class Checks {
     }
 }
 '@
-$sourceCommit = 'c' * 40
 $targetCommit = 'd' * 40
-$head = [ordered]@{
-    repositoryId = [string]$config.repositoryId
-    projectId = [string]$config.projectId
-    pullRequestId = 42
-    sourceRef = 'refs/heads/feature'
-    targetRef = 'refs/heads/master'
-    sourceCommit = $sourceCommit
-    targetCommit = $targetCommit
-    iterationId = 3
-    status = 'active'
-    isDraft = $false
+$getSourceCommit = {
+    param([int]$PullRequestId)
+    return $PullRequestId.ToString('x8') + ('c' * 32)
 }
 $textDigest = {
     param([string]$Value)
@@ -63,19 +55,35 @@ $provider = {
         'ListPage' {
             if ([int]$Request.skip -eq 0) {
                 return @{
-                    items = @([ordered]@{
-                            pullRequestId = 42
+                    items = @(for ($offset = 0;
+                            $offset -lt $HeadCount; $offset++) {
+                        [ordered]@{
+                            pullRequestId = 42 + $offset
                             status = 'active'
                             isDraft = $false
                             targetRef = 'refs/heads/master'
-                        })
-                    count = 1
+                        }
+                    })
+                    count = $HeadCount
                 }
             }
             return @{ items = @(); count = 0 }
         }
         'Head' {
-            $live = [ordered]@{} + $head
+            $pullRequestId = [int]$Request.pullRequestId
+            $live = [ordered]@{
+                repositoryId = [string]$config.repositoryId
+                projectId = [string]$config.projectId
+                pullRequestId = $pullRequestId
+                sourceRef = "refs/heads/feature-$pullRequestId"
+                targetRef = 'refs/heads/master'
+                sourceCommit =
+                    & $getSourceCommit $pullRequestId
+                targetCommit = $targetCommit
+                iterationId = 3
+                status = 'active'
+                isDraft = $false
+            }
             if ($DiscussionMode -ceq 'drift' -and
                 @($calls | Where-Object { $_ -ceq 'Head' }).Count -gt 2) {
                 $live.sourceCommit = 'e' * 40
@@ -112,7 +120,8 @@ $provider = {
                                 'current-lines'
                             changeType = 'modified'
                             pathRelation = 'same-path'
-                            sourceCommit = $sourceCommit
+                            sourceCommit =
+                                [string]$Request.sourceCommit
                             targetCommit = $targetCommit
                             sourceContentState =
                                 'available'

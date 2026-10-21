@@ -29,6 +29,7 @@ BeforeAll {
             comments = @(); changeLines = 3; headVisits = @{}
             sourceContent = $null
             iteration = 1; commit = 'a' * 40
+            description = 'Initial PR description.'
             headStatus = @{}; headTarget = @{}; headDraft = @{} }
         $provider = {
             param($op, $request)
@@ -72,6 +73,9 @@ BeforeAll {
                             $state.headDraft[$id]
                         } else { $state.rows[$id - 1].isDraft }
                         sourceRef = 'refs/heads/feature'
+                        title = 'Synthetic PR'
+                        description =
+                            [string]$state.description
                         targetRef = if ($state.headTarget.ContainsKey($id)) {
                             $state.headTarget[$id]
                         } else { $state.rows[$id - 1].targetRef }
@@ -136,6 +140,227 @@ BeforeAll {
                 [string]$Snapshot.systemValue
             } else { $null }),
             [EnvironmentVariableTarget]::Process)
+    }
+    function New-TemplateAuthorityCase {
+        param(
+            [ValidateSet('true', 'false', 'absent', 'malformed')]
+            [string]$Flag = 'true',
+            [int]$MaxReads = 128,
+            [int]$PullRequestId = 17
+        )
+        $config = Get-Content (
+            Join-Path $repo `
+                'samples\named-areequal-current-pr.config.json'
+        ) -Raw | ConvertFrom-Json -AsHashtable
+        $config.enabled = $true
+        $config.limits.maxReads = $MaxReads
+        switch ($Flag) {
+            true {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            $true
+                    }
+            }
+            false {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            $false
+                    }
+            }
+            absent {
+                [void]$config.Remove(
+                    'sharedAcquisition')
+            }
+            malformed {
+                $config.sharedAcquisition =
+                    [ordered]@{
+                        includePullRequestTemplateAuthority =
+                            'true'
+                    }
+            }
+        }
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-template-pester-' +
+            [guid]::NewGuid().ToString('N'))
+        $script:roots.Add($root)
+        New-Item -ItemType Directory -Path $root -Force |
+            Out-Null
+        $stub = Join-Path $root 'az-template-authority.ps1'
+        @'
+if ($args -contains 'get-access-token') {
+    @{ accessToken = 'x' * 128 } |
+        ConvertTo-Json -Compress
+}
+elseif ($args -contains 'repositories') {
+    @{ defaultBranch = 'refs/heads/master' } |
+        ConvertTo-Json -Compress
+}
+else {
+    exit 7
+}
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $state = [ordered]@{
+            title = 'Current PR title'
+            description = "Summary`n`nDetails"
+            mode = 'complete'
+            uris =
+                [Collections.Generic.List[string]]::new()
+            itemUris =
+                [Collections.Generic.List[string]]::new()
+        }
+        $httpGet = {
+            param(
+                $Uri,
+                $Method,
+                $Headers,
+                $TimeoutSec,
+                $UseBasicParsing
+            )
+            $state.uris.Add([string]$Uri) |
+                Out-Null
+            if ([string]$Headers.Authorization -cne
+                ('Bearer ' + ('x' * 128))) {
+                throw 'unexpected-authorization'
+            }
+            $content = if (
+                [string]$Uri -match
+                    ("/pullRequests/$PullRequestId" +
+                        '\?')) {
+                [ordered]@{
+                    pullRequestId = $PullRequestId
+                    repository = [ordered]@{
+                        id = $config.repositoryId
+                        project = [ordered]@{
+                            id = $config.projectId
+                        }
+                    }
+                    status = 'active'
+                    isDraft = $false
+                    title = $state.title
+                    description =
+                        $state.description
+                    sourceRefName =
+                        'refs/heads/feature/test'
+                    targetRefName =
+                        'refs/heads/master'
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    ("/pullRequests/$PullRequestId" +
+                        '/iterations\?')) {
+                [ordered]@{
+                    value = @([ordered]@{
+                            id = 4
+                            sourceRefCommit =
+                                @{ commitId = ('a' * 40) }
+                            targetRefCommit =
+                                @{ commitId = ('b' * 40) }
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/refs\?filter=heads%2Ffeature%2Ftest') {
+                [ordered]@{
+                    value = @([ordered]@{
+                            name =
+                                'refs/heads/feature/test'
+                            objectId = ('a' * 40)
+                        })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/refs\?filter=heads%2Fmaster') {
+                [ordered]@{
+                    value = $(if (
+                        $state.mode -ceq 'stale') {
+                        @()
+                    }
+                    else {
+                        @([ordered]@{
+                                name =
+                                    'refs/heads/master'
+                                objectId = ('d' * 40)
+                            })
+                    })
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/items\?.*scopePath=%2F\.azuredevops') {
+                $state.itemUris.Add([string]$Uri) |
+                    Out-Null
+                $items = switch ($state.mode) {
+                    unavailable { @() }
+                    ambiguous {
+                        @(
+                            [ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = ('e' * 40)
+                                isFolder = $false
+                            },
+                            [ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template/other.md'
+                                objectId = ('f' * 40)
+                                isFolder = $false
+                            }
+                        )
+                    }
+                    malformed {
+                        @([ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = 'not-a-blob'
+                                isFolder = $false
+                            })
+                    }
+                    default {
+                        @([ordered]@{
+                                path =
+                                    '/.azuredevops/pull_request_template.md'
+                                objectId = ('e' * 40)
+                                isFolder = $false
+                            })
+                    }
+                }
+                [ordered]@{
+                    value = @($items)
+                } | ConvertTo-Json -Depth 8 -Compress
+            }
+            elseif (
+                [string]$Uri -match
+                    '/items\?.*path=%2F\.azuredevops%2Fpull_request_template\.md') {
+                $state.itemUris.Add([string]$Uri) |
+                    Out-Null
+                "## Summary`nDescribe the change."
+            }
+            else {
+                throw "unexpected-uri:$Uri"
+            }
+            [pscustomobject]@{
+                RawContentLength =
+                    [Text.Encoding]::UTF8.
+                        GetByteCount($content)
+                Content = $content
+                Headers = @{
+                    'Content-Type' =
+                        'application/json'
+                }
+            }
+        }.GetNewClosure()
+        return [ordered]@{
+            config = $config
+            root = $root
+            stub = $stub
+            state = $state
+            httpGet = $httpGet
+        }
     }
 }
 AfterAll {
@@ -649,6 +874,1038 @@ $httpGet = {
         }
     }
 
+    It 'acquires fresh Named PR metadata and unique default-branch template authority when explicitly enabled' {
+        $c = New-TemplateAuthorityCase -Flag true
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $first = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+        $c.state.title = 'Fresh title'
+        $c.state.description = 'Fresh description'
+        $second = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $first.title |
+            Should -BeExactly 'Current PR title'
+        $first.description |
+            Should -BeExactly "Summary`n`nDetails"
+        $second.title | Should -BeExactly 'Fresh title'
+        $second.description |
+            Should -BeExactly 'Fresh description'
+        $second.descriptionDigest |
+            Should -BeExactly (
+                'v1:sha256:' +
+                [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData(
+                        [Text.UTF8Encoding]::new($false).
+                            GetBytes('Fresh description'))).
+                    ToLowerInvariant())
+        $second.templateAuthority.state |
+            Should -BeExactly 'complete'
+        $second.templateAuthority.path |
+            Should -BeExactly `
+                '/.azuredevops/pull_request_template.md'
+        $second.templateAuthority.configurationRef |
+            Should -BeExactly 'refs/heads/master'
+        $second.templateAuthority.configurationCommit |
+            Should -BeExactly ('d' * 40)
+        $second.templateAuthority.blob |
+            Should -BeExactly ('e' * 40)
+        $second.templateAuthority.content |
+            Should -BeExactly `
+                "## Summary`nDescribe the change."
+        $second.templateAuthority.contentDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        @($c.state.itemUris |
+            Where-Object {
+                $_ -match 'scopePath=' -and
+                $_ -match 'recursionLevel=Full'
+            }) | Should -HaveCount 2
+    }
+
+    It 'carries enabled Named metadata through the shared transient snapshot route' {
+        $transportCase = New-TemplateAuthorityCase `
+            -Flag true -PullRequestId 1
+        $c = New-IntakeCase `
+            -Count 1 -MaxHeads 1
+        $c.config.rules = @(
+            [ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            }
+        )
+        $c.config.sharedAcquisition =
+            [ordered]@{
+                includePullRequestTemplateAuthority =
+                    $true
+            }
+        $transport =
+            New-ActivePrAzureDevOpsProvider `
+                -Config $c.config `
+                -AzureCliPath $transportCase.stub `
+                -HttpGetInvoker $transportCase.httpGet
+        $baseProvider = $c.provider
+        $provider = {
+            param($Operation, $Request)
+            if ($Operation -ceq 'Head') {
+                return & $transport `
+                    $Operation $Request
+            }
+            return & $baseProvider `
+                $Operation $Request
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo `
+            -IncludeTransientSnapshots -Run
+
+        $snapshot =
+            $result.transientSnapshots['1'].head
+        $snapshot.title |
+            Should -BeExactly 'Current PR title'
+        $snapshot.description |
+            Should -BeExactly "Summary`n`nDetails"
+        $snapshot.descriptionDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $snapshot.templateAuthority.state |
+            Should -BeExactly 'complete'
+        $snapshot.templateAuthority.configurationRef |
+            Should -BeExactly 'refs/heads/master'
+        $snapshot.templateAuthority.configurationCommit |
+            Should -BeExactly ('d' * 40)
+    }
+
+    It 'leaves template authority unknown without extra reads when the Named flag is <Flag>' `
+        -TestCases @(
+            @{ Flag = 'false' }
+            @{ Flag = 'absent' }
+        ) {
+        param($Flag)
+        $c = New-TemplateAuthorityCase -Flag $Flag
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $head = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $head.title |
+            Should -BeExactly 'Current PR title'
+        $head.descriptionDigest |
+            Should -Match '^v1:sha256:[0-9a-f]{64}$'
+        $head.templateAuthority.state |
+            Should -BeExactly 'unknown'
+        $head.templateAuthority.reason |
+            Should -BeExactly `
+                'template-authority-unavailable'
+        $c.state.uris | Should -HaveCount 3
+        @($c.state.uris | Where-Object {
+                $_ -match 'heads%2Fmaster|scopePath='
+            }) | Should -HaveCount 0
+        $c.state.itemUris | Should -HaveCount 0
+    }
+
+    It 'rejects a malformed Named template authority flag' {
+        $c = New-TemplateAuthorityCase `
+            -Flag malformed
+        {
+            New-ActivePrAzureDevOpsProvider `
+                -Config $c.config `
+                -AzureCliPath $c.stub `
+                -HttpGetInvoker $c.httpGet
+        } | Should -Throw `
+            '*template authority flag must be a Boolean*'
+    }
+
+    It 'treats a changed PR description as fresh head drift' {
+        $c = New-IntakeCase `
+            -Count 1 -MaxHeads 1
+        $baseProvider = $c.provider
+        $provider = {
+            param($Operation, $Request)
+            $result = & $baseProvider `
+                $Operation $Request
+            if ($Operation -ceq 'Head' -and
+                $c.state.headVisits[
+                    [int]$Request.pullRequestId] -gt 1) {
+                $result.description =
+                    'Edited PR description.'
+            }
+            return $result
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo -Run
+
+        $result.heads[0].reasonCode |
+            Should -BeExactly 'head-drift'
+    }
+
+    It 'returns deterministic unknown template authority for <Mode>' `
+        -TestCases @(
+            @{
+                Mode = 'unavailable'
+                Reason =
+                    'template-authority-unavailable'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'ambiguous'
+                Reason =
+                    'template-authority-ambiguous'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'malformed'
+                Reason =
+                    'template-authority-malformed'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'stale'
+                Reason =
+                    'template-authority-stale'
+                MaxReads = 128
+            }
+            @{
+                Mode = 'read-budget'
+                Reason =
+                    'template-authority-unavailable'
+                MaxReads = 7
+            }
+        ) {
+        param($Mode, $Reason, $MaxReads)
+        $c = New-TemplateAuthorityCase `
+            -Flag true -MaxReads $MaxReads
+        $c.state.mode = $Mode
+        $provider = New-ActivePrAzureDevOpsProvider `
+            -Config $c.config `
+            -AzureCliPath $c.stub `
+            -HttpGetInvoker $c.httpGet
+
+        $head = & $provider Head @{
+            pullRequestId = 17
+            timeoutMilliseconds = 15000
+        }
+
+        $head.templateAuthority.state |
+            Should -BeExactly 'unknown'
+        $head.templateAuthority.reason |
+            Should -BeExactly $Reason
+        if ($Mode -ceq 'stale') {
+            $c.state.itemUris |
+                Should -HaveCount 0
+        }
+        elseif ($Mode -ceq 'read-budget') {
+            $c.state.itemUris |
+                Should -HaveCount 1
+        }
+        else {
+            $c.state.itemUris |
+                Should -HaveCount 1
+        }
+    }
+
+    It 'rejects over-bound or inconsistent PR template metadata' {
+        $baseHead = [ordered]@{
+            pullRequestId = 17
+            repositoryId =
+                '11111111-1111-1111-1111-111111111111'
+            projectId =
+                '22222222-2222-2222-2222-222222222222'
+            status = 'active'
+            isDraft = $false
+            sourceRef = 'refs/heads/feature/test'
+            targetRef = 'refs/heads/master'
+            sourceCommit = 'a' * 40
+            targetCommit = 'b' * 40
+            iterationId = 4
+            title = 'Title'
+            description = 'Description'
+            descriptionDigest =
+                'v1:sha256:' + ('0' * 64)
+        }
+        $config = (New-TemplateAuthorityCase `
+                -Flag true).config
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.Remove(
+            'descriptionDigest')
+        $baseHead.title = 'x' * 4097
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.title = 'Title'
+        $baseHead.description = 'x' * 131073
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+
+        $baseHead.description = 'Description'
+        $baseHead.templateAuthority =
+            [ordered]@{
+                state = 'complete'
+                path =
+                    '/.azuredevops/pull_request_template.md'
+                configurationRef =
+                    'refs/heads/master'
+                configurationCommit = 'd' * 40
+                blob = 'e' * 40
+                contentDigest =
+                    'v1:sha256:' + ('0' * 64)
+                content = 'Template'
+            }
+        {
+            & (Get-Module DevPilot.ActivePrIntake) {
+                param($Head, $Config)
+                Assert-IntakeHead `
+                    -Head $Head -Id 17 `
+                    -Config $Config
+            } $baseHead $config
+        } | Should -Throw 'invalid-head'
+    }
+
+    It 'resumes a single retained project context and preserves completed progress' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $c.config.rules = @(
+            [ordered]@{
+                id =
+                    'bpm-named-areequal-arguments@1'
+                capability =
+                    'bpm-named-areequal-arguments@1'
+            }
+        )
+        $c.config.sharedAcquisition =
+            [ordered]@{
+                includePullRequestTemplateAuthority =
+                    $true
+            }
+        $context = [ordered]@{
+            state = 'complete'
+            path = 'src/App.csproj'
+            content =
+                '<Project><PropertyGroup><LangVersion>latest</LangVersion></PropertyGroup></Project>'
+            byteLength = 82
+            sourceDigest =
+                'v1:sha256:' + ('1' * 64)
+        }
+        $state = $c.state
+        $baseProvider = $c.provider
+        $state['changeStarts'] =
+            [Collections.Generic.List[int]]::new()
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes') {
+                return & $baseProvider `
+                    $op $request
+            }
+            $start = [int]$request.
+                fileStartOrdinal
+            [void]$state.changeStarts.Add(
+                $start)
+            $entries = @(switch ($start) {
+                    0 {
+                        [ordered]@{
+                            changeTrackingId = 1
+                            path = 'src/A.cs'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('2' * 64)
+                                })
+                            content = 'class A {}'
+                            byteLength = 10
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('3' * 64)
+                            projectContext =
+                                $context
+                        }
+                        break
+                    }
+                    1 {
+                        [ordered]@{
+                            changeTrackingId = 2
+                            path = 'src/B.csproj'
+                            changeType = 'edit'
+                            state = 'complete'
+                            spans = @([ordered]@{
+                                    startLine = 1
+                                    endLine = 1
+                                    state = 'complete'
+                                    sourceDigest =
+                                        'v1:sha256:' +
+                                        ('4' * 64)
+                                })
+                            content = '<Project />'
+                            byteLength = 11
+                            sourceDigest =
+                                'v1:sha256:' +
+                                ('5' * 64)
+                        }
+                        break
+                    }
+                    2 { break }
+                    default {
+                        throw "Unexpected file ordinal '$start'."
+                    }
+                })
+            return [ordered]@{
+                changedFiles = $entries.Count
+                changedLines =
+                    $entries.Count
+                entries = $entries
+                projectContexts = $(if (
+                    $start -eq 0) {
+                    @($context)
+                }
+                else { @() })
+                inventory = @(
+                    [ordered]@{
+                        changeTrackingId = 1
+                        path = 'src/A.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    },
+                    [ordered]@{
+                        changeTrackingId = 2
+                        path = 'src/B.csproj'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition =
+                            'required'
+                        evidenceReason =
+                            'contextual-project-metadata'
+                    })
+                fileProgress = [ordered]@{
+                    inventoryDigest = '6' * 64
+                    evidencePlanDigest = '7' * 64
+                    totalFiles = 2
+                    totalInventoryFiles = 2
+                    startOrdinal = $start
+                    nextOrdinal =
+                        $start + $entries.Count
+                    complete =
+                        $start -ge 1
+                    cumulativeChangedLines =
+                        [Math]::Min(2,
+                            $start +
+                            $entries.Count)
+                }
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $first.heads[0].reasonCode |
+            Should -BeExactly `
+                'file-progress-pending'
+        $second = Invoke-IntakeCase $c
+        $second.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $completedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $completedProgress.nextOrdinal |
+            Should -Be 2
+        @($completedProgress.entries) |
+            Should -HaveCount 2
+        @($completedProgress.projectContexts) |
+            Should -HaveCount 1
+
+        $third = Invoke-IntakeCase $c
+        $third.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2)
+        $reusedProgress =
+            Get-Content $progressPath -Raw |
+            ConvertFrom-Json `
+                -AsHashtable -Depth 64
+        $reusedProgress.nextOrdinal |
+            Should -Be 2
+        @($reusedProgress.entries) |
+            Should -HaveCount 2
+
+        $state.description =
+            'Edited PR description without a head change.'
+        $state['templateCommit'] =
+            '9' * 40
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($op, $request)
+            $value = & $baseProvider $op $request
+            if ($op -ceq 'Head') {
+                $value.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '8' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+            }
+            return $value
+        }.GetNewClosure()
+        $fourth = Invoke-ActivePrIntake `
+            -Config $c.config `
+            -Provider $c.provider `
+            -StateRoot $c.root `
+            -RepositoryRoot $repo `
+            -IncludeTransientSnapshots -Run
+        $fourth.heads[0].reasonCode |
+            Should -BeExactly `
+                'rules-incomplete'
+        @($state.changeStarts) |
+            Should -Be @(0, 1, 2, 2)
+        $fourth.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+        $fourth.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly $state.templateCommit
+        $sharedHead =
+            $fourth.transientSnapshots['1'].head
+        $sharedHead.description |
+            Should -BeExactly $state.description
+        $sharedHead.templateAuthority.
+            configurationCommit |
+            Should -BeExactly $state.templateCommit
+    }
+
+    It 'continues 32-file progress across metadata-only template commit drift and resets on a code head change' {
+        $c = New-IntakeCase -Count 1 `
+            -MaxHeads 1
+        $c.config.limits.maxChangedFiles = 64
+        $c.config['toolkit'] =
+            [ordered]@{
+                head = 'a' * 40
+                tree = 'b' * 40
+            }
+        $state = $c.state
+        $state['templateCommit'] = '8' * 40
+        $state['starts'] =
+            [Collections.Generic.List[int]]::new()
+        $baseProvider = $c.provider
+        $c.provider = {
+            param($operation, $request)
+            if ($operation -ceq 'Head') {
+                $head = & $baseProvider `
+                    $operation $request
+                $head.templateAuthority =
+                    [ordered]@{
+                        state = 'complete'
+                        path =
+                            '/.azuredevops/pull_request_template.txt'
+                        configurationRef =
+                            'refs/heads/master'
+                        configurationCommit =
+                            $state.templateCommit
+                        blob = '7' * 40
+                        contentDigest =
+                            'v1:sha256:' +
+                            [Convert]::ToHexString(
+                                [Security.Cryptography.SHA256]::HashData(
+                                    [Text.UTF8Encoding]::new($false).
+                                        GetBytes('template'))).
+                                ToLowerInvariant()
+                        content = 'template'
+                    }
+                return $head
+            }
+            if ($operation -ceq 'Changes') {
+                $start =
+                    [int]$request.fileStartOrdinal
+                [void]$state.starts.Add($start)
+                $count = [Math]::Min(
+                    16, 48 - $start)
+                $entries = @(
+                    for ($offset = 0;
+                        $offset -lt $count;
+                        $offset++) {
+                        $ordinal =
+                            $start + $offset + 1
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            state = 'complete'
+                            spans = @()
+                            content = $null
+                            byteLength = 0
+                            sourceDigest =
+                                'v1:sha256:' +
+                                $ordinal.ToString(
+                                    'x64')
+                        }
+                    })
+                $inventory = @(
+                    for ($ordinal = 1;
+                        $ordinal -le 48;
+                        $ordinal++) {
+                        [ordered]@{
+                            changeTrackingId =
+                                $ordinal
+                            path =
+                                "src/File$ordinal.cs"
+                            changeType = 'delete'
+                            originalPath = $null
+                            evidenceDisposition =
+                                'required'
+                            evidenceReason =
+                                'deleted-change'
+                        }
+                    })
+                return [ordered]@{
+                    changedFiles = $count
+                    changedLines = 0
+                    entries = $entries
+                    projectContexts = @()
+                    inventory = $inventory
+                    fileProgress = [ordered]@{
+                        inventoryDigest =
+                            '1' * 64
+                        evidencePlanDigest =
+                            '2' * 64
+                        totalFiles = 48
+                        totalInventoryFiles = 48
+                        startOrdinal = $start
+                        nextOrdinal =
+                            $start + $count
+                        complete =
+                            ($start + $count) -ge 48
+                        cumulativeChangedLines = 0
+                    }
+                }
+            }
+            return & $baseProvider `
+                $operation $request
+        }.GetNewClosure()
+
+        $first = Invoke-IntakeCase $c
+        $second = Invoke-IntakeCase $c
+        $progressPath = Join-Path $c.root `
+            'active-pr-intake-v1\file-progress\1.json'
+        $legacyProgress =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyProgress.schemaVersion = 2
+        [void]$legacyProgress.Remove(
+            'fileProgressBindingDigest')
+        $legacyBytes =
+            [Text.UTF8Encoding]::new(
+                $false).GetBytes(
+                (ConvertTo-Json `
+                    -InputObject $legacyProgress `
+                    -Depth 64))
+        $legacyTemp =
+            "$progressPath.legacy"
+        [IO.File]::WriteAllBytes(
+            $legacyTemp, $legacyBytes)
+        [IO.File]::Move(
+            $legacyTemp, $progressPath, $true)
+        $previousCohort =
+            Get-Content (
+                Join-Path $c.root `
+                    'active-pr-intake-v1\cohort.json') `
+                -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyHead = @(
+            $previousCohort.heads |
+                Where-Object {
+                    [string]$_.declarationDigest -ceq
+                        [string]$legacyProgress.
+                            declarationDigest
+                })
+        $legacyHead | Should -HaveCount 1
+        $legacyBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $legacyHead[0].declaration
+        $state.templateCommit = '9' * 40
+        $state.description =
+            'Fresh metadata with identical template bytes.'
+        $c.config.toolkit.head = 'c' * 40
+        $c.config.toolkit.tree = 'd' * 40
+        $c.config['cursorCompatibility'] =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$second.binding.
+                        configDigest
+                previousToolkitHead = 'a' * 40
+                previousToolkitTree = 'b' * 40
+            }
+        $currentHead = & $c.provider Head @{
+            pullRequestId = 1
+        }
+        $currentBinding = & (
+            Get-Module DevPilot.ActivePrIntake) {
+            param($Head)
+            Get-IntakeFileProgressBindingDigest `
+                -Head $Head
+        } $currentHead
+        $legacyBinding |
+            Should -BeExactly $currentBinding
+        $state.rows =
+            @($state.rows[0], $state.rows[0])
+        $transition = Invoke-IntakeCase $c
+        $transition.reasonCodes |
+            Should -Contain 'missing-page'
+        $transition.heads |
+            Should -HaveCount 0
+        @($transition.binding.configLineage) |
+            Should -Be @(
+                [string]$transition.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
+        @($transition.binding.
+                fileProgressMigrationProofs) |
+            Should -HaveCount 1
+        $state.rows = @($state.rows[0])
+        $third = Invoke-IntakeCase $c
+
+        $first.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        $second.heads[0].fileProgress.
+            processedFiles | Should -Be 32
+        $third.heads[0].reasonCode |
+            Should -BeExactly rules-incomplete `
+                -Because (
+                    $third |
+                        ConvertTo-Json `
+                            -Depth 16 -Compress)
+        @($state.starts) |
+            Should -Be @(0, 16, 32)
+        @($third.binding.configLineage) |
+            Should -Be @(
+                [string]$third.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
+        $third.heads[0].declaration.
+            templateAuthority.configurationCommit |
+            Should -BeExactly ('9' * 40)
+        $third.heads[0].declaration.
+            description |
+            Should -BeExactly $state.description
+
+        $c.config.toolkit.head = 'e' * 40
+        $c.config.toolkit.tree = 'f' * 40
+        $c.config.cursorCompatibility =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$third.binding.
+                        configDigest
+                previousToolkitHead = 'c' * 40
+                previousToolkitTree = 'd' * 40
+            }
+        $fourth = Invoke-IntakeCase $c
+        $fourth.heads[0].reasonCode |
+            Should -BeExactly rules-incomplete
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48)
+        @($fourth.binding.configLineage) |
+            Should -Be @(
+                [string]$fourth.binding.
+                    configDigest,
+                [string]$third.binding.
+                    configDigest,
+                [string]$second.binding.
+                    configDigest)
+
+        [void]$c.config.Remove(
+            'cursorCompatibility')
+        $c.config.automationMarker =
+            '[DevPilot-Automation:v2]'
+        $fifth = Invoke-IntakeCase $c
+        $fifth.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48, 0)
+        @($fifth.binding.configLineage) |
+            Should -Be @(
+                [string]$fifth.binding.
+                    configDigest)
+
+        $foreignProgress =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $foreignProgress.configDigest =
+            '9' * 64
+        [IO.File]::WriteAllText(
+            $progressPath,
+            (ConvertTo-Json `
+                -InputObject $foreignProgress `
+                -Depth 64))
+        $foreign = Invoke-IntakeCase $c
+        $foreign.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48, 0, 0)
+
+        $state.commit = 'c' * 40
+        $state.iteration = 2
+        $sixth = Invoke-IntakeCase $c
+        $sixth.heads[0].fileProgress.
+            processedFiles | Should -Be 16
+        @($state.starts) |
+            Should -Be @(0, 16, 32, 48, 0, 0, 0)
+
+        $legacyWithoutProof =
+            Get-Content $progressPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $legacyWithoutProof.schemaVersion = 2
+        [void]$legacyWithoutProof.Remove(
+            'fileProgressBindingDigest')
+        [IO.File]::WriteAllText(
+            $progressPath,
+            (ConvertTo-Json `
+                -InputObject $legacyWithoutProof `
+                -Depth 64))
+        $c.config.toolkit.head = '1' * 40
+        $c.config.toolkit.tree = '2' * 40
+        $c.config.cursorCompatibility =
+            [ordered]@{
+                previousConfigDigest =
+                    [string]$sixth.binding.
+                        configDigest
+                previousToolkitHead = 'e' * 40
+                previousToolkitTree = 'f' * 40
+            }
+        $state.rows =
+            @($state.rows[0], $state.rows[0])
+        $proofTransition =
+            Invoke-IntakeCase $c
+        @($proofTransition.binding.
+                fileProgressMigrationProofs) |
+            Should -HaveCount 1
+        $cohortPath = Join-Path $c.root `
+            'active-pr-intake-v1\cohort.json'
+        $cohort =
+            Get-Content $cohortPath -Raw |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+        $cohort.binding.
+            fileProgressMigrationProofs = @()
+        $cohortJson =
+            ConvertTo-Json -InputObject $cohort `
+                -Depth 64
+        [IO.File]::WriteAllText(
+            $cohortPath, $cohortJson)
+        [IO.File]::WriteAllText(
+            (Join-Path (
+                    Join-Path $c.root `
+                        'active-pr-intake-v1') `
+                $proofTransition.generationFile),
+            $cohortJson)
+        $state.rows = @($state.rows[0])
+        $withoutProof =
+            Invoke-IntakeCase $c
+        $withoutProof.heads[0].
+            fileProgress.processedFiles |
+            Should -Be 16
+        @($state.starts) |
+            Should -Be @(
+                0, 16, 32, 48, 0, 0, 0, 0)
+    }
+
+    It 'fails closed on malformed duplicate foreign or over-cap config lineage' {
+        $mutations = @(
+            @{
+                name = 'malformed'
+                apply = {
+                    param($cohort)
+                    $cohort.binding.configLineage =
+                        @('not-a-digest')
+                }
+            },
+            @{
+                name = 'duplicate'
+                apply = {
+                    param($cohort)
+                    $digest =
+                        [string]$cohort.binding.
+                            configDigest
+                    $cohort.binding.configLineage =
+                        @($digest, $digest)
+                }
+            },
+            @{
+                name = 'foreign-current'
+                apply = {
+                    param($cohort)
+                    $foreign = 'f' * 64
+                    $cohort.binding.configLineage =
+                        @($foreign)
+                }
+            },
+            @{
+                name = 'over-cap'
+                apply = {
+                    param($cohort)
+                    $current =
+                        [string]$cohort.binding.
+                            configDigest
+                    $firstPrior = '1' * 64
+                    $secondPrior = '2' * 64
+                    $thirdPrior = '3' * 64
+                    $cohort.binding.configLineage =
+                        @(
+                            $current,
+                            $firstPrior,
+                            $secondPrior,
+                            $thirdPrior)
+                }
+            },
+            @{
+                name = 'malformed-proof'
+                apply = {
+                    param($cohort)
+                    $cohort.binding.
+                        fileProgressMigrationProofs =
+                        @([ordered]@{
+                                pullRequestId = 1
+                                configDigest =
+                                    [string]$cohort.
+                                        binding.
+                                        configDigest
+                                declarationDigest =
+                                    'not-a-digest'
+                                fileProgressBindingDigest =
+                                    '1' * 64
+                            })
+                }
+            },
+            @{
+                name = 'over-cap-proofs'
+                apply = {
+                    param($cohort)
+                    $proofs = @(
+                        for ($id = 1;
+                            $id -le 4;
+                            $id++) {
+                            [ordered]@{
+                                pullRequestId = $id
+                                configDigest =
+                                    [string]$cohort.
+                                        binding.
+                                        configDigest
+                                declarationDigest =
+                                    $id.ToString('x64')
+                                fileProgressBindingDigest =
+                                    ($id + 4).
+                                        ToString('x64')
+                            }
+                        })
+                    $cohort.binding.
+                        fileProgressMigrationProofs =
+                        $proofs
+                }
+            })
+
+        foreach ($mutation in $mutations) {
+            $c = New-IntakeCase -Count 1 `
+                -MaxHeads 1
+            $c.config.limits.
+                maxPullRequests = 1
+            $first = Invoke-IntakeCase $c
+            $cohortPath = Join-Path $c.root `
+                'active-pr-intake-v1\cohort.json'
+            $generationPath = Join-Path (
+                Join-Path $c.root `
+                    'active-pr-intake-v1') `
+                $first.generationFile
+            $cohort =
+                Get-Content $cohortPath -Raw |
+                    ConvertFrom-Json `
+                        -AsHashtable -Depth 64
+            & $mutation.apply $cohort
+            $mutatedJson =
+                ConvertTo-Json `
+                    -InputObject $cohort `
+                    -Depth 64
+            [IO.File]::WriteAllText(
+                $cohortPath, $mutatedJson)
+            [IO.File]::WriteAllText(
+                $generationPath, $mutatedJson)
+
+            {
+                Invoke-IntakeCase $c
+            } | Should -Throw `
+                -Because $mutation.name
+        }
+    }
+
     It 'enumerates 347 non-draft heads from 574 active with 227 drafts across 100+ pages' {
         $c = New-IntakeCase -Count 574 -PageSize 3 -MaxHeads 5
         for ($i = 0; $i -lt 227; $i++) { $c.state.rows[$i].isDraft = $true }
@@ -765,6 +2022,316 @@ $httpGet = {
                         $e.generationFile) -Raw)
         $c.state.headVisits[1] | Should -BeGreaterThan 1
         $e.cursor.nextPullRequestId | Should -Be 2
+    }
+    It 'yields incomplete file progress and revisits it after later cohorts' {
+        $c = New-IntakeCase -Count 6 -MaxHeads 2
+        $baseProvider = $c.provider
+        $starts =
+            [Collections.Generic.List[int]]::new()
+        $c.provider = {
+            param($op, $request)
+            if ($op -cne 'Changes' -or
+                [int]$request.pullRequestId -ne 1) {
+                return & $baseProvider $op $request
+            }
+            $start = [int]$request.fileStartOrdinal
+            [void]$starts.Add($start)
+            $entry = [ordered]@{
+                changeTrackingId = $start + 1
+                path = "src/File$($start + 1).cs"
+                changeType = 'edit'
+                state = 'complete'
+                spans = @([ordered]@{
+                        startLine = 1
+                        endLine = 1
+                        state = 'complete'
+                        sourceDigest =
+                            'v1:sha256:' + ('1' * 64)
+                    })
+                content = "class C$start {}"
+                byteLength =
+                    [Text.Encoding]::UTF8.GetByteCount(
+                        "class C$start {}")
+                sourceDigest =
+                    'v1:sha256:' + ('2' * 64)
+            }
+            return [ordered]@{
+                changedFiles = 1
+                changedLines = $start + 1
+                entries = @($entry)
+                projectContexts = @()
+                inventory = @(
+                    [ordered]@{
+                        changeTrackingId = 1
+                        path = 'src/File1.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition = 'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    },
+                    [ordered]@{
+                        changeTrackingId = 2
+                        path = 'src/File2.cs'
+                        changeType = 'edit'
+                        originalPath = $null
+                        evidenceDisposition = 'required'
+                        evidenceReason =
+                            'non-generated-csharp'
+                    })
+                fileProgress = [ordered]@{
+                    inventoryDigest = '3' * 64
+                    evidencePlanDigest = '4' * 64
+                    totalFiles = 2
+                    totalInventoryFiles = 2
+                    startOrdinal = $start
+                    nextOrdinal = $start + 1
+                    complete = $start -eq 1
+                    cumulativeChangedLines =
+                        $start + 1
+                }
+            }
+        }.GetNewClosure()
+
+        $cycles =
+            [Collections.Generic.List[object]]::new()
+        $results =
+            [Collections.Generic.List[object]]::new()
+        foreach ($ordinal in 1..4) {
+            $result = Invoke-IntakeCase $c
+            [void]$results.Add($result)
+            [void]$cycles.Add(@(
+                    $result.heads |
+                        Where-Object {
+                            $_.declaration -is
+                                [Collections.IDictionary]
+                        } |
+                        ForEach-Object {
+                            [int]$_.pullRequestId
+                        }))
+        }
+
+        @($cycles[0]) | Should -Be @(1, 2)
+        @($cycles[1]) | Should -Be @(3, 4)
+        @($cycles[2]) | Should -Be @(5, 6)
+        @($cycles[3]) | Should -Be @(1, 2)
+        $results[0].heads[0].reasonCode |
+            Should -BeExactly 'file-progress-pending'
+        $results[0].cursor.nextPullRequestId |
+            Should -Be 3
+        @($starts) | Should -Be @(0, 1)
+        $results[3].heads[0].reasonCode |
+            Should -BeExactly 'rules-incomplete'
+    }
+    It 'persists lifecycle traversal order across intake restarts' {
+        $c = New-IntakeCase -Count 4 -MaxHeads 2
+        $orders =
+            [Collections.Generic.List[object]]::new()
+        $lifecycle = {
+            param($Inventory)
+            $ids = @($Inventory | ForEach-Object {
+                    [int]$_.pullRequestId
+                })
+            [void]$orders.Add($ids)
+            return [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                runId = [guid]::NewGuid().ToString('N')
+                cutoffUtc =
+                    '2025-10-21T00:00:00.0000000Z'
+                health = 'healthy'
+                providerWrites = 0
+                modelWrites = 0
+                confirmedAbandonedIds = @()
+                reviewEligibleIds = @($ids)
+                nextPullRequestId = $(if (
+                    $orders.Count -eq 1) {
+                        3
+                    }
+                    else { 1 })
+                decisions = @()
+                events = @()
+            }
+        }.GetNewClosure()
+
+        $first = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle -Run
+        $second = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle -Run
+
+        @($orders[0]) | Should -Be @(1, 2, 3, 4)
+        @($orders[1]) | Should -Be @(3, 4, 1, 2) `
+            -Because ($second |
+                ConvertTo-Json -Depth 20 -Compress)
+        $first.lifecycle.nextPullRequestId | Should -Be 3
+        $second.lifecycle.nextPullRequestId | Should -Be 1
+    }
+    It 'accepts dictionary and PSCustomObject lifecycle cursors for <Name>' `
+        -TestCases @(
+            @{
+                Name = 'dictionary-int'
+                Shape = 'dictionary'
+                Cursor = [int]3
+                Expected = 3
+            }
+            @{
+                Name = 'pscustom-long'
+                Shape = 'pscustom'
+                Cursor = [long]3
+                Expected = 3
+            }
+            @{
+                Name = 'pscustom-null'
+                Shape = 'pscustom'
+                Cursor = $null
+                Expected = $null
+            }
+            @{
+                Name = 'pscustom-end'
+                Shape = 'pscustom'
+                Cursor = [long]4
+                Expected = 4
+            }
+            @{
+                Name = 'dictionary-wrap'
+                Shape = 'dictionary'
+                Cursor = [int]1
+                Expected = 1
+            }
+        ) {
+        param($Name, $Shape, $Cursor, $Expected)
+        $c = New-IntakeCase -Count 4 -MaxHeads 3
+        $lifecycle = {
+            param($Inventory)
+            $value = [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                runId = 'fixture'
+                cutoffUtc =
+                    '2025-10-21T00:00:00.0000000Z'
+                health = 'healthy'
+                providerWrites = 1
+                modelWrites = 0
+                confirmedAbandonedIds = @(4)
+                reviewEligibleIds = @(1, 2, 3)
+                nextPullRequestId = $Cursor
+                decisions = @()
+                events = @()
+            }
+            if ($Shape -ceq 'pscustom') {
+                return [pscustomobject]$value
+            }
+            return $value
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle `
+            -IncludeTransientSnapshots -Run
+
+        $result.lifecycle.kind |
+            Should -BeExactly 'stale-pr-lifecycle-v1-run'
+        $result.lifecycle.providerWrites | Should -Be 1
+        $result.lifecycle.confirmedAbandonedIds |
+            Should -Be @(4)
+        if ($null -eq $Expected) {
+            $result.lifecycle.nextPullRequestId |
+                Should -BeNullOrEmpty
+        }
+        else {
+            [long]$result.lifecycle.nextPullRequestId |
+                Should -Be ([long]$Expected)
+        }
+        @($result.transientSnapshots.Keys |
+            ForEach-Object { [int]$_ } |
+            Sort-Object) | Should -Be @(1, 2, 3)
+        @($c.state.calls | Where-Object {
+                $_ -ceq 'Head:4'
+            }) | Should -HaveCount 0
+    }
+    It 'preserves lifecycle and acquisition progress across fresh processes' {
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-fresh-lifecycle-' +
+            [guid]::NewGuid().ToString('N'))
+        [void]$script:roots.Add($root)
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-ActivePrLifecycleGatingFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $firstOutput = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $root 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($firstOutput -join "`n")
+        $first = ($firstOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $secondOutput = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $root 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($secondOutput -join "`n")
+        $second = ($secondOutput -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+
+        $first.lifecycleOrder | Should -Be @(1, 2, 3, 4)
+        $first.selectedPullRequestIds | Should -Be @(1, 2)
+        $first.lifecycleNextPullRequestId | Should -Be 3
+        $second.lifecycleOrder | Should -Be @(3, 4, 1, 2)
+        $second.selectedPullRequestIds | Should -Be @(3, 4)
+        $second.lifecycleNextPullRequestId | Should -Be 1
+        $second.providerWrites | Should -Be 0
+        $second.modelWrites | Should -Be 0
+    }
+    It 'accepts the native lifecycle PSCustomObject in a fresh process' {
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-native-lifecycle-' +
+            [guid]::NewGuid().ToString('N'))
+        $stateRoot = Join-Path $root 'state'
+        $lifecycleRoot = Join-Path $root 'lifecycle'
+        [void]$script:roots.Add($root)
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-NativeLifecycleActivePrFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $output = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $stateRoot `
+                -LifecycleRoot $lifecycleRoot 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($output -join "`n")
+        $result = ($output -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+
+        $result.nativeResultType |
+            Should -BeExactly 'System.Management.Automation.PSCustomObject'
+        $result.nativeNextCursorType |
+            Should -BeExactly 'System.Int64'
+        $result.nativeNextPullRequestId |
+            Should -Be 303
+        $result.nativeReviewEligibleCount |
+            Should -Be 302
+        $result.nativeProviderWrites | Should -Be 1
+        $result.nativeConfirmedAbandonedIds |
+            Should -Be @(303)
+        $result.intakeLifecycleKind |
+            Should -BeExactly 'stale-pr-lifecycle-v1-run'
+        $result.intakeLifecycleDiagnostic |
+            Should -BeNullOrEmpty
+        $result.intakeProviderWrites |
+            Should -Be 1
+        $result.intakeConfirmedAbandonedIds |
+            Should -Be @(303)
+        $result.selectedPullRequestIds |
+            Should -Be @(1, 2, 3, 4)
+        $result.fixtureStatusWrites | Should -Be 1
+        $result.fixtureEvidenceReads | Should -Be 2
+        $result.externalWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
     }
     It 'marks changed or inaccessible heads unknown, never evaluated' {
         $c = New-IntakeCase -Count 3

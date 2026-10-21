@@ -272,6 +272,42 @@ Describe 'Owner v2 preview orchestrator manifest and state' {
         [Convert]::ToHexString($after) | Should -BeExactly ([Convert]::ToHexString($before))
     }
 
+    It 'updates the durable index without rereading unchanged record bodies' {
+        $stateRoot = New-TestStateRoot
+        $firstManifest = New-TestManifestFile -Name 'index-first.json'
+        $secondManifest = New-TestManifestFile -Name 'index-second.json' -Mutator {
+            param($m)
+            $m.entries[0].head.sourceCommit = 'd' * 40
+            Set-TestPackageSourceCommit -Entry $m.entries[0] `
+                -SourceCommit ('d' * 40)
+        }
+        $first = Invoke-OwnerV2PreviewPrepare `
+            -StateRoot $stateRoot -ManifestPath $firstManifest
+        Mock Get-OwnerV2CapabilityRecords {
+            throw 'unchanged record bodies were reread'
+        } -ModuleName DevPilot.OwnerOrchestrator
+
+        $second = Invoke-OwnerV2PreviewPrepare `
+            -StateRoot $stateRoot -ManifestPath $secondManifest
+        $run = Invoke-OwnerV2PreviewRun `
+            -StateRoot $stateRoot -ManifestPath $secondManifest
+        $index = Get-Content -LiteralPath (
+            Join-Path $second.records[0].capabilityRoot `
+                'index\records.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 32
+
+        @($index.records) | Should -HaveCount 2
+        @($index.records.identity) |
+            Should -Be @($index.records.identity | Sort-Object)
+        $index.records.identity | Should -Contain $first.records[0].identity
+        $index.records.identity | Should -Contain $second.records[0].identity
+        @($run.records) | Should -HaveCount 1
+        $run.records[0].state |
+            Should -BeIn @('completed', 'incomplete', 'unknown')
+        Should -Invoke Get-OwnerV2CapabilityRecords `
+            -ModuleName DevPilot.OwnerOrchestrator -Times 0 -Exactly
+    }
+
     It 'uses distinct identities for changed head, rule, config, and model bindings' {
         $stateRoot = New-TestStateRoot
         $base = (Invoke-OwnerV2PreviewPrepare -StateRoot $stateRoot -ManifestPath (New-TestManifestFile -Name 'base.json')).records[0].identity

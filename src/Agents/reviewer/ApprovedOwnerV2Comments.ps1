@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
@@ -315,6 +316,8 @@ function Read-ApprovedOwnerV2Evidence {
             'notAttempted'
         } else { 'attempted' })
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
+    Set-ApprovedOwnerV2CommentPresentation -Contract $contract `
+        -Observation $observation -ToolkitConfig $toolkitConfig
     foreach ($entry in ([ordered]@{
             bindingId = $contract.Binding.BindingId
             subjectKey = $contract.Binding.SubjectKey
@@ -1334,4 +1337,32 @@ function Invoke-ApprovedOwnerV2Comments {
                 -Phase outcomes -InvocationId $invocationId -Payload $failure -Key $Key)
         throw
     }
+}
+
+function Set-ApprovedOwnerV2CommentPresentation {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][Collections.IDictionary]$Observation,
+        [Parameter(Mandatory)][Collections.IDictionary]$ToolkitConfig
+    )
+    $delivery = if ([string]$Contract.Request.CapabilityId -ceq 'bpm-named-areequal-arguments@1') { 'named-areequal' } else { 'owner' }
+    Assert-OwnerCommentRuleReferences -References $ToolkitConfig['commentRuleReferences'] `
+        -Repository $ToolkitConfig['commentRuleRepository'] -Delivery $delivery
+    $artifacts = @($Observation.sourceArtifacts | Where-Object {
+        [string](Get-ApprovedOwnerV2Value $_ 'kind' '') -ceq
+            'owner-v2-comment-presentation'
+    })
+    if ($artifacts.Count -eq 0) { return }
+    if ($artifacts.Count -ne 1 -or
+        [string]$artifacts[0].sha256 -cne (
+            Get-ApprovedOwnerV2TextSha256 'owner-v2-comment-presentation:subject-provider-links-v1') -or
+        [string]$artifacts[0].signature -cne 'not-applicable') {
+        throw 'Owner v2 observation has an unknown or ambiguous comment presentation mode.'
+    }
+    $Contract | Add-Member -NotePropertyName CommentPresentation `
+        -NotePropertyValue ([ordered]@{
+            subjectProvider = $ToolkitConfig.subjectProvider
+            ruleReferences = $ToolkitConfig['commentRuleReferences']
+            ruleRepository = $ToolkitConfig['commentRuleRepository']
+        })
 }
