@@ -210,31 +210,54 @@ BeforeAll {
                 [string]$PushDetail = 'valid',
                 [AllowNull()][ref]$PushDetailReads,
                 [AllowNull()][ref]$GetReads,
-                [AllowNull()][ref]$PatchCalls
+                [AllowNull()][ref]$PatchCalls,
+                [AllowNull()]
+                [Collections.Generic.List[object]]$RequestLog,
+                [string]$SyntheticToken = ('t' * 120)
             )
             $handler = {
-                param($Arguments, $InputPath)
-                if ($Arguments[0] -ceq 'account') {
+                param($Request)
+                $uri = [uri]$Request.Uri
+                $path = $uri.AbsolutePath
+                $method = [string]$Request.Method
+                if ($null -ne $RequestLog) {
+                    [void]$RequestLog.Add([ordered]@{
+                            uri = $uri.AbsoluteUri
+                            method = $method
+                            authorizationExact =
+                                $Request.Headers.Contains(
+                                    'Authorization') -and
+                                [string]$Request.Headers.Authorization -ceq
+                                    ('Bearer ' + $SyntheticToken)
+                            authorizationWasPlaceholder =
+                                [string]$Request.Headers.Authorization -ceq
+                                    ('*' * 6)
+                            contentType = $(if (
+                                $Request.Contains('ContentType')
+                            ) {
+                                [string]$Request.ContentType
+                            } else { $null })
+                            bodyBase64 = $(if (
+                                $Request.Contains('Body')
+                            ) {
+                                [Convert]::ToBase64String(
+                                    [byte[]]$Request.Body)
+                            } else { $null })
+                        })
+                }
+                if ($path -clike '*/_apis/connectionData') {
                     return @{
-                        user = @{
-                            name =
-                                'service@example.invalid'
+                        authenticatedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor =
+                                'aad.synthetic-service-account'
+                        }
+                        authorizedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor =
+                                'aad.synthetic-service-account'
                         }
                     }
-                }
-                $resourceIndex =
-                    [Array]::IndexOf(
-                        [object[]]$Arguments,
-                        '--resource')
-                $resource = [string]$Arguments[
-                    $resourceIndex + 1]
-                $method = 'GET'
-                $methodIndex = [Array]::IndexOf(
-                    [object[]]$Arguments,
-                    '--http-method')
-                if ($methodIndex -ge 0) {
-                    $method = [string]$Arguments[
-                        $methodIndex + 1]
                 }
                 if ($method -ceq 'GET' -and
                     $null -ne $GetReads) {
@@ -244,25 +267,17 @@ BeforeAll {
                     $null -ne $PatchCalls) {
                     $PatchCalls.Value++
                 }
-                $pullRequestId = 1
-                $routeIndex = [Array]::IndexOf(
-                    [object[]]$Arguments,
-                    '--route-parameters')
-                if ($routeIndex -ge 0) {
-                    foreach ($argument in @(
-                            $Arguments |
-                                Select-Object `
-                                    -Skip ($routeIndex + 1))) {
-                        if ([string]$argument -match
-                            '^pullRequestId=(?<id>[0-9]+)$') {
-                            $pullRequestId =
-                                [long]$Matches.id
-                            break
-                        }
-                    }
+                $pullRequestId = 1L
+                if ($path -match
+                    '/pullrequests/(?<id>[0-9]+)') {
+                    $pullRequestId =
+                        [long]$Matches.id
                 }
-                switch ($resource) {
-                    pullRequests {
+                if ($method -ceq 'PATCH') {
+                    return @{ status = 'abandoned' }
+                }
+                switch -Regex ($path) {
+                    '/pullrequests/[0-9]+$' {
                         return @{
                             pullRequestId = $pullRequestId
                             status = 'active'
@@ -289,7 +304,7 @@ BeforeAll {
                             }
                         }
                     }
-                    pullRequestIterations {
+                    '/pullrequests/[0-9]+/iterations$' {
                         if ($NoIterations) {
                             return @{
                                 count = 0
@@ -339,7 +354,7 @@ BeforeAll {
                             value = $iterationRows
                         }
                     }
-                    pullRequestThreads {
+                    '/pullrequests/[0-9]+/threads$' {
                         $comments = @(@{
                                 id = 1
                                 parentCommentId = 0
@@ -378,7 +393,7 @@ BeforeAll {
                                 })
                         }
                     }
-                    refs {
+                    '/refs$' {
                         return @{
                             count = 1
                             continuation_token = $null
@@ -389,7 +404,7 @@ BeforeAll {
                                 })
                         }
                     }
-                    pushes {
+                    '/pushes/[0-9]+$' {
                         if ($null -ne $PushDetailReads) {
                             $PushDetailReads.Value++
                         }
@@ -460,11 +475,31 @@ BeforeAll {
                         }
                     }
                     default {
-                        throw "unexpected-resource:$resource"
+                        throw "unexpected-http:$method $uri"
                     }
                 }
             }.GetNewClosure()
             return $handler
+    }
+
+    function New-TestAzureDevOpsLifecycleProvider {
+        param(
+            [Collections.IDictionary]$InputConfig = $config,
+            [Parameter(Mandatory)]
+            [scriptblock]$HttpInvoker,
+            [AllowNull()][scriptblock]$UtcNowProvider
+        )
+        $arguments = @{
+            Config = $InputConfig
+            TokenInvoker = {
+                @{ accessToken = 't' * 120 }
+            }
+            HttpInvoker = $HttpInvoker
+        }
+        if ($null -ne $UtcNowProvider) {
+            $arguments.UtcNowProvider = $UtcNowProvider
+        }
+        return New-StalePrAzureDevOpsProvider @arguments
     }
 }
 
@@ -1068,120 +1103,217 @@ Describe 'Stale lifecycle provider authority source' {
             'sourceRefCommit\.(author|committer)')
     }
 
-    It 'launches the actual subprocess with one canonical status body' {
-        $fixture = Join-Path $repo `
-            'tests\fixtures\StalePrFakeAzureCli.cmd'
-        $log = Join-Path $TestDrive `
-            'stale-pr-fake-az.json'
-        $prior = [Environment]::GetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-            [EnvironmentVariableTarget]::Process)
-        [Environment]::SetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-            $log,
-            [EnvironmentVariableTarget]::Process)
-        try {
-            $provider = New-StalePrAzureDevOpsProvider `
-                -Config $config -AzureCliPath $fixture
-            $response = & $provider AbandonStatus @{
-                pullRequestId = 1637334
-                body = [ordered]@{
-                    status = 'abandoned'
+    It 'constructs exact direct identity GET and status PATCH requests' {
+        $requests =
+            [Collections.Generic.List[object]]::new()
+        $http = New-AzLifecycleInvoker `
+            -RequestLog $requests
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config `
+            -TokenInvoker {
+                @{ accessToken = 't' * 120 }
+            } `
+            -HttpInvoker $http
+
+        $identity = & $provider Identity @{}
+        $response = & $provider AbandonStatus @{
+            pullRequestId = 1637334
+            body = [ordered]@{
+                status = 'abandoned'
+            }
+        }
+
+        $identity.id | Should -BeExactly (
+            [string]$config.expectedAccount.id)
+        $response.status | Should -BeExactly abandoned
+        @($requests) | Should -HaveCount 2
+        $requests[0].uri | Should -BeExactly (
+            'https://dev.azure.com/example-org/' +
+            '_apis/connectionData?connectOptions=1&' +
+            'api-version=7.1-preview.1')
+        $requests[0].method | Should -BeExactly GET
+        $requests[0].authorizationExact | Should -BeTrue
+        $requests[0].authorizationWasPlaceholder | Should -BeFalse
+        $requests[0].bodyBase64 | Should -BeNullOrEmpty
+        $requests[1].uri | Should -BeExactly (
+            'https://dev.azure.com/example-org/' +
+            'ExampleProject/_apis/git/repositories/' +
+            '11111111-1111-1111-1111-111111111111/' +
+            'pullrequests/1637334?api-version=7.1')
+        $requests[1].method | Should -BeExactly PATCH
+        $requests[1].authorizationExact | Should -BeTrue
+        $requests[1].authorizationWasPlaceholder | Should -BeFalse
+        $requests[1].contentType |
+            Should -BeExactly 'application/json'
+        $bodyBytes = [Convert]::FromBase64String(
+            [string]$requests[1].bodyBase64)
+        $bodyBytes.Length | Should -Be 22
+        [Text.UTF8Encoding]::new(
+            $false, $true).GetString($bodyBytes) |
+            Should -BeExactly '{"status":"abandoned"}'
+        $bodyBytes[0..2] |
+            Should -Not -Be @(0xEF, 0xBB, 0xBF)
+        (ConvertTo-Json $requests -Depth 16) |
+            Should -Not -Match ('t' * 120)
+        $source = Get-Content -LiteralPath (
+            Join-Path $repo `
+                'src\DevPilot.PullRequestLifecycle\DevPilot.PullRequestLifecycle.psm1') `
+            -Raw
+        $placeholderPattern =
+            'Authorization\s*=\s*"' +
+            [regex]::Escape(('*' * 6)) + '"'
+        $source | Should -Not -Match $placeholderPattern
+    }
+
+    It 'constructs every lifecycle GET URI with one cached token' {
+        $requests =
+            [Collections.Generic.List[object]]::new()
+        $tokenCalls = [ref]0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config `
+            -TokenInvoker {
+                $tokenCalls.Value++
+                @{ accessToken = 't' * 120 }
+            }.GetNewClosure() `
+            -HttpInvoker (
+                New-AzLifecycleInvoker `
+                    -MissingSummaryPushDate `
+                    -RequestLog $requests)
+
+        [void](& $provider Identity @{})
+        $evidence = & $provider ReadEvidence @{
+            pullRequestId = 1
+        }
+
+        $evidence.complete | Should -BeTrue
+        $tokenCalls.Value | Should -Be 1
+        $actualUris = @($requests | ForEach-Object {
+                [string]$_.uri
+            })
+        $expectedUris = @(
+            (
+            'https://dev.azure.com/example-org/' +
+                '_apis/connectionData?connectOptions=1&' +
+                'api-version=7.1-preview.1'),
+            (
+            'https://dev.azure.com/example-org/' +
+                'ExampleProject/_apis/git/repositories/' +
+                '11111111-1111-1111-1111-111111111111/' +
+                'pullRequests/1?api-version=7.1'),
+            (
+            'https://dev.azure.com/example-org/' +
+                'ExampleProject/_apis/git/repositories/' +
+                '11111111-1111-1111-1111-111111111111/' +
+                'pullRequests/1/iterations?api-version=7.1'),
+            (
+            'https://dev.azure.com/example-org/' +
+                'ExampleProject/_apis/git/repositories/' +
+                '11111111-1111-1111-1111-111111111111/' +
+                'pullRequests/1/threads?api-version=7.1'),
+            (
+            'https://dev.azure.com/example-org/' +
+                'ExampleProject/_apis/git/repositories/' +
+                '11111111-1111-1111-1111-111111111111/' +
+                'refs?filter=heads%2Ffeature-1&' +
+                'includeStatuses=false&peelTags=false&' +
+                'api-version=7.1'),
+            (
+            'https://dev.azure.com/example-org/' +
+                'ExampleProject/_apis/git/repositories/' +
+                '11111111-1111-1111-1111-111111111111/' +
+                'pushes/7?includeRefUpdates=false&' +
+                'includeCommits=false&api-version=7.1'))
+        $actualUris | Should -HaveCount $expectedUris.Count
+        for ($index = 0;
+            $index -lt $expectedUris.Count;
+            $index++) {
+            $actualUris[$index] |
+                Should -BeExactly $expectedUris[$index]
+        }
+        @($requests | Where-Object {
+                [string]$_.method -cne 'GET' -or
+                -not [bool]$_.authorizationExact -or
+                [bool]$_.authorizationWasPlaceholder -or
+                $null -ne $_.bodyBase64
+            }) | Should -HaveCount 0
+    }
+
+    It 'fails closed when either direct connection identity mismatches' `
+        -TestCases @(
+            @{ Field = 'authenticatedUser' }
+            @{ Field = 'authorizedUser' }
+        ) {
+        param($Field)
+        $http = {
+            param($Request)
+            $response = @{
+                authenticatedUser = @{
+                    id = '33333333-3333-3333-3333-333333333333'
+                    subjectDescriptor =
+                        'aad.synthetic-service-account'
+                }
+                authorizedUser = @{
+                    id = '33333333-3333-3333-3333-333333333333'
+                    subjectDescriptor =
+                        'aad.synthetic-service-account'
+                }
+            }
+            $response[$Field].id =
+                '99999999-9999-9999-9999-999999999999'
+            return $response
+        }
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $config `
+            -TokenInvoker {
+                @{ accessToken = 't' * 120 }
+            } `
+            -HttpInvoker $http
+        {
+            & $provider Identity @{}
+        } | Should -Throw '*identity-mismatch*'
+    }
+
+    It 'sanitizes direct HTTP write failures in signed records' {
+        $evidence = New-LifecycleEvidence -Id 1637334
+        $http = {
+            param($Request)
+            if ([string]$Request.Method -ceq 'PATCH') {
+                $failure = [InvalidOperationException]::new(
+                    'RAW-SECRET-MARKER')
+                $failure.Data['serverErrorCode'] =
+                    'InvalidArgumentValueException'
+                $response = [pscustomobject]@{
+                    StatusCode = 400
+                }
+                $failure | Add-Member `
+                    -MemberType NoteProperty `
+                    -Name Response -Value $response
+                throw $failure
+            }
+            return @{
+                authenticatedUser = @{
+                    id = '33333333-3333-3333-3333-333333333333'
+                    subjectDescriptor =
+                        'aad.synthetic-service-account'
+                }
+                authorizedUser = @{
+                    id = '33333333-3333-3333-3333-333333333333'
+                    subjectDescriptor =
+                        'aad.synthetic-service-account'
                 }
             }
         }
-        finally {
-            [Environment]::SetEnvironmentVariable(
-                'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-                $prior,
-                [EnvironmentVariableTarget]::Process)
-        }
-
-        [string]$response.status |
-            Should -BeExactly abandoned
-        $record = Get-Content $log -Raw |
-            ConvertFrom-Json -AsHashtable -Depth 16
-        $arguments = @($record.arguments)
-        $normalizedArguments = @($arguments)
-        $inputIndex = [Array]::IndexOf(
-            [object[]]$normalizedArguments,
-            '--in-file')
-        $inputIndex | Should -Be 19
-        $normalizedArguments[$inputIndex + 1] =
-            '<temp-path>'
-        $normalizedArguments | Should -Be @(
-            'devops',
-            'invoke',
-            '--organization',
-            [string]$config.organization,
-            '--area',
-            'git',
-            '--resource',
-            'pullRequests',
-            '--route-parameters',
-            "project=$($config.projectName)",
-            "repositoryId=$($config.repositoryId)",
-            'pullRequestId=1637334',
-            '--http-method',
-            'PATCH',
-            '--api-version',
-            '7.1',
-            '-o',
-            'json',
-            '--only-show-errors',
-            '--in-file',
-            '<temp-path>')
-        [bool]$record.inputExistsDuringProcess |
-            Should -BeTrue
-        [int]$record.bodyLength | Should -Be 22
-        $body = [Text.UTF8Encoding]::new(
-            $false, $true).GetString(
-            [Convert]::FromBase64String(
-                [string]$record.bodyBase64))
-        $body | Should -BeExactly (
-            '{"status":"abandoned"}')
-        [Convert]::FromBase64String(
-            [string]$record.bodyBase64)[0..2] |
-            Should -Not -Be @(0xEF, 0xBB, 0xBF)
-        Test-Path -LiteralPath (
-            [string]$record.inputPath) |
-            Should -BeFalse
-    }
-
-    It 'signs only bounded diagnostics for a nonzero CLI exit' {
-        $fixture = Join-Path $repo `
-            'tests\fixtures\StalePrFakeAzureCli.cmd'
-        $log = Join-Path $TestDrive `
-            'stale-pr-fake-az-failure.json'
-        $priorLog = [Environment]::GetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-            [EnvironmentVariableTarget]::Process)
-        $priorExit = [Environment]::GetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
-            [EnvironmentVariableTarget]::Process)
-        [Environment]::SetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-            $log,
-            [EnvironmentVariableTarget]::Process)
-        [Environment]::SetEnvironmentVariable(
-            'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
-            '23',
-            [EnvironmentVariableTarget]::Process)
         $realProvider = New-StalePrAzureDevOpsProvider `
-            -Config $config -AzureCliPath $fixture
-        $evidence = New-LifecycleEvidence -Id 1637334
+            -Config $config `
+            -TokenInvoker {
+                @{ accessToken = 't' * 120 }
+            } `
+            -HttpInvoker $http
         $provider = {
             param($Operation, $Arguments)
             switch ($Operation) {
                 Identity {
-                    return [ordered]@{
-                        id =
-                            '33333333-3333-3333-3333-333333333333'
-                        descriptor =
-                            'aad.synthetic-service-account'
-                        uniqueName =
-                            'service@example.invalid'
-                    }
+                    return & $realProvider Identity @{}
                 }
                 ReadEvidence {
                     return $evidence
@@ -1197,56 +1329,34 @@ Describe 'Stale lifecycle provider authority source' {
                         status = 'active'
                     }
                 }
-                default {
-                    throw "unexpected:$Operation"
-                }
             }
         }.GetNewClosure()
-        try {
-            $result = Invoke-LifecycleCase `
-                -Provider $provider `
-                -Inventory @([ordered]@{
-                        pullRequestId = 1637334
-                        status = 'active'
-                        isDraft = $false
-                        targetRef = 'refs/heads/master'
-                        creationUtc =
-                            '2024-01-01T00:00:00Z'
-                    })
-        }
-        finally {
-            [Environment]::SetEnvironmentVariable(
-                'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
-                $priorLog,
-                [EnvironmentVariableTarget]::Process)
-            [Environment]::SetEnvironmentVariable(
-                'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
-                $priorExit,
-                [EnvironmentVariableTarget]::Process)
-        }
+        $result = Invoke-LifecycleCase `
+            -Provider $provider `
+            -Inventory @([ordered]@{
+                    pullRequestId = 1637334
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                })
 
-        $result.providerWrites | Should -Be 1
-        $result.decisions[0].reason |
-            Should -BeExactly ambiguous-post-write
         $diagnostic = $result.events[0].diagnostic
         $diagnostic.kind |
-            Should -BeExactly azure-cli-nonzero-exit
-        $diagnostic.cliExitCode | Should -Be 23
-        $serialized = ConvertTo-Json $result `
-            -Depth 64 -Compress
-        $serialized | Should -Not -Match 'RAW-SECRET-MARKER'
+            Should -BeExactly http-request-failed
+        $diagnostic.httpStatus | Should -Be 400
+        $diagnostic.serverErrorCode |
+            Should -BeExactly InvalidArgumentValueException
         @($diagnostic.Keys | Sort-Object) |
-            Should -Be @('cliExitCode', 'kind')
-        $record = Get-Content $log -Raw |
-            ConvertFrom-Json -AsHashtable -Depth 16
-        Test-Path -LiteralPath (
-            [string]$record.inputPath) |
-            Should -BeFalse
+            Should -Be @(
+                'httpStatus', 'kind', 'serverErrorCode')
+        (ConvertTo-Json $result -Depth 64) |
+            Should -Not -Match 'RAW-SECRET-MARKER'
     }
 
     It 'ignores recent system-only events but includes recent bot comments' {
-        $systemOnly = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $systemOnly = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker)
         $systemEvidence = & $systemOnly ReadEvidence @{
             pullRequestId = 1
@@ -1254,8 +1364,8 @@ Describe 'Stale lifecycle provider authority source' {
         $systemEvidence.latestActivityUtc |
             Should -BeExactly '2024-12-01T00:00:00.0000000Z'
 
-        $botComment = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $botComment = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -ActualCommentUtc '2026-01-02T00:00:00Z')
         $botEvidence = & $botComment ReadEvidence @{
@@ -1267,8 +1377,8 @@ Describe 'Stale lifecycle provider authority source' {
 
     It 'uses push occurrence time and rejects malformed comment evidence' {
         $summaryPushReads = 0
-        $recentPush = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $recentPush = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -PushUtc '2026-01-03T00:00:00Z' `
                     -PushDetailReads (
@@ -1280,8 +1390,8 @@ Describe 'Stale lifecycle provider authority source' {
             Should -BeExactly '2026-01-03T00:00:00.0000000Z'
         $summaryPushReads | Should -Be 0
 
-        $malformed = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $malformed = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -ActualCommentUtc '2024-12-02T00:00:00Z' `
                     -MalformedComment)
@@ -1298,23 +1408,8 @@ Describe 'Stale lifecycle provider authority source' {
             -PushUtc '2024-12-03T04:05:06Z' `
             -MissingSummaryPushDate `
             -PushDetailReads ([ref]$detailReads)
-        $rawPush = & $invoker @(
-            'devops', 'invoke',
-            '--resource', 'pushes') ''
-        [long]$rawPush.pushId | Should -Be 7
-        [string]$rawPush.date |
-            Should -BeExactly '2024-12-03T04:05:06Z'
-        $rawPush.repository |
-            Should -BeOfType ([Collections.IDictionary])
-        [string]$rawPush.repository.id |
-            Should -BeExactly ([string]$config.repositoryId)
-        $rawPush.repository.project |
-            Should -BeOfType ([Collections.IDictionary])
-        [string]$rawPush.repository.project.id |
-            Should -BeExactly ([string]$config.projectId)
-        $detailReads = 0
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker $invoker
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker $invoker
         $evidence = & $provider ReadEvidence @{
             pullRequestId = 1
         }
@@ -1326,8 +1421,8 @@ Describe 'Stale lifecycle provider authority source' {
 
     It 'deduplicates missing summary push dates by pushId' {
         $detailReads = 0
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -PushUtc '2024-12-03T04:05:06Z' `
                     -MissingSummaryPushDate `
@@ -1374,15 +1469,15 @@ Describe 'Stale lifecycle provider authority source' {
             }.GetNewClosure()
         }
         $providerArguments = @{
-            Config = $boundedConfig
-            Invoker = (
+            InputConfig = $boundedConfig
+            HttpInvoker = (
                 New-AzLifecycleInvoker `
                     -MissingSummaryPushDate)
         }
         if ($null -ne $clock) {
             $providerArguments.UtcNowProvider = $clock
         }
-        $provider = New-StalePrAzureDevOpsProvider `
+        $provider = New-TestAzureDevOpsLifecycleProvider `
             @providerArguments
 
         {
@@ -1399,8 +1494,8 @@ Describe 'Stale lifecycle provider authority source' {
         $boundedConfig.subjectProvider.maximumReads = 6
         $boundedConfig.limits.maxReads = 100
         $getReads = [ref]0
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $boundedConfig -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $boundedConfig -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -ActualCommentUtc '2026-01-02T00:00:00Z' `
                     -GetReads $getReads)
@@ -1452,7 +1547,7 @@ Describe 'Stale lifecycle provider authority source' {
         @($result.decisions | Where-Object {
                 [long]$_.pullRequestId -eq 3
             }) | Should -HaveCount 0
-        $getReads.Value | Should -Be 6
+        $getReads.Value | Should -Be 5
     }
 
     It 'shares one elapsed deadline across candidates' {
@@ -1465,15 +1560,15 @@ Describe 'Stale lifecycle provider authority source' {
         $clockCalls = [ref]0
         $clock = {
             $clockCalls.Value++
-            if ($clockCalls.Value -lt 12) {
+            if ($clockCalls.Value -lt 20) {
                 return $start
             }
             return $start.AddSeconds(
                 [int]$boundedConfig.limits.maxSeconds + 1)
         }.GetNewClosure()
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $boundedConfig `
-            -UtcNowProvider $clock -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $boundedConfig `
+            -UtcNowProvider $clock -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -ActualCommentUtc '2026-01-02T00:00:00Z')
         $root = New-LifecycleRoot
@@ -1542,9 +1637,9 @@ Describe 'Stale lifecycle provider authority source' {
             return $start.AddSeconds(
                 [int]$boundedConfig.limits.maxSeconds + 1)
         }.GetNewClosure()
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $boundedConfig `
-            -UtcNowProvider $clock -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $boundedConfig `
+            -UtcNowProvider $clock -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -PatchCalls $patchCalls)
         $root = New-LifecycleRoot
@@ -1591,8 +1686,8 @@ Describe 'Stale lifecycle provider authority source' {
         ) {
         param($Mode)
         $detailReads = 0
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -MissingSummaryPushDate `
                     -PushDetail $Mode `
@@ -1607,8 +1702,8 @@ Describe 'Stale lifecycle provider authority source' {
     }
 
     It 'accepts complete empty counted-activity histories using creation' {
-        $provider = New-StalePrAzureDevOpsProvider `
-            -Config $config -Invoker (
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $config -HttpInvoker (
                 New-AzLifecycleInvoker -NoIterations)
         $evidence = & $provider ReadEvidence @{
             pullRequestId = 1

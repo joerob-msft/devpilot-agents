@@ -61,8 +61,7 @@ if ($lifecycleConfig.Enabled) {
         -RepoRoot $RepoRoot
     $lifecycleProvider =
         New-StalePrAzureDevOpsProvider `
-            -Config $config -AzureCliPath $AzureCliPath `
-            -IdentityProvider $provider
+            -Config $config -AzureCliPath $AzureCliPath
     $cutoffUtc = [DateTime]::UtcNow.AddYears(-1)
     $lifecycleEvaluator = {
         param([object[]]$Inventory)

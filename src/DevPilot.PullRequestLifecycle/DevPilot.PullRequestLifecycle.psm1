@@ -71,32 +71,44 @@ function Get-StalePrWriteDiagnostic {
         [Management.Automation.ErrorRecord]$ErrorRecord
     )
     $kind = 'provider-write-failed'
-    $exitCode = $null
+    $httpStatus = $null
+    $serverErrorCode = $null
     $exception = $ErrorRecord.Exception
     while ($null -ne $exception) {
         if ($exception.Data.Contains('stalePrFailureKind')) {
             $candidate = [string]$exception.Data[
                 'stalePrFailureKind']
             if ($candidate -cin @(
-                    'azure-cli-nonzero-exit',
+                    'http-request-failed',
                     'provider-write-failed')) {
                 $kind = $candidate
             }
         }
-        if ($exception.Data.Contains('stalePrCliExitCode')) {
-            $candidateExit = 0
+        if ($exception.Data.Contains('stalePrHttpStatus')) {
+            $candidateStatus = 0
             if ([int]::TryParse(
                     [string]$exception.Data[
-                        'stalePrCliExitCode'],
-                    [ref]$candidateExit)) {
-                $exitCode = $candidateExit
+                        'stalePrHttpStatus'],
+                    [ref]$candidateStatus)) {
+                $httpStatus = $candidateStatus
+            }
+        }
+        if ($exception.Data.Contains('stalePrServerErrorCode')) {
+            $candidateCode = [string]$exception.Data[
+                'stalePrServerErrorCode']
+            if ($candidateCode -cin @(
+                    'GitPullRequestNotFoundException',
+                    'InvalidArgumentValueException',
+                    'UnauthorizedRequestException')) {
+                $serverErrorCode = $candidateCode
             }
         }
         $exception = $exception.InnerException
     }
     return [ordered]@{
         kind = $kind
-        cliExitCode = $exitCode
+        httpStatus = $httpStatus
+        serverErrorCode = $serverErrorCode
     }
 }
 
@@ -520,9 +532,9 @@ function New-StalePrAzureDevOpsProvider {
         [Collections.IDictionary]$Config,
         [string]$AzureCliPath = 'az',
         [Parameter(DontShow)]
-        [AllowNull()][scriptblock]$IdentityProvider,
+        [AllowNull()][scriptblock]$TokenInvoker,
         [Parameter(DontShow)]
-        [AllowNull()][scriptblock]$Invoker,
+        [AllowNull()][scriptblock]$HttpInvoker,
         [Parameter(DontShow)]
         [AllowNull()][scriptblock]$UtcNowProvider
     )
@@ -566,109 +578,188 @@ function New-StalePrAzureDevOpsProvider {
         ${function:Get-StalePrFailureReason}
     $canonicalJsonCommand =
         ${function:ConvertTo-ApprovedOwnerV2CanonicalJson}
-    $invoke = {
-        param([string[]]$Arguments, [string]$InputPath = '')
-        if ($null -ne $Invoker) {
-            return & $Invoker $Arguments $InputPath
+    $organizationUri = [Uri]$organization
+    if ($organizationUri.Scheme -cne 'https' -or
+        $organizationUri.Host -cne 'dev.azure.com' -or
+        $organizationUri.AbsolutePath.Trim('/') -cne
+            $organizationUri.Segments[-1].Trim('/')) {
+        throw 'stale-pr-organization-uri-invalid'
+    }
+    $organizationBase = $organization.TrimEnd('/')
+    $tokenState = [pscustomobject]@{
+        AccessToken = ''
+    }
+    $getAccessToken = {
+        if (-not [string]::IsNullOrWhiteSpace(
+                [string]$tokenState.AccessToken)) {
+            return [string]$tokenState.AccessToken
         }
-        $args = @($Arguments)
-        if ($InputPath) { $args += @('--in-file', $InputPath) }
-        $output = @(& $AzureCliPath @args 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            $failure = [InvalidOperationException]::new(
-                'stale-pr-provider-inaccessible')
-            $failure.Data['stalePrFailureKind'] =
-                'azure-cli-nonzero-exit'
-            $failure.Data['stalePrCliExitCode'] =
-                [int]$LASTEXITCODE
-            throw $failure
+        $response = if ($null -ne $TokenInvoker) {
+            & $TokenInvoker
         }
-        $text = $output -join "`n"
-        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-        return $text | ConvertFrom-Json -AsHashtable -Depth 100
+        else {
+            [void][Environment]::SetEnvironmentVariable(
+                'AZURE_DEVOPS_EXT_PAT', $null,
+                [EnvironmentVariableTarget]::Process)
+            [void][Environment]::SetEnvironmentVariable(
+                'SYSTEM_ACCESSTOKEN', $null,
+                [EnvironmentVariableTarget]::Process)
+            $output = @(& $AzureCliPath `
+                account get-access-token `
+                --resource `
+                    499b84ac-1321-427f-aa17-267ca6975798 `
+                --only-show-errors -o json 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+                throw 'stale-pr-token-unavailable'
+            }
+            ($output -join "`n") |
+                ConvertFrom-Json -AsHashtable -Depth 16
+        }
+        $token = if ($response -is
+                [Collections.IDictionary]) {
+            [string]$response.accessToken
+        }
+        else { [string]$response }
+        if ($token -cnotmatch '^\S{100,}$') {
+            throw 'stale-pr-token-unavailable'
+        }
+        $tokenState.AccessToken = $token
+        return $token
     }.GetNewClosure()
-    $read = {
+    $invokeHttp = {
         param(
-            [string]$Resource,
-            [long]$PullRequestId,
+            [Parameter(Mandatory)][uri]$Uri,
+            [Parameter(Mandatory)]
+            [ValidateSet('GET', 'PATCH')]
+            [string]$Method,
             [Parameter(Mandatory)]$Budget,
-            [string[]]$AdditionalRoute = @(),
-            [string[]]$Query = @()
+            [AllowNull()][byte[]]$Body = $null
         )
-        if ([int]$Budget.Count -ge $readCeiling) {
+        if ($Uri.Scheme -cne 'https' -or
+            $Uri.Host -cne $organizationUri.Host -or
+            -not $Uri.AbsolutePath.StartsWith(
+                $organizationUri.AbsolutePath.TrimEnd('/') + '/',
+                [StringComparison]::Ordinal)) {
+            throw 'stale-pr-http-uri-invalid'
+        }
+        if ($Method -ceq 'GET' -and
+            [int]$Budget.Count -ge $readCeiling) {
             throw 'stale-pr-read-budget-exhausted'
         }
         if ((& $getUtcNow) -ge
             [DateTime]$Budget.DeadlineUtc) {
             throw 'stale-pr-deadline-exhausted'
         }
-        $Budget.Count++
-        $arguments = @(
-            'devops', 'invoke',
-            '--organization', $organization,
-            '--area', 'git',
-            '--resource', $Resource,
-            '--route-parameters',
-            "project=$projectName",
-            "repositoryId=$repositoryId",
-            "pullRequestId=$PullRequestId"
-        ) + $AdditionalRoute
-        if ($Query.Count) {
-            $arguments += @('--query-parameters') + $Query
+        if ($Method -ceq 'GET') {
+            $Budget.Count++
         }
-        $arguments += @(
-            '--http-method', 'GET',
-            '--api-version', '7.1',
-            '-o', 'json',
-            '--only-show-errors'
-        )
-        $response = & $invoke $arguments
+        $token = & $getAccessToken
+        $remainingSeconds = [int][Math]::Max(
+            1,
+            [Math]::Ceiling(
+                ([DateTime]$Budget.DeadlineUtc -
+                    (& $getUtcNow)).TotalSeconds))
+        $request = @{
+            Uri = $Uri
+            Method = $Method
+            Headers = @{
+                Authorization = ('Bearer ' + $token)
+            }
+            TimeoutSec = $remainingSeconds
+            UseBasicParsing = $true
+        }
+        if ($Method -ceq 'PATCH') {
+            if ($null -eq $Body) {
+                throw 'stale-pr-write-body-invalid'
+            }
+            $request.Body = $Body
+            $request.ContentType = 'application/json'
+        }
+        try {
+            $response = if ($null -ne $HttpInvoker) {
+                & $HttpInvoker $request
+            }
+            else {
+                Invoke-WebRequest @request
+            }
+        }
+        catch {
+            $failure = [InvalidOperationException]::new(
+                'stale-pr-provider-inaccessible')
+            $failure.Data['stalePrFailureKind'] =
+                'http-request-failed'
+            if ($null -ne $_.Exception.Response) {
+                $failure.Data['stalePrHttpStatus'] =
+                    [int]$_.Exception.Response.StatusCode
+            }
+            if ($_.Exception.Data.Contains(
+                    'serverErrorCode')) {
+                $failure.Data['stalePrServerErrorCode'] =
+                    [string]$_.Exception.Data[
+                        'serverErrorCode']
+            }
+            throw $failure
+        }
         if ((& $getUtcNow) -ge
             [DateTime]$Budget.DeadlineUtc) {
             throw 'stale-pr-deadline-exhausted'
         }
-        return $response
+        if ($response -is [Collections.IDictionary]) {
+            return $response
+        }
+        if ([long]$response.RawContentLength -lt 0 -or
+            [long]$response.RawContentLength -gt 16777216) {
+            throw 'stale-pr-read-budget-exhausted'
+        }
+        try {
+            return ([string]$response.Content).
+                TrimStart([char]0xFEFF) |
+                ConvertFrom-Json -AsHashtable -Depth 100
+        }
+        catch {
+            throw 'stale-pr-response-invalid'
+        }
+    }.GetNewClosure()
+    $read = {
+        param(
+            [string]$RelativePathAndQuery,
+            [long]$PullRequestId,
+            [Parameter(Mandatory)]$Budget
+        )
+        $uri = [Uri](
+            $organizationBase + '/' +
+            [Uri]::EscapeDataString($projectName) +
+            '/_apis/git/repositories/' +
+            [Uri]::EscapeDataString($repositoryId) +
+            '/pullRequests/' +
+            [Uri]::EscapeDataString(
+                [string]$PullRequestId) +
+            $RelativePathAndQuery)
+        return & $invokeHttp `
+            -Uri $uri -Method GET -Budget $Budget
     }.GetNewClosure()
     $readPush = {
         param(
             [long]$PushId,
             [Parameter(Mandatory)]$Budget
         )
-        if ([int]$Budget.Count -ge $readCeiling) {
-            throw 'stale-pr-read-budget-exhausted'
-        }
-        if ((& $getUtcNow) -ge
-            [DateTime]$Budget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
-        }
-        $Budget.Count++
-        $response = & $invoke @(
-            'devops', 'invoke',
-            '--organization', $organization,
-            '--area', 'git',
-            '--resource', 'pushes',
-            '--route-parameters',
-            "project=$projectName",
-            "repositoryId=$repositoryId",
-            "pushId=$PushId",
-            '--query-parameters',
-            'includeRefUpdates=false',
-            'includeCommits=false',
-            '--http-method', 'GET',
-            '--api-version', '7.1',
-            '-o', 'json',
-            '--only-show-errors'
-        )
-        if ((& $getUtcNow) -ge
-            [DateTime]$Budget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
-        }
-        return $response
+        $uri = [Uri](
+            $organizationBase + '/' +
+            [Uri]::EscapeDataString($projectName) +
+            '/_apis/git/repositories/' +
+            [Uri]::EscapeDataString($repositoryId) +
+            '/pushes/' +
+            [Uri]::EscapeDataString([string]$PushId) +
+            '?includeRefUpdates=false&includeCommits=false' +
+            '&api-version=7.1')
+        return & $invokeHttp `
+            -Uri $uri -Method GET -Budget $Budget
     }.GetNewClosure()
     $readEvidence = {
         param([long]$PullRequestId)
         $pushDates = @{}
-        $pr = & $read 'pullRequests' $PullRequestId $runBudget
+        $pr = & $read '?api-version=7.1' `
+            $PullRequestId $runBudget
         if ($pr.repository -isnot [Collections.IDictionary] -or
             [string]$pr.repository.id -ine $repositoryId -or
             $pr.repository.project -isnot
@@ -676,9 +767,9 @@ function New-StalePrAzureDevOpsProvider {
             [string]$pr.repository.project.id -ine $projectId) {
             throw 'stale-pr-repository-mismatch'
         }
-        $iterations = & $read 'pullRequestIterations' `
+        $iterations = & $read '/iterations?api-version=7.1' `
             $PullRequestId $runBudget
-        $threads = & $read 'pullRequestThreads' `
+        $threads = & $read '/threads?api-version=7.1' `
             $PullRequestId $runBudget
         if ($null -ne $iterations.continuation_token -or
             [int]$iterations.count -ne @($iterations.value).Count -or
@@ -713,35 +804,18 @@ function New-StalePrAzureDevOpsProvider {
             '^refs/heads/(?<filter>.+)$') {
             throw 'stale-pr-source-ref-invalid'
         }
-        if ([int]$runBudget.Count -ge $readCeiling) {
-            throw 'stale-pr-read-budget-exhausted'
-        }
-        if ((& $getUtcNow) -ge
-            [DateTime]$runBudget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
-        }
-        $runBudget.Count++
-        $refs = & $invoke @(
-            'devops', 'invoke',
-            '--organization', $organization,
-            '--area', 'git',
-            '--resource', 'refs',
-            '--route-parameters',
-            "project=$projectName",
-            "repositoryId=$repositoryId",
-            '--query-parameters',
-            "filter=heads/$($Matches.filter)",
-            'includeStatuses=false',
-            'peelTags=false',
-            '--http-method', 'GET',
-            '--api-version', '7.1',
-            '-o', 'json',
-            '--only-show-errors'
-        )
-        if ((& $getUtcNow) -ge
-            [DateTime]$runBudget.DeadlineUtc) {
-            throw 'stale-pr-deadline-exhausted'
-        }
+        $refsUri = [Uri](
+            $organizationBase + '/' +
+            [Uri]::EscapeDataString($projectName) +
+            '/_apis/git/repositories/' +
+            [Uri]::EscapeDataString($repositoryId) +
+            '/refs?filter=' +
+            [Uri]::EscapeDataString(
+                "heads/$($Matches.filter)") +
+            '&includeStatuses=false&peelTags=false' +
+            '&api-version=7.1')
+        $refs = & $invokeHttp `
+            -Uri $refsUri -Method GET -Budget $runBudget
         $matchingRefs = @($refs.value | Where-Object {
                 [string]$_.name -ceq $sourceRef -and
                 [string]$_.objectId -cmatch
@@ -904,14 +978,29 @@ function New-StalePrAzureDevOpsProvider {
         )
         switch -CaseSensitive ($Operation) {
             Identity {
-                if ($null -ne $IdentityProvider) {
-                    return & $IdentityProvider Identity @{}
+                $connectionUri = [Uri](
+                    $organizationBase +
+                    '/_apis/connectionData' +
+                    '?connectOptions=1' +
+                    '&api-version=7.1-preview.1')
+                $connection = & $invokeHttp `
+                    -Uri $connectionUri -Method GET `
+                    -Budget $runBudget
+                foreach ($name in @(
+                        'authenticatedUser',
+                        'authorizedUser')) {
+                    $identity = $connection[$name]
+                    if ($identity -isnot
+                            [Collections.IDictionary] -or
+                        [string]$identity.id -ine
+                            [string]$actor.id -or
+                        [string]$identity.subjectDescriptor -cne
+                            [string]$actor.descriptor) {
+                        throw 'stale-pr-provider-identity-mismatch'
+                    }
                 }
-                $account = & $invoke @(
-                    'account', 'show',
-                    '--only-show-errors', '-o', 'json')
-                if ([string]$account.user.name -ine
-                    [string]$actor.uniqueName) {
+                if ([string]$connection.authenticatedUser.id -ine
+                    [string]$connection.authorizedUser.id) {
                     throw 'stale-pr-provider-identity-mismatch'
                 }
                 return [ordered]@{} + $actor
@@ -921,7 +1010,7 @@ function New-StalePrAzureDevOpsProvider {
                     [long]$Arguments.pullRequestId)
             }
             ReadStatus {
-                $pr = & $read 'pullRequests' `
+                $pr = & $read '?api-version=7.1' `
                     ([long]$Arguments.pullRequestId) `
                     $runBudget
                 return [ordered]@{
@@ -936,34 +1025,22 @@ function New-StalePrAzureDevOpsProvider {
                     [string]$Arguments.body.status -cne 'abandoned') {
                     throw 'stale-pr-write-body-invalid'
                 }
-                $temp = Join-Path ([IO.Path]::GetTempPath()) (
-                    'stale-pr-status-' +
-                    [guid]::NewGuid().ToString('N') + '.json')
-                try {
-                    [IO.File]::WriteAllText(
-                        $temp,
-                        (& $canonicalJsonCommand `
-                            $Arguments.body),
-                        [Text.UTF8Encoding]::new($false))
-                    return & $invoke @(
-                        'devops', 'invoke',
-                        '--organization', $organization,
-                        '--area', 'git',
-                        '--resource', 'pullRequests',
-                        '--route-parameters',
-                        "project=$projectName",
-                        "repositoryId=$repositoryId",
-                        "pullRequestId=$([long]$Arguments.pullRequestId)",
-                        '--http-method', 'PATCH',
-                        '--api-version', '7.1',
-                        '-o', 'json',
-                        '--only-show-errors'
-                    ) $temp
-                }
-                finally {
-                    Remove-Item -LiteralPath $temp -Force `
-                        -ErrorAction SilentlyContinue
-                }
+                $body = [Text.UTF8Encoding]::new(
+                    $false).GetBytes(
+                    (& $canonicalJsonCommand `
+                        $Arguments.body))
+                $uri = [Uri](
+                    $organizationBase + '/' +
+                    [Uri]::EscapeDataString($projectName) +
+                    '/_apis/git/repositories/' +
+                    [Uri]::EscapeDataString($repositoryId) +
+                    '/pullrequests/' +
+                    [Uri]::EscapeDataString(
+                        [string][long]$Arguments.pullRequestId) +
+                    '?api-version=7.1')
+                return & $invokeHttp `
+                    -Uri $uri -Method PATCH `
+                    -Budget $runBudget -Body $body
             }
             default {
                 throw "Unsupported stale PR operation '$Operation'."
