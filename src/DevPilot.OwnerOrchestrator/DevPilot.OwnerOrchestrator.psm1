@@ -1186,7 +1186,91 @@ function Get-OwnerV2CapabilityRecords {
 }
 
 function Write-OwnerV2Index {
-    param([Parameter(Mandatory)][string]$CapabilityRoot)
+    param(
+        [Parameter(Mandatory)][string]$CapabilityRoot,
+        [AllowNull()][Collections.IDictionary]$Record
+    )
+    $recordDir = Join-Path $CapabilityRoot 'records'
+    $indexPath = Join-Path (Join-Path $CapabilityRoot 'index') 'records.json'
+    if ($null -ne $Record -and
+        (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
+        Assert-OwnerV2Record -Record $Record
+        $existing = Read-OwnerV2JsonFile -Path $indexPath
+        if ([int]$existing.schemaVersion -ne 1 -or
+            [string]$existing.kind -cne 'owner-v2-preview-index' -or
+            -not $existing.Contains('records')) {
+            throw 'Malformed Owner v2 index.'
+        }
+        Assert-OwnerV2PathHasNoLinks -Path $recordDir
+        $fileIdentities =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
+        foreach ($file in @(
+                Get-ChildItem -LiteralPath $recordDir `
+                    -Filter '*.json' -File
+            )) {
+            if ($file.Name -cmatch
+                '^\.owner-v2-stage-[0-9a-f]{32}\.json$') {
+                continue
+            }
+            if ($file.Name -cnotmatch '^([0-9a-f]{64})\.json$') {
+                throw "Malformed Owner v2 record filename '$($file.Name)'."
+            }
+            [void]$fileIdentities.Add($Matches[1])
+        }
+        $indexed = [Collections.Generic.List[object]]::new()
+        $seen = [Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal)
+        foreach ($item in @($existing.records)) {
+            if ($item -isnot [Collections.IDictionary]) {
+                throw 'Malformed Owner v2 index record.'
+            }
+            $identity = [string]$item.identity
+            if ($identity -cnotmatch '^[0-9a-f]{64}$' -or
+                -not $seen.Add($identity)) {
+                throw 'Malformed Owner v2 index record identity.'
+            }
+            if ($identity -ceq [string]$Record.identity) {
+                [void]$indexed.Add(
+                    (Get-OwnerV2IndexRecord -Record $Record))
+            }
+            else {
+                [void]$indexed.Add($item)
+            }
+        }
+        if ($seen.Add([string]$Record.identity)) {
+            [void]$indexed.Add(
+                (Get-OwnerV2IndexRecord -Record $Record))
+        }
+        $indexedIdentities =
+            [Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::Ordinal)
+        foreach ($item in @($indexed)) {
+            [void]$indexedIdentities.Add([string]$item.identity)
+        }
+        $indexMatchesRecords =
+            $indexedIdentities.Count -eq $fileIdentities.Count
+        if ($indexMatchesRecords) {
+            foreach ($identity in $fileIdentities) {
+                if (-not $indexedIdentities.Contains($identity)) {
+                    $indexMatchesRecords = $false
+                    break
+                }
+            }
+        }
+        if ($indexMatchesRecords) {
+            $index = [ordered]@{
+                schemaVersion = 1
+                kind = 'owner-v2-preview-index'
+                records = @($indexed | Sort-Object -Property @{
+                        Expression = { [string]$_.identity }
+                        Ascending = $true
+                    })
+            }
+            [void](Write-OwnerV2AtomicJson -Path $indexPath -Value $index)
+            return $index
+        }
+    }
     $records = @(Get-OwnerV2CapabilityRecords -CapabilityRoot $CapabilityRoot |
         Sort-Object -Property @{ Expression = { [string]$_.identity }; Ascending = $true })
     $index = [ordered]@{
@@ -1194,7 +1278,7 @@ function Write-OwnerV2Index {
         kind = 'owner-v2-preview-index'
         records = @($records | ForEach-Object { Get-OwnerV2IndexRecord -Record $_ })
     }
-    [void](Write-OwnerV2AtomicJson -Path (Join-Path (Join-Path $CapabilityRoot 'index') 'records.json') -Value $index)
+    [void](Write-OwnerV2AtomicJson -Path $indexPath -Value $index)
     return $index
 }
 
@@ -1435,7 +1519,8 @@ function Set-OwnerV2ModelExecutionAttempted {
         $record.modelExecutionState = 'attempted'
         $record.updatedUtc = 'utc:' + ([DateTime]::UtcNow).ToString('o')
         [void](Write-OwnerV2AtomicJson -Path $RecordPath -Value $record)
-        [void](Write-OwnerV2Index -CapabilityRoot $CapabilityRoot)
+        [void](Write-OwnerV2Index -CapabilityRoot $CapabilityRoot `
+                -Record $record)
     }
     finally {
         Exit-AgentLock -Stream $lock
@@ -2452,7 +2537,8 @@ function Invoke-OwnerV2PreviewPrepare {
                 [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
                 $created = $true
             }
-            $index = Write-OwnerV2Index -CapabilityRoot $capabilityRoot
+            $index = Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                -Record $record
             [void]$prepared.Add([ordered]@{
                     identity = $identity
                     stateDigest = $entry.StateDigest
@@ -2517,15 +2603,17 @@ function Invoke-OwnerV2PreviewRun {
             Assert-OwnerV2RecordBinding -Record $record -Entry $entry
             if (ConvertTo-OwnerV2CurrentRecord -Record $record) {
                 [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
-                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                        -Record $record)
             }
             if (Repair-OwnerV2DiscussionRefreshJournal `
                     -Entry $entry -CapabilityRoot $capabilityRoot `
                     -RecordPath $recordPath -ObservationPath $observationPath) {
-                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
                 $record = Read-OwnerV2JsonFile -Path $recordPath
                 Assert-OwnerV2Record -Record $record
                 Assert-OwnerV2RecordBinding -Record $record -Entry $entry
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                        -Record $record)
             }
             if ([string]$record.state -ceq 'completed' -and
                 [string]$entry.CapabilityKind -cin @(
@@ -2580,7 +2668,8 @@ function Invoke-OwnerV2PreviewRun {
                         $currentRecord.updatedUtc = 'utc:' + ([DateTime]::UtcNow).ToString('o')
                         [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $currentRecord)
                         Invoke-OwnerV2Checkpoint -Name 'discussion-refresh-after-record'
-                        [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                        [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                                -Record $currentRecord)
                         Remove-Item -LiteralPath $journalPath -Force
                     }
                     [void]$ran.Add([ordered]@{
@@ -2636,7 +2725,8 @@ function Invoke-OwnerV2PreviewRun {
                     }
                     else { 'legacy-model-execution-unknown' })
                 [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
-                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                        -Record $record)
                 [void]$ran.Add([ordered]@{
                         identity = $identity
                         state = 'incomplete'
@@ -2651,7 +2741,8 @@ function Invoke-OwnerV2PreviewRun {
                 $record.updatedUtc = 'utc:' + $now.ToString('o')
                 $record.incompleteReason = 'maximum-attempts'
                 [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
-                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+                [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                        -Record $record)
                 [void]$ran.Add([ordered]@{ identity = $identity; state = 'incomplete'; reason = 'maximum-attempts' })
                 continue
             }
@@ -2666,7 +2757,8 @@ function Invoke-OwnerV2PreviewRun {
             }
             $reservationId = [string]$record.lease.id
             [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
-            [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+            [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                    -Record $record)
             $reserved = $true
             Invoke-OwnerV2Checkpoint -Name 'run-after-reservation'
         }
@@ -2892,7 +2984,8 @@ function Invoke-OwnerV2PreviewRun {
             $record.resultDigest = Get-OwnerV2Digest -Value $observation
             $record.incompleteReason = $reason
             [void](Write-OwnerV2AtomicJson -Path $recordPath -Value $record)
-            [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot)
+            [void](Write-OwnerV2Index -CapabilityRoot $capabilityRoot `
+                    -Record $record)
             [void]$ran.Add([ordered]@{
                     identity = $identity
                     state = $finalState

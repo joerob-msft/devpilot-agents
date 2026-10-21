@@ -641,24 +641,28 @@ Describe 'Named AreEqual current PR bridge' {
     It 'completes in a fresh process with only bridge imports' `
         -TestCases @(
             @{ Mode = 'empty'; ExpectedExit = 0
-                ExpectedState = 'completed' }
+                ExpectedState = 'completed'; HeadCount = 1 }
             @{ Mode = 'human'; ExpectedExit = 0
-                ExpectedState = 'completed' }
+                ExpectedState = 'completed'; HeadCount = 1 }
             @{ Mode = 'drift'; ExpectedExit = 0
-                ExpectedState = 'partial' }
+                ExpectedState = 'partial'; HeadCount = 1 }
+            @{ Mode = 'empty'; ExpectedExit = 0
+                ExpectedState = 'completed'; HeadCount = 4 }
         ) {
-        param($Mode, $ExpectedExit, $ExpectedState)
+        param($Mode, $ExpectedExit, $ExpectedState, $HeadCount)
         $config = New-BridgeConfig
         $config.enabled = $true
+        $config.limits.maxHeadsPerRun = $HeadCount
         $configPath = Join-Path $TestDrive `
-            "fresh-$Mode-config.json"
+            "fresh-$Mode-$HeadCount-config.json"
         [IO.File]::WriteAllText(
             $configPath,
             (ConvertTo-Json -InputObject $config -Depth 32) + "`n",
             [Text.UTF8Encoding]::new($false))
-        $state = Join-Path $TestDrive "fresh-$Mode-state"
+        $state = Join-Path $TestDrive `
+            "fresh-$Mode-$HeadCount-state"
         $manifest = Join-Path $TestDrive `
-            "fresh-$Mode-manifest.json"
+            "fresh-$Mode-$HeadCount-manifest.json"
         $fixture = Join-Path $PSScriptRoot `
             'fixtures\Invoke-NamedAreEqualBridgeFreshProcess.ps1'
         $pwsh = (Get-Command pwsh -CommandType Application |
@@ -666,7 +670,8 @@ Describe 'Named AreEqual current PR bridge' {
         $output = @(& $pwsh -NoProfile -NonInteractive `
             -File $fixture -ConfigPath $configPath `
             -StateRoot $state -ManifestPath $manifest `
-            -RepoRoot $repoRoot -DiscussionMode $Mode 2>&1)
+            -RepoRoot $repoRoot -DiscussionMode $Mode `
+            -HeadCount $HeadCount 2>&1)
         $LASTEXITCODE | Should -Be $ExpectedExit `
             -Because ($output -join "`n")
         $result = ($output -join "`n") |
@@ -675,7 +680,7 @@ Describe 'Named AreEqual current PR bridge' {
         if ($ExpectedExit -eq 0) {
             $result.providerWrites | Should -Be 0
             $result.modelWrites | Should -Be 0
-            $result.recordCount | Should -Be 1
+            $result.recordCount | Should -Be $HeadCount
             $result.recordState | Should -BeExactly $(if (
                     $Mode -ceq 'drift'
                 ) { 'unknown' } else { 'completed' })

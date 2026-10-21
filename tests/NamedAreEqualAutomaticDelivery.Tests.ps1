@@ -600,6 +600,24 @@ Describe 'Named AreEqual automatic delivery' {
                 -Policy $signed } | Should -Throw '*ceilings*'
     }
 
+    It 'keeps Named rule commit authority strict until policy reauthorization' {
+        $context = New-NamedDeliveryContext
+        $context.Policy.rule.commit = 'a' * 40
+        $context.Evidence.Declaration.rule.commit = 'b' * 40
+        $provider = New-NamedDeliveryProvider `
+            -Evidence $context.Evidence
+
+        {
+            Invoke-AutomaticNamedAreEqualBatch `
+                -Evidence @($context.Evidence) `
+                -Policy $context.Policy `
+                -DeliveryRoot $context.Root -Key $context.Key `
+                -Provider $provider.Handler
+        } | Should -Throw "*binding 'rule' is stale or foreign*"
+        $provider.State.operations.Count | Should -Be 0
+        $provider.State.writes | Should -Be 0
+    }
+
     It 'rejects named policy construction above 2 per run or 5 per PR' {
         $context = New-NamedDeliveryContext
         $context.Policy.limits.maxCreatesPerRun | Should -Be 2
