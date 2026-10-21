@@ -1068,6 +1068,183 @@ Describe 'Stale lifecycle provider authority source' {
             'sourceRefCommit\.(author|committer)')
     }
 
+    It 'launches the actual subprocess with one canonical status body' {
+        $fixture = Join-Path $repo `
+            'tests\fixtures\StalePrFakeAzureCli.ps1'
+        $log = Join-Path $TestDrive `
+            'stale-pr-fake-az.json'
+        $prior = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+            $log,
+            [EnvironmentVariableTarget]::Process)
+        try {
+            $provider = New-StalePrAzureDevOpsProvider `
+                -Config $config -AzureCliPath $fixture
+            $response = & $provider AbandonStatus @{
+                pullRequestId = 1637334
+                body = [ordered]@{
+                    status = 'abandoned'
+                }
+            }
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+                $prior,
+                [EnvironmentVariableTarget]::Process)
+        }
+
+        [string]$response.status |
+            Should -BeExactly abandoned
+        $record = Get-Content $log -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 16
+        $arguments = @($record.arguments)
+        $arguments[0..1] | Should -Be @(
+            'devops', 'invoke')
+        $arguments | Should -Contain '--area'
+        $arguments[
+            [Array]::IndexOf(
+                [object[]]$arguments,
+                '--area') + 1] |
+            Should -BeExactly git
+        $arguments[
+            [Array]::IndexOf(
+                [object[]]$arguments,
+                '--resource') + 1] |
+            Should -BeExactly pullRequests
+        $arguments | Should -Contain (
+            "project=$($config.projectName)")
+        $arguments | Should -Contain (
+            "repositoryId=$($config.repositoryId)")
+        $arguments | Should -Contain (
+            'pullRequestId=1637334')
+        $arguments[
+            [Array]::IndexOf(
+                [object[]]$arguments,
+                '--http-method') + 1] |
+            Should -BeExactly PATCH
+        $arguments[
+            [Array]::IndexOf(
+                [object[]]$arguments,
+                '--api-version') + 1] |
+            Should -BeExactly '7.1'
+        $arguments | Should -Contain '--in-file'
+        [bool]$record.inputExistsDuringProcess |
+            Should -BeTrue
+        [int]$record.bodyLength | Should -Be 22
+        $body = [Text.UTF8Encoding]::new(
+            $false, $true).GetString(
+            [Convert]::FromBase64String(
+                [string]$record.bodyBase64))
+        $body | Should -BeExactly (
+            '{"status":"abandoned"}')
+        [Convert]::FromBase64String(
+            [string]$record.bodyBase64)[0..2] |
+            Should -Not -Be @(0xEF, 0xBB, 0xBF)
+        Test-Path -LiteralPath (
+            [string]$record.inputPath) |
+            Should -BeFalse
+    }
+
+    It 'signs only bounded diagnostics for a nonzero CLI exit' {
+        $fixture = Join-Path $repo `
+            'tests\fixtures\StalePrFakeAzureCli.ps1'
+        $log = Join-Path $TestDrive `
+            'stale-pr-fake-az-failure.json'
+        $priorLog = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+            [EnvironmentVariableTarget]::Process)
+        $priorExit = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+            $log,
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
+            '23',
+            [EnvironmentVariableTarget]::Process)
+        $realProvider = New-StalePrAzureDevOpsProvider `
+            -Config $config -AzureCliPath $fixture
+        $evidence = New-LifecycleEvidence -Id 1637334
+        $provider = {
+            param($Operation, $Arguments)
+            switch ($Operation) {
+                Identity {
+                    return [ordered]@{
+                        id =
+                            '33333333-3333-3333-3333-333333333333'
+                        descriptor =
+                            'aad.synthetic-service-account'
+                        uniqueName =
+                            'service@example.invalid'
+                    }
+                }
+                ReadEvidence {
+                    return $evidence
+                }
+                AbandonStatus {
+                    return & $realProvider `
+                        $Operation $Arguments
+                }
+                ReadStatus {
+                    return @{
+                        pullRequestId =
+                            [long]$Arguments.pullRequestId
+                        status = 'active'
+                    }
+                }
+                default {
+                    throw "unexpected:$Operation"
+                }
+            }
+        }.GetNewClosure()
+        try {
+            $result = Invoke-LifecycleCase `
+                -Provider $provider `
+                -Inventory @([ordered]@{
+                        pullRequestId = 1637334
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc =
+                            '2024-01-01T00:00:00Z'
+                    })
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_FAKE_AZ_LOG',
+                $priorLog,
+                [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_FAKE_AZ_EXIT',
+                $priorExit,
+                [EnvironmentVariableTarget]::Process)
+        }
+
+        $result.providerWrites | Should -Be 1
+        $result.decisions[0].reason |
+            Should -BeExactly ambiguous-post-write
+        $diagnostic = $result.events[0].diagnostic
+        $diagnostic.kind |
+            Should -BeExactly azure-cli-nonzero-exit
+        $diagnostic.cliExitCode | Should -Be 23
+        $serialized = ConvertTo-Json $result `
+            -Depth 64 -Compress
+        $serialized | Should -Not -Match 'RAW-SECRET-MARKER'
+        @($diagnostic.Keys | Sort-Object) |
+            Should -Be @('cliExitCode', 'kind')
+        $record = Get-Content $log -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 16
+        Test-Path -LiteralPath (
+            [string]$record.inputPath) |
+            Should -BeFalse
+    }
+
     It 'ignores recent system-only events but includes recent bot comments' {
         $systemOnly = New-StalePrAzureDevOpsProvider `
             -Config $config -Invoker (
