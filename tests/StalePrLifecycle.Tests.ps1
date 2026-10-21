@@ -1242,6 +1242,7 @@ Describe 'Stale lifecycle provider authority source' {
             ConvertFrom-Json -AsHashtable -Depth 64
         $boundedConfig.limits.maxSeconds = 1
         $httpCalls = [ref]0
+        $pids = @()
         try {
             $provider = New-StalePrAzureDevOpsProvider `
                 -Config $boundedConfig `
@@ -1256,8 +1257,34 @@ Describe 'Stale lifecycle provider authority source' {
                 & $provider Identity @{}
             } | Should -Throw '*stale-pr-deadline-exhausted*'
             $watch.Stop()
+            $watch.Elapsed.TotalSeconds |
+                Should -BeLessThan 3
+            $httpCalls.Value | Should -Be 0
+            $deadline = [DateTime]::UtcNow.AddSeconds(3)
+            while (-not (Test-Path $pidLog) -and
+                [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            $pids = @(Get-Content $pidLog |
+                ForEach-Object {
+                    [int]($_.Split('=')[1])
+                })
+            $pids | Should -HaveCount 2
+            foreach ($processId in $pids) {
+                Get-Process -Id $processId `
+                    -ErrorAction SilentlyContinue |
+                    Should -BeNullOrEmpty
+            }
         }
         finally {
+            foreach ($processId in $pids) {
+                $remainingProcess = Get-Process -Id $processId `
+                    -ErrorAction SilentlyContinue
+                if ($null -ne $remainingProcess) {
+                    Stop-Process -Id $processId -Force `
+                        -ErrorAction SilentlyContinue
+                }
+            }
             [Environment]::SetEnvironmentVariable(
                 'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
                 $prior,
@@ -1266,25 +1293,6 @@ Describe 'Stale lifecycle provider authority source' {
                 'DEVPILOT_STALE_PR_TOKEN_MODE',
                 $priorMode,
                 [EnvironmentVariableTarget]::Process)
-        }
-
-        $watch.Elapsed.TotalSeconds |
-            Should -BeLessThan 3
-        $httpCalls.Value | Should -Be 0
-        $deadline = [DateTime]::UtcNow.AddSeconds(3)
-        while (-not (Test-Path $pidLog) -and
-            [DateTime]::UtcNow -lt $deadline) {
-            Start-Sleep -Milliseconds 25
-        }
-        $pids = @(Get-Content $pidLog |
-            ForEach-Object {
-                [int]($_.Split('=')[1])
-            })
-        $pids | Should -HaveCount 2
-        foreach ($processId in $pids) {
-            Get-Process -Id $processId `
-                -ErrorAction SilentlyContinue |
-                Should -BeNullOrEmpty
         }
     }
 
@@ -1334,6 +1342,7 @@ Describe 'Stale lifecycle provider authority source' {
             $Mode,
             [EnvironmentVariableTarget]::Process)
         $httpCalls = [ref]0
+        $pids = @()
         try {
             $provider = New-StalePrAzureDevOpsProvider `
                 -Config $config -AzureCliPath $az `
@@ -1347,8 +1356,26 @@ Describe 'Stale lifecycle provider authority source' {
                 & $provider Identity @{}
             } | Should -Throw '*stale-pr-token-response-too-large*'
             $watch.Stop()
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 5
+            $httpCalls.Value | Should -Be 0
+            $pids = @(Get-Content $pidLog |
+                ForEach-Object {
+                    [int]($_.Split('=')[1])
+                })
+            $pids | Should -HaveCount 1
+            Get-Process -Id $pids[0] `
+                -ErrorAction SilentlyContinue |
+                Should -BeNullOrEmpty
         }
         finally {
+            foreach ($processId in $pids) {
+                $remainingProcess = Get-Process -Id $processId `
+                    -ErrorAction SilentlyContinue
+                if ($null -ne $remainingProcess) {
+                    Stop-Process -Id $processId -Force `
+                        -ErrorAction SilentlyContinue
+                }
+            }
             [Environment]::SetEnvironmentVariable(
                 'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
                 $priorLog,
@@ -1358,17 +1385,27 @@ Describe 'Stale lifecycle provider authority source' {
                 $priorMode,
                 [EnvironmentVariableTarget]::Process)
         }
+    }
 
-        $watch.Elapsed.TotalSeconds | Should -BeLessThan 5
-        $httpCalls.Value | Should -Be 0
-        $pids = @(Get-Content $pidLog |
-            ForEach-Object {
-                [int]($_.Split('=')[1])
-            })
-        $pids | Should -HaveCount 1
-        Get-Process -Id $pids[0] `
-            -ErrorAction SilentlyContinue |
-            Should -BeNullOrEmpty
+    It 'keeps token stream caps fixed and checks them before writes' {
+        $source = Get-Content (Join-Path $repo `
+                'src\DevPilot.PullRequestLifecycle\DevPilot.PullRequestLifecycle.psm1') `
+            -Raw
+        $source | Should -Match (
+            '\$outputBuffer\s*=\s*\[byte\[\]\]::new\(8192\)')
+        $source | Should -Match (
+            '\$errorBuffer\s*=\s*\[byte\[\]\]::new\(4096\)')
+        $source | Should -Match (
+            '(?s)if \(\$output\.Length \+ \$count -gt 1048576\) ' +
+            '\{.*?throw ''stale-pr-token-response-too-large''\s*' +
+            '\}\s*\$output\.Write\(\$outputBuffer, 0, \$count\)')
+        $source | Should -Match (
+            '(?s)if \(\$error\.Length \+ \$count -gt 65536\) ' +
+            '\{.*?throw ''stale-pr-token-response-too-large''\s*' +
+            '\}\s*\$error\.Write\(\$errorBuffer, 0, \$count\)')
+        $source | Should -Not -Match 'CopyToAsync'
+        $source | Should -Not -Match (
+            '(?:\[Threading\.Tasks\.Task\]|Task)\.WaitAll')
     }
 
     It 'constructs every lifecycle GET URI with one cached token' {
