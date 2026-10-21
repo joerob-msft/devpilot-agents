@@ -111,8 +111,10 @@ pipeline, without repeated deployment approvals. New lines still need their
 own tag rulesets before qualification. Resume and rollback remain explicit
 operator actions, not automatic retries.
 
-The coordinator also checks every 15 minutes when enabled, covering a missed
-automation-started canary completion handoff. It runs on hosted Ubuntu because
+The coordinator also checks hourly when enabled, covering a missed
+automation-started canary completion handoff without polling 96 times per day.
+Normal CI and canary completion events still coordinate immediately; a missed
+handoff may wait up to an hour for the fallback. It runs on hosted Ubuntu because
 it only reads metadata and dispatches workflows; no Windows desktop identity
 or publication credential is needed. Ordinary commits, disabled opt-in,
 pending canaries and prior Release attempts do not cause duplicate work.
@@ -144,6 +146,12 @@ Windows and platform-sensitive source qualification, so repeating them adds
 time without a new source or artifact boundary. The preflight summary records
 the reused run ID. Explicit resume never reuses current-main CI for an older
 candidate; it reruns complete Windows and platform qualification.
+
+CI keeps all required checks and Windows, Linux and macOS coverage. The main
+Windows Pester job excludes only suites already executed by the required
+Windows platform or dashboard job; a regression checks that their union covers
+every Windows Pester suite exactly once. New PR commits cancel superseded PR
+validation, but never cancel push or manual CI runs used as release evidence.
 
 The release then clones the protected reference consumer,
 installs the candidate through the consumer installer into an empty

@@ -48,7 +48,7 @@ Do not activate or merge policy changes during a release.
 Ordinary code merges do not arm a release. For an already-merged version,
 explicit publication authorization permits dispatching **Release Automation**
 from `main`; it passes the bound SHA and successful canary ID internally.
-The opt-in also enables a 15-minute coordinator continuation check for a
+The opt-in also enables an hourly coordinator continuation check for a
 successful automation-started patch canary whose completion handoff was missed.
 It never arms ordinary merges or duplicates an existing release.
 Manual/rollback canaries do not independently authorize automatic publication,
