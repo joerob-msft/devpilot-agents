@@ -53,7 +53,7 @@ $script:NamedAreEqualPolicyDigest =
 $script:ContextualCapabilityId =
     'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:e5c08293d234207780f6c50a5050d7afa08f5fbaba6f172cf0ea1f3a3a57fd8f'
+    'v1:sha256:615f82cb1eff222d280ba43ace7ee6676da99a5c104578f82946442f3a8d8a54'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =

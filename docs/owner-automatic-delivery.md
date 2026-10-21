@@ -100,6 +100,12 @@ qualified types, aliases, and snapshot-local shadowing; it does not infer a
 specialized exception naming convention or flag nested test helpers. A finding
 is anchored to an actual changed token in the catch declaration, not a changed
 filter/body beneath an old declaration, and asks the author to update all uses.
+The identifier line is preferred when changed; delimiter-only edits do not
+make an unchanged type/identifier eligible. Generated paths, auto-generated
+banners, and generated-attributed declarations are excluded from both targets
+and binding inputs. Conditional method bodies or unrelated snapshot directives
+do not withhold resolved catches. Changed inactive catches and conditional
+imports/type declarations that can affect binding remain unknown.
 No source edits are performed. Missing/ambiguous type binding, conditional
 binding, or malformed syntax is unknown, not compliant or a violation.
 Resolution uses the bounded current-source snapshot and the framework reference,
