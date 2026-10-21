@@ -4,13 +4,21 @@ BeforeAll {
     $handlerPath = Join-Path $repo 'src\Agents\review-handler\Start-ReviewHandlerAgent.ps1'
     $ast = [Management.Automation.Language.Parser]::ParseFile(
         $handlerPath, [ref]$null, [ref]$null)
-    foreach ($name in @('Get-HandlerMarkerSchema', 'Test-HandlerMarkerBinding', 'Get-HandlerRuntimeContext')) {
+    foreach ($name in @('Get-HandlerHashValue', 'Get-HandlerMarkerSchema', 'Test-HandlerMarkerBinding', 'Get-HandlerRuntimeContext')) {
         $definition = $ast.Find({
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
             }, $true)
         . ([scriptblock]::Create($definition.Extent.Text))
     }
+    $failureBranch = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.IfStatementAst] -and
+                $node.Extent.Text.StartsWith('if (-not $marker)') -and
+                $node.Extent.Text.Contains('$partialWorkDetected')
+        }, $true)
+    if (-not $failureBranch) { throw 'Could not locate the handler invalid-marker recovery branch.' }
+    $handlerFailureRecovery = [scriptblock]::Create($failureBranch.Extent.Text)
     $script:ResultMarkerPrefix = 'REVIEW_HANDLER_RESULT_V2:'
     $script:HandlerLegacyResultMarkerPrefix = 'REVIEW_HANDLER_RESULT_V1:'
     $script:OperatorAlias = 'operator'
@@ -106,6 +114,70 @@ Describe 'source-scoped failure attempts' {
 }
 
 Describe 'handler terminal recovery contract' {
+    It 'defers an invalid marker with <Name> without losing its recovery diagnostics' -ForEach @(
+        @{ Name = 'unstructured output'; Outcome = $null; ModifiedCount = 0; FailureClass = 'contract-failure' },
+        @{ Name = 'no modified files'; Outcome = @{ ModifiedFiles = @(); ModelActuallyRan = $true }; ModifiedCount = 0; FailureClass = 'contract-failure' },
+        @{ Name = 'one modified file'; Outcome = @{ ModifiedFiles = @('a.ps1'); ModelActuallyRan = $true }; ModifiedCount = 1; FailureClass = 'partial-work-unconfirmed' },
+        @{ Name = 'multiple modified files'; Outcome = @{ ModifiedFiles = @('a.ps1', 'b.ps1'); ModelActuallyRan = $true }; ModifiedCount = 2; FailureClass = 'partial-work-unconfirmed' }
+    ) {
+        Set-StrictMode -Version Latest
+        $marker = $null
+        $cliOutcome = $Outcome
+        $structuredFailureClass = ''
+        $structuredFailureReason = ''
+        $run = @{ ExitCode = 0; TimedOut = $false; OutputDrained = $true; StdOut = 'No valid result marker.'; StdErr = '' }
+        $CycleTimeoutSeconds = 30
+        $prId = 42
+        $nonce = 'n' * 36
+        $session = @{}
+        $bound = @{ SourceCommit = ('a' * 40); SourceBranch = 'feature/test'; Pr = @{ title = 'Example change' } }
+        $worktreePath = $repo
+        $preRunLocalHead = (& git -C $worktreePath rev-parse HEAD).Trim()
+        $preRunWorktreeStatus = (& git -C $worktreePath status --porcelain=v1 -uno) -join "`n"
+        $attemptsState = @{}
+        $attemptsStatePath = Join-Path $TestDrive "$Name-attempts.json"
+        $AgencyPath = 'agency.exe'
+        $MinBackoffSeconds = 30
+        $logDir = Join-Path $TestDrive "$Name-logs"
+        $cycleTimer = [Diagnostics.Stopwatch]::StartNew()
+        $CycleNumber = 1
+        $result = @{ ExitCode = 0; Summary = '' }
+        $script:recoveryMetadata = $null
+        $script:recoveryEvent = $null
+
+        function Invoke-AgentMcpTool {
+            param($Session, $Name, $Arguments)
+            if ($Name -cne 'repo_pull_request' -or $Arguments.action -cne 'get') {
+                throw 'Recovery must only re-read the bound pull request.'
+            }
+            return @{ lastMergeSourceCommit = @{ commitId = ('a' * 40) } }
+        }
+        function Write-HandlerCycleMetadata {
+            param([hashtable]$Fields)
+            $script:recoveryMetadata = $Fields
+        }
+        function Send-HandlerEvent {
+            param([string]$Type, [hashtable]$Data)
+            $script:recoveryEvent = @{ Type = $Type; Data = $Data }
+        }
+        function Send-HandlerTeamsNotification {}
+        function Get-HandlerPullRequestLink { return 'https://example.invalid/pr/42' }
+
+        $recovered = & $handlerFailureRecovery
+
+        $recovered.ExitCode | Should -Be 1
+        $recovered.Summary | Should -BeLike 'PR 42 deferred for recovery:*'
+        $attemptsState['42'].failureClass | Should -BeExactly $FailureClass
+        $attemptsState['42'].deterministicCount | Should -Be 0
+        $script:recoveryMetadata.modifiedFileCount | Should -Be $ModifiedCount
+        $script:recoveryEvent.Type | Should -BeExactly 'work.completed'
+        $script:recoveryEvent.Data.failureClass | Should -BeExactly $FailureClass
+        $script:recoveryEvent.Data.modifiedFileCount | Should -Be $ModifiedCount
+        $script:recoveryEvent.Data.retryable | Should -BeTrue
+        @(Get-ChildItem -LiteralPath (Join-Path $logDir 'failed-cycles') -Filter '*.txt').Count |
+            Should -Be 1
+    }
+
     It 'accepts a bound V2 source-change marker' {
         $nonce = 'n' * 36
         $repoId = '11111111-1111-1111-1111-111111111111'
