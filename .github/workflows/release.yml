@@ -41,9 +41,7 @@ jobs:
       contents: read
       actions: read
     outputs:
-      approval-mode: ${{ steps.approval.outputs.mode }}
-      qualification-environment: ${{ steps.approval.outputs.qualification }}
-      publish-environment: ${{ steps.approval.outputs.publish }}
+      ci-run-id: ${{ steps.source-ci.outputs.ci-run-id }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -153,60 +151,69 @@ jobs:
             }
           }
 
-      - name: Load approval policy from the trusted workflow commit, including on resume
+      - name: Load qualification policy from the trusted workflow commit, including on resume
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           path: .release-policy
           persist-credentials: false
 
-      - name: Validate automatic patch eligibility and pre-provisioned environments
-        id: approval
+      - name: Verify reusable source CI and existing main-only release environments
+        id: source-ci
         uses: actions/github-script@v8
         env:
           RELEASE_VERSION: ${{ inputs.version }}
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
-          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         with:
           script: |
-            const select = require('./.release-policy/.github/scripts/release-approval.cjs');
-            const policy = await select({
+            const requirePolicy = require('./.release-policy/.github/scripts/release-policy.cjs');
+            const policy = await requirePolicy({
               github, ...context.repo,
               version: process.env.RELEASE_VERSION,
               workflowCommit: process.env.WORKFLOW_COMMIT,
               candidateCommit: process.env.CANDIDATE_COMMIT,
               resumePublishedTag: process.env.RESUME_PUBLISHED_TAG === 'true',
-              automaticPatchEnabled: process.env.AUTOMATIC_PATCH_ENABLED || '',
             });
-            core.setOutput('mode', policy.mode);
-            core.setOutput('qualification', policy.qualification);
-            core.setOutput('publish', policy.publish);
-            await core.summary.addRaw(`Release approval mode: ${policy.mode}`).write();
+            core.setOutput('ci-run-id', policy.ciRunId === null ? '' : String(policy.ciRunId));
+            await core.summary.addRaw(policy.ciRunId === null
+              ? 'Recovery: rerun complete candidate source qualification.'
+              : `Source qualification: reuse exact-main push CI ${policy.ciRunId}; all jobs and required checks passed.`).write();
 
   windows-complete:
     name: Complete Windows qualification
     needs: preflight
     runs-on: windows-latest
     steps:
+      - name: Reuse verified complete Windows CI for this exact source commit
+        if: needs.preflight.outputs.ci-run-id != ''
+        shell: pwsh
+        env:
+          CI_RUN_ID: ${{ needs.preflight.outputs.ci-run-id }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+        run: Write-Host "Complete Windows source qualification passed in CI $env:CI_RUN_ID for $env:CANDIDATE_COMMIT."
       - uses: actions/checkout@v6
+        if: needs.preflight.outputs.ci-run-id == ''
         with:
           ref: ${{ inputs.candidateCommit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v6
+        if: needs.preflight.outputs.ci-run-id == ''
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
           package-manager-cache: false
       - name: Install PowerShell test modules
+        if: needs.preflight.outputs.ci-run-id == ''
         shell: pwsh
         run: |
           Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
       - name: Run complete CI and release tests
+        if: needs.preflight.outputs.ci-run-id == ''
         shell: pwsh
         run: ./tools/Invoke-DevPilotCi.ps1 -Mode WindowsComplete
 
@@ -219,21 +226,32 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Reuse verified platform CI for this exact source commit
+        if: needs.preflight.outputs.ci-run-id != ''
+        shell: pwsh
+        env:
+          CI_RUN_ID: ${{ needs.preflight.outputs.ci-run-id }}
+          CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
+        run: Write-Host "Platform source qualification passed in CI $env:CI_RUN_ID for $env:CANDIDATE_COMMIT."
       - uses: actions/checkout@v6
+        if: needs.preflight.outputs.ci-run-id == ''
         with:
           ref: ${{ inputs.candidateCommit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v6
+        if: needs.preflight.outputs.ci-run-id == ''
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: src/DevPilot.Dashboard/package-lock.json
           package-manager-cache: false
       - name: Install Pester
+        if: needs.preflight.outputs.ci-run-id == ''
         shell: pwsh
         run: Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
       - name: Run platform-sensitive suites
+        if: needs.preflight.outputs.ci-run-id == ''
         shell: pwsh
         run: ./tools/Invoke-DevPilotCi.ps1 -Mode PlatformSafety
 
@@ -267,7 +285,7 @@ jobs:
     needs: [preflight, windows-complete, platform-safety, canary-gate]
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: ${{ needs.preflight.outputs.qualification-environment }}
+    environment: release-qualification
     steps:
       - uses: actions/checkout@v6
         with:
@@ -356,7 +374,7 @@ jobs:
     needs: [preflight, windows-complete, platform-safety, canary-gate, installed-artifact]
     runs-on: windows-latest
     timeout-minutes: 30
-    environment: ${{ needs.preflight.outputs.publish-environment }}
+    environment: release-publish
     permissions:
       contents: read
     steps:
@@ -373,13 +391,7 @@ jobs:
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
           RESUME_PUBLISHED_TAG: ${{ inputs.resumePublishedTag }}
-          APPROVAL_MODE: ${{ needs.preflight.outputs.approval-mode }}
-          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         run: |
-          if ($env:APPROVAL_MODE -ceq 'automatic-patch' -and
-              $env:AUTOMATIC_PATCH_ENABLED -cne 'true') {
-            throw 'Automatic patch publication was disabled; stop without materializing credentials.'
-          }
           git fetch --quiet origin main --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not refresh main and release tags at the publication boundary.' }
           $main = (git rev-parse origin/main).Trim()
@@ -486,7 +498,7 @@ jobs:
     needs: [preflight, publish-immutable]
     runs-on: [self-hosted, Windows, X64, devpilot-canary]
     timeout-minutes: 120
-    environment: ${{ needs.preflight.outputs.qualification-environment }}
+    environment: release-qualification
     permissions:
       contents: read
     steps:
@@ -565,7 +577,7 @@ jobs:
     needs: [preflight, immutable-smoke]
     runs-on: windows-latest
     timeout-minutes: 30
-    environment: ${{ needs.preflight.outputs.publish-environment }}
+    environment: release-publish
     permissions:
       contents: write
     steps:
@@ -582,13 +594,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ inputs.workflowCommit }}
           CANDIDATE_COMMIT: ${{ inputs.candidateCommit }}
           RELEASE_VERSION: ${{ inputs.version }}
-          APPROVAL_MODE: ${{ needs.preflight.outputs.approval-mode }}
-          AUTOMATIC_PATCH_ENABLED: ${{ vars.DEVPILOT_AUTOMATIC_PATCH_RELEASES }}
         run: |
-          if ($env:APPROVAL_MODE -ceq 'automatic-patch' -and
-              $env:AUTOMATIC_PATCH_ENABLED -cne 'true') {
-            throw 'Automatic patch promotion was disabled; use manual recovery.'
-          }
           if ($env:RELEASE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
             throw 'Invalid stable release version at the channel boundary.'
           }

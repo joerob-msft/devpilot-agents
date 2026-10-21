@@ -33,15 +33,18 @@ and normal pull-request creation. Publishing requires an explicit request to
 release or publish the version. Resuming an interrupted publication requires
 an explicit request to resume it.
 
-An increasing version-bump merge arms automatic qualification after exact-main
-push CI. Human protected-environment approval remains the default publication gate.
-An explicitly enabled existing-line patch may use the separately provisioned
-`release-patch-*` environments after the read-only eligibility policy passes.
-See `docs/releases.md` for the default-off repository opt-in, strict main-only
-environment provisioning and verification. Never remove reviewers from the
-existing manual environments or auto-approve their pending jobs.
-New version lines, rollback, partial publication and explicit resume remain
-manually approved. Do not activate or merge policy changes during a release.
+With repository variable `DEVPILOT_AUTOMATIC_RELEASES=true`, an increasing
+version-bump merge arms automatic qualification after exact-main push CI.
+The existing three release environments must already have an administrator-
+authorized main-only, no-required-reviewer policy; do not create replacement
+environments, copy credentials or auto-approve pending jobs. See
+`docs/releases.md` for post-release policy activation and verification.
+Fresh releases reuse fully green push CI for the exact source commit; all
+live, clean-install and immutable-tag smoke checks remain mandatory.
+Resume requalifies the candidate with complete Windows/platform tests.
+New lines require explicit version authorization and their tag rulesets;
+rollback, partial publication and resume still require explicit dispatch.
+Do not activate or merge policy changes during a release.
 Ordinary code merges do not arm a release. For an already-merged version,
 explicit publication authorization permits dispatching **Release Automation**
 from `main`; it passes the bound SHA and successful canary ID internally.
@@ -115,7 +118,7 @@ require an explicit stable version without the `v` prefix.
    ```
 
    Verify that newly created coordinator is at `$sha`; follow its dispatched
-   canary and Release runs and their protected human approvals. It must not
+   canary and Release runs and their protected qualification stages. It must not
    reuse failed CI, skip a gate, duplicate a pending run, or resume an existing
    immutable tag. The steps below remain the manual coordination path.
 4. Snapshot existing Release Canary workflow run IDs, then dispatch:

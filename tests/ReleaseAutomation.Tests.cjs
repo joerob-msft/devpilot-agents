@@ -18,7 +18,7 @@ function fixture() {
   };
   const state = {
     ci: [ci], canary: [], releases: [], tag: false,
-    refs: [sha], jobs: [{ status: "completed", conclusion: "success" }],
+    refs: [sha], jobs: [{ name: "CI", status: "completed", conclusion: "success" }],
     dispatched: [], messages: [],
     rules: [
       { id: 1, name: "release-tag-creation", rules: [{ type: "creation" }],
@@ -33,8 +33,13 @@ function fixture() {
   const missing = () => Object.assign(new Error("Not found"), { status: 404 });
   const github = {
     paginate: (method, args) => method(args),
+    request: async () => ({ data: [
+      { type: "pull_request" },
+      { type: "required_status_checks", parameters: { required_status_checks: [{ context: "CI" }] } },
+    ] }),
     rest: {
       repos: {
+        getBranch: async () => ({ data: { protected: true } }),
         getRepoRulesets: async () => state.rules,
         getRepoRuleset: async ({ ruleset_id }) => {
           const rule = state.rules.find(entry => entry.id === ruleset_id);
@@ -80,6 +85,7 @@ function fixture() {
       warning: message => state.messages.push(message),
     },
     version: "0.5.0", versionChanged: true, workflowCommit: sha,
+    automaticReleasesEnabled: "true",
   };
   return { options, state, ci, canary, sha };
 }
@@ -152,7 +158,7 @@ test("every exact-main CI job must succeed, without skipped jobs", async () => {
   for (const conclusion of ["failure", "skipped", "canceled", null]) {
     const { options, state } = fixture();
     state.jobs[0].conclusion = conclusion;
-    await assert.rejects(coordinate(options), /CI has incomplete/);
+    await assert.rejects(coordinate(options), /Every exact-main CI job must succeed/);
     assert.equal(state.dispatched.length, 0);
   }
 });
@@ -160,7 +166,7 @@ test("every exact-main CI job must succeed, without skipped jobs", async () => {
 test("newer failed CI cannot be replaced by an older successful event", async () => {
   const { options, state, ci } = fixture();
   state.ci.push({ ...ci, id: 43, conclusion: "failure" });
-  await assert.rejects(coordinate(options), /Workflow did not succeed/);
+  await assert.rejects(coordinate(options), /Exact-main CI must succeed/);
   assert.equal(state.dispatched.length, 0);
 });
 
@@ -231,5 +237,60 @@ test("immutable-tag bypass actors cannot be granted by automation", async () => 
   const { options, state } = fixture();
   state.rules[1].bypass_actors = [{ actor_type: "DeployKey" }];
   await assert.rejects(coordinate(options), /Unexpected bypass actor/);
+  assert.equal(state.dispatched.length, 0);
+});
+
+test("automatic events are default-off, while explicit manual coordination remains available", async () => {
+  for (const automaticReleasesEnabled of ["", "false"]) {
+    for (const eventName of ["workflow_run", "schedule"]) {
+      const { options, state } = fixture();
+      Object.assign(options, { automaticReleasesEnabled });
+      options.context.eventName = eventName;
+      options.github.paginate = () => { throw new Error("Disabled automation must not query or dispatch."); };
+      assert.equal(await coordinate(options), "automatic-release-disabled");
+      assert.equal(state.dispatched.length, 0);
+    }
+  }
+  for (const automaticReleasesEnabled of ["yes", true]) {
+    const { options, state } = fixture();
+    options.automaticReleasesEnabled = automaticReleasesEnabled;
+    await assert.rejects(coordinate(options), /DEVPILOT_AUTOMATIC_RELEASES must be/);
+    assert.equal(state.dispatched.length, 0);
+  }
+  const { options, state } = fixture();
+  options.automaticReleasesEnabled = "false";
+  options.context.eventName = "workflow_dispatch";
+  assert.equal(await coordinate(options), "canary-dispatched");
+  assert.equal(state.dispatched.length, 1);
+});
+
+test("scheduled continuation dispatches one release after a missed bot-canary handoff", async () => {
+  const { options, state, canary, sha } = fixture();
+  options.context.eventName = "schedule";
+  state.canary.push(canary);
+  assert.equal(await coordinate(options), "release-dispatched");
+  assert.equal(state.dispatched.length, 1);
+  assert.equal(state.dispatched[0].inputs.canaryRunId, "50");
+  state.releases.push({ head_sha: sha, display_title: `Release v0.5.0 from ${sha}` });
+  assert.equal(await coordinate(options), "existing-release-run");
+  assert.equal(state.dispatched.length, 1);
+});
+
+test("scheduled continuation cannot arm ordinary merges, retry failed canaries or use a manual canary", async () => {
+  for (const mutate of [
+    f => { f.canary.conclusion = "failure"; },
+    f => { f.canary.actor.login = "operator"; },
+  ]) {
+    const f = fixture();
+    f.options.context.eventName = "schedule";
+    f.state.canary.push(f.canary);
+    mutate(f);
+    await assert.rejects(coordinate(f.options));
+    assert.equal(f.state.dispatched.length, 0);
+  }
+  const { options, state } = fixture();
+  options.context.eventName = "schedule";
+  options.versionChanged = false;
+  assert.equal(await coordinate(options), "scheduled-release-disabled");
   assert.equal(state.dispatched.length, 0);
 });

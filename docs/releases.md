@@ -61,8 +61,9 @@ events and stale commits, requires every CI job to succeed, and dispatches
 `release-canary.yml`. When that automation-started exact-commit canary succeeds,
 it passes the verified run ID into `release.yml`.
 
-By default, all existing canary, installed-qualification, and publication
-environment approvals remain. The coordinator has Actions write and Contents read only,
+Automatic events are disabled unless the repository variable
+`DEVPILOT_AUTOMATIC_RELEASES` is exactly `true`. The coordinator has Actions
+write and Contents read only,
 does not receive the release deploy key, and cannot create releases or tags.
 It uses no PR artifacts or caches and never approves an environment.
 An independent manual canary or rollback canary does not authorize automatic
@@ -76,88 +77,56 @@ An existing immutable tag, failed canary, or interrupted release requires the
 explicit manual recovery procedures below, never an automatic tag repair or
 resume. If `main` advances, qualification must restart for the new commit.
 
-### Optional approval-free existing-line patches
+### Approval-free automation
 
-This path is **disabled by default**. Preparing or merging the policy change
-does not change any live environment setting, publish a version, or opt in.
-Do not merge release-workflow changes or activate this path while a release is
-in progress: exact-main binding deliberately invalidates a superseded workflow.
+This path is **disabled by default**. Do not merge release-workflow changes or
+activate the policy while a release is in progress: exact-main binding
+deliberately invalidates a superseded workflow. After that release is fully
+published, an administrator can explicitly adopt unattended publication.
 
-After the in-flight release is fully published, an administrator can explicitly
-enable approval-free patches. A protected-main PR merge with an increasing
-VERSION is then the release authorization; subsequent CI, live canary, clean
-installation, immutable-tag smoke and publication remain mandatory.
+Reuse `release-canary`, `release-qualification` and `release-publish`, including
+their existing variables and environment-scoped credentials. Remove their
+required-human-reviewer rules; retain exactly the branch `main`, with no tag
+selector, wildcard, wait timer or custom approval rule. No new environments or
+credential copying are needed. Never put credentials in workflow code, files,
+logs, repository secrets or the coordinator. The dedicated runner and its
+read-only canary identity restrictions remain unchanged.
 
-The read-only `release-approval.cjs` classifier permits the automatic path only
-for a fresh, strictly newer patch on a line with a published stable predecessor.
-The floating channel must be annotated and point to the highest immutable
-patch, with exactly one compatible annotated binding and a stable GitHub
-Release. Missing new-line channels retain manual approval. Lightweight,
-malformed, ambiguous, rolled-back or partially published predecessors fail
-closed. An existing candidate tag, explicit resume, or exactVersion rollback
-retains the original manual environments. API errors are never treated as
-permission to use an automatic environment.
-The candidate must descend from the published predecessor; the active tag
-rulesets are checked by the same shared verifier used by the coordinator.
+Before activation, verify the main and tag rulesets, their bypass actors,
+current stable tag/Release bindings, consumer ref and eligible canary fixtures.
+Read tokens may omit tag bypass actors; an administrator must verify no
+immutable-tag bypass and only the existing publication DeployKey bypass for
+tag creation/channel updates. The read-only `release-policy.cjs` verifies
+protected-main PR/status-check rules, green exact-main push CI, tag restrictions
+and all three existing main-only environments before qualification proceeds.
+Missing environments and API errors fail closed, never create an unprotected
+environment or fall back to assumed success. Environment names remain fixed
+in trusted workflow code, never dispatch inputs.
 
-The workflow independently requires exact-current-main green push CI, all jobs
-successful, protected-main PR/status-check rules and pre-provisioned automatic
-environments before any automatic job can access credentials. Environment
-names are fixed by trusted workflow policy, never a dispatch input. On resume,
-the policy is loaded from the current workflow commit, not the older candidate.
-Tag protections, existing permissions and the minimal publication jobs remain
-unchanged. The coordinator cannot approve jobs or write tags.
+Set the **repository** Actions variable `DEVPILOT_AUTOMATIC_RELEASES` to exactly
+`true` after the policy PR and environment settings are ready. Leave it unset
+or `false` otherwise; do not shadow it in environments. A protected-main PR
+merge with an increasing VERSION then authorizes the existing qualified release
+pipeline, without repeated deployment approvals. New lines still need their
+own tag rulesets before qualification. Resume and rollback remain explicit
+operator actions, not automatic retries.
 
-Provision these **new** environments without modifying the original three:
+The coordinator also checks every 15 minutes when enabled, covering a missed
+automation-started canary completion handoff. It runs on hosted Ubuntu because
+it only reads metadata and dispatches workflows; no Windows desktop identity
+or publication credential is needed. Ordinary commits, disabled opt-in,
+pending canaries and prior Release attempts do not cause duplicate work.
+Failed canaries and interrupted immutable publication are never automatically
+retried.
 
-| Environment | Variables | Secret provisioned by administrator |
-|---|---|---|
-| `release-patch-canary` | Existing consumer repository/ref and Reviewer/Handler canary PR IDs | `RELEASE_CONSUMER_READ_PAT`, if required |
-| `release-patch-qualification` | Existing consumer repository/ref | `RELEASE_CONSUMER_READ_PAT`, if required |
-| `release-patch-publish` | None | `RELEASE_DEPLOY_KEY` through the existing authorized secret-management process |
+Set the variable to `false` to stop future automatic coordination. Also cancel
+an active workflow when an immediate stop is required: changing a variable
+does not revoke an already-running workflow's authorization. An immutable tag
+already published cannot be undone; use explicit recovery or channel rollback.
 
-Each new environment must admit exactly the branch `main` (no tag selector or
-wildcard), with no required reviewer, wait timer or custom approval rule. The
-classifier verifies all three exist and have that branch policy before emitting
-an environment name. This prevents GitHub Actions from silently creating an
-unprotected environment when a name is missing. Keep credentials
-environment-scoped; never copy them into workflow code, files, logs, repository
-secrets or the coordinator. Preserve the existing dedicated runner and its
-read-only canary identity restrictions.
-
-Before activation, independently verify the main and tag rulesets, their bypass
-actors, current stable tag/Release bindings, consumer ref and eligible canary
-fixtures. Read tokens may omit tag bypass actors; an administrator must verify
-them, including no immutable-tag bypass and only the existing dedicated
-publication DeployKey bypass for tag creation/channel updates. Do not weaken
-those protections or the existing manual environments.
-
-Set the **repository** Actions variable `DEVPILOT_AUTOMATIC_PATCH_RELEASES` to
-exactly `true` only after provisioning and reviewing the policy. Leave it
-unset or `false` otherwise; do not shadow it in environment variables.
-First validate with an intentional reviewed patch-version merge. Inspect each
-workflow's `Release approval mode: automatic-patch` summary and confirm all
-qualification stages precede immutable publication and channel movement.
-
-The coordinator also checks every 15 minutes when this opt-in is true. It can
-continue a successful automation-started canary if the completion handoff was
-missed. Ordinary commits, disabled opt-in and manual new-line releases are not
-armed by this schedule; pending canaries and existing Release runs are not
-duplicated, and failed canaries or partial publication are never retried
-automatically.
-
-To stop future automatic publication, set the variable to `false`. Publication
-and promotion reject a disabled opt-in in their workflow context before write
-steps, but changing a repository variable is not a reliable live cancellation
-mechanism for an already-running workflow. Cancel that run as well when an
-immediate stop is required. A tag already published cannot
-be undone: use the existing manually approved recovery or channel rollback.
-Do not remove reviewers from `release-canary`, `release-qualification` or
-`release-publish`; new lines and recovery continue using those environments.
-
-Before approving a new line, configure its creation, immutable, and channel
+Before publishing a new line, configure its creation, immutable, and channel
 rulesets. Coordination verifies their active patterns and restrictions before
-dispatch; environment approvers also verify bypass actors because read tokens
+dispatch; the administrator also verifies bypass actors because read tokens
 may not expose them. Automation does not create rulesets or weaken older
 lines' protection. Pester container setup/teardown failures fail both CI and
 installed qualification even when all individual test assertions passed.
@@ -166,8 +135,17 @@ installed qualification even when all individual test assertions passed.
 `main` workflow commit, an exact candidate commit, and a successful canary run
 ID. Fresh publication requires the workflow and candidate commits to be the
 same current `main` commit. It refuses dirty, existing, malformed, prerelease,
-or non-monotonic versions. It repeats the complete
-Windows and platform-sensitive CI, clones the protected reference consumer,
+or non-monotonic versions. For fresh releases it verifies and reuses the latest
+successful push CI for that exact current-main commit, including every job and
+each required check exactly once. PR, fork, manual, stale, failed, incomplete,
+canceled or skipped CI is never substituted, nor is an older green attempt
+used instead of a newer failed run. These CI jobs already cover the full
+Windows and platform-sensitive source qualification, so repeating them adds
+time without a new source or artifact boundary. The preflight summary records
+the reused run ID. Explicit resume never reuses current-main CI for an older
+candidate; it reruns complete Windows and platform qualification.
+
+The release then clones the protected reference consumer,
 installs the candidate through the consumer installer into an empty
 commit-addressed cache, runs consumer launch-contract tests, and runs the
 installed Golden, broker, dashboard, renderer, ConPTY, MCP-recovery, and
@@ -213,11 +191,11 @@ Never assign this label to pull-request jobs or a shared general-purpose runner.
 
 Create all three environments before the first release:
 
-- `release-canary`: required reviewers, self-review disabled, deployment branch
+- `release-canary`: no required reviewers, deployment branch
   limited to `main`, dedicated self-hosted canary runner, canary PR IDs.
-- `release-qualification`: required reviewers, self-review disabled,
+- `release-qualification`: no required reviewers,
   deployment branch limited to `main`, dedicated self-hosted canary runner.
-- `release-publish`: required reviewers, self-review disabled, deployment
+- `release-publish`: no required reviewers, deployment
   branch limited to `main`, and the release deploy key. Publication jobs use
   hosted Windows runners and execute only fixed workflow commands.
 
@@ -236,7 +214,7 @@ The dedicated runner's ADO credential and any optional PAT must be read-only.
 The release deploy key exists only in `release-publish`; its public half is a
 write-enabled repository deploy key and it is the only bypass actor on
 release-tag creation and channel rulesets. The workflow's `GITHUB_TOKEN`
-creates the GitHub Release only after protected-environment approval and final
+creates the GitHub Release only after all protected qualification and final
 smoke tests; Git tag writes use the deploy key.
 
 ## Required rulesets
@@ -262,8 +240,8 @@ Keep the `0.4` protections intact. A new version line requires its own immutable
 and channel rulesets before publication; a version-file bump alone is not a
 release. Never broaden bypass actors when adding that line.
 
-Environment approvers must verify the rulesets in repository settings before
-approving the first publication. The required `main` checks are:
+The administrator must verify the rulesets in repository settings before
+enabling unattended publication. The required `main` checks are:
 
 - `Generic-toolkit invariant`
 - `PSScriptAnalyzer`
@@ -287,17 +265,17 @@ from updating or deleting them.
 Repository agents can use
 `.github/skills/devpilot-release/SKILL.md` to prepare the version-bump pull
 request and dispatch the protected workflows after merge. The skill does not
-replace environment approvals, rulesets, or any qualification gate.
+grant deployment authority, replace rulesets, or skip any qualification gate.
 
 1. Update `VERSION`, the harness manifest, dashboard package files, and release
-   metadata to the intended stable version (currently `0.5.0`).
+   metadata to the intended stable version.
 2. Run `tools/Test-DevPilotVersion.ps1`.
 3. Run `tools/Invoke-DevPilotCi.ps1 -Mode WindowsComplete`.
 4. Merge through protected `main` and confirm every required CI check is green
    for the exact commit.
-5. Approve the automatic **Release Canary** for a merged version bump, or run
+5. Observe the automatic **Release Canary** for a merged version bump, or run
    **Release Automation** once from `main` for an already-merged version.
-   It chains the existing protected workflows; approve their required gates.
+   It chains the existing protected workflows without human deployment gates.
    For manual coordination, run `Release Canary` with the exact current `main` commit as both
    `workflowCommit` and `candidateCommit`, in `exactCommit` mode. Confirm the
    protected read-only workflow succeeds for at least three consecutive

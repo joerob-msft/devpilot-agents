@@ -1,8 +1,8 @@
 const assert = require("node:assert/strict");
-const selectReleaseApproval = require("./release-approval.cjs");
+const releasePolicy = require("./release-policy.cjs");
 
 module.exports = async function coordinateRelease({
-  github, context, core, version, versionChanged, workflowCommit, automaticPatchEnabled = "",
+  github, context, core, version, versionChanged, workflowCommit, automaticReleasesEnabled = "",
 }) {
   const { owner, repo } = context.repo;
   const repository = `${owner}/${repo}`;
@@ -10,6 +10,14 @@ module.exports = async function coordinateRelease({
   assert.match(workflowCommit, /^[0-9a-f]{40}$/);
   assert.match(version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
   assert.equal(typeof versionChanged, "boolean");
+  assert.ok(["", "false", "true"].includes(automaticReleasesEnabled),
+    "DEVPILOT_AUTOMATIC_RELEASES must be empty, false or true.");
+  assert.ok(["workflow_run", "workflow_dispatch", "schedule"].includes(context.eventName),
+    "Unsupported automation event.");
+  if (context.eventName !== "workflow_dispatch" && automaticReleasesEnabled !== "true") {
+    core.info("Automatic publication is disabled; explicit manual dispatch is still available.");
+    return "automatic-release-disabled";
+  }
 
   function validateRun(run, path, event) {
     assert.ok(Number.isSafeInteger(run.id) && run.id > 0, "Invalid workflow run ID.");
@@ -56,7 +64,7 @@ module.exports = async function coordinateRelease({
     }
   } else if (context.eventName === "schedule") {
     assert.equal(context.ref, "refs/heads/main", "Scheduled coordination must run on main.");
-    if (automaticPatchEnabled !== "true" || !versionChanged) {
+    if (!versionChanged) {
       return "scheduled-release-disabled";
     }
   } else {
@@ -64,23 +72,10 @@ module.exports = async function coordinateRelease({
     assert.equal(context.ref, "refs/heads/main", "Dispatch automation from main.");
   }
 
-  await requireCurrentMain();
-  const ciRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-    owner, repo, workflow_id: "ci.yml", head_sha: workflowCommit,
-    branch: "main", event: "push", per_page: 100,
-  });
-  const ci = ciRuns.sort((a, b) => b.id - a.id)[0];
-  assert.ok(ci, "No exact-main push CI run exists.");
-  validateRun(ci, ".github/workflows/ci.yml", "push");
-  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-    owner, repo, run_id: ci.id, filter: "latest", per_page: 100,
-  });
-  assert.ok(jobs.length > 0 && jobs.every(job =>
-    job.status === "completed" && job.conclusion === "success"),
-  "CI has incomplete, failed, canceled, or skipped jobs.");
+  await releasePolicy.requireMainQualification(github, { owner, repo }, repository, workflowCommit);
 
   const line = version.split(".").slice(0, 2).join(".");
-  await selectReleaseApproval.requireTagProtections(github, { owner, repo }, line);
+  await releasePolicy.requireTagProtections(github, { owner, repo }, line);
 
   try {
     await github.rest.git.getRef({ owner, repo, ref: `tags/v${version}` });
@@ -90,13 +85,6 @@ module.exports = async function coordinateRelease({
     if (error.status !== 404) throw error;
   }
 
-  const approval = await selectReleaseApproval({
-    github, owner, repo, version, workflowCommit, candidateCommit: workflowCommit,
-    automaticPatchEnabled,
-  });
-  if (context.eventName === "schedule" && approval.mode !== "automatic-patch") {
-    return "scheduled-manual-release";
-  }
   const title = `Release v${version} from ${workflowCommit}`;
   const releases = await runs("release.yml");
   if (releases.some(run => run.head_sha === workflowCommit && run.display_title === title)) {
@@ -120,9 +108,9 @@ module.exports = async function coordinateRelease({
       return "waiting-canary";
     }
     validateRun(canary, ".github/workflows/release-canary.yml", "workflow_dispatch");
-    if (approval.mode === "automatic-patch") {
+    if (context.eventName !== "workflow_dispatch") {
       assert.equal(canary.actor.login, "github-actions[bot]",
-        "Automatic patch publication requires an automation-started canary.");
+        "Automatic publication requires an automation-started canary.");
     }
     await requireCurrentMain();
     await github.rest.actions.createWorkflowDispatch({
@@ -132,7 +120,7 @@ module.exports = async function coordinateRelease({
         canaryRunId: String(canary.id), resumePublishedTag: "false",
       },
     });
-    core.info(`Dispatched ${approval.mode} Release ${version} using canary ${canary.id}.`);
+    core.info(`Dispatched Release ${version} using canary ${canary.id}.`);
     return "release-dispatched";
   }
 
