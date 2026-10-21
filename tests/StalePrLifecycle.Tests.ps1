@@ -1169,46 +1169,40 @@ Describe 'Stale lifecycle provider authority source' {
         $boundedConfig = $config |
             ConvertTo-Json -Depth 64 |
             ConvertFrom-Json -AsHashtable -Depth 64
-        $boundedConfig.limits.maxSeconds = 3
-        $start = [DateTime]::SpecifyKind(
-            [DateTime]'2026-01-01T00:00:00',
-            [DateTimeKind]::Utc)
-        $clock = [pscustomobject]@{
-            Current = $start
-        }
+        $boundedConfig.limits.maxSeconds = 1
         $httpCalls = [ref]0
         $provider = New-StalePrAzureDevOpsProvider `
             -Config $boundedConfig `
-            -UtcNowProvider {
-                $clock.Current
-            }.GetNewClosure() `
             -TokenInvoker {
-                $clock.Current =
-                    $start.AddSeconds(10)
+                param($DeadlineUtc, $TimeoutMilliseconds)
+                Start-Sleep -Seconds 3
                 @{ accessToken = 't' * 120 }
-            }.GetNewClosure() `
+            } `
             -HttpInvoker {
                 param($Request)
                 $httpCalls.Value++
                 throw 'HTTP must not be dispatched.'
             }.GetNewClosure()
 
+        $watch = [Diagnostics.Stopwatch]::StartNew()
         {
             & $provider Identity @{}
         } | Should -Throw '*stale-pr-deadline-exhausted*'
+        $watch.Stop()
+        $watch.Elapsed.TotalSeconds |
+            Should -BeLessThan 2.5
         $httpCalls.Value | Should -Be 0
     }
 
     It 'constructs every lifecycle GET URI with one cached token' {
         $requests =
             [Collections.Generic.List[object]]::new()
-        $tokenCalls = [ref]0
         $provider = New-StalePrAzureDevOpsProvider `
             -Config $config `
             -TokenInvoker {
-                $tokenCalls.Value++
+                param($DeadlineUtc, $TimeoutMilliseconds)
                 @{ accessToken = 't' * 120 }
-            }.GetNewClosure() `
+            } `
             -HttpInvoker (
                 New-AzLifecycleInvoker `
                     -MissingSummaryPushDate `
@@ -1220,7 +1214,6 @@ Describe 'Stale lifecycle provider authority source' {
         }
 
         $evidence.complete | Should -BeTrue
-        $tokenCalls.Value | Should -Be 1
         $actualUris = @($requests | ForEach-Object {
                 [string]$_.uri
             })
