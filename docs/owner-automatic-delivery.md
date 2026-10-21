@@ -79,6 +79,11 @@ presentation context, including completed-observation discussion refresh.
 Custom acquisition providers can pass the same context through
 `New-OwnerAzureDevOpsReadOnlyProviderAdapter -CommentPresentation`, with
 `subjectProvider` and `ruleReferences` members.
+An existing source-artifact slot records the render-mode discriminator, not
+new authority. Reconstruction applies linked context only when the observation
+declares that mode; custom Owner providers that omit it retain their plain
+locations and matching body digests. Unknown or duplicate mode artifacts are
+rejected. The existing exact body digest binds the actual rendered citations.
 
 The optional toolkit-config `commentRuleReferences` map supplies verified,
 human-facing citations without changing source acceptance or rule semantics.

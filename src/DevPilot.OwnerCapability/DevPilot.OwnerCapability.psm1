@@ -2033,6 +2033,17 @@ function Resolve-OwnerV2DiscussionReconciliation {
         [object[]]$AuthenticatedPriorComments = @()
     )
 
+    $Observation.sourceArtifacts = @($Observation.sourceArtifacts | Where-Object {
+        [string](Get-OwnerV2Member -Value $_ -Name kind) -cne
+            'owner-v2-comment-presentation'
+    })
+    if ($null -ne (Get-OwnerV2Member -Value $Contract -Name CommentPresentation)) {
+        $Observation.sourceArtifacts += [ordered]@{
+            kind = 'owner-v2-comment-presentation'
+            sha256 = Get-OwnerV1WriterSha256 -Text 'owner-v2-comment-presentation:subject-provider-links-v1'
+            signature = 'not-applicable'
+        }
+    }
     if ([string](Get-OwnerV2Member -Value $Observation -Name capability) -ceq
         $script:NamedAreEqualCapability) {
         return Resolve-NamedAreEqualDiscussionReconciliation `
