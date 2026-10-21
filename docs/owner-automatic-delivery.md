@@ -126,10 +126,11 @@ A markerless comment owned by the configured automation actor is not
 relabeled as human coverage: without authentic prior proof or an exact
 current marker, it is unknown and cannot authorize a duplicate create.
 
-When authorizing this additive bundle, retain four exact prior bindings:
-the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, the 21-rule bundle with its 21 unchanged IDs, and
-the immediately prior 22-rule bundle with all 22 existing IDs. Use
+When authorizing this additive bundle, retain the exact 18/20/21/22-rule
+bindings, each with its own explicitly unchanged rule-ID set. In particular,
+do not carry named-call semantics from a binding that predates the
+constant-trigger nuance. All 22 immediately prior rule meanings are unchanged
+by this addition. Use
 `-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
 `-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
 in an 18/20/21-rule binding. `block-body-indentation` is new and is rejected
