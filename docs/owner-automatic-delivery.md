@@ -94,12 +94,41 @@ Changed missing requirements require new proof; they are never blindly
 promoted from history. Contextual automatic delivery remains create-only,
 model-free, and capped at two creates per run and five creates per PR.
 
-When authorizing this additive bundle, retain three exact prior bindings:
+The additive `file-copyright-header` rule checks C# files in the current
+changed-file inventory, including modified existing test files. It implements
+the canonical EngHub CodingStyle.md **Copyright header** section at line 929
+(commit `7cbaf3ef94e3bec3af10875b7c6a2690d111416b`): two dash-separator
+comments around `// Copyright (c) Microsoft Corporation.  All rights reserved.`
+before any code. BOM, LF/CRLF, and horizontal whitespace are supported. The
+same notice may include a four-digit year or hyphen-separated year range;
+historical years are accepted without annual rollover.
+The rule does not require a year, inspect unchanged files, or
+claim other languages are implemented. Generated, vendored, deleted, and
+context-only files are excluded; unavailable source or comparison authority
+is unknown, not compliance.
+
+The finding uses a typed `file-header` anchor at the physical start of the
+changed file, not a changed-line claim. Existing canonical path/span binding
+is retained; separate header evidence binds source and comparison commits,
+content digests, change type, and original rename path. The actual intake and
+every provider create preflight derive that evidence from source and target.
+Missing headers on new files or after header removal are introduced; a missing
+header on both sides is explicitly **pre-existing and nonblocking**, not a
+regression. Both kinds are nonblocking comments only. A current distinct human
+copyright request anywhere in the same file suppresses a duplicate; a
+markerless automation/reviewer-owned request or unproven prior context remains
+unknown. Exact current reviewer-owned marker/body readback is a no-op.
+
+When authorizing this additive bundle, retain four exact prior bindings:
 the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
 only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
-`-ThirdPreviousRule*` respectively. Never include
-`pr-template-compliance` in a prior bundle's unchanged IDs.
+21 existing IDs, plus the 22-rule bundle with all 22 existing IDs. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `file-copyright-header`
+in an old bundle's unchanged IDs, or `pr-template-compliance` in the 18/20/21
+bundles. Existing create ceilings, run/PR history, idempotency, Owner behavior,
+and model-free/create-only authority are unchanged. This source change does
+not enable a live policy or perform any provider writes.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a

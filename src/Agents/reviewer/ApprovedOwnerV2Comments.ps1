@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot '..\..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
 
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
@@ -33,7 +34,8 @@ $script:ApprovedContextualRuleIds = @(
     'secret-redaction',
     'dependency-fanout',
     'test-class-code-coverage',
-    'pr-template-compliance'
+    'pr-template-compliance',
+    'file-copyright-header'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
@@ -177,6 +179,10 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
         [void](& $assertIds `
                 $Compatibility.unchangedRuleIds `
                 'ruleCompatibility.unchangedRuleIds')
+        if (-not (Test-ContextualConventionPriorRuleIds -Rule $Compatibility.previousRule `
+            -RuleIds @($Compatibility.unchangedRuleIds))) {
+            throw 'Rule compatibility promotes a rule absent from the prior bundle.'
+        }
         if ([string]$Compatibility.previousRule.hash -ceq
                 [string]$Compatibility.currentRule.hash -and
             [long]$Compatibility.previousRule.length -eq
@@ -218,6 +224,9 @@ function Assert-ApprovedOwnerV2RuleCompatibility {
             [void](& $assertIds `
                     $entry.unchangedRuleIds `
                     'ruleCompatibility.previousRules.unchangedRuleIds')
+            if (-not (Test-ContextualConventionPriorRuleIds -Rule $entry.rule -RuleIds @($entry.unchangedRuleIds))) {
+                throw 'Rule compatibility promotes a rule absent from the prior bundle.'
+            }
             $bindingKey =
                 [string]$entry.rule.hash +
                 '|' +
@@ -940,6 +949,15 @@ function Get-ApprovedOwnerV2Proposal {
             throw 'Only exact allowlisted contextual findings are writer eligible.'
         }
         $source = $Finding.binding.source.representation
+        $fileHeaderScope =
+            [string](Get-ApprovedOwnerV2Value $Finding.anchor 'scope' '') -ceq 'file-header'
+        if ($fileHeaderScope -and (
+            [string]$Finding.ruleId -cne 'file-copyright-header' -or
+            [int]$Finding.anchor.line -ne 1 -or
+            [string]$Finding.anchor.symbol -cne 'copyright-header' -or
+            $Finding.fileHeader -isnot [Collections.IDictionary])) {
+            throw 'Only copyright findings may use file-header authority.'
+        }
         if ($pullRequestScope) {
             if ([string]$Finding.ruleId -cne
                     'pr-template-compliance' -or
@@ -1025,7 +1043,10 @@ function Get-ApprovedOwnerV2Proposal {
                 @($Finding.missingSections)
         }
         else {
-            $proposal['scope'] = 'changed-line'
+            $proposal['scope'] = $(if ($fileHeaderScope) { 'file-header' } else { 'changed-line' })
+            if ($fileHeaderScope) {
+                $proposal['fileHeader'] = $Finding.fileHeader
+            }
             $proposal['path'] =
                 [string]$Finding.anchor.path
             $proposal['line'] =
@@ -1449,10 +1470,7 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     semanticKey =
                         [string]$selection.semanticKey
                     ruleId = [string]$selection.ruleId
-                    scope = $(if ($pullRequestScope) {
-                        'pull-request'
-                    }
-                    else { 'changed-line' })
+                    scope = [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')
                 }
                 event = [ordered]@{
                     eventId = [string]$event.eventId
@@ -1710,6 +1728,8 @@ function Assert-ApprovedOwnerV2LiveRead {
         $namedAreEqual = $Delivery -ceq 'named-areequal'
         $contextual = $Delivery -ceq
             'contextual-conventions'
+        $fileHeaderScope =
+            [string](Get-ApprovedOwnerV2Value $selection 'scope' '') -ceq 'file-header'
         $pullRequestScope =
             [string](Get-ApprovedOwnerV2Value `
                 $selection 'scope' '') -ceq
@@ -1748,8 +1768,25 @@ function Assert-ApprovedOwnerV2LiveRead {
                 throw 'Live PR description or effective template binding changed.'
             }
         }
+        elseif ($fileHeaderScope) {
+            $anchors = @($Live.Anchors | Where-Object {
+                [string](Get-ApprovedOwnerV2Value $_ 'scope' '') -ceq 'file-header' -and
+                [string]$_.path -ceq [string]$selection.path
+            })
+            if ($Delivery -cne 'contextual-conventions' -or
+                [string]$selection.ruleId -cne 'file-copyright-header' -or
+                [int]$selection.line -ne 1 -or
+                $anchors.Count -ne 1 -or
+                [int]$anchors[0].changeTrackingId -lt 1 -or
+                [int]$anchors[0].iterationId -ne [int]$Live.Snapshot.CurrentIterationId -or
+                (Get-ApprovedOwnerV2Digest $anchors[0].fileHeader) -cne
+                    (Get-ApprovedOwnerV2Digest $selection.fileHeader)) {
+                throw 'Live copyright changed-file or source/target header binding changed.'
+            }
+        }
         else {
             $anchors = @($Live.Anchors | Where-Object {
+                    [string](Get-ApprovedOwnerV2Value $_ 'scope' '') -cne 'file-header' -and
                     [string]$_.path -ieq [string]$selection.path -and
                     [int]$selection.line -ge [int]$_.startLine -and
                     [int]$selection.line -le [int]$_.endLine
@@ -2013,6 +2050,8 @@ function Invoke-ApprovedOwnerV2Comments {
                 }
                 else {
                     @($freshState.Anchors | Where-Object {
+                            ([string](Get-ApprovedOwnerV2Value $_ 'scope' 'changed-line') -ceq
+                                [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')) -and
                             [string]$_.path -ieq [string]$selection.path -and
                             [int]$selection.line -ge [int]$_.startLine -and
                             [int]$selection.line -le [int]$_.endLine

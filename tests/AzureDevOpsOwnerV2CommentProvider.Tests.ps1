@@ -73,7 +73,12 @@ $folder = [char]::ConvertFromUtf32(0x1F4C2)
 }
 
 Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
-    It 'executes the dot-sourced PR description and template digest path' {
+    It 'executes the dot-sourced <Scope> freshness read with rename=<Rename>' -TestCases @(
+        @{ Scope = 'pull-request'; Rename = $false },
+        @{ Scope = 'file-header'; Rename = $false },
+        @{ Scope = 'file-header'; Rename = $true }
+    ) {
+        param($Scope, $Rename)
         (Get-Command `
                 Get-ApprovedOwnerV2ProviderTextSha256 `
                 -CommandType Function) |
@@ -156,6 +161,9 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
 '@
         $description =
             'Synthetic description without required sections.'
+        $content = "namespace Tests`n{`n    class C { int M() => 2; }`n}"
+        $targetContent = $content.Replace('=> 2', '=> 1')
+        $readPaths = [Collections.Generic.List[string]]::new()
         $original =
             ${function:Invoke-ApprovedOwnerV2AzureCliJson}
         $fake = {
@@ -238,7 +246,14 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
                 }
                 pullRequestIterationChanges {
                     return [ordered]@{
-                        changeEntries = @()
+                        changeEntries = $(if ($Scope -ceq 'file-header') {
+                            @([ordered]@{
+                                changeTrackingId = 7
+                                changeType = $(if ($Rename) { 'rename, edit' } else { 'edit' })
+                                originalPath = $(if ($Rename) { '/src/Old.cs' } else { $null })
+                                item = @{ path = '/src/Header.cs' }
+                            })
+                        } else { @() })
                     }
                 }
                 pullRequestThreads {
@@ -254,6 +269,17 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
                     }
                 }
                 items {
+                    $pathArgument = @($Arguments | Where-Object { $_ -like 'path=*' })
+                    if ($pathArgument.Count -eq 1 -and
+                        $pathArgument[0] -in @('path=/src/Header.cs', 'path=/src/Old.cs')) {
+                        [void]$readPaths.Add($pathArgument[0])
+                        return [ordered]@{
+                            content = $(if ($Arguments -contains ('versionDescriptor.version=' + ('a' * 40))) {
+                                $content
+                            } else { $targetContent })
+                            contentMetadata = @{ contentType = 'text/plain' }
+                        }
+                    }
                     if ($Arguments -contains
                         'scopePath=/.azuredevops') {
                         return [ordered]@{
@@ -299,7 +325,16 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
                     uniqueName =
                         [string]$reviewer.UniqueName
                 }
-                selections = @([ordered]@{
+                selections = @($(if ($Scope -ceq 'file-header') {
+                    [ordered]@{
+                        findingId = 'contextual-v1:' + ('3' * 64)
+                        scope = 'file-header'
+                        ruleId = 'file-copyright-header'
+                        path = 'src/Header.cs'
+                        line = 1
+                        symbol = 'copyright-header'
+                    }
+                } else { [ordered]@{
                         findingId =
                             'contextual-v1:' + ('3' * 64)
                         scope = 'pull-request'
@@ -307,13 +342,27 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
                         constructRef =
                             'construct:' + ('4' * 64)
                         marker = '5' * 64
-                    })
+                    } }))
             }
         }
         finally {
             Set-Item -LiteralPath (
                 'Function:\Invoke-ApprovedOwnerV2AzureCliJson') `
                 -Value $original
+        }
+        if ($Scope -ceq 'file-header') {
+            @($live.Anchors) | Should -HaveCount 1
+            $live.Anchors[0].scope | Should -BeExactly file-header
+            $live.Anchors[0].startLine | Should -Be 1
+            $live.Anchors[0].fileHeader.origin | Should -BeExactly pre-existing
+            $live.Anchors[0].fileHeader.targetDigest |
+                Should -BeExactly ('v1:sha256:' + (Get-ApprovedOwnerV2ProviderTextSha256 $targetContent))
+            if ($Rename) {
+                $live.Anchors[0].fileHeader.oldPath | Should -BeExactly 'src/Old.cs'
+                $readPaths[1] | Should -BeExactly 'path=/src/Old.cs'
+            }
+            else { $readPaths[1] | Should -BeExactly 'path=/src/Header.cs' }
+            return
         }
         $expectedDescription =
             Get-ApprovedOwnerV2ProviderTextSha256 `

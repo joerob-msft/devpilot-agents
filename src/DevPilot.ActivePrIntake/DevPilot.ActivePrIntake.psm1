@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1')
+Import-Module (Join-Path $PSScriptRoot '..\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psd1')
 . (Join-Path $PSScriptRoot `
     '..\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 . (Join-Path $PSScriptRoot 'DevPilot.ChangeDerivation.ps1')
@@ -2625,6 +2626,8 @@ function New-ActivePrAzureDevOpsProvider {
         ${function:Get-ApprovedOwnerV2ChangedSpans}
     $changeDerivationCommand =
         ${function:New-DevPilotChangeDerivation}
+    $copyrightHeaderEvidenceCommand =
+        Get-Command Get-ContextualCopyrightHeaderEvidence -CommandType Function
     $newTransportFailureCommand =
         ${function:New-IntakeTransportFailure}
     $copyFailureDataCommand =
@@ -4037,6 +4040,13 @@ print(json.dumps({
                             -SourceCommit $sourceCommit `
                             -TargetCommit $targetCommit
                     if ($isCSharp) {
+                        $normalizedChange['fileHeader'] =
+                            & $copyrightHeaderEvidenceCommand `
+                                -Path ([string]$entry.path) `
+                                -OldPath ([string]$entry.originalPath) `
+                                -ChangeType $changeType `
+                                -Content $sourceContent -TargetContent $targetContent `
+                                -SourceCommit $sourceCommit -TargetCommit $targetCommit
                         $sourceDirectory =
                             [IO.Path]::GetDirectoryName(
                                 ([string]$entry.path).Replace(
