@@ -121,7 +121,7 @@ Describe 'Release publication boundary' {
             $text | Should -Not -Match 'inputs\.(approval|environment)|approve.*pending_deployments'
             $text | Should -Not -Match 'release-patch-|outputs\.(qualification|publish|canary)-environment'
         }
-        $automation | Should -Match 'cron: "\*/15 \* \* \* \*"'
+        $automation | Should -Match 'cron: "17 \* \* \* \*"'
         $automation | Should -Match "vars.DEVPILOT_AUTOMATIC_RELEASES == 'true'"
         $ci | Should -Match 'node --test ./tests/ReleaseAutomation.Tests.cjs ./tests/ReleasePolicy.Tests.cjs'
         $ciRunner | Should -Match 'tests\\ReleasePolicy.Tests.cjs'
@@ -157,6 +157,70 @@ Describe 'Release publication boundary' {
             $ciRunner.IndexOf("if (`$Mode -eq 'PlatformSafety')"))
         foreach ($path in [regex]::Matches($platform, "tests\\[^']+\.Tests\.ps1")) {
             $ci | Should -Match ([regex]::Escape($path.Value.Replace('\', '/')))
+        }
+    }
+
+    It 'covers each Windows Pester suite exactly once across required CI jobs' {
+        $scheduled = [Collections.Generic.List[string]]::new()
+        foreach ($id in @('tests', 'platform-safety', 'dashboard')) {
+            $job = [regex]::Match($ci,
+                "(?ms)^  ${id}:\r?\n.*?(?=^  [a-z0-9-]+:|\z)").Value
+            $job | Should -Match 'runs-on: windows-latest|os: \[windows-latest,'
+            $defaults = [regex]::Match($job,
+                '(?ms)^    defaults:\r?\n.*?(?=^    steps:)').Value
+            $directory = [regex]::Match($defaults,
+                '(?m)^        working-directory: (?<path>[^\r\n]+)').Groups['path'].Value
+            $base = if ($directory) { Join-Path $root $directory.Trim() } else { $root }
+
+            foreach ($block in Get-WorkflowRunBlocks $job) {
+                $tokens = $null
+                $errors = $null
+                $ast = [Management.Automation.Language.Parser]::ParseInput(
+                    $block, [ref]$tokens, [ref]$errors)
+                $errors | Should -BeNullOrEmpty
+                foreach ($command in $ast.FindAll({
+                            param($node)
+                            $node -is [Management.Automation.Language.CommandAst] -and
+                            $node.GetCommandName() -eq 'Invoke-Pester'
+                        }, $true)) {
+                    $paths = @()
+                    $excluded = @()
+                    for ($index = 1; $index -lt $command.CommandElements.Count - 1; $index++) {
+                        $parameter = $command.CommandElements[$index]
+                        if ($parameter -isnot [Management.Automation.Language.CommandParameterAst]) {
+                            continue
+                        }
+                        if ($parameter.ParameterName -eq 'Path') {
+                            $paths = @($command.CommandElements[$index + 1].SafeGetValue())
+                        }
+                        elseif ($parameter.ParameterName -eq 'ExcludePath') {
+                            $excluded = @($command.CommandElements[$index + 1].SafeGetValue())
+                        }
+                    }
+                    $paths.Count | Should -BeGreaterThan 0
+                    $excluded = @($excluded | ForEach-Object {
+                            $_.Replace('/', '\')
+                        })
+                    foreach ($path in $paths) {
+                        $absolute = [IO.Path]::GetFullPath((Join-Path $base $path))
+                        $files = if (Test-Path -LiteralPath $absolute -PathType Container) {
+                            Get-ChildItem -LiteralPath $absolute -Filter '*.Tests.ps1' -Recurse -File
+                        }
+                        else {
+                            Get-Item -LiteralPath $absolute -ErrorAction Stop
+                        }
+                        foreach ($file in $files) {
+                            if (@($excluded | Where-Object { $file.FullName.Replace('/', '\') -like $_ }).Count -eq 0) {
+                                $scheduled.Add($file.FullName)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'tests') -Filter '*.Tests.ps1' -Recurse -File) {
+            @($scheduled | Where-Object { $_ -eq $file.FullName }).Count |
+                Should -Be 1 -Because "$($file.Name) must run once, without dropping Windows coverage"
         }
     }
 

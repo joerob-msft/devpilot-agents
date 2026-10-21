@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   hygiene:
     name: Generic-toolkit invariant
@@ -94,7 +98,18 @@ jobs:
       - name: Run targeted tests
         shell: pwsh
         run: |
-          $result = Invoke-Pester -Path ./tests -Output Detailed -PassThru
+          # These suites already run in the required Windows platform or dashboard job.
+          $result = Invoke-Pester -Path ./tests -ExcludePath @(
+            '*/tests/DispatchProtocol.Tests.ps1',
+            '*/tests/DurableState.Tests.ps1',
+            '*/tests/DurableStateMigration.Tests.ps1',
+            '*/tests/FailureRecovery.Tests.ps1',
+            '*/tests/Invoke-TimedProcess.Tests.ps1',
+            '*/tests/ManualRedispatch.Tests.ps1',
+            '*/tests/ReviewHandler.Resume.Tests.ps1',
+            '*/tests/ReviewerOutput.Tests.ps1',
+            '*/tests/DispatchStartup.Tests.ps1'
+          ) -Output Detailed -PassThru
           if ($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0) {
               throw "Pester reported $($result.FailedCount) failed test(s), $($result.FailedContainersCount) failed container(s)."
           }
