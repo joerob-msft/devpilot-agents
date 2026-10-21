@@ -654,11 +654,20 @@ function New-StalePrAzureDevOpsProvider {
             $Budget.Count++
         }
         $token = & $getAccessToken
+        $afterTokenUtc = & $getUtcNow
+        if ($afterTokenUtc -ge
+            [DateTime]$Budget.DeadlineUtc) {
+            throw 'stale-pr-deadline-exhausted'
+        }
+        $remaining =
+            ([DateTime]$Budget.DeadlineUtc -
+                $afterTokenUtc).TotalSeconds
+        if ($remaining -le 0) {
+            throw 'stale-pr-deadline-exhausted'
+        }
         $remainingSeconds = [int][Math]::Max(
             1,
-            [Math]::Ceiling(
-                ([DateTime]$Budget.DeadlineUtc -
-                    (& $getUtcNow)).TotalSeconds))
+            [Math]::Ceiling($remaining))
         $request = @{
             Uri = $Uri
             Method = $Method
