@@ -3,6 +3,9 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot `
+    '..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1')
+
 $script:ApprovedOwnerV2SchemaVersion = 1
 $script:ApprovedOwnerV2Capability = 'bpm-test-ownership@1'
 $script:ApprovedNamedAreEqualCapability = 'bpm-named-areequal-arguments@1'

@@ -84,6 +84,9 @@ new authority. Reconstruction applies linked context only when the observation
 declares that mode; custom Owner providers that omit it retain their plain
 locations and matching body digests. Unknown or duplicate mode artifacts are
 rejected. The existing exact body digest binds the actual rendered citations.
+The dot-sourced approved writer imports its canonical harness dependency
+directly; provider preflight does not rely on a prior wrapper or test-suite
+import to make canonical digest helpers available.
 
 The optional toolkit-config `commentRuleReferences` map supplies verified,
 human-facing citations without changing source acceptance or rule semantics.

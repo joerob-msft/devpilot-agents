@@ -401,4 +401,44 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
         $proposal.Contains('path') | Should -BeFalse
         $proposal.Contains('line') | Should -BeFalse
     }
+
+    It 'runs dot-sourced provider preflight in a fresh process without preloaded harness helpers' {
+        $child = @'
+$ErrorActionPreference = 'Stop'
+if (Get-Command Get-AgentCanonicalDigest -ListImported -ErrorAction SilentlyContinue) {
+    throw 'The child unexpectedly started with canonical harness helpers.'
+}
+Import-Module '__PESTER_MODULE__'
+$config = New-PesterConfiguration
+$config.Run.Path = '__TEST_PATH__'
+$config.Run.PassThru = $true
+$config.Filter.FullName = 'Azure DevOps Owner v2 PR-wide freshness read.executes the dot-sourced PR description and template digest path'
+$config.Output.Verbosity = 'None'
+$result = Invoke-Pester -Configuration $config
+[ordered]@{
+    discovered = $result.TotalCount
+    selected = $result.TotalCount - $result.NotRunCount
+    passed = $result.PassedCount
+    failed = $result.FailedCount
+    skipped = $result.SkippedCount
+    failures = @($result.Failed | ForEach-Object {
+        ($_.ErrorRecord | ForEach-Object { $_.ToString() }) -join "`n"
+    })
+} | ConvertTo-Json -Depth 8 -Compress
+if ($result.FailedCount -gt 0 -or $result.PassedCount -ne 1) { exit 1 }
+'@
+        $child = $child.Replace(
+            '__PESTER_MODULE__', (Get-Module Pester).Path.Replace("'", "''")).
+            Replace('__TEST_PATH__', (
+                Join-Path $PSScriptRoot 'AzureDevOpsOwnerV2CommentProvider.Tests.ps1'
+            ).Replace("'", "''"))
+        $output = @(& (Get-Command pwsh -CommandType Application).Source `
+            -NoLogo -NoProfile -NonInteractive -Command $child 2>&1)
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output -join "`n") | ConvertFrom-Json -AsHashtable
+        $result.selected | Should -Be 1
+        $result.passed | Should -Be 1
+        $result.failed | Should -Be 0
+        $result.skipped | Should -Be 0
+    }
 }
