@@ -50,7 +50,8 @@ or authorize this phase.
 
 When a deterministic reviewer upgrade changes its current marker or formatter,
 an earlier contextual comment can remain `noOp` only through authenticated
-delivery history. The reader verifies the lane key on the signed create event,
+delivery history, including when only its body changes and its marker stays
+the same. The reader verifies the lane key on the signed create event,
 intent, and outcome, links their run/event/state identities, requires the same
 immutable PR source and target, rule content hash, construct identity, path,
 line, and symbol, and then requires the exact live reviewer-owned comment,
@@ -59,6 +60,53 @@ The rule commit and implementation may advance while the authoritative rule
 hash and construct remain identical. Copied, edited, deleted, moved, duplicate,
 foreign-identity, stale-head, or changed-rule evidence remains unknown and
 cannot authorize a create, update, or rewrite.
+
+## Finding presentation
+
+Contextual, named-assertion, and Owner findings use actionable bold titles,
+readable rule names, a concise explanation, and a **Changed-line occurrences**
+list. With a configured subject provider, every displayed occurrence has its
+own source-commit-pinned link;
+named-assertion groups still show at most the first twelve calls and explicitly
+report truncation. This changes neither the method grouping nor the full
+typed call list used by preflight.
+
+Source links are built from the existing subject provider's HTTPS organization
+and the contract's project/repository IDs. A mismatching provider scope is
+rejected; rule-reference URLs cannot change finding anchors or write scope.
+Both current-PR bridges and approved-evidence reconstruction use that same
+presentation context, including completed-observation discussion refresh.
+Custom acquisition providers can pass the same context through
+`New-OwnerAzureDevOpsReadOnlyProviderAdapter -CommentPresentation`, with
+`subjectProvider` and `ruleReferences` members.
+
+The optional toolkit-config `commentRuleReferences` map supplies verified,
+human-facing citations without changing source acceptance or rule semantics.
+Keys are contextual rule IDs, `named-areequal`, or `owner`. Each entry has
+`label` (`EngHub rules` or `Rule references`) and one to eight `links`, each
+with `name` and an HTTPS `url` pinned by `version=GC<commit>`, `path`, and
+`line`. Verify that the named section actually exists at that exact location;
+do not derive line numbers from a different document revision. The sample
+configs include verified named-argument section references. Rules without
+configured citations display their readable names, never fabricated links.
+These citations are presentation metadata, not new evaluation authority.
+
+Exact rule hashes and bindings remain in observations and signed delivery
+records rather than a rule-bundle hash paragraph. PR-template findings stay
+PR-wide: their template link uses the effective default-branch commit, with
+no invented code occurrence. A collapsed template-provenance block retains
+the existing exact template-content evidence needed for missing-section
+subset reconciliation across default-branch advances.
+
+Existing canonical Owner and named-assertion bodies remain recognized as
+`noOp` under their unchanged identity, marker, anchor, and current-context
+checks. Contextual historical bodies require the existing signed history
+proof, whether their marker changed or not. A presentation upgrade never
+rewrites an old comment; conflicting or unverifiable contextual/Named markers
+remain `unknown`. Owner's explicitly approved stale-body update path otherwise
+retains its existing behavior.
+
+## Contextual rule behavior
 
 The contextual bundle also enforces EngHub's general named-call convention as
 one rule group. A changed invocation, object construction, or `this`/`base`

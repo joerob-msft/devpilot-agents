@@ -334,7 +334,11 @@ function New-NamedBridgeAcquisitionProvider {
     }.GetNewClosure()
     return New-OwnerAzureDevOpsReadOnlyProviderAdapter `
         -Name 'named-areequal-current-pr-read-only' `
-        -ReviewerIdentity $reviewer -Handler $handler
+        -ReviewerIdentity $reviewer -Handler $handler `
+        -CommentPresentation ([ordered]@{
+            subjectProvider = $Config.subjectProvider
+            ruleReferences = $Config['commentRuleReferences']
+        })
 }
 
 function Get-NamedBridgeRelevantChangeSet {

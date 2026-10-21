@@ -657,6 +657,81 @@ BeforeAll {
 }
 
 Describe 'Named AreEqual automatic delivery' {
+    It 'keeps linked formatter bodies compatible with live provider preflight and current-marker noOp' {
+        foreach ($delivery in @('named-areequal', 'contextual-conventions')) {
+            $context = if ($delivery -ceq 'named-areequal') {
+                New-NamedDeliveryContext
+            } else { New-ContextualDeliveryContext }
+            $evidence = $context.Evidence
+            $sample = if ($delivery -ceq 'named-areequal') {
+                'named-areequal-current-pr.config.json'
+            } else { 'contextual-conventions-current-pr.config.json' }
+            $references = (Get-Content -LiteralPath (
+                Join-Path $repoRoot "samples\$sample") -Raw |
+                ConvertFrom-Json -AsHashtable).commentRuleReferences
+            $evidence.Contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+                subjectProvider = $evidence.Provider
+                ruleReferences = $references
+            }
+            $finding = $evidence.Observation.findings[0]
+            $body = if ($delivery -ceq 'named-areequal') {
+                $marker = Get-NamedAreEqualMarkerKey -Contract $evidence.Contract -Finding $finding
+                Format-NamedAreEqualComment -Contract $evidence.Contract -Finding $finding -MarkerKey $marker
+            } else {
+                $marker = Get-ContextualConventionMarkerKey -Contract $evidence.Contract -Finding $finding
+                Format-ContextualConventionComment -Contract $evidence.Contract -Finding $finding -MarkerKey $marker
+            }
+            $finding.reconciliation.bodySha256 = Get-ApprovedOwnerV2TextSha256 $body
+            $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery $delivery
+            $proposal.body | Should -Match '\*\*EngHub rules:\*\* \['
+            $proposal.body | Should -Match '\*\*Changed-line occurrences:\*\*'
+            $proposal.body | Should -Match (
+                'version=GC' + $evidence.Declaration.head.sourceCommit + '&path=')
+            $proposal.body | Should -Not -Match '(?m)^(?:Rule bundle:|Convention:)|SHA-256'
+            $provider = New-NamedDeliveryProvider -Evidence $evidence
+            $approval = @{
+                subject = @{
+                    projectId = $evidence.Declaration.subject.projectId
+                    repositoryId = $evidence.Declaration.subject.repositoryId
+                    pullRequestId = $evidence.Declaration.subject.pullRequestId
+                    sourceCommit = $evidence.Declaration.head.sourceCommit
+                    targetCommit = $evidence.Declaration.target.targetCommit
+                    targetRef = $evidence.Declaration.target.targetRef
+                }
+                provider = $evidence.Provider
+                operator = $evidence.Provider.reviewerIdentity
+            }
+            foreach ($existing in @($false, $true)) {
+                if ($existing) {
+                    $provider.State.threads = @([ordered]@{
+                        threadId = 100
+                        status = 'active'
+                        isDeleted = $false
+                        isOutdated = $false
+                        contextState = 'current'
+                        sourceCommit = $evidence.Declaration.head.sourceCommit
+                        anchor = @{ path = $proposal.path; line = $proposal.line }
+                        comments = @(@{
+                            commentId = 101
+                            commentType = 'text'
+                            isDeleted = $false
+                            reviewerOwned = $true
+                            reviewerIdentityState = 'matched'
+                            body = $proposal.body
+                        })
+                    })
+                }
+                $live = & $provider.Handler 'ReadCurrent' @{ evidence = $evidence; selections = @($proposal) }
+                $result = Assert-ApprovedOwnerV2LiveRead -Evidence $evidence `
+                    -Approval $approval -Live $live -Selections @($proposal) `
+                    -ExpectedSnapshotSha256 ('9' * 64) -Delivery $delivery
+                $result.Classifications[$proposal.findingId] |
+                    Should -BeExactly $(if ($existing) { 'noOp' } else { 'wouldCreate' })
+            }
+            $provider.State.writes | Should -Be 0
+        }
+    }
+
     It 'returns disabled from the CLI with no local delivery root or provider access' {
         $context = New-NamedDeliveryContext
         $state = Write-NamedDeliveryState -Context $context

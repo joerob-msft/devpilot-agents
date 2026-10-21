@@ -4,6 +4,12 @@ BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     Import-Module (Join-Path $repoRoot `
             'src\DevPilot.OwnerAdapters\DevPilot.OwnerAdapters.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
+            'src\DevPilot.OwnerCapability\DevPilot.OwnerCapability.psd1') -Force
+    Import-Module (Join-Path $repoRoot `
+            'src\OwnerObservationContract\OwnerObservationContract.psd1') -Force
+    . (Join-Path $repoRoot `
+        'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
     . (Join-Path $repoRoot `
         'src\Agents\reviewer\AzureDevOpsOwnerV2CommentProvider.ps1')
 }
@@ -333,5 +339,66 @@ Describe 'Azure DevOps Owner v2 PR-wide freshness read' {
             Should -BeExactly $expectedTemplate
         @($live.Anchors) |
             Should -HaveCount 0
+
+        $config = Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json -AsHashtable
+        $contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+            subjectProvider = $config.subjectProvider
+        }
+        $source = $live.PullRequest.metadata.template
+        $constructRef = 'construct:' + ('4' * 64)
+        $finding = [ordered]@{
+            identity = 'contextual-v1:' + ('3' * 64)
+            semanticKey = 'v1:sha256:' + ('5' * 64)
+            disposition = 'violation'
+            ruleId = 'pr-template-compliance'
+            constructRef = $constructRef
+            issueIdentity = 'v1:sha256:' + ('6' * 64)
+            missingSections = @('Problem', 'Solution', 'Validation')
+            evidence = 'Add meaningful content under the required PR description sections.'
+            anchor = @{ scope = 'pull-request'; subject = 'description' }
+            binding = New-OwnerCanonicalPullRequestBinding `
+                -DescriptionSha256 $expectedDescription `
+                -TemplatePath $source.path -TemplateRef $source.ref `
+                -TemplateCommit $source.commit -TemplateBlob $source.blob `
+                -TemplateContentSha256 $source.contentSha256 `
+                -ConstructIdentity $constructRef
+        }
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Contract $contract -Snapshot $live.Snapshot -Observation ([ordered]@{
+                capability = 'bpm-contextual-conventions@1'
+                lifecycle = @{ status = 'completed' }
+                findings = @($finding)
+                effects = @{ dedupe = @{} }
+                sourceArtifacts = @()
+            })
+        $evidence = [pscustomobject]@{
+            Contract = $contract
+            Declaration = @{ capability = @{ id = 'bpm-contextual-conventions@1' } }
+            Observation = $observation
+        }
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+            -Finding $finding -Delivery contextual-conventions
+        $result = Assert-ApprovedOwnerV2LiveRead `
+            -Evidence $evidence -Live $live -Selections @($proposal) `
+            -ExpectedSnapshotSha256 $live.Snapshot.Digest.Substring(10) `
+            -Delivery contextual-conventions -Approval @{
+                subject = @{
+                    projectId = $contract.Request.ProjectId
+                    repositoryId = $contract.Request.RepositoryId
+                    pullRequestId = 42
+                    sourceCommit = $contract.Request.SourceCommit
+                    targetCommit = $contract.Request.TargetCommit
+                    targetRef = $contract.Request.TargetRef
+                }
+                provider = $live.ProviderBinding
+                operator = $live.Reviewer
+            }
+        $result.Classifications[$finding.identity] | Should -BeExactly wouldCreate
+        $proposal.body | Should -Match '\*\*Effective template:\*\* \['
+        $proposal.body | Should -Match 'version=GC1111111111111111111111111111111111111111'
+        $proposal.body | Should -Not -Match 'Changed-line occurrences:|Rule bundle:'
+        $proposal.Contains('path') | Should -BeFalse
+        $proposal.Contains('line') | Should -BeFalse
     }
 }

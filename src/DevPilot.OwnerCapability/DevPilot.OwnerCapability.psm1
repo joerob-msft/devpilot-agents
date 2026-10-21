@@ -96,6 +96,109 @@ function ConvertTo-OwnerV1WriterMarkdownCode {
     return (($Text -replace '[\x00-\x1f\x7f]', ' ') -replace '`', '｀').Trim()
 }
 
+function ConvertTo-OwnerCommentLink {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Url
+    )
+    $uri = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or
+        $Url -match '[\x00-\x20\x7f<>]' -or
+        [string]::IsNullOrWhiteSpace($Name) -or
+        $Name.Length -gt 1024 -or $Name -match '[\x00-\x1f\x7f]') {
+        throw 'Comment references require a bounded label and an absolute HTTPS URL.'
+    }
+    $label = $Name -replace '([\\`*_\[\]<>])', '\$1'
+    $target = $uri.AbsoluteUri.Replace('(', '%28').Replace(')', '%29').
+        Replace('[', '%5B').Replace(']', '%5D')
+    return "[$label]($target)"
+}
+
+function Get-OwnerCommentRepositoryUrl {
+    param([Parameter(Mandatory)][object]$Contract)
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $provider = Get-OwnerV2Member -Value $presentation -Name subjectProvider
+    if ($null -eq $provider) { return $null }
+    if ([string](Get-OwnerV2Member -Value $provider -Name repositoryId) -cne
+            [string]$Contract.Request.RepositoryId -or
+        [string](Get-OwnerV2Member -Value $provider -Name projectId) -cne
+            [string]$Contract.Request.ProjectId) {
+        throw 'Comment source links must use the bound subject repository and project.'
+    }
+    $organization = [string](Get-OwnerV2Member -Value $provider -Name organization)
+    $uri = $null
+    if (-not [uri]::TryCreate($organization, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Query -or
+        $uri.Fragment -or $organization -match '[\x00-\x20\x7f<>]') {
+        throw 'Comment source links require the configured HTTPS organization URL.'
+    }
+    return $uri.AbsoluteUri.TrimEnd('/') + '/' +
+        [uri]::EscapeDataString([string]$Contract.Request.ProjectId) +
+        '/_git/' + [uri]::EscapeDataString([string]$Contract.Request.RepositoryId)
+}
+
+function Format-OwnerCommentRuleReference {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$RuleId,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $presentation = Get-OwnerV2Member -Value $Contract -Name CommentPresentation
+    $references = Get-OwnerV2Member -Value $presentation -Name ruleReferences
+    if ($null -ne $references -and $references -isnot [Collections.IDictionary]) {
+        throw 'Comment rule references must be a map keyed by the existing rule identity.'
+    }
+    $reference = Get-OwnerV2Member -Value $references -Name $RuleId
+    if ($null -eq $reference) { return "**Rule:** $Name." }
+    if ($reference -isnot [Collections.IDictionary]) {
+        throw 'Comment rule reference entries must contain a label and pinned links.'
+    }
+    $label = [string](Get-OwnerV2Member -Value $reference -Name label)
+    $links = @(Get-OwnerV2Member -Value $reference -Name links)
+    if ($label -cnotin @('EngHub rules', 'Rule references') -or
+        $links.Count -lt 1 -or $links.Count -gt 8) {
+        throw 'Comment rule references require a supported label and one to eight pinned links.'
+    }
+    $rendered = foreach ($link in $links) {
+        $url = [string](Get-OwnerV2Member -Value $link -Name url)
+        if ($url -cnotmatch '[?&]version=GC[0-9a-f]{40}(?:&|$)' -or
+            $url -cnotmatch '[?&]path=[^&#]+' -or
+            $url -cnotmatch '[?&]line=[1-9][0-9]*(?:&|$)') {
+            throw 'Comment rule links must identify an exact source commit, path, and line.'
+        }
+        ConvertTo-OwnerCommentLink `
+            -Name ([string](Get-OwnerV2Member -Value $link -Name name)) -Url $url
+    }
+    return "**${label}:** " + ($rendered -join '; ') + '.'
+}
+
+function Format-OwnerCommentOccurrences {
+    param(
+        [Parameter(Mandatory)][object]$Contract,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int[]]$Lines
+    )
+    $path = ConvertTo-OwnerV1WriterPath -Path $Path
+    $repositoryUrl = Get-OwnerCommentRepositoryUrl -Contract $Contract
+    $locations = foreach ($line in $Lines) {
+        if ($line -lt 1 -or $line -gt 200000) {
+            throw 'Comment occurrences require exact positive source lines.'
+        }
+        if ($repositoryUrl) {
+            $url = $repositoryUrl + '?version=GC' +
+                [string]$Contract.Request.SourceCommit +
+                '&path=' + [uri]::EscapeDataString($path) + "&line=$line"
+            ConvertTo-OwnerCommentLink -Name "$($path.TrimStart('/')):$line" -Url $url
+        }
+        else {
+            "``$(ConvertTo-OwnerV1WriterMarkdownCode $path):$line``"
+        }
+    }
+    return @('**Changed-line occurrences:**') +
+        @($locations | ForEach-Object { "- $_" }) -join "`n"
+}
+
 function Get-OwnerV1WriterMarkerKey {
     param(
         [Parameter(Mandatory)][object]$Contract,
@@ -142,7 +245,8 @@ function Format-OwnerV1WriterComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     $request = $Contract.Request
@@ -159,6 +263,21 @@ function Format-OwnerV1WriterComment {
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath
     )
     $section = ConvertTo-OwnerV1WriterMarkdownCode ([string]$request.RuleSection)
+    if (-not $Legacy) {
+        return @(
+            '**Add an Owner attribute to this changed test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId owner -Name 'Changed MSTest methods require an Owner attribute')
+            ''
+            "Changed MSTest method ``$symbol`` has no ``Owner`` attribute. Add ``[Owner(`"<owner-alias>`")]`` to this test method."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path `
+                -Lines @([int](Get-OwnerV2Member -Value $anchor -Name line)))
+            ''
+            "<!-- ${script:OwnerV1WriterMarkerPrefix}:$MarkerKey -->"
+        ) -join "`n"
+    }
     return @(
         '**Owner attribute missing**'
         ''
@@ -235,7 +354,8 @@ function Format-NamedAreEqualComment {
     param(
         [Parameter(Mandatory)][object]$Contract,
         [Parameter(Mandatory)][Collections.IDictionary]$Finding,
-        [Parameter(Mandatory)][string]$MarkerKey
+        [Parameter(Mandatory)][string]$MarkerKey,
+        [switch]$Legacy
     )
 
     if ($MarkerKey -cne (Get-NamedAreEqualMarkerKey `
@@ -254,6 +374,23 @@ function Format-NamedAreEqualComment {
     }
     $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
         ConvertTo-OwnerV1WriterPath -Path $request.RulePath)
+    if (-not $Legacy) {
+        return @(
+            '**Use named arguments for Assert.AreEqual in this test method**'
+            ''
+            (Format-OwnerCommentRuleReference -Contract $Contract `
+                -RuleId named-areequal -Name 'Name every supplied Assert.AreEqual argument')
+            ''
+            "Method ``$symbol`` contains $count changed positional ``Assert.AreEqual`` call(s). Name every supplied argument according to the selected overload, commonly ``expected:`` and ``actual:`` (and ``delta:`` or ``message:`` when supplied). Preserve argument order and values."
+            ''
+            (Format-OwnerCommentOccurrences -Contract $Contract -Path $path -Lines $sample)
+            $(if ($count -gt $sample.Count) {
+                "Showing the first 12 of $count changed calls."
+            })
+            ''
+            "<!-- ${script:NamedAreEqualMarkerPrefix}:$MarkerKey -->"
+        ) | Where-Object { $null -ne $_ } | Join-String -Separator "`n"
+    }
     return @(
         '**Use named arguments for Assert.AreEqual in this test method**'
         ''
@@ -347,23 +484,24 @@ function Format-ContextualConventionComment {
             -Contract $Contract -Finding $Finding)) {
         throw 'Contextual convention marker does not match its finding.'
     }
-    $request = $Contract.Request
     $pullRequestScope =
         [string](Get-OwnerV2Member `
             -Value $Finding.anchor `
             -Name scope) -ceq
             'pull-request'
-    $ruleId = ConvertTo-OwnerV1WriterMarkdownCode (
-        [string]$Finding.ruleId)
+    $policy = Get-Content -LiteralPath (
+        Join-Path $PSScriptRoot 'Policy\contextual-conventions.v1.json') -Raw |
+        ConvertFrom-Json -AsHashtable
+    $rule = @($policy.rules | Where-Object { $_.id -ceq [string]$Finding.ruleId })[0]
+    $ruleName = [string]$rule.name
+    $ruleReference = Format-OwnerCommentRuleReference -Contract $Contract `
+        -RuleId ([string]$Finding.ruleId) -Name $ruleName
     $summary = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.evidence)
     if ([string]::IsNullOrWhiteSpace($summary) -or
         $summary.Length -gt 512) {
         throw 'Contextual convention evidence summary is invalid.'
     }
-    $rulePath = ConvertTo-OwnerV1WriterMarkdownCode (
-        ConvertTo-OwnerV1WriterPath -Path (
-            [string]$request.RulePath))
     if ($pullRequestScope) {
         $source =
             $Finding.binding.source.representation
@@ -385,18 +523,31 @@ function Format-ContextualConventionComment {
             ConvertTo-OwnerV1WriterMarkdownCode (
                 ConvertTo-OwnerV1WriterPath `
                     -Path ([string]$source.template.path))
+        $repositoryUrl = Get-OwnerCommentRepositoryUrl -Contract $Contract
+        $templateLink = if ($repositoryUrl) {
+            ConvertTo-OwnerCommentLink -Name $templatePath -Url (
+                $repositoryUrl + '?version=GC' + [string]$source.template.commit +
+                '&path=' + [uri]::EscapeDataString($templatePath))
+        }
+        else { "``$templatePath``" }
         return @(
             '**Complete the required pull request template sections**'
+            ''
+            $ruleReference
             ''
             "$summary"
             ''
             "Missing or placeholder-only sections: $missing."
             ''
-            "Effective template: ``$templatePath`` from ``$([string]$source.template.ref)`` (blob ``$([string]$source.template.blob)``; SHA-256 ``$([string]$source.template.contentSha256)``)."
+            "**Effective template:** $templateLink"
             ''
             'This is a PR-wide description issue; no code line is implicated.'
             ''
-            "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+            '<details><summary>Template provenance</summary>'
+            ''
+            "Effective template: ``$templatePath`` from ``$([string]$source.template.ref)`` (blob ``$([string]$source.template.blob)``; SHA-256 ``$([string]$source.template.contentSha256)``)."
+            ''
+            '</details>'
             ''
             "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
         ) -join "`n"
@@ -407,13 +558,16 @@ function Format-ContextualConventionComment {
     $symbol = ConvertTo-OwnerV1WriterMarkdownCode (
         [string]$Finding.anchor.symbol)
     return @(
-        "**$ruleId**"
+        "**$ruleName**"
+        ''
+        $ruleReference
         ''
         "$summary"
         ''
-        "Changed code: ``$symbol`` at ``$path``:$([int]$Finding.anchor.line)."
+        "Changed construct: ``$symbol``."
         ''
-        "Rule bundle: ``$rulePath`` at ``$([string]$request.RuleCommit)`` (SHA-256 ``$(([string]$request.RuleHash).Substring(10))``)."
+        (Format-OwnerCommentOccurrences -Contract $Contract -Path $path `
+            -Lines @([int]$Finding.anchor.line))
         ''
         "<!-- ${script:ContextualMarkerPrefix}:$MarkerKey -->"
     ) -join "`n"
@@ -1110,9 +1264,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                 [string]$proof.selection.symbol -cne
                     [string]$finding.anchor.symbol -or
                 [string]$proof.selection.constructIdentity -cne
-                    [string]$finding.binding.constructIdentity -or
-                [string]$proof.selection.marker -ceq
-                    $marker) {
+                    [string]$finding.binding.constructIdentity) {
                 continue
             }
             $priorEntries =
@@ -1414,8 +1566,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
             $sameBody =
-                Get-OwnerV1WriterSha256 -Text (
-                    [string]$entry.Comment.body) -ceq
+                (Get-OwnerV1WriterSha256 -Text (
+                    [string]$entry.Comment.body)) -ceq
                     $bodyDigest
             $finding.providerMarker =
                 New-OwnerProviderMarker `
@@ -1796,8 +1948,11 @@ function Resolve-NamedAreEqualDiscussionReconciliation {
             [string]$thread.contextState -ceq 'current' -and
             [string]$thread.sourceCommit -ceq
                 [string]$Contract.Request.SourceCommit
-        $classification = if ($trusted -and
-            [string]$comment.body -ceq $body) {
+        $legacyBody = Format-NamedAreEqualComment -Contract $Contract `
+            -Finding $finding -MarkerKey $marker -Legacy
+        $classification = if ($trusted -and (
+            [string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq $legacyBody)) {
             'noOp'
         }
         else { 'unknown' }
@@ -2066,7 +2221,10 @@ function Resolve-OwnerV2DiscussionReconciliation {
             $classification = 'unknown'
             $reason = 'reviewer-marker-thread-status-unknown'
         }
-        elseif ([string]$comment.body -ceq $body) {
+        elseif ([string]$comment.body -ceq $body -or
+            [string]$comment.body -ceq (
+                Format-OwnerV1WriterComment -Contract $Contract `
+                    -Finding $finding -MarkerKey $markerKey -Legacy)) {
             $classification = 'noOp'
             $reason = 'reviewer-marker-body-current'
         }

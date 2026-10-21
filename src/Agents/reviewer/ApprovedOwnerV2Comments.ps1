@@ -609,6 +609,11 @@ function Read-ApprovedOwnerV2Evidence {
             'notAttempted'
         } else { 'attempted' })
     $contract = New-ApprovedOwnerV2Contract -Declaration $declaration
+    $contract | Add-Member -NotePropertyName CommentPresentation `
+        -NotePropertyValue ([ordered]@{
+            subjectProvider = $toolkitConfig.subjectProvider
+            ruleReferences = $toolkitConfig['commentRuleReferences']
+        })
     foreach ($entry in ([ordered]@{
             bindingId = $contract.Binding.BindingId
             subjectKey = $contract.Binding.SubjectKey

@@ -375,7 +375,22 @@ Describe 'Owner v2 semantic capability' {
         $actual.Marker | Should -BeExactly (
             '9642698498d4e90b0a84cf948cb521f68cae5a8f84718821fda7f722a7a6233c'
         )
-        $actual.Body | Should -BeExactly $expectedBody
+        $expectedCurrentBody = @"
+**Add an Owner attribute to this changed test method**
+
+**Rule:** Changed MSTest methods require an Owner attribute.
+
+Changed MSTest method ``NeedsOwner`` has no ``Owner`` attribute. Add ``[Owner("<owner-alias>")]`` to this test method.
+
+**Changed-line occurrences:**
+- ``/src/WidgetTests.cs:7``
+
+<!-- devpilot-owner-comment:v1:$($actual.Marker) -->
+"@
+        $actual.Body | Should -BeExactly $expectedCurrentBody.Replace("`r`n", "`n")
+        (Format-OwnerV1WriterComment -Contract $contract `
+            -Finding $finding -MarkerKey $actual.Marker -Legacy) |
+            Should -BeExactly $expectedBody
     }
 
     It 'assesses only changed MSTest methods and keeps classes advisory and unknown' {
@@ -712,6 +727,15 @@ Describe 'Owner v2 semantic capability' {
                     Reason = 'reviewer-marker-body-stale'
                 },
                 [ordered]@{
+                    Name = 'unchanged canonical legacy body'
+                    Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
+                            -Finding $finding -Body (Format-OwnerV1WriterComment `
+                                -Contract $base.Contract -Finding $finding `
+                                -MarkerKey $writer.Marker -Legacy))
+                    Classification = 'noOp'
+                    Reason = 'reviewer-marker-body-current'
+                },
+                [ordered]@{
                     Name = 'unrelated human comment'
                     Threads = @(New-TestOwnerDiscussionThread -Contract $base.Contract `
                             -Finding $finding -Body 'please consider this' -ReviewerOwned $false)
@@ -1033,7 +1057,7 @@ Describe 'Owner capability module surface' {
             -MarkerKey $marker
 
         $marker | Should -Match '^[0-9a-f]{64}$'
-        $body | Should -Match 'secret-redaction'
+        $body | Should -Match '\*\*Redact secrets on every response path, including cold-cache paths\*\*'
         $body | Should -Match 'CreateResponse'
         $body | Should -Not -Match 'password|api.?key|token='
         $body | Should -Match (
@@ -1132,5 +1156,76 @@ Describe 'Owner capability module surface' {
         $body | Should -Match 'PR-wide'
         $body | Should -Match 'Problem, Solution, Validation'
         $body | Should -Not -Match 'Changed code:'
+    }
+
+    It 'renders verified descriptive rule links and rejects unpinned or foreign-scope presentation' {
+        $references = (Get-Content -LiteralPath (
+            Join-Path $PSScriptRoot '..\samples\contextual-conventions-current-pr.config.json'
+        ) -Raw | ConvertFrom-Json -AsHashtable).commentRuleReferences
+        $contract = [pscustomobject]@{
+            Request = [pscustomobject]@{
+                CapabilityId = 'bpm-contextual-conventions@1'
+                RuleSection = 'bpm-contextual-conventions@1'
+                RepositoryId = 'repo'
+                ProjectId = 'project'
+                PullRequestId = 42
+                SourceCommit = 'a' * 40
+                RuleHash = 'v1:sha256:' + ('b' * 64)
+            }
+            CommentPresentation = @{
+                subjectProvider = @{
+                    organization = 'https://dev.azure.com/example-org'
+                    projectId = 'project'
+                    repositoryId = 'repo'
+                }
+                ruleReferences = $references
+            }
+        }
+        $finding = [ordered]@{
+            disposition = 'violation'
+            ruleId = 'named-call-arguments'
+            constructRef = 'construct:' + ('d' * 64)
+            evidence = 'Name the required call arguments without changing their order or values.'
+            anchor = @{ path = 'src/Request.cs'; line = 93; symbol = 'C.Run' }
+        }
+        $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+        $links = $references['named-call-arguments'].links
+        @($links.name) | Should -Be @(
+            'Name same-type parameters',
+            'Name parameters for multi-line method call',
+            'Name constant parameters')
+        foreach ($index in 0..2) {
+            $links[$index].url | Should -Match (
+                '\?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=' +
+                '/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=' +
+                @(547, 590, 617)[$index] + '$')
+        }
+        $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+        $ruleLinks = @($links | ForEach-Object { "[$($_.name)]($($_.url))" }) -join '; '
+        $expectedBody = @"
+**Name arguments required by each documented call-site trigger**
+
+**EngHub rules:** $ruleLinks.
+
+Name the required call arguments without changing their order or values.
+
+Changed construct: ``C.Run``.
+
+**Changed-line occurrences:**
+- [src/Request.cs:93](https://dev.azure.com/example-org/project/_git/repo?version=GCaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&path=%2Fsrc%2FRequest.cs&line=93)
+
+<!-- devpilot-contextual-convention:v1:$marker -->
+"@
+        $body | Should -BeExactly $expectedBody.Replace("`r`n", "`n")
+        $body | Should -Not -Match 'Rule bundle:|SHA-256|Dobby|Discovery:|Cross-check:'
+        $contract.CommentPresentation.subjectProvider.repositoryId = 'foreign'
+        { Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker } |
+            Should -Throw '*bound subject repository*'
+        (Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding) |
+            Should -BeExactly $marker
+        $contract.CommentPresentation.subjectProvider.repositoryId = 'repo'
+        $links[0].url = $links[0].url -replace 'version=GC[0-9a-f]{40}', 'version=GBmaster'
+        { Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker } |
+            Should -Throw '*exact source commit*'
     }
 }

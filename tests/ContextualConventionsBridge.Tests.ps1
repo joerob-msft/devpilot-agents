@@ -828,6 +828,42 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'preserves configured citations through acquisition, completed refresh, and approved reconstruction' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $config['commentRuleReferences'] = (
+            Get-Content -LiteralPath (
+                Join-Path $repoRoot 'samples\contextual-conventions-current-pr.config.json') -Raw |
+                ConvertFrom-Json -AsHashtable).commentRuleReferences
+        $configPath = Join-Path $TestDrive 'presentation-config.json'
+        [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 64))
+        $bodies = @(
+            foreach ($attempt in 1..2) {
+                $prepared = New-ContextualPreparedIntake
+                $result = Invoke-SyntheticContextualBridge -Config $config `
+                    -Prepared $prepared -Name presentation-roundtrip
+                @($result.records) | Should -HaveCount 1 -Because (
+                    $result | ConvertTo-Json -Depth 16 -Compress)
+                $evidence = Read-ApprovedOwnerV2Evidence `
+                    -StateRoot (Join-Path $TestDrive 'presentation-roundtrip-state') `
+                    -Identity $result.records[0].identity -RepoRoot $repoRoot `
+                    -ToolkitConfigPath $configPath -Delivery contextual-conventions
+                $finding = @($evidence.Observation.findings |
+                    Where-Object { $_.ruleId -ceq 'exception-logging' })[0]
+                $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+                    -Finding $finding -Delivery contextual-conventions
+                $proposal.body | Should -Match '\*\*EngHub rules:\*\* \[Log at Source or Sink\]'
+                $proposal.body | Should -Match (
+                    'version=GC' + $prepared.Head.sourceCommit + '&path=%2Fsrc%2FChecks.cs&line=1')
+                $proposal.bodySha256 | Should -BeExactly (
+                    Get-ApprovedOwnerV2TextSha256 $proposal.body)
+                $proposal.body
+            }
+        )
+        $bodies | Should -HaveCount 2
+        $bodies[0] | Should -BeExactly $bodies[1]
+    }
+
     It 'requires the contextual shared acquisition template authority switch to be literal true' {
         foreach ($value in @(
                 $false,
@@ -947,6 +983,55 @@ Describe 'Contextual convention current PR bridge' {
             Should -Be 1
         $result.effects.dedupe.unknown |
             Should -Be 0
+    }
+
+    It 'recognizes a signed historical body at the unchanged current marker without rewriting it' {
+        foreach ($variant in @('authentic', 'edited', 'duplicate', 'unsigned')) {
+            $case = New-ContextualUpgradeRecognitionCase
+            $finding = $case.Observation.findings[0]
+            $marker = Get-ContextualConventionMarkerKey -Contract $case.Contract -Finding $finding
+            $body = @(
+                '**explicit-string-comparison**'
+                ''
+                'Use explicit StringComparison semantics.'
+                ''
+                'Changed code: `FilterByTag` at `/src/Checks.cs`:32.'
+                ''
+                "Rule bundle: ``/$($case.Contract.Request.RulePath)`` at ``$($case.Contract.Request.RuleCommit)`` (SHA-256 ``$($case.Contract.Request.RuleHash.Substring(10))``)."
+                ''
+                "<!-- devpilot-contextual-convention:v1:$marker -->"
+            ) -join "`n"
+            $case.Proof.selection.marker = $marker
+            $case.Proof.selection.body = $body
+            $case.Proof.selection.bodySha256 =
+                (Get-ContextualTestTextDigest $body).Substring(10)
+            $case.Thread.comments[0].body = $body
+            if ($variant -ceq 'edited') { $case.Thread.comments[0].body += "`nEdited." }
+            if ($variant -ceq 'duplicate') {
+                $case.Thread.comments += [ordered]@{
+                    commentId = 102
+                    commentType = 'text'
+                    isDeleted = $false
+                    reviewerOwned = $true
+                    reviewerIdentityState = 'matched'
+                    body = $body
+                }
+            }
+            $proofs = if ($variant -ceq 'unsigned') { @() } else { @($case.Proof) }
+            $result = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $case.Observation -Contract $case.Contract `
+                -Snapshot $case.Snapshot -AuthenticatedPriorComments $proofs
+            $result.findings[0].reconciliation.classification |
+                Should -BeExactly $(if ($variant -ceq 'authentic') { 'noOp' } else { 'unknown' })
+            $result.effects.dedupe.wouldCreate | Should -Be 0
+            $result.effects.dedupe.wouldUpdate | Should -Be 0
+            $result.effects.providerWrites | Should -Be 0
+            if ($variant -ceq 'authentic') {
+                $result.findings[0].reconciliation.reason |
+                    Should -BeExactly authenticated-prior-reviewer-comment
+                $case.Thread.comments[0].body | Should -BeExactly $body
+            }
+        }
     }
 
     It 'supports exact multiple prior bundles without carrying changed rule meaning' {

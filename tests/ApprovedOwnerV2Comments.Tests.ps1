@@ -1370,7 +1370,7 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -BeTrue
     }
 
-    It 'exports the exact V1-compatible marker, body, anchor, and body digest' {
+    It 'exports the unchanged V1 marker and anchor with the exact current body digest' {
         $evidence = New-TestOwnerV2Evidence
         $package = New-ApprovedOwnerV2ReviewPackage -Evidence $evidence
 
@@ -1378,7 +1378,7 @@ Describe 'Approved Owner v2 review and approval packages' {
         $proposal = $package.proposals[0]
         $proposal.markerComment | Should -BeExactly (
             "<!-- devpilot-owner-comment:v1:$($proposal.marker) -->")
-        $proposal.body | Should -Match '\*\*Owner attribute missing\*\*'
+        $proposal.body | Should -Match '\*\*Add an Owner attribute to this changed test method\*\*'
         $proposal.path | Should -BeExactly 'tests/WidgetTests.cs'
         $proposal.line | Should -Be 12
         (Get-ApprovedOwnerV2TextSha256 $proposal.body) |
