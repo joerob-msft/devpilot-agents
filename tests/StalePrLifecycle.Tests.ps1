@@ -1279,12 +1279,16 @@ Describe 'Stale lifecycle acquisition ordering' {
             ConvertTo-Json -Depth 64 |
             ConvertFrom-Json -AsHashtable -Depth 64
         $calls = [Collections.Generic.List[string]]::new()
-        $rows = @([ordered]@{
-                pullRequestId = 1
-                status = 'active'
-                isDraft = $false
-                targetRef = 'refs/heads/master'
-                creationUtc = '2023-01-01T00:00:00Z'
+        $rows = @(
+            1..2 | ForEach-Object {
+                [ordered]@{
+                    pullRequestId = $_
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc =
+                        '2023-01-01T00:00:00Z'
+                }
             })
         $provider = {
             param($Operation, $Request)
@@ -1312,13 +1316,13 @@ Describe 'Stale lifecycle acquisition ordering' {
         }.GetNewClosure()
         $lifecycle = {
             param($Inventory)
-            return [ordered]@{
+            return [pscustomobject][ordered]@{
                 schemaVersion = 1
                 kind = 'stale-pr-lifecycle-v1-run'
                 health = 'healthy'
-                providerWrites = 0
+                providerWrites = 1
                 modelWrites = 0
-                confirmedAbandonedIds = @()
+                confirmedAbandonedIds = @(2)
                 reviewEligibleIds = @(1)
                 nextPullRequestId = 999
                 decisions = @()
@@ -1338,8 +1342,17 @@ Describe 'Stale lifecycle acquisition ordering' {
             Should -BeExactly 'lifecycle-phase-failed'
         $result.lifecycle.diagnostic |
             Should -BeExactly 'lifecycle-cursor-invalid'
+        $result.lifecycle.providerWrites |
+            Should -Be 1
+        $result.lifecycle.confirmedAbandonedIds |
+            Should -Be @(2)
+        $result.lifecycle.unknownPossibleEffect |
+            Should -BeFalse
         $result.heads[0].reasonCode |
             Should -BeExactly 'lifecycle-activity-unverified'
+        @($result.heads | Where-Object {
+                [long]$_.pullRequestId -eq 2
+            }) | Should -HaveCount 0
         @($calls | Where-Object {
                 $_ -like 'Head:*'
             }) | Should -HaveCount 0

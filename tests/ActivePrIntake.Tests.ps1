@@ -2170,6 +2170,90 @@ $httpGet = {
         $first.lifecycle.nextPullRequestId | Should -Be 3
         $second.lifecycle.nextPullRequestId | Should -Be 1
     }
+    It 'accepts dictionary and PSCustomObject lifecycle cursors for <Name>' `
+        -TestCases @(
+            @{
+                Name = 'dictionary-int'
+                Shape = 'dictionary'
+                Cursor = [int]3
+                Expected = 3
+            }
+            @{
+                Name = 'pscustom-long'
+                Shape = 'pscustom'
+                Cursor = [long]3
+                Expected = 3
+            }
+            @{
+                Name = 'pscustom-null'
+                Shape = 'pscustom'
+                Cursor = $null
+                Expected = $null
+            }
+            @{
+                Name = 'pscustom-end'
+                Shape = 'pscustom'
+                Cursor = [long]4
+                Expected = 4
+            }
+            @{
+                Name = 'dictionary-wrap'
+                Shape = 'dictionary'
+                Cursor = [int]1
+                Expected = 1
+            }
+        ) {
+        param($Name, $Shape, $Cursor, $Expected)
+        $c = New-IntakeCase -Count 4 -MaxHeads 3
+        $lifecycle = {
+            param($Inventory)
+            $value = [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-lifecycle-v1-run'
+                runId = 'fixture'
+                cutoffUtc =
+                    '2025-10-21T00:00:00.0000000Z'
+                health = 'healthy'
+                providerWrites = 1
+                modelWrites = 0
+                confirmedAbandonedIds = @(4)
+                reviewEligibleIds = @(1, 2, 3)
+                nextPullRequestId = $Cursor
+                decisions = @()
+                events = @()
+            }
+            if ($Shape -ceq 'pscustom') {
+                return [pscustomobject]$value
+            }
+            return $value
+        }.GetNewClosure()
+
+        $result = Invoke-ActivePrIntake `
+            -Config $c.config -Provider $c.provider `
+            -StateRoot $c.root -RepositoryRoot $repo `
+            -LifecycleEvaluator $lifecycle `
+            -IncludeTransientSnapshots -Run
+
+        $result.lifecycle.kind |
+            Should -BeExactly 'stale-pr-lifecycle-v1-run'
+        $result.lifecycle.providerWrites | Should -Be 1
+        $result.lifecycle.confirmedAbandonedIds |
+            Should -Be @(4)
+        if ($null -eq $Expected) {
+            $result.lifecycle.nextPullRequestId |
+                Should -BeNullOrEmpty
+        }
+        else {
+            [long]$result.lifecycle.nextPullRequestId |
+                Should -Be ([long]$Expected)
+        }
+        @($result.transientSnapshots.Keys |
+            ForEach-Object { [int]$_ } |
+            Sort-Object) | Should -Be @(1, 2, 3)
+        @($c.state.calls | Where-Object {
+                $_ -ceq 'Head:4'
+            }) | Should -HaveCount 0
+    }
     It 'preserves lifecycle and acquisition progress across fresh processes' {
         $root = Join-Path $env:USERPROFILE (
             '.copilot\intake-fresh-lifecycle-' +
@@ -2202,6 +2286,52 @@ $httpGet = {
         $second.lifecycleNextPullRequestId | Should -Be 1
         $second.providerWrites | Should -Be 0
         $second.modelWrites | Should -Be 0
+    }
+    It 'accepts the native lifecycle PSCustomObject in a fresh process' {
+        $root = Join-Path $env:USERPROFILE (
+            '.copilot\intake-native-lifecycle-' +
+            [guid]::NewGuid().ToString('N'))
+        $stateRoot = Join-Path $root 'state'
+        $lifecycleRoot = Join-Path $root 'lifecycle'
+        [void]$script:roots.Add($root)
+        $fixture = Join-Path $PSScriptRoot `
+            'fixtures\Invoke-NativeLifecycleActivePrFreshProcess.ps1'
+        $pwsh = (Get-Command pwsh -CommandType Application |
+            Select-Object -First 1).Source
+        $output = @(& $pwsh -NoProfile -NonInteractive `
+                -File $fixture -RepoRoot $repo `
+                -StateRoot $stateRoot `
+                -LifecycleRoot $lifecycleRoot 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($output -join "`n")
+        $result = ($output -join "`n") |
+            ConvertFrom-Json -AsHashtable -Depth 32
+
+        $result.nativeResultType |
+            Should -BeExactly 'System.Management.Automation.PSCustomObject'
+        $result.nativeNextCursorType |
+            Should -BeExactly 'System.Int64'
+        $result.nativeNextPullRequestId |
+            Should -Be 303
+        $result.nativeReviewEligibleCount |
+            Should -Be 302
+        $result.nativeProviderWrites | Should -Be 1
+        $result.nativeConfirmedAbandonedIds |
+            Should -Be @(303)
+        $result.intakeLifecycleKind |
+            Should -BeExactly 'stale-pr-lifecycle-v1-run'
+        $result.intakeLifecycleDiagnostic |
+            Should -BeNullOrEmpty
+        $result.intakeProviderWrites |
+            Should -Be 1
+        $result.intakeConfirmedAbandonedIds |
+            Should -Be @(303)
+        $result.selectedPullRequestIds |
+            Should -Be @(1, 2, 3, 4)
+        $result.fixtureStatusWrites | Should -Be 1
+        $result.fixtureEvidenceReads | Should -Be 2
+        $result.externalWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
     }
     It 'marks changed or inaccessible heads unknown, never evaluated' {
         $c = New-IntakeCase -Count 3

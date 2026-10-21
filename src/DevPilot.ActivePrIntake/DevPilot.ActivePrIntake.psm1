@@ -1609,8 +1609,8 @@ function Invoke-ActivePrIntake {
                         if ($null -ne
                             $lifecycle.nextPullRequestId) {
                             $nextLifecycleValue =
-                                $lifecycle[
-                                    'nextPullRequestId']
+                                $lifecycle.
+                                    nextPullRequestId
                             $nextLifecycleId =
                                 Assert-IntakeNumber `
                                     -Value $nextLifecycleValue `
@@ -1627,7 +1627,35 @@ function Invoke-ActivePrIntake {
                         $envelope.lifecycle = $lifecycle
                     }
                     catch {
-                        $confirmedAbandoned.Clear()
+                        $preserveConfirmedEffects =
+                            $lifecycleValidationStage -cin @(
+                                'review-eligibility',
+                                'next-candidate',
+                                'accepted')
+                        $reportedProviderWrites = 0
+                        $reportedModelWrites = 0
+                        if ($lifecycle -is
+                                [Collections.IDictionary] -or
+                            $lifecycle -is [pscustomobject]) {
+                            $providerWritesValue =
+                                $lifecycle.providerWrites
+                            $modelWritesValue =
+                                $lifecycle.modelWrites
+                            if ($providerWritesValue -isnot
+                                    [bool] -and
+                                [string]$providerWritesValue -cmatch
+                                    '^(0|1|2)$') {
+                                $reportedProviderWrites =
+                                    [int]$providerWritesValue
+                            }
+                            if ($modelWritesValue -isnot [bool] -and
+                                [string]$modelWritesValue -ceq '0') {
+                                $reportedModelWrites = 0
+                            }
+                        }
+                        if (-not $preserveConfirmedEffects) {
+                            $confirmedAbandoned.Clear()
+                        }
                         $lifecycleReviewEligible.Clear()
                         $lifecycleFailureReason =
                             [string]$_.Exception.Message
@@ -1653,9 +1681,16 @@ function Invoke-ActivePrIntake {
                             })
                             diagnosticStage =
                                 $lifecycleValidationStage
-                            providerWrites = 0
-                            modelWrites = 0
-                            confirmedAbandonedIds = @()
+                            providerWrites =
+                                $reportedProviderWrites
+                            modelWrites =
+                                $reportedModelWrites
+                            confirmedAbandonedIds = @(
+                                $confirmedAbandoned |
+                                    Sort-Object)
+                            unknownPossibleEffect =
+                                $reportedProviderWrites -gt
+                                $confirmedAbandoned.Count
                             reviewEligibleIds = @()
                             nextPullRequestId = $null
                             decisions = @()
