@@ -1000,11 +1000,20 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'named-call-arguments')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @(
+                        'pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:651976321ca2745b0f2847418f59c7254dd4a29e75b3c5228300f507a597089a'
+                length = 7078
             }
         }
 
@@ -1021,7 +1030,7 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -Be 2
         @($proofs[0].
                 ruleCompatibility.previousRules) |
-            Should -HaveCount 3
+            Should -HaveCount 4
     }
 
     It 'binds additive history compatibility into the signed contextual policy' {
@@ -1034,8 +1043,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-        $evidence.Declaration.rule.length = 6249
+            'v1:sha256:651976321ca2745b0f2847418f59c7254dd4a29e75b3c5228300f507a597089a'
+        $evidence.Declaration.rule.length = 7078
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1121,6 +1130,52 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -Evidence $evidence `
                 -Policy $policy
         } | Should -Not -Throw
+
+        $priorBindings = @(
+            @{ hash = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'; length = 3706; count = 18 },
+            @{ hash = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'; length = 5205; count = 20 },
+            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 21 },
+            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 22 }
+        )
+        $previousRules = @(foreach ($prior in $priorBindings) {
+            $unchanged = @($script:ApprovedContextualRuleIds | Where-Object {
+                    $_ -cne 'generic-exception-naming' -and
+                    ($prior.count -ge 22 -or $_ -cne 'pr-template-compliance') -and
+                    ($prior.count -ge 21 -or $_ -cne 'named-call-arguments') -and
+                    ($prior.count -ge 20 -or $_ -cnotin @(
+                        'xml-summary-layout', 'duplicate-constant-declarations'))
+                })
+            $unchanged | Should -HaveCount $prior.count
+            [ordered]@{
+                rule = [ordered]@{ hash = $prior.hash; length = $prior.length }
+                unchangedRuleIds = $unchanged
+            }
+        })
+        $fourPrior = [ordered]@{
+            schemaVersion = 2
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRules = $previousRules
+            currentRule = $compatibility.currentRule
+        }
+        $fourPolicy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $evidence -PolicyId contextual-four-prior-policy `
+            -MaxCreatesPerRun 2 -MaxCreatesPerPullRequest 5 `
+            -HistoryCompatibility $fourPrior -CreatedUtc '20261021T000000Z'
+        $key = [byte[]](1..32)
+        $signedPath = Join-Path $TestDrive 'contextual-four-prior-signed.json'
+        [void](Write-AutomaticOwnerV2ServicePolicy `
+            -Path $signedPath -Policy $fourPolicy -Key $key)
+        $readback = Read-ApprovedOwnerV2SignedRecord -Path $signedPath -Key $key
+        (Get-ApprovedOwnerV2Digest $readback.historyCompatibility) |
+            Should -BeExactly (Get-ApprovedOwnerV2Digest $fourPrior)
+        $readback.historyCompatibility.previousRules | Should -HaveCount 4
+        $readback.limits.maxCreatesPerRun | Should -Be 2
+        $readback.limits.maxCreatesPerPullRequest | Should -Be 5
+        $readback.authority.action | Should -BeExactly create
+        $readback.authority.modelAuthorization | Should -BeFalse
+        $readback.authority.updates | Should -BeFalse
+        { Assert-AutomaticOwnerV2ServicePolicy -Evidence $evidence -Policy $readback } |
+            Should -Not -Throw
     }
 
     It 'validates multiple exact prior bundles with rule-specific unchanged sets' {

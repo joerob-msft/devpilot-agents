@@ -32,6 +32,16 @@
       "pullRequestId": 17562908,
       "threadId": 266816420
     },
+    "genericExceptionNaming": {
+      "authorityState": "canonical coding style and user-directed review example",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "headingLine": 1225,
+      "summary": "Name generic exception in catch blocks ex",
+      "pullRequestId": 17431492,
+      "threadId": 267231965
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -147,6 +157,13 @@
       "sourceSection": "Current effective repository pull request template / Problem, Solution, Validation",
       "scope": "pull-request-description",
       "requiredSections": ["Problem", "Solution", "Validation"]
+    },
+    {
+      "id": "generic-exception-naming",
+      "name": "Name proven System.Exception catch variables ex and update their uses",
+      "sourceSection": "Generic exception naming",
+      "scope": "changed-catch-declaration",
+      "specializedExceptions": "No variable naming convention is inferred for specialized exception types."
     }
   ]
 }

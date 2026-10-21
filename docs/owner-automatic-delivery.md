@@ -94,12 +94,44 @@ Changed missing requirements require new proof; they are never blindly
 promoted from history. Contextual automatic delivery remains create-only,
 model-free, and capped at two creates per run and five creates per PR.
 
-When authorizing this additive bundle, retain three exact prior bindings:
+The additive `generic-exception-naming` rule requires `ex` only for a catch
+variable bound by Roslyn to the framework's `System.Exception`. It resolves
+qualified types, aliases, and snapshot-local shadowing; it does not infer a
+specialized exception naming convention or flag nested test helpers. A finding
+is anchored to an actual changed token in the catch declaration, not a changed
+filter/body beneath an old declaration, and asks the author to update all uses.
+The identifier line is preferred when changed; delimiter-only edits do not
+make an unchanged type/identifier eligible. Generated paths, auto-generated
+banners, and generated-attributed ancestors exclude catch findings. Generated
+snapshot files retain their compiled types, imports, and declaration structure
+for binding; only generated executable block interiors are masked with original
+coordinates preserved. Noncompiled `obj` and reference-only paths are ignored.
+Conditional method bodies or unrelated snapshot directives
+do not withhold resolved catches. Changed inactive catches and conditional
+imports/type declarations that can affect binding remain unknown. Inactive catch
+relevance is checked at its catch keyword line, not an unrelated edited line
+elsewhere in the same disabled block.
+No source edits are performed. Missing/ambiguous type binding, conditional
+binding, or malformed syntax is unknown, not compliant or a violation.
+Resolution uses the bounded current-source snapshot and the framework reference,
+not a full repository build; unrelated compilation diagnostics do not veto a
+resolved catch type. A current human naming request must mention the same
+variable and request `ex` at the exact current anchor to suppress a duplicate.
+Unrelated or stale discussion does not establish naming coverage.
+
+When authorizing this additive bundle, retain four exact prior bindings:
 the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
-`-ThirdPreviousRule*` respectively. Never include
-`pr-template-compliance` in a prior bundle's unchanged IDs.
+only its 20 unchanged IDs, the 21-rule bundle with its 21 existing IDs, and
+the prior 22-rule bundle with its 22 existing IDs. Preserve the prior signed
+unchanged-ID sets, including the general named-call semantics distinction:
+do not promote a rule into a bundle that did not accept it. Use `-PreviousRule*`,
+`-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and `-FourthPreviousRule*`
+respectively. Never include `generic-exception-naming` in any prior bundle's
+unchanged IDs; `pr-template-compliance` belongs only to the prior 22-rule set.
+The existing schema-v2 signed compatibility format, create-only authority,
+zero model starts, two total contextual creates per run, five per PR, and four
+heads per scheduled run are unchanged. Adding the rule does not deploy it,
+rewrite installed configuration, authorize a policy, or change scheduled tasks.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
