@@ -1165,6 +1165,40 @@ Describe 'Stale lifecycle provider authority source' {
         $source | Should -Not -Match $placeholderPattern
     }
 
+    It 'does not dispatch HTTP when token acquisition exhausts deadline' {
+        $boundedConfig = $config |
+            ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $boundedConfig.limits.maxSeconds = 3
+        $start = [DateTime]::SpecifyKind(
+            [DateTime]'2026-01-01T00:00:00',
+            [DateTimeKind]::Utc)
+        $clock = [pscustomobject]@{
+            Current = $start
+        }
+        $httpCalls = [ref]0
+        $provider = New-StalePrAzureDevOpsProvider `
+            -Config $boundedConfig `
+            -UtcNowProvider {
+                $clock.Current
+            }.GetNewClosure() `
+            -TokenInvoker {
+                $clock.Current =
+                    $start.AddSeconds(10)
+                @{ accessToken = 't' * 120 }
+            }.GetNewClosure() `
+            -HttpInvoker {
+                param($Request)
+                $httpCalls.Value++
+                throw 'HTTP must not be dispatched.'
+            }.GetNewClosure()
+
+        {
+            & $provider Identity @{}
+        } | Should -Throw '*stale-pr-deadline-exhausted*'
+        $httpCalls.Value | Should -Be 0
+    }
+
     It 'constructs every lifecycle GET URI with one cached token' {
         $requests =
             [Collections.Generic.List[object]]::new()
