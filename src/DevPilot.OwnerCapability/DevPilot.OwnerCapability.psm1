@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+$script:ContextualDigest = 'v1:sha256:e5c08293d234207780f6c50a5050d7afa08f5fbaba6f172cf0ea1f3a3a57fd8f'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+$script:ContextualPolicyDigest = 'v1:sha256:651976321ca2745b0f2847418f59c7254dd4a29e75b3c5228300f507a597089a'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -611,6 +611,25 @@ function Test-ContextualDuplicateConstantHumanCoverage {
         }
     }
     return $false
+}
+
+function Test-ContextualExceptionNamingHumanCoverage {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][string]$Variable
+    )
+    $name = '(?<![A-Za-z0-9_])' +
+        [regex]::Escape($Variable) + '(?![A-Za-z0-9_])'
+    return (
+        $Variable -cmatch '^[A-Za-z_][A-Za-z0-9_]{0,127}$' -and
+        $Body -cmatch $name -and
+        $Body -match '(?i)\b(?:catch|generic|System\.Exception)\b' -and
+        $Body -notmatch '(?i)\b(?:do\s+not|don''t|never)\s+(?:rename|name|use)\b' -and
+        ($Body -match (
+                '(?is)\b(?:rename|name)\b[^\r\n.]{0,256}' +
+                $name + '[^\r\n.]{0,80}\b(?:to|as)\s+[`''"]*ex\b') -or
+            $Body -match (
+                '(?i)\buse\s+[`''"]*ex[`''"]*\s+for\b[^\r\n.]{0,128}\b(?:generic|catch)\b')))
 }
 
 function Resolve-ContextualConventionDiscussionReconciliation {
@@ -1365,6 +1384,15 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             'ambiguous') {
                         $ambiguous = $true
                     }
+                    elseif ([string]$finding.ruleId -ceq
+                            'generic-exception-naming' -and (
+                            [bool]$comment.reviewerOwned -or
+                            -not (
+                                Test-ContextualExceptionNamingHumanCoverage `
+                                    -Body ([string]$comment.body) `
+                                    -Variable ([string]$finding.anchor.symbol)))) {
+                        $crossRule = $true
+                    }
                     elseif (-not $sameAnchor -and
                         [string]$finding.ruleId -ceq
                             'duplicate-constant-declarations' -and
@@ -1413,9 +1441,9 @@ function Resolve-ContextualConventionDiscussionReconciliation {
         }
         if ($matches.Count -eq 1) {
             $entry = $matches[0]
-            $sameBody =
+            $sameBody = (
                 Get-OwnerV1WriterSha256 -Text (
-                    [string]$entry.Comment.body) -ceq
+                    [string]$entry.Comment.body)) -ceq
                     $bodyDigest
             $finding.providerMarker =
                 New-OwnerProviderMarker `
@@ -4127,9 +4155,15 @@ function Invoke-ContextualConventionsCapabilityResponse {
         [void]$assessments.Add([ordered]@{
                 assessmentId = "method:c:$digest"
                 evidenceUnitIds = @('identity', 'rule')
-                state = 'complete'
+                state = $(if ($ruleId -ceq 'generic-exception-naming') {
+                    'unknown'
+                }
+                else { 'complete' })
                 data = [ordered]@{
-                    state = 'advisory'
+                    state = $(if ($ruleId -ceq 'generic-exception-naming') {
+                        'unknown'
+                    }
+                    else { 'advisory' })
                     reason =
                         'contextual-proof-withheld'
                     constructRef = "construct:$digest"

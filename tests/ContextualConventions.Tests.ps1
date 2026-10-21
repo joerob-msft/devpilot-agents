@@ -211,9 +211,9 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention analyzer' {
-    It 'exports the fixed twenty-two-rule allow set' {
+    It 'exports the fixed twenty-three-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 22
+            Should -HaveCount 23
     }
 
     It 'detects a high-confidence <Rule> violation' -TestCases $script:Cases {
@@ -1073,11 +1073,11 @@ internal const string Value = "same";
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 22
+            $outcomes | Should -HaveCount 23
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 21
+                }) | Should -HaveCount 22
         }
     }
 

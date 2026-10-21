@@ -828,6 +828,115 @@ Describe what validations are needed:
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'carries the generic catch rule through acquisition, exact source binding, formatter, and reviewer readback' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            'class C { void M() { try {} catch (System.Exception cleanupScheduleException) when (!cleanupScheduleException.IsFatal()) {} } }')
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name generic-catch
+        $result.state | Should -BeExactly completed
+        $configPath = Join-Path $TestDrive 'generic-catch-config.json'
+        $config | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath $configPath
+        $evidence = Read-ApprovedOwnerV2Evidence `
+            -StateRoot (Join-Path $TestDrive 'generic-catch-state') `
+            -Identity $result.records[0].identity -RepoRoot $repoRoot `
+            -ToolkitConfigPath $configPath -Delivery contextual-conventions
+        $finding = @($evidence.Observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming)[0]
+        $finding.anchor.path | Should -BeExactly src/Checks.cs
+        $finding.anchor.line | Should -Be 1
+        $finding.anchor.symbol | Should -BeExactly cleanupScheduleException
+        $finding.binding.source.representation.path |
+            Should -BeExactly src/Checks.cs
+        $finding.binding.source.representation.startLine | Should -Be 1
+        $finding.binding.source.sha256 | Should -Match '^[0-9a-f]{64}$'
+        $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence `
+            -Finding $finding -Delivery contextual-conventions
+        $proposal.classification | Should -BeExactly wouldCreate
+        $proposal.body | Should -Match 'System\.Exception'
+        $proposal.body | Should -Match 'update its uses'
+        $proposal.body | Should -Match 'generic-exception-naming'
+        $proposal.scope | Should -BeExactly changed-line
+        $readback = New-ContextualUpgradeRecognitionCase
+        $readback.Thread.anchor.path = $finding.anchor.path
+        $readback.Thread.anchor.line = $finding.anchor.line
+        $readback.Thread.comments[0].body = $proposal.body
+        $observation = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $evidence.Observation -Contract $evidence.Contract `
+            -Snapshot $readback.Snapshot
+        $current = @($observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming)[0]
+        $current.reconciliation.classification | Should -BeExactly noOp
+        $current.reconciliation.reason | Should -BeExactly exact-current-comment
+        $observation.effects.providerWrites | Should -Be 0
+        $observation.execution.modelStarts | Should -Be 0
+    }
+
+    It 'requires naming-specific current human coverage for <Mode>' -TestCases @(
+        @{ Mode = 'covered'; Expected = 'humanCovered' }
+        @{ Mode = 'unrelated'; Expected = 'unknown' }
+        @{ Mode = 'wrong-variable'; Expected = 'unknown' }
+        @{ Mode = 'negated'; Expected = 'unknown' }
+        @{ Mode = 'reviewer-unmarked'; Expected = 'unknown' }
+        @{ Mode = 'ambiguous-author'; Expected = 'unknown' }
+        @{ Mode = 'wrong-line'; Expected = 'wouldCreate' }
+        @{ Mode = 'wrong-head'; Expected = 'wouldCreate' }
+        @{ Mode = 'outdated'; Expected = 'wouldCreate' }
+        @{ Mode = 'resolved'; Expected = 'wouldCreate' }
+        @{ Mode = 'deleted'; Expected = 'wouldCreate' }
+        @{ Mode = 'cross-rule-marker'; Expected = 'unknown' }
+    ) {
+        param($Mode, $Expected)
+        $case = New-ContextualUpgradeRecognitionCase
+        $case.Observation.findings[0].ruleId = 'generic-exception-naming'
+        $case.Observation.findings[0].anchor.symbol = 'cleanupScheduleException'
+        $comment = $case.Thread.comments[0]
+        $comment.body = 'Rename the new generic catch variable cleanupScheduleException to ex and update its uses.'
+        $comment.reviewerOwned = $false
+        $comment.reviewerIdentityState = 'foreign'
+        switch ($Mode) {
+            unrelated { $comment.body = 'Log cleanupScheduleException once in this catch.' }
+            wrong-variable { $comment.body = 'Rename the generic catch variable otherException to ex.' }
+            negated { $comment.body = "Do not rename generic catch variable cleanupScheduleException to ex." }
+            reviewer-unmarked {
+                $comment.reviewerOwned = $true
+                $comment.reviewerIdentityState = 'matched'
+            }
+            ambiguous-author { $comment.reviewerIdentityState = 'ambiguous' }
+            wrong-line { $case.Thread.anchor.line++ }
+            wrong-head { $case.Thread.sourceCommit = '0' * 40 }
+            outdated { $case.Thread.isOutdated = $true }
+            resolved { $case.Thread.status = 'fixed' }
+            deleted { $case.Thread.isDeleted = $true }
+            cross-rule-marker {
+                $comment.body += "`n<!-- devpilot-named-areequal:v1:$('9' * 64) -->"
+            }
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract -Snapshot $case.Snapshot
+        $result.findings[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.effects.providerWrites | Should -Be 0
+    }
+
+    It 'does not turn unsupported catch binding into a complete compliant evaluation' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            'class C { void M() { try {} catch (UnknownException other) {} } }')
+        $result = Invoke-SyntheticContextualBridge -Config $config `
+            -Prepared $prepared -Name generic-catch-unknown
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath `
+            -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings |
+            Where-Object ruleId -CEQ generic-exception-naming) | Should -HaveCount 0
+        @($observation.outcomes | Where-Object {
+                $_.ruleId -ceq 'generic-exception-naming' -and $_.state -ceq 'unknown'
+            }) | Should -HaveCount 1
+        $observation.counts.unknown | Should -BeGreaterThan 0
+        $observation.effects.providerWrites | Should -Be 0
+    }
+
     It 'requires the contextual shared acquisition template authority switch to be literal true' {
         foreach ($value in @(
                 $false,
@@ -958,8 +1067,9 @@ Describe 'Contextual convention current PR bridge' {
                 ConvertFrom-Json -AsHashtable `
                     -Depth 32).rules.id |
                     Where-Object {
-                        [string]$_ -cne
-                            'pr-template-compliance'
+                        [string]$_ -cnotin @(
+                            'pr-template-compliance',
+                            'generic-exception-naming')
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -973,7 +1083,10 @@ Describe 'Contextual convention current PR bridge' {
                         length = 3706
                     }
                     unchangedRuleIds = @(
-                        'explicit-string-comparison')
+                        $priorTwentyOne | Where-Object {
+                            $_ -cnotin @('named-call-arguments',
+                                'xml-summary-layout', 'duplicate-constant-declarations')
+                        })
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -982,7 +1095,9 @@ Describe 'Contextual convention current PR bridge' {
                         length = 5205
                     }
                     unchangedRuleIds = @(
-                        'http-client-lifetime')
+                        $priorTwentyOne | Where-Object {
+                            $_ -cne 'named-call-arguments'
+                        })
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -992,13 +1107,28 @@ Describe 'Contextual convention current PR bridge' {
                     }
                     unchangedRuleIds =
                         $priorTwentyOne
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @(
+                        $priorTwentyOne +
+                        'pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    (New-ContextualTestConfig).contextualRule.hash
+                length =
+                    (New-ContextualTestConfig).contextualRule.length
             }
         }
+        @($compatibility.previousRules[0].unchangedRuleIds) | Should -HaveCount 18
+        @($compatibility.previousRules[1].unchangedRuleIds) | Should -HaveCount 20
+        @($compatibility.previousRules[2].unchangedRuleIds) | Should -HaveCount 21
+        @($compatibility.previousRules[3].unchangedRuleIds) | Should -HaveCount 22
         $cases = @(
             [ordered]@{
                 ruleId =
@@ -1039,7 +1169,22 @@ Describe 'Contextual convention current PR bridge' {
                     $compatibility.
                         previousRules[2].rule
                 expected = 'unknown'
+            },
+            [ordered]@{
+                ruleId =
+                    'pr-template-compliance'
+                prior =
+                    $compatibility.
+                        previousRules[3].rule
+                expected = 'noOp'
             })
+        foreach ($entry in $compatibility.previousRules) {
+            $cases += [ordered]@{
+                ruleId = 'generic-exception-naming'
+                prior = $entry.rule
+                expected = 'unknown'
+            }
+        }
         foreach ($control in $cases) {
             $case =
                 New-ContextualUpgradeRecognitionCase
@@ -1111,8 +1256,9 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    $case.Config.contextualRule.hash
+                length =
+                    $case.Config.contextualRule.length
             }
         }
         switch ($Mode) {

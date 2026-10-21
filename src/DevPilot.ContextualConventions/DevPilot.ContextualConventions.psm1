@@ -28,7 +28,8 @@ $script:RuleIds = @(
     'secret-redaction',
     'dependency-fanout',
     'test-class-code-coverage',
-    'pr-template-compliance'
+    'pr-template-compliance',
+    'generic-exception-naming'
 )
 
 function Get-ContextualConventionRuleIds {
@@ -3536,6 +3537,136 @@ function Get-ContextualDuplicateConstantOutcome {
         -Path $Path
 }
 
+function Get-ContextualExceptionNamingOutcomes {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Spans,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $ruleId = 'generic-exception-naming'
+    $catches = @($Root.DescendantNodes() | Where-Object {
+            $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.CatchDeclarationSyntax] -and
+            -not $_.Identifier.IsMissing -and
+            $_.Identifier.ValueText.Length -gt 0 -and
+            (Test-ContextualNodeChanged -Node $_ -Spans $Spans)
+        })
+    if ($catches.Count -eq 0) {
+        if (@($Root.DescendantTrivia(
+                    [Func[Microsoft.CodeAnalysis.SyntaxNode, bool]]$null, $true) | Where-Object {
+                    $_.IsDirective -and
+                    $_.ToString() -match '^#\s*(?:if|elif|else|endif|define|undef)\b'
+                }).Count -gt 0) {
+            return New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason conditional-catch-binding-unproven -Path $Path
+        }
+        return New-ContextualOutcome -RuleId $ruleId -State compliant `
+            -Reason no-applicable-violation -Path $Path
+    }
+    $trees = [Collections.Generic.List[Microsoft.CodeAnalysis.SyntaxTree]]::new()
+    $sourceTree = $Root.GetLocation().SourceTree
+    [void]$trees.Add($sourceTree)
+    $bindingUnknown = $false
+    foreach ($file in $SnapshotFiles) {
+        if (-not ([string]$file.path).EndsWith(
+                '.cs', [StringComparison]::OrdinalIgnoreCase) -or
+            [string]$file.path -ieq $Path) {
+            continue
+        }
+        if ([string]$file.state -cne 'complete' -or
+            $file.content -isnot [string]) {
+            $bindingUnknown = $true
+            continue
+        }
+        [void]$trees.Add(
+            [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+                [string]$file.content))
+    }
+    foreach ($tree in $trees) {
+        if (@($tree.GetRoot().DescendantTrivia(
+                    [Func[Microsoft.CodeAnalysis.SyntaxNode, bool]]$null, $true) | Where-Object {
+                    $_.IsDirective -and
+                    $_.ToString() -match '^#\s*(?:if|elif|else|endif|define|undef)\b'
+                }).Count -gt 0 -or
+            @($tree.GetDiagnostics() | Where-Object {
+                    $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            $bindingUnknown = $true
+        }
+    }
+    $model = $null
+    $systemException = $null
+    if (-not $bindingUnknown) {
+        $references = [Microsoft.CodeAnalysis.MetadataReference[]]@(
+            [Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile(
+                [object].Assembly.Location))
+        $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+            'ContextualExceptionNaming', $trees.ToArray(), $references,
+            [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+                [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary))
+        $systemException = $compilation.GetSpecialType(
+            [Microsoft.CodeAnalysis.SpecialType]::System_Object).
+            ContainingAssembly.GetTypeByMetadataName('System.Exception')
+        $model = $compilation.GetSemanticModel($sourceTree)
+    }
+    foreach ($declaration in $catches) {
+        $changedTokens = @($declaration.DescendantTokens() | Where-Object {
+                Test-ContextualChangedLine `
+                    -Line ($_.GetLocation().GetLineSpan().StartLinePosition.Line + 1) `
+                    -Spans $Spans
+            })
+        if ($changedTokens.Count -eq 0) {
+            continue
+        }
+        $line = [int]$changedTokens[0].GetLocation().
+            GetLineSpan().StartLinePosition.Line + 1
+        $variable = [string]$declaration.Identifier.ValueText
+        $type = if ($null -ne $model) {
+            $model.GetTypeInfo($declaration.Type).Type
+        }
+        else { $null }
+        if ($bindingUnknown -or $null -eq $type -or
+            $null -eq $systemException -or
+            $type.TypeKind -ne [Microsoft.CodeAnalysis.TypeKind]::Class) {
+            New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason generic-exception-type-binding-unproven `
+                -Path $Path -Line $line -EndLine $line -Symbol $variable
+            continue
+        }
+        $generic = [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
+            $type, $systemException)
+        $baseType = $type
+        while ($null -ne $baseType -and
+            -not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals(
+                $baseType, $systemException)) {
+            $baseType = $baseType.BaseType
+        }
+        if ($null -eq $baseType) {
+            New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason catch-exception-base-type-unproven `
+                -Path $Path -Line $line -EndLine $line -Symbol $variable
+            continue
+        }
+        if ($generic -and $variable -cne 'ex') {
+            New-ContextualOutcome -RuleId $ruleId -State violation `
+                -Reason generic-exception-variable-not-ex `
+                -Path $Path -Line $line -EndLine $line -Symbol $variable `
+                -Evidence (
+                    "Name the System.Exception catch variable '$variable' 'ex' " +
+                    'and update its uses, including the filter and catch body. ' +
+                    'This convention does not prescribe names for specialized exceptions.')
+        }
+        else {
+            New-ContextualOutcome -RuleId $ruleId -State compliant `
+                -Reason $(if ($generic) {
+                    'generic-exception-variable-is-ex'
+                }
+                else { 'not-system-exception' }) `
+                -Path $Path -Line $line -EndLine $line -Symbol $variable
+        }
+    }
+}
+
 function Get-ContextualRoslynOutcomes {
     param(
         [Parameter(Mandatory)][string]$Content,
@@ -3565,6 +3696,15 @@ function Get-ContextualRoslynOutcomes {
         Get-ContextualCoverageOutcomes `
             -Root $root -Path $Path -Spans $Spans `
             -SnapshotFiles $SnapshotFiles)
+    $exceptionNamingOutcomes = @(
+        Get-ContextualExceptionNamingOutcomes `
+            -Root $root -Path $Path -Spans $Spans `
+            -SnapshotFiles $SnapshotFiles)
+    if ($exceptionNamingOutcomes.Count -eq 0) {
+        $exceptionNamingOutcomes = @(
+            New-ContextualOutcome -RuleId generic-exception-naming `
+                -State compliant -Reason no-applicable-violation -Path $Path)
+    }
     $xmlSummaryOutcome =
         Get-ContextualXmlSummaryLayoutOutcome `
             -Root $root -Content $Content `
@@ -3643,7 +3783,8 @@ function Get-ContextualRoslynOutcomes {
     }
 
     foreach ($catch in $catches) {
-        if (-not (Test-ContextualNodeChanged `
+        if ($null -eq $catch.Declaration -or
+            -not (Test-ContextualNodeChanged `
                 -Node $catch -Spans $Spans)) {
             continue
         }
@@ -4805,13 +4946,16 @@ function Get-ContextualRoslynOutcomes {
                 -State unknown `
                 -Reason csharp-syntax-incomplete `
                 -Path $Path)
+        $exceptionNamingOutcomes = @(
+            New-ContextualOutcome -RuleId generic-exception-naming `
+                -State unknown -Reason csharp-syntax-incomplete -Path $Path)
     }
     $baseOutcomes = @($script:RuleIds | Where-Object {
-            $_ -cne 'test-class-code-coverage'
+            $_ -cnotin @('test-class-code-coverage', 'generic-exception-naming')
         } | ForEach-Object {
             $results[$_]
         })
-    return @($baseOutcomes + $coverageOutcomes)
+    return @($baseOutcomes + $coverageOutcomes + $exceptionNamingOutcomes)
 }
 
 function Get-ContextualConventionOutcomes {

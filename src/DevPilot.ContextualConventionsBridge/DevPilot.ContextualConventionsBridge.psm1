@@ -14,11 +14,11 @@ Import-Module (Join-Path $PSScriptRoot `
 
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
 $script:ContextualCapabilityDigest =
-    'v1:sha256:c499e05a5ded02b644ac5680907f987662ea20553c9b99d1c40c51eda920c2e5'
+    'v1:sha256:e5c08293d234207780f6c50a5050d7afa08f5fbaba6f172cf0ea1f3a3a57fd8f'
 $script:ContextualPolicyPath =
     'src/DevPilot.OwnerCapability/Policy/contextual-conventions.v1.json'
 $script:ContextualPolicyDigest =
-    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+    'v1:sha256:651976321ca2745b0f2847418f59c7254dd4a29e75b3c5228300f507a597089a'
 $script:ContextualConfigId = 'contextual-conventions-v1-user-approved'
 
 function Get-ContextualBridgeDigest {
@@ -71,14 +71,14 @@ function Assert-ContextualBridgeConfig {
         $policyPath, [Text.UTF8Encoding]::new($false))
     if ((Get-ContextualBridgeTextDigest $policy) -cne
             $script:ContextualPolicyDigest -or
-        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 6249 -or
+        [Text.Encoding]::UTF8.GetByteCount($policy) -ne 7078 -or
         [string]$Config.contextualRule.path -cne
             $script:ContextualPolicyPath -or
         [string]$Config.contextualRule.section -cne
             $script:ContextualCapability -or
         [string]$Config.contextualRule.hash -cne
             $script:ContextualPolicyDigest -or
-        [long]$Config.contextualRule.length -ne 6249 -or
+        [long]$Config.contextualRule.length -ne 7078 -or
         [string]$Config.contextualRule.repositoryId -notmatch
             '^[A-Za-z0-9_.-]{1,256}$' -or
         [string]$Config.toolkit.head -cnotmatch '^[0-9a-f]{40}$' -or
@@ -145,7 +145,7 @@ function New-ContextualBridgeManifestEntry {
         commit = [string]$Config.toolkit.head
         section = $script:ContextualCapability
         hash = $script:ContextualPolicyDigest
-        length = 6249
+        length = 7078
     }
     $capability = [ordered]@{
         id = $script:ContextualCapability
@@ -829,7 +829,7 @@ function Invoke-ContextualConventionsCurrentPrBridge {
                     ruleCommit = [string]$Config.toolkit.head
                     ruleSection = $script:ContextualCapability
                     ruleHash = $script:ContextualPolicyDigest
-                    ruleLength = 6249
+                    ruleLength = 7078
                 }))
             foreach ($change in @($page.changes | Where-Object {
                         [string]$_.changeType -cne 'deleted' -and

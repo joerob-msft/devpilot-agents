@@ -33,7 +33,8 @@ $script:ApprovedContextualRuleIds = @(
     'secret-redaction',
     'dependency-fanout',
     'test-class-code-coverage',
-    'pr-template-compliance'
+    'pr-template-compliance',
+    'generic-exception-naming'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'
