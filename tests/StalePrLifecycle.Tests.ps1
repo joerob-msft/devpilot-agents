@@ -1070,7 +1070,7 @@ Describe 'Stale lifecycle provider authority source' {
 
     It 'launches the actual subprocess with one canonical status body' {
         $fixture = Join-Path $repo `
-            'tests\fixtures\StalePrFakeAzureCli.ps1'
+            'tests\fixtures\StalePrFakeAzureCli.cmd'
         $log = Join-Path $TestDrive `
             'stale-pr-fake-az.json'
         $prior = [Environment]::GetEnvironmentVariable(
@@ -1102,36 +1102,35 @@ Describe 'Stale lifecycle provider authority source' {
         $record = Get-Content $log -Raw |
             ConvertFrom-Json -AsHashtable -Depth 16
         $arguments = @($record.arguments)
-        $arguments[0..1] | Should -Be @(
-            'devops', 'invoke')
-        $arguments | Should -Contain '--area'
-        $arguments[
-            [Array]::IndexOf(
-                [object[]]$arguments,
-                '--area') + 1] |
-            Should -BeExactly git
-        $arguments[
-            [Array]::IndexOf(
-                [object[]]$arguments,
-                '--resource') + 1] |
-            Should -BeExactly pullRequests
-        $arguments | Should -Contain (
-            "project=$($config.projectName)")
-        $arguments | Should -Contain (
-            "repositoryId=$($config.repositoryId)")
-        $arguments | Should -Contain (
-            'pullRequestId=1637334')
-        $arguments[
-            [Array]::IndexOf(
-                [object[]]$arguments,
-                '--http-method') + 1] |
-            Should -BeExactly PATCH
-        $arguments[
-            [Array]::IndexOf(
-                [object[]]$arguments,
-                '--api-version') + 1] |
-            Should -BeExactly '7.1'
-        $arguments | Should -Contain '--in-file'
+        $normalizedArguments = @($arguments)
+        $inputIndex = [Array]::IndexOf(
+            [object[]]$normalizedArguments,
+            '--in-file')
+        $inputIndex | Should -Be 19
+        $normalizedArguments[$inputIndex + 1] =
+            '<temp-path>'
+        $normalizedArguments | Should -Be @(
+            'devops',
+            'invoke',
+            '--organization',
+            [string]$config.organization,
+            '--area',
+            'git',
+            '--resource',
+            'pullRequests',
+            '--route-parameters',
+            "project=$($config.projectName)",
+            "repositoryId=$($config.repositoryId)",
+            'pullRequestId=1637334',
+            '--http-method',
+            'PATCH',
+            '--api-version',
+            '7.1',
+            '-o',
+            'json',
+            '--only-show-errors',
+            '--in-file',
+            '<temp-path>')
         [bool]$record.inputExistsDuringProcess |
             Should -BeTrue
         [int]$record.bodyLength | Should -Be 22
@@ -1151,7 +1150,7 @@ Describe 'Stale lifecycle provider authority source' {
 
     It 'signs only bounded diagnostics for a nonzero CLI exit' {
         $fixture = Join-Path $repo `
-            'tests\fixtures\StalePrFakeAzureCli.ps1'
+            'tests\fixtures\StalePrFakeAzureCli.cmd'
         $log = Join-Path $TestDrive `
             'stale-pr-fake-az-failure.json'
         $priorLog = [Environment]::GetEnvironmentVariable(
