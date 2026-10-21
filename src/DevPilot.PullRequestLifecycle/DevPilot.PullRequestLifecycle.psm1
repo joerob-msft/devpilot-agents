@@ -176,6 +176,46 @@ function Invoke-StalePrTokenProcess {
         [Parameter(Mandatory)][string]$AzureCliPath,
         [Parameter(Mandatory)][DateTime]$DeadlineUtc
     )
+    $stopTree = {
+        param([int]$RootProcessId)
+        $processes = @(Get-CimInstance `
+            -ClassName Win32_Process `
+            -ErrorAction SilentlyContinue)
+        $children = @{}
+        foreach ($item in $processes) {
+            $parent = [int]$item.ParentProcessId
+            if (-not $children.ContainsKey($parent)) {
+                $children[$parent] =
+                    [Collections.Generic.List[int]]::new()
+            }
+            [void]$children[$parent].Add(
+                [int]$item.ProcessId)
+        }
+        $discovered =
+            [Collections.Generic.HashSet[int]]::new()
+        [void]$discovered.Add($RootProcessId)
+        $ordered =
+            [Collections.Generic.List[int]]::new()
+        [void]$ordered.Add($RootProcessId)
+        for ($index = 0;
+            $index -lt $ordered.Count;
+            $index++) {
+            $parentId = $ordered[$index]
+            if ($children.ContainsKey($parentId)) {
+                foreach ($childId in $children[$parentId]) {
+                    if ($discovered.Add($childId)) {
+                        [void]$ordered.Add($childId)
+                    }
+                }
+            }
+        }
+        for ($index = $ordered.Count - 1;
+            $index -ge 0;
+            $index--) {
+            Stop-Process -Id $ordered[$index] -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }.GetNewClosure()
     $arguments = @(
         'account', 'get-access-token',
         '--resource',
@@ -202,34 +242,97 @@ function Invoke-StalePrTokenProcess {
     $process.StartInfo = $start
     $output = [IO.MemoryStream]::new()
     $error = [IO.MemoryStream]::new()
+    $processId = 0
     try {
         if (-not $process.Start()) {
             throw 'stale-pr-token-unavailable'
         }
-        $outputTask =
-            $process.StandardOutput.BaseStream.CopyToAsync($output)
-        $errorTask =
-            $process.StandardError.BaseStream.CopyToAsync($error)
-        while (-not $process.WaitForExit(50)) {
+        $processId = $process.Id
+        $outputBuffer = [byte[]]::new(8192)
+        $errorBuffer = [byte[]]::new(4096)
+        $outputRead =
+            $process.StandardOutput.BaseStream.ReadAsync(
+                $outputBuffer, 0, $outputBuffer.Length)
+        $errorRead =
+            $process.StandardError.BaseStream.ReadAsync(
+                $errorBuffer, 0, $errorBuffer.Length)
+        while ($null -ne $outputRead -or
+            $null -ne $errorRead) {
             if ([DateTime]::UtcNow -ge $DeadlineUtc) {
-                $process.Kill($true)
+                & $stopTree `
+                    -RootProcessId $processId
                 throw 'stale-pr-deadline-exhausted'
             }
-            if ($output.Length -gt 1048576 -or
-                $error.Length -gt 65536) {
-                $process.Kill($true)
-                throw 'stale-pr-token-response-too-large'
+            $pending =
+                [Collections.Generic.List[Threading.Tasks.Task]]::new()
+            if ($null -ne $outputRead) {
+                [void]$pending.Add($outputRead)
+            }
+            if ($null -ne $errorRead) {
+                [void]$pending.Add($errorRead)
+            }
+            $remaining = [int][Math]::Floor(
+                ($DeadlineUtc - [DateTime]::UtcNow).
+                    TotalMilliseconds)
+            if ($remaining -le 0) {
+                & $stopTree `
+                    -RootProcessId $processId
+                throw 'stale-pr-deadline-exhausted'
+            }
+            $next = [Threading.Tasks.Task]::WhenAny(
+                $pending.ToArray())
+            if (-not $next.Wait($remaining)) {
+                & $stopTree `
+                    -RootProcessId $processId
+                throw 'stale-pr-deadline-exhausted'
+            }
+            $completed = $next.GetAwaiter().GetResult()
+            if ([object]::ReferenceEquals(
+                    $completed, $outputRead)) {
+                $count = $outputRead.GetAwaiter().GetResult()
+                if ($count -eq 0) {
+                    $outputRead = $null
+                }
+                else {
+                    if ($output.Length + $count -gt 1048576) {
+                        & $stopTree `
+                            -RootProcessId $processId
+                        throw 'stale-pr-token-response-too-large'
+                    }
+                    $output.Write($outputBuffer, 0, $count)
+                    $outputRead =
+                        $process.StandardOutput.BaseStream.ReadAsync(
+                            $outputBuffer, 0, $outputBuffer.Length)
+                }
+            }
+            else {
+                $count = $errorRead.GetAwaiter().GetResult()
+                if ($count -eq 0) {
+                    $errorRead = $null
+                }
+                else {
+                    if ($error.Length + $count -gt 65536) {
+                        & $stopTree `
+                            -RootProcessId $processId
+                        throw 'stale-pr-token-response-too-large'
+                    }
+                    $error.Write($errorBuffer, 0, $count)
+                    $errorRead =
+                        $process.StandardError.BaseStream.ReadAsync(
+                            $errorBuffer, 0, $errorBuffer.Length)
+                }
             }
         }
-        [Threading.Tasks.Task]::WaitAll(
-            [Threading.Tasks.Task[]]@(
-                $outputTask, $errorTask))
+        $remaining = [int][Math]::Floor(
+            ($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0 -or
+            -not $process.WaitForExit($remaining)) {
+            & $stopTree `
+                -RootProcessId $processId
+            throw 'stale-pr-deadline-exhausted'
+        }
         if ($process.ExitCode -ne 0) {
             throw 'stale-pr-token-unavailable'
-        }
-        if ($output.Length -gt 1048576 -or
-            $error.Length -gt 65536) {
-            throw 'stale-pr-token-response-too-large'
         }
         $text = [Text.UTF8Encoding]::new(
             $false, $true).GetString(
@@ -752,9 +855,11 @@ function New-StalePrAzureDevOpsProvider {
     $canonicalJsonCommand =
         ${function:ConvertTo-ApprovedOwnerV2CanonicalJson}
     $tokenProcessCommand =
-        ${function:Invoke-StalePrTokenProcess}
+        (Get-Command Invoke-StalePrTokenProcess `
+            -CommandType Function).ScriptBlock
     $boundedTokenInvokerCommand =
-        ${function:Invoke-StalePrTokenInvokerBounded}
+        (Get-Command Invoke-StalePrTokenInvokerBounded `
+            -CommandType Function).ScriptBlock
     $organizationUri = [Uri]$organization
     if ($organizationUri.Scheme -cne 'https' -or
         $organizationUri.Host -cne 'dev.azure.com' -or
