@@ -99,8 +99,10 @@ changed-file inventory, including modified existing test files. It implements
 the canonical EngHub CodingStyle.md **Copyright header** section at line 929
 (commit `7cbaf3ef94e3bec3af10875b7c6a2690d111416b`): two dash-separator
 comments around `// Copyright (c) Microsoft Corporation.  All rights reserved.`
-before any code. BOM, LF/CRLF, and horizontal whitespace are supported.
-It does not require a year or annual rollover, inspect unchanged files, or
+before any code. BOM, LF/CRLF, and horizontal whitespace are supported. The
+same notice may include a four-digit year or hyphen-separated year range;
+historical years are accepted without annual rollover.
+The rule does not require a year, inspect unchanged files, or
 claim other languages are implemented. Generated, vendored, deleted, and
 context-only files are excluded; unavailable source or comparison authority
 is unknown, not compliance.

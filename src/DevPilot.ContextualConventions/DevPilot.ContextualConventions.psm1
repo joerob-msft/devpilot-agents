@@ -79,7 +79,7 @@ function Get-ContextualCopyrightHeaderState {
         return 'excluded'
     }
     if ($Content -cmatch
-        '\A\uFEFF?[ \t\r\n]*//[ \t]*-{3,}[ \t]*\r?\n[ \t]*//[ \t]*Copyright[ \t]+\(c\)[ \t]+Microsoft[ \t]+Corporation\.[ \t]+All[ \t]+rights[ \t]+reserved\.[ \t]*\r?\n[ \t]*//[ \t]*-{3,}[ \t]*(?:\r?\n|\z)') {
+        '\A\uFEFF?[ \t\r\n]*//[ \t]*-{3,}[ \t]*\r?\n[ \t]*//[ \t]*Copyright[ \t]+\(c\)[ \t]+(?:[0-9]{4}(?:[ \t]*-[ \t]*[0-9]{4})?[ \t]+)?Microsoft[ \t]+Corporation\.[ \t]+All[ \t]+rights[ \t]+reserved\.[ \t]*\r?\n[ \t]*//[ \t]*-{3,}[ \t]*(?:\r?\n|\z)') {
         return 'present'
     }
     return 'missing'

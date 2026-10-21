@@ -57,9 +57,25 @@ Describe 'Changed C# file copyright headers' {
         $result.fileHeader.origin | Should -BeExactly introduced
     }
 
-    It 'accepts the canonical header without inventing a year' {
-        (Invoke-CopyrightCase -Content "$header`nnamespace Tests { class C {} }").state |
+    It 'accepts the same Microsoft notice with <YearForm> without requiring annual rollover' -TestCases @(
+        @{ YearForm = 'no year'; YearText = '' },
+        @{ YearForm = 'the current year'; YearText = "$([DateTime]::UtcNow.Year) " },
+        @{ YearForm = 'a historical year'; YearText = '2010 ' },
+        @{ YearForm = 'a historical year range'; YearText = '2010-2016 ' },
+        @{ YearForm = 'a horizontally spaced year range'; YearText = "2010 `t- 2016 " }
+    ) {
+        param($YearForm, $YearText)
+        $text = "// ---`n// Copyright (c) ${YearText}Microsoft Corporation. All rights reserved.`n// ---`nnamespace Tests { class C {} }"
+        (Invoke-CopyrightCase -Content $text).state |
             Should -BeExactly compliant
+    }
+
+    It 'classifies removal of a historical dated header as introduced, not pre-existing' {
+        $text = "// ---`n// Copyright (c) 2010-2016 Microsoft Corporation. All rights reserved.`n// ---`nnamespace Tests { class C {} }"
+        $result = Invoke-CopyrightCase -Target $text
+        $result.state | Should -BeExactly violation
+        $result.fileHeader.origin | Should -BeExactly introduced
+        $result.fileHeader.targetHeaderState | Should -BeExactly present
     }
 
     It 'accepts <Newline> with a leading BOM, blank lines and semantic horizontal whitespace' -TestCases @(
@@ -77,7 +93,11 @@ Describe 'Changed C# file copyright headers' {
         @{ Case = 'a string literal'; Text = 'class C { string S = "// Copyright (c) Microsoft Corporation.  All rights reserved."; }' },
         @{ Case = 'a late header'; Text = "namespace Tests {}`n//------------------------------------------------------------`n// Copyright (c) Microsoft Corporation.  All rights reserved.`n//------------------------------------------------------------" },
         @{ Case = 'a block with nonstandard framing'; Text = '/* Copyright (c) Microsoft Corporation. All rights reserved. */ class C {}' },
-        @{ Case = 'a year not in the canonical example'; Text = "// ---`n// Copyright (c) 2026 Microsoft Corporation. All rights reserved.`n// ---`nclass C {}" }
+        @{ Case = 'a malformed year'; Text = "// ---`n// Copyright (c) 20x6 Microsoft Corporation. All rights reserved.`n// ---`nclass C {}" },
+        @{ Case = 'a malformed year range'; Text = "// ---`n// Copyright (c) 2010-20x6 Microsoft Corporation. All rights reserved.`n// ---`nclass C {}" },
+        @{ Case = 'a wrong owner'; Text = "// ---`n// Copyright (c) 2010-2016 Contoso Corporation. All rights reserved.`n// ---`nclass C {}" },
+        @{ Case = 'an incomplete notice'; Text = "// ---`n// Copyright (c) 2010 Microsoft Corporation.`n// ---`nclass C {}" },
+        @{ Case = 'a missing notice'; Text = "// ---`n// All rights reserved.`n// ---`nclass C {}" }
     ) {
         param($Case, $Text)
         (Invoke-CopyrightCase -Content $Text).state | Should -BeExactly violation
