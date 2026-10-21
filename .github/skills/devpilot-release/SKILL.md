@@ -33,11 +33,24 @@ and normal pull-request creation. Publishing requires an explicit request to
 release or publish the version. Resuming an interrupted publication requires
 an explicit request to resume it.
 
-An increasing version-bump merge arms automatic qualification after exact-main
-push CI. Human protected-environment approval remains the publication gate.
+With repository variable `DEVPILOT_AUTOMATIC_RELEASES=true`, an increasing
+version-bump merge arms automatic qualification after exact-main push CI.
+The existing three release environments must already have an administrator-
+authorized main-only, no-required-reviewer policy; do not create replacement
+environments, copy credentials or auto-approve pending jobs. See
+`docs/releases.md` for post-release policy activation and verification.
+Fresh releases reuse fully green push CI for the exact source commit; all
+live, clean-install and immutable-tag smoke checks remain mandatory.
+Resume requalifies the candidate with complete Windows/platform tests.
+New lines require explicit version authorization and their tag rulesets;
+rollback, partial publication and resume still require explicit dispatch.
+Do not activate or merge policy changes during a release.
 Ordinary code merges do not arm a release. For an already-merged version,
 explicit publication authorization permits dispatching **Release Automation**
 from `main`; it passes the bound SHA and successful canary ID internally.
+The opt-in also enables a 15-minute coordinator continuation check for a
+successful automation-started patch canary whose completion handoff was missed.
+It never arms ordinary merges or duplicates an existing release.
 Manual/rollback canaries do not independently authorize automatic publication,
 and interrupted releases are never automatically resumed.
 
@@ -105,7 +118,7 @@ require an explicit stable version without the `v` prefix.
    ```
 
    Verify that newly created coordinator is at `$sha`; follow its dispatched
-   canary and Release runs and their protected human approvals. It must not
+   canary and Release runs and their protected qualification stages. It must not
    reuse failed CI, skip a gate, duplicate a pending run, or resume an existing
    immutable tag. The steps below remain the manual coordination path.
 4. Snapshot existing Release Canary workflow run IDs, then dispatch:

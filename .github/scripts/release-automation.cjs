@@ -1,7 +1,8 @@
 const assert = require("node:assert/strict");
+const releasePolicy = require("./release-policy.cjs");
 
 module.exports = async function coordinateRelease({
-  github, context, core, version, versionChanged, workflowCommit,
+  github, context, core, version, versionChanged, workflowCommit, automaticReleasesEnabled = "",
 }) {
   const { owner, repo } = context.repo;
   const repository = `${owner}/${repo}`;
@@ -9,6 +10,14 @@ module.exports = async function coordinateRelease({
   assert.match(workflowCommit, /^[0-9a-f]{40}$/);
   assert.match(version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
   assert.equal(typeof versionChanged, "boolean");
+  assert.ok(["", "false", "true"].includes(automaticReleasesEnabled),
+    "DEVPILOT_AUTOMATIC_RELEASES must be empty, false or true.");
+  assert.ok(["workflow_run", "workflow_dispatch", "schedule"].includes(context.eventName),
+    "Unsupported automation event.");
+  if (context.eventName !== "workflow_dispatch" && automaticReleasesEnabled !== "true") {
+    core.info("Automatic publication is disabled; explicit manual dispatch is still available.");
+    return "automatic-release-disabled";
+  }
 
   function validateRun(run, path, event) {
     assert.ok(Number.isSafeInteger(run.id) && run.id > 0, "Invalid workflow run ID.");
@@ -53,54 +62,20 @@ module.exports = async function coordinateRelease({
         return "manual-canary";
       }
     }
+  } else if (context.eventName === "schedule") {
+    assert.equal(context.ref, "refs/heads/main", "Scheduled coordination must run on main.");
+    if (!versionChanged) {
+      return "scheduled-release-disabled";
+    }
   } else {
     assert.equal(context.eventName, "workflow_dispatch", "Unsupported automation event.");
     assert.equal(context.ref, "refs/heads/main", "Dispatch automation from main.");
   }
 
-  await requireCurrentMain();
-  const ciRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-    owner, repo, workflow_id: "ci.yml", head_sha: workflowCommit,
-    branch: "main", event: "push", per_page: 100,
-  });
-  const ci = ciRuns.sort((a, b) => b.id - a.id)[0];
-  assert.ok(ci, "No exact-main push CI run exists.");
-  validateRun(ci, ".github/workflows/ci.yml", "push");
-  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-    owner, repo, run_id: ci.id, filter: "latest", per_page: 100,
-  });
-  assert.ok(jobs.length > 0 && jobs.every(job =>
-    job.status === "completed" && job.conclusion === "success"),
-  "CI has incomplete, failed, canceled, or skipped jobs.");
+  await releasePolicy.requireMainQualification(github, { owner, repo }, repository, workflowCommit);
 
   const line = version.split(".").slice(0, 2).join(".");
-  const summaries = await github.paginate(github.rest.repos.getRepoRulesets, {
-    owner, repo, includes_parents: false, per_page: 100,
-  });
-  for (const [name, patterns, types] of [
-    ["release-tag-creation", [`refs/tags/v${line}`, `refs/tags/v${line}.*`], ["creation"]],
-    [`immutable-v${line}-patches`, [`refs/tags/v${line}.*`], ["update", "deletion"]],
-    [`v${line}-channel`, [`refs/tags/v${line}`], ["update", "deletion"]],
-  ]) {
-    const matches = summaries.filter(rule => rule.name === name);
-    assert.equal(matches.length, 1, `Missing or ambiguous protection: ${name}`);
-    const { data: rule } = await github.rest.repos.getRepoRuleset({
-      owner, repo, ruleset_id: matches[0].id, includes_parents: false,
-    });
-    assert.equal(rule.target, "tag");
-    assert.equal(rule.enforcement, "active", `Inactive protection: ${name}`);
-    assert.equal(rule.conditions.ref_name.exclude.length, 0, `Excluded tag protection: ${name}`);
-    assert.ok(patterns.every(pattern => rule.conditions.ref_name.include.includes(pattern)),
-      `Missing version-line pattern: ${name}`);
-    assert.ok(types.every(type => rule.rules.some(entry => entry.type === type)),
-      `Missing tag restriction: ${name}`);
-    // Read tokens may omit bypass actors; environment approvers still verify them.
-    if (rule.bypass_actors) {
-      assert.ok(name.startsWith("immutable-") ? rule.bypass_actors.length === 0 :
-        rule.bypass_actors.every(actor => actor.actor_type === "DeployKey"),
-      `Unexpected bypass actor: ${name}`);
-    }
-  }
+  await releasePolicy.requireTagProtections(github, { owner, repo }, line);
 
   try {
     await github.rest.git.getRef({ owner, repo, ref: `tags/v${version}` });
@@ -133,6 +108,10 @@ module.exports = async function coordinateRelease({
       return "waiting-canary";
     }
     validateRun(canary, ".github/workflows/release-canary.yml", "workflow_dispatch");
+    if (context.eventName !== "workflow_dispatch") {
+      assert.equal(canary.actor.login, "github-actions[bot]",
+        "Automatic publication requires an automation-started canary.");
+    }
     await requireCurrentMain();
     await github.rest.actions.createWorkflowDispatch({
       owner, repo, workflow_id: "release.yml", ref: "main",
@@ -141,7 +120,7 @@ module.exports = async function coordinateRelease({
         canaryRunId: String(canary.id), resumePublishedTag: "false",
       },
     });
-    core.info(`Dispatched protected Release ${version} using canary ${canary.id}.`);
+    core.info(`Dispatched Release ${version} using canary ${canary.id}.`);
     return "release-dispatched";
   }
 

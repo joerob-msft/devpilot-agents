@@ -68,6 +68,12 @@ Immutable annotated patch tags such as `v0.4.0` are qualified first, while the
 protected `v0.4` channel moves only after installed-artifact and mandatory live
 read-only canary gates pass. See [DevPilot Agents releases](docs/releases.md)
 for the trust model, required rulesets, checklist, and rollback procedure.
+Automatic publication is opt-in and uses the existing main-only release
+environments without repeated human deployment approvals. Fresh releases reuse
+green push CI for the exact source commit instead of rerunning it; live canary,
+clean-install and immutable-tag smoke checks remain mandatory. Recovery still
+requires explicit dispatch and complete candidate qualification. See
+[release automation policy](docs/releases.md#approval-free-automation).
 
 ---
 

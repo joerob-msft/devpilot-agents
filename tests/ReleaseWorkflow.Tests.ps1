@@ -52,9 +52,9 @@ Describe 'Release publication boundary' {
     }
 
     It 'keeps publication behind complete deterministic, installed, and live gates' {
-        $release | Should -Match '(?s)publish-immutable:.*needs: \[windows-complete, platform-safety, canary-gate, installed-artifact\]'
-        $release | Should -Match '(?s)immutable-smoke:.*needs: publish-immutable'
-        $release | Should -Match '(?s)promote:.*needs: immutable-smoke'
+        $release | Should -Match '(?s)publish-immutable:.*needs: \[preflight, windows-complete, platform-safety, canary-gate, installed-artifact\]'
+        $release | Should -Match '(?s)immutable-smoke:.*needs: \[preflight, publish-immutable\]'
+        $release | Should -Match '(?s)promote:.*needs: \[preflight, immutable-smoke\]'
         $release | Should -Match 'environment: release-publish'
         $release | Should -Match '(?s)promote:.*permissions:\s+contents: write'
         $release | Should -Not -Match 'ssh-key:'
@@ -108,6 +108,56 @@ Describe 'Release publication boundary' {
         $canary | Should -Match 'AGENCY_VERBOSITY: error'
         $canary | Should -Match '\$env:LOCALAPPDATA = Join-Path \$env:HOME ''localappdata'''
         $release | Should -Match 'Verify mandatory live canary'
+    }
+
+    It 'verifies trusted main policy before accessing the existing fixed environments' {
+        $canary | Should -Match '(?s)approval-policy:.*ref: \$\{\{ github.sha \}\}'
+        $canary | Should -Match '(?s)live-read-only:.*needs: approval-policy'
+        $release | Should -Match 'path: \.release-policy'
+        $release | Should -Match "require\('./\.release-policy/\.github/scripts/release-policy.cjs'\)"
+        $canary | Should -Match '\$env:WORKFLOW_REF -cne ''refs/heads/main'''
+        $release | Should -Match '\$env:WORKFLOW_REF -cne ''refs/heads/main'''
+        foreach ($text in @($canary, $release)) {
+            $text | Should -Not -Match 'inputs\.(approval|environment)|approve.*pending_deployments'
+            $text | Should -Not -Match 'release-patch-|outputs\.(qualification|publish|canary)-environment'
+        }
+        $automation | Should -Match 'cron: "\*/15 \* \* \* \*"'
+        $automation | Should -Match "vars.DEVPILOT_AUTOMATIC_RELEASES == 'true'"
+        $ci | Should -Match 'node --test ./tests/ReleaseAutomation.Tests.cjs ./tests/ReleasePolicy.Tests.cjs'
+        $ciRunner | Should -Match 'tests\\ReleasePolicy.Tests.cjs'
+    }
+
+    It 'reuses only preflight-verified source CI and runs every original qualification step on recovery' {
+        $release | Should -Match 'ci-run-id: \$\{\{ steps.source-ci.outputs.ci-run-id \}\}'
+        $release | Should -Match "policy.ciRunId === null \? '' : String\(policy.ciRunId\)"
+        foreach ($id in @('windows-complete', 'platform-safety')) {
+            $job = [regex]::Match($release,
+                "(?ms)^  ${id}:\r?\n.*?(?=^  [a-z0-9-]+:|\z)").Value
+            $job | Should -Not -BeNullOrEmpty
+            $steps = @([regex]::Matches($job,
+                '(?ms)^      - .*?(?=^      - |\z)') | ForEach-Object Value)
+            $reuse = @($steps | Where-Object { $_ -match 'Reuse verified' })
+            $reuse.Count | Should -Be 1
+            $reuse[0] | Should -Match "if: needs.preflight.outputs.ci-run-id != ''"
+            foreach ($step in @($steps | Where-Object { $_ -notmatch 'Reuse verified' })) {
+                $step | Should -Match "(?m)^        if: needs.preflight.outputs.ci-run-id == ''\r?$"
+            }
+        }
+        $ci | Should -Match 'Invoke-Pester -Path ./tests '
+        foreach ($command in @(
+                'Test-NoEmployerSpecifics.ps1', 'Invoke-ScriptAnalyzer -Path ./src -Recurse',
+                'Test-ModuleManifest', 'Get-DevPilotAgentPath', 'npm test',
+                'npm run test:renderer', 'npm run test:pty', 'Test-Provider.ps1',
+                'Start-ReviewHandlerAgent.ps1 -DryRun', 'Start-ReviewerAgent.ps1 -DryRun'
+            )) {
+            $ci | Should -Match ([regex]::Escape($command))
+        }
+        $platform = $ciRunner.Substring($ciRunner.IndexOf("if (`$Mode -eq 'PlatformSafety')"),
+            $ciRunner.IndexOf("& (Join-Path `$root 'tools\Test-NoEmployerSpecifics.ps1')") -
+            $ciRunner.IndexOf("if (`$Mode -eq 'PlatformSafety')"))
+        foreach ($path in [regex]::Matches($platform, "tests\\[^']+\.Tests\.ps1")) {
+            $ci | Should -Match ([regex]::Escape($path.Value.Replace('\', '/')))
+        }
     }
 
     It 'allows only qualified immutable releases in the target line to receive rollback promotion' {
