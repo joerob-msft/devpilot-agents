@@ -3829,7 +3829,9 @@ function Get-ContextualReusedStringOutcomes {
         if ($peers.Count -le $priorCount) { continue }
         $leader = @($peers | Where-Object Changed | Sort-Object Path, Line, Column -CaseSensitive)[0]
         if ([string]$leader.Path -ine $Path) { continue }
-        $ordered = @($changed | Where-Object Symbol -CEQ $leader.Symbol | Sort-Object Line, Column)
+        $ordered = @($changed | Where-Object {
+            [StringComparer]::Ordinal.Equals([string]$_.Symbol, [string]$leader.Symbol)
+        } | Sort-Object Line, Column)
         if ($peers.Count -gt 1024) {
             $outcomes.Add((New-ContextualOutcome -RuleId $ruleId -State unknown `
                 -Reason reused-string-evidence-cap-exhausted -Path $Path))
@@ -3848,10 +3850,12 @@ function Get-ContextualReusedStringOutcomes {
                 'Use private const string atop the class.'
             }
             $existing = @($constants | Where-Object {
-                $_.Value -ceq $value -and [string]$_.Project.State -ceq 'complete' -and
+                [StringComparer]::Ordinal.Equals([string]$_.Value, $value) -and
+                [string]$_.Project.State -ceq 'complete' -and
                 $projects.Count -eq 1 -and [string]$_.Project.Path -ieq $projects[0] -and
                 [string]$_.Project.Digest -ceq [string]$leader.Project.Digest -and
-                ($_.Shared -or ($types.Count -eq 1 -and $_.Symbol -ceq $leader.Symbol))
+                ($_.Shared -or ($types.Count -eq 1 -and
+                    [StringComparer]::Ordinal.Equals([string]$_.Symbol, [string]$leader.Symbol)))
             })
             $escaped = ConvertTo-Json -InputObject $value -Compress
             $display = if ($escaped.Length -le 64) { $escaped } else { $escaped.Substring(0,61) + '...' }

@@ -377,6 +377,15 @@ class C { string A => "wire"; string B => "wire"; }
         $result[0].evidence | Should -Not -Match 'Declare constants'
     }
 
+    It 'does not reuse a culture-equivalent constant with a different decoded string value' {
+        $file=New-LiteralComparisonFile -Content 'class C { const string Key = "\u00e9"; string X => "e\u0301"; string Y => "e\u0301"; }'
+        $result=@(Get-ContextualConventionOutcomes -Content $file.content -Path $file.path `
+            -Spans $file.spans -SnapshotFiles @($file) |
+            Where-Object { $_.ruleId -ceq 'reused-string-literals' -and $_.state -ceq 'violation' })
+        $result | Should -HaveCount 1
+        $result[0].evidence | Should -Not -Match '^Reuse C.Key'
+    }
+
     It 'exports the fixed twenty-three-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
             Should -HaveCount 23
