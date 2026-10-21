@@ -958,8 +958,9 @@ Describe 'Contextual convention current PR bridge' {
                 ConvertFrom-Json -AsHashtable `
                     -Depth 32).rules.id |
                     Where-Object {
-                        [string]$_ -cne
-                            'pr-template-compliance'
+                        [string]$_ -cnotin @(
+                            'pr-template-compliance',
+                            'block-body-indentation')
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -992,11 +993,20 @@ Describe 'Contextual convention current PR bridge' {
                     }
                     unchangedRuleIds =
                         $priorTwentyOne
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @(
+                        $priorTwentyOne + @('pr-template-compliance'))
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
+                length = 7314
             }
         }
         $cases = @(
@@ -1039,7 +1049,19 @@ Describe 'Contextual convention current PR bridge' {
                     $compatibility.
                         previousRules[2].rule
                 expected = 'unknown'
+            },
+            [ordered]@{
+                ruleId = 'pr-template-compliance'
+                prior = $compatibility.previousRules[3].rule
+                expected = 'noOp'
             })
+        foreach ($entry in $compatibility.previousRules) {
+            $cases += [ordered]@{
+                ruleId = 'block-body-indentation'
+                prior = $entry.rule
+                expected = 'unknown'
+            }
+        }
         foreach ($control in $cases) {
             $case =
                 New-ContextualUpgradeRecognitionCase
@@ -1074,6 +1096,7 @@ Describe 'Contextual convention current PR bridge' {
         @{ Mode = 'malformed-sibling' }
         @{ Mode = 'extra-top-key' }
         @{ Mode = 'unregistered-rule' }
+        @{ Mode = 'new-rule-in-prior-bundle' }
     ) {
         param($Mode)
         $case =
@@ -1111,8 +1134,8 @@ Describe 'Contextual convention current PR bridge' {
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
+                length = 7314
             }
         }
         switch ($Mode) {
@@ -1139,6 +1162,11 @@ Describe 'Contextual convention current PR bridge' {
                 $compatibility.previousRules[1].
                     unchangedRuleIds = @(
                         'not-a-registered-rule')
+            }
+            new-rule-in-prior-bundle {
+                $compatibility.previousRules[1].
+                    unchangedRuleIds = @(
+                        'block-body-indentation')
             }
         }
         $case.Proof['ruleCompatibility'] =
@@ -1347,6 +1375,49 @@ Describe 'Contextual convention current PR bridge' {
             Should -BeExactly unknown
         $result.findingsComplete |
             Should -BeFalse
+    }
+
+    It 'recognizes an indentation request on the proven block brace without changing the statement anchor' {
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'block-body-indentation'
+        $finding['indentationContext'] = [ordered]@{
+            blockStartLine = 31
+            blockEndLine = 40
+            statementLine = 32
+        }
+        $case.Thread.anchor.line = 31
+        $case.Thread.comments[0].body =
+            'Indent the try body one level (four spaces).'
+        $case.Thread.comments[0].reviewerOwned = $false
+        $case.Thread.comments[0].reviewerIdentityState = 'foreign'
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot
+        $result.findings[0].anchor.line | Should -Be 32
+        $result.findings[0].reconciliation.classification |
+            Should -BeExactly humanCovered
+    }
+
+    It 'recognizes the exact current indentation reviewer marker as a no-op' {
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'block-body-indentation'
+        $finding['indentationContext'] = [ordered]@{
+            blockStartLine = 31
+            blockEndLine = 40
+            statementLine = 32
+        }
+        $marker = Get-ContextualConventionMarkerKey `
+            -Contract $case.Contract -Finding $finding
+        $case.Thread.comments[0].body =
+            Format-ContextualConventionComment -Contract $case.Contract `
+                -Finding $finding -MarkerKey $marker
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract `
+            -Snapshot $case.Snapshot
+        $result.findings[0].reconciliation.classification |
+            Should -BeExactly noOp
     }
 
     It 'treats the existing ranged duplicate-constant human review as coverage' {
@@ -1910,6 +1981,163 @@ internal const string Value = "wire-value";
         @($observation.sourceArtifacts.kind) |
             Should -Contain `
                 owner-v2-discussion-snapshot
+    }
+
+    It 'evaluates block indentation through the bridge and suppresses current coverage for <Mode>' -TestCases @(
+        @{ Mode = 'uncovered'; Expected = 'wouldCreate' }
+        @{ Mode = 'human-at-brace'; Expected = 'humanCovered' }
+        @{ Mode = 'unrelated-at-brace'; Expected = 'unknown' }
+        @{ Mode = 'reviewer-at-statement'; Expected = 'noOp' }
+        @{ Mode = 'copied-marker'; Expected = 'unknown' }
+        @{ Mode = 'outdated-human'; Expected = 'wouldCreate' }
+        @{ Mode = 'deleted-human'; Expected = 'wouldCreate' }
+        @{ Mode = 'changed-try-covered'; Expected = 'humanCovered' }
+        @{ Mode = 'reviewer-markerless'; Expected = 'unknown' }
+    ) {
+        param($Mode, $Expected)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $content = @'
+class C
+{
+    void M()
+    {
+        try
+        {
+        Work();
+        }
+        finally { }
+    }
+}
+'@
+        $prepared = New-ContextualPreparedIntake -Content $content
+        $prepared.Intake.transientSnapshots['42'].
+            changes.entries[0].spans[0].startLine = 7
+        $prepared.Intake.transientSnapshots['42'].
+            changes.entries[0].spans[0].endLine = 7
+        if ($Mode -ceq 'changed-try-covered') {
+            $prepared.Intake.transientSnapshots['42'].
+                changes.entries[0].spans[0].startLine = 5
+            $prepared.Intake.transientSnapshots['42'].
+                changes.entries[0].spans[0].endLine = 6
+            $prepared.Intake.transientSnapshots['42'].changes.changedLines = 2
+        }
+        if ($Mode -cin @(
+                'human-at-brace', 'unrelated-at-brace',
+                'outdated-human', 'deleted-human', 'changed-try-covered',
+                'reviewer-markerless')) {
+            $body = if ($Mode -ceq 'unrelated-at-brace') {
+                'Please improve the error handling.'
+            }
+            else {
+                'Indent the new try body one level (four spaces).'
+            }
+            $identity = if ($Mode -ceq 'reviewer-markerless') { 'reviewer' } else { 'human' }
+            Add-SyntheticDiscussion -Prepared $prepared -Config $config `
+                -Body $body -Identity $identity -Path 'src/Checks.cs' -Line 6
+            $thread = $prepared.Intake.transientSnapshots['42'].
+                discussions.threads[0]
+            $thread.threadContext.rightFileEnd.line = 8
+            if ($Mode -ceq 'outdated-human') {
+                $thread.pullRequestThreadContext.iterationContext.
+                    secondComparingIteration = 2
+            }
+            if ($Mode -ceq 'deleted-human') {
+                $thread.isDeleted = $true
+            }
+        }
+        elseif ($Mode -cin @('reviewer-at-statement', 'copied-marker')) {
+            $first = $prepared | ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $comment = Get-SyntheticCurrentPrTemplateComment `
+                -Config $config -Prepared $first -Name "indentation-$Mode-first"
+            $identity = if ($Mode -ceq 'copied-marker') { 'human' } else { 'reviewer' }
+            Add-SyntheticDiscussion -Prepared $prepared -Config $config `
+                -Body $comment.Body -Identity $identity `
+                -Path 'src/Checks.cs' -Line 7
+        }
+        $result = Invoke-SyntheticContextualBridge `
+            -Config $config -Prepared $prepared -Name "indentation-$Mode"
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $observation = Get-Content -LiteralPath (
+            $result.outcomes[0].observationPath) -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings) | Should -HaveCount 1
+        $finding = $observation.findings[0]
+        $finding.ruleId | Should -BeExactly block-body-indentation
+        $anchorLine = if ($Mode -ceq 'changed-try-covered') { 6 } else { 7 }
+        $finding.anchor.line | Should -Be $anchorLine
+        $finding.binding.span.startLine | Should -Be $anchorLine
+        $finding.indentationContext.blockStartLine | Should -Be 6
+        $finding.indentationContext.statementLine | Should -Be 7
+        $finding.reconciliation.classification | Should -BeExactly $Expected -Because (
+            $observation | ConvertTo-Json -Depth 32 -Compress)
+        if ($Mode -ceq 'reviewer-markerless') {
+            $finding.reconciliation.reason |
+                Should -BeExactly unmarked-current-reviewer-comment
+        }
+        $result.state | Should -BeExactly $(if ($Expected -ceq 'unknown') {
+                'partial'
+            } else { 'completed' })
+    }
+
+    It 'refuses indentation evaluation on source or target drift for <Field>' -TestCases @(
+        @{ Field = 'sourceCommit' }
+        @{ Field = 'targetCommit' }
+    ) {
+        param($Field)
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            "class C`n{`n    void M()`n    {`n    Work();`n    }`n}")
+        $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.spans[0].startLine = 5
+        $entry.spans[0].endLine = 5
+        $fieldName = $Field
+        $headProvider = {
+            param($Head)
+            $current = [ordered]@{} + $Head
+            $current[$fieldName] = '9' * 40
+            return $current
+        }.GetNewClosure()
+        $result = Invoke-SyntheticContextualBridge `
+            -Config $config -Prepared $prepared `
+            -Name "indentation-drift-$Field" -HeadProvider $headProvider
+        $result.state | Should -BeExactly partial
+        $result.providerWrites | Should -Be 0
+        @($result.outcomes | Where-Object reason -CEQ post-evaluation-head-refused) |
+            Should -HaveCount 1
+    }
+
+    It 'excludes deleted and generated source evidence from indentation findings' {
+        foreach ($mode in @('deleted', 'generated')) {
+            $config = New-ContextualTestConfig
+            $config.enabled = $true
+            $prepared = New-ContextualPreparedIntake -Content (
+                "class C`n{`n    void M()`n    {`n    Work();`n    }`n}")
+            $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+            $entry.spans[0].startLine = 5
+            $entry.spans[0].endLine = 5
+            if ($mode -ceq 'deleted') {
+                $entry.changeType = 'delete'
+                $entry.spans = @()
+                $entry.content = ''
+                $entry.sourceDigest = 'v1:sha256:' + ('0' * 64)
+                $entry.byteLength = 0
+            }
+            else { $entry.path = 'generated/Checks.cs' }
+            $result = Invoke-SyntheticContextualBridge `
+                -Config $config -Prepared $prepared -Name "indentation-$mode"
+            $result.state | Should -BeExactly completed -Because (
+                $result | ConvertTo-Json -Depth 16 -Compress)
+            $result.providerWrites | Should -Be 0
+            $observation = Get-Content -LiteralPath (
+                $result.outcomes[0].observationPath) -Raw |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            @($observation.findings | Where-Object ruleId -CEQ block-body-indentation) |
+                Should -HaveCount 0
+        }
     }
 
     It 'evaluates one synthetic PR-wide template violation with zero writes' {

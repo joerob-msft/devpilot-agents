@@ -211,6 +211,16 @@
               "enum": ["Problem", "Solution", "Validation"]
             }
           },
+          "indentationContext": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["blockStartLine", "blockEndLine", "statementLine"],
+            "properties": {
+              "blockStartLine": { "type": "integer", "minimum": 1 },
+              "blockEndLine": { "type": "integer", "minimum": 1 },
+              "statementLine": { "type": "integer", "minimum": 1 }
+            }
+          },
           "reconciliation": { "$ref": "#/$defs/discussionReconciliation" },
           "binding": {
             "oneOf": [
@@ -218,7 +228,17 @@
               { "$ref": "#/$defs/findingBinding" }
             ]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["ruleId"],
+              "properties": { "ruleId": { "const": "block-body-indentation" } }
+            },
+            "then": { "required": ["indentationContext"] },
+            "else": { "not": { "required": ["indentationContext"] } }
+          }
+        ]
       }
     },
     "outcomes": { "type": "array",

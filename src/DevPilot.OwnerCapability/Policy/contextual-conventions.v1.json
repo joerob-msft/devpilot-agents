@@ -32,6 +32,16 @@
       "pullRequestId": 17562908,
       "threadId": 266816420
     },
+    "blockBodyIndentation": {
+      "authorityState": "user-directed current EngHub coding style and demonstrated review",
+      "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+      "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
+      "blob": "d2580c45ce5e48c9a6f8a49dc6599c8f6088d835",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "lines": [18, 22, 25],
+      "pullRequestId": 17431492,
+      "threadId": 267231374
+    },
     "acceptanceSnapshotSha256": "a4954f352c34c165a5b4d71d86975e72ece43b569d7bd8723a36e8bb209baf36"
   },
   "rules": [
@@ -147,6 +157,13 @@
       "sourceSection": "Current effective repository pull request template / Problem, Solution, Validation",
       "scope": "pull-request-description",
       "requiredSections": ["Problem", "Solution", "Validation"]
+    },
+    {
+      "id": "block-body-indentation",
+      "name": "Indent direct C# block statements by one four-space increment",
+      "sourceSection": "White space and indentation rules / Indentation",
+      "scope": "changed direct statement starts in syntax-proven blocks, or a changed try header and standalone space-indented opening brace affecting its existing body",
+      "unsupported": "Continuation alignment, embedded unbraced statements, labels, inline block layouts, tab-indented baseline braces, and unproven preprocessor configuration are not guessed."
     }
   ]
 }

@@ -1000,11 +1000,19 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'named-call-arguments')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @('pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
+                length = 7314
             }
         }
 
@@ -1021,7 +1029,7 @@ Describe 'Approved Owner v2 review and approval packages' {
             Should -Be 2
         @($proofs[0].
                 ruleCompatibility.previousRules) |
-            Should -HaveCount 3
+            Should -HaveCount 4
     }
 
     It 'binds additive history compatibility into the signed contextual policy' {
@@ -1034,8 +1042,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-        $evidence.Declaration.rule.length = 6249
+            'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
+        $evidence.Declaration.rule.length = 7314
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1155,11 +1163,19 @@ Describe 'Approved Owner v2 review and approval packages' {
                     }
                     unchangedRuleIds = @(
                         'named-call-arguments')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash =
+                            'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
+                        length = 6249
+                    }
+                    unchangedRuleIds = @('pr-template-compliance')
                 })
             currentRule = [ordered]@{
                 hash =
-                    'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'
-                length = 6249
+                    'v1:sha256:fb7ebb29e72791b592b0ec39017be48512b09e04586b8f8573167aae994de9f0'
+                length = 7314
             }
         }
         $validated =
@@ -1170,9 +1186,25 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
-                    'named-call-arguments')
+                    'named-call-arguments',
+                    'pr-template-compliance',
+                    'block-body-indentation')
         @($validated.previousRules) |
-            Should -HaveCount 3
+            Should -HaveCount 4
+        foreach ($index in 0..3) {
+            $invalid = $compatibility | ConvertTo-Json -Depth 16 |
+                ConvertFrom-Json -AsHashtable -Depth 16
+            $invalid.previousRules[$index].unchangedRuleIds +=
+                'block-body-indentation'
+            {
+                Assert-ApprovedOwnerV2RuleCompatibility `
+                    -Compatibility $invalid -CurrentRule $compatibility.currentRule `
+                    -AllowedRuleIds @(
+                        'explicit-string-comparison', 'http-client-lifetime',
+                        'named-call-arguments', 'pr-template-compliance',
+                        'block-body-indentation')
+            } | Should -Throw '*is invalid*'
+        }
 
         $duplicate = $compatibility |
             ConvertTo-Json -Depth 16 |
@@ -1188,8 +1220,30 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
-                    'named-call-arguments')
+                    'named-call-arguments',
+                    'pr-template-compliance')
         } | Should -Throw '*duplicate or current*'
+    }
+
+    It 'rejects the new indentation rule in a schema-v1 prior bundle unchanged list' {
+        $compatibility = [ordered]@{
+            schemaVersion = 1
+            kind = 'contextual-additive-rule-history-compatibility'
+            previousRule = @{ hash = 'v1:sha256:' + ('a' * 64); length = 6249 }
+            currentRule = @{ hash = 'v1:sha256:' + ('b' * 64); length = 7314 }
+            unchangedRuleIds = @('block-body-indentation')
+        }
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility `
+                -Compatibility $compatibility -CurrentRule $compatibility.currentRule `
+                -AllowedRuleIds @('block-body-indentation')
+        } | Should -Throw '*is invalid*'
+        $command = Get-Command (Join-Path $repoRoot 'tools\Invoke-AutomaticOwnerV2Delivery.ps1')
+        foreach ($parameter in @(
+                'FourthPreviousRuleHash', 'FourthPreviousRuleLength',
+                'FourthUnchangedRuleId')) {
+            $command.Parameters.Keys | Should -Contain $parameter
+        }
     }
 
     It 'refuses prior history signed by a foreign key' {

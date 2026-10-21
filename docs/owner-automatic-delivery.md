@@ -94,12 +94,48 @@ Changed missing requirements require new proof; they are never blindly
 promoted from history. Contextual automatic delivery remains create-only,
 model-free, and capped at two creates per run and five creates per PR.
 
-When authorizing this additive bundle, retain three exact prior bindings:
-the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs. Use `-PreviousRule*`, `-AdditionalPreviousRule*`, and
-`-ThirdPreviousRule*` respectively. Never include
-`pr-template-compliance` in a prior bundle's unchanged IDs.
+The contextual `block-body-indentation` rule implements the demonstrated
+EngHub four-space block-body requirement. Roslyn identifies direct statement
+starts inside C# blocks. A finding anchors to an exactly changed
+statement-start line, or to a changed `try` opening brace when the `try`
+header also changed and its existing body is now under/over-indented.
+The demonstrated PR adds `try`/`{` at lines 105-106 while moving unchanged
+`if` text to line 107: the correct changed anchor is 106, not 107.
+A standalone opening brace with a spaces-only prefix
+establishes the baseline, and the statement must start exactly four spaces
+further right. Tabs in a changed statement prefix, under-indentation, and
+extra increments violate this supported check. Old unmodified indentation is
+not cleanup scope.
+
+This is not a general C# formatter: continuation arguments, fluent chains,
+initializer members, and unbraced embedded bodies are not checked. Literal
+contents, interpolation contents, comments, blank lines, and generated/deleted
+files cannot become statement anchors. Conditional compilation without proven
+configuration, incomplete syntax, labels, inline block layouts, and
+tab-indented baseline braces are explicitly unknown rather than guessed
+compliant. No project language-version or semantic binding is needed to
+measure a syntax-proven block's whitespace.
+
+A current review on the proven opening brace that explicitly requests body
+indentation counts as `humanCovered`, even though the finding remains
+anchored to changed code and binds the measured statement line. Unrelated brace reviews are withheld as
+unknown. Existing exact reviewer markers retain the usual no-op/dedupe
+behavior. The rule uses the existing create-only, model-free delivery path;
+it does not enable or alter live runtime configuration.
+A markerless comment owned by the configured automation actor is not
+relabeled as human coverage: without authentic prior proof or an exact
+current marker, it is unknown and cannot authorize a duplicate create.
+
+When authorizing this additive bundle, retain the exact 18/20/21/22-rule
+bindings, each with its own explicitly unchanged rule-ID set. In particular,
+do not carry named-call semantics from a binding that predates the
+constant-trigger nuance. All 22 immediately prior rule meanings are unchanged
+by this addition. Use
+`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
+`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
+in an 18/20/21-rule binding. `block-body-indentation` is new and is rejected
+in every prior bundle's unchanged-ID list. These proofs are explicit and
+signed per rule; there is no blanket old-bundle compatibility.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a
