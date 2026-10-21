@@ -1226,9 +1226,16 @@ Describe 'Stale lifecycle provider authority source' {
         $prior = [Environment]::GetEnvironmentVariable(
             'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
             [EnvironmentVariableTarget]::Process)
+        $priorMode = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_MODE',
+            [EnvironmentVariableTarget]::Process)
         [Environment]::SetEnvironmentVariable(
             'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
             $pidLog,
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_MODE',
+            'descendant-holds-pipes',
             [EnvironmentVariableTarget]::Process)
         $boundedConfig = $config |
             ConvertTo-Json -Depth 64 |
@@ -1255,6 +1262,10 @@ Describe 'Stale lifecycle provider authority source' {
                 'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
                 $prior,
                 [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_TOKEN_MODE',
+                $priorMode,
+                [EnvironmentVariableTarget]::Process)
         }
 
         $watch.Elapsed.TotalSeconds |
@@ -1275,6 +1286,89 @@ Describe 'Stale lifecycle provider authority source' {
                 -ErrorAction SilentlyContinue |
                 Should -BeNullOrEmpty
         }
+    }
+
+    It 'hard-bounds native token stdout and stderr' `
+        -TestCases @(
+            @{ Mode = 'stdout-overrun' }
+            @{ Mode = 'stderr-overrun' }
+        ) {
+        param($Mode)
+        $sdkRoot = Join-Path $TestDrive "fake-azure-cli-$Mode"
+        $wbin = Join-Path $sdkRoot 'wbin'
+        New-Item -ItemType Directory -Path $wbin `
+            -Force | Out-Null
+        $project = Join-Path $repo `
+            'tests\fixtures\StalePrSlowTokenProcess.csproj'
+        $build = @(& dotnet build $project `
+            -o $sdkRoot -nologo `
+            --verbosity quiet 2>&1)
+        $LASTEXITCODE | Should -Be 0 `
+            -Because ($build -join "`n")
+        $az = Join-Path $wbin 'az.cmd'
+        [IO.File]::WriteAllLines(
+            $az,
+            @(
+                '@IF EXIST "%~dp0\..\python.exe" (',
+                'SET AZ_INSTALLER=MSI',
+                '"%~dp0\..\python.exe" -IBm azure.cli %*',
+                ') ELSE (',
+                'echo Failed to load python executable.',
+                'exit /b 1',
+                ')'
+            ),
+            [Text.ASCIIEncoding]::new())
+        $pidLog = Join-Path $TestDrive "$Mode-pids.txt"
+        $priorLog = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+            [EnvironmentVariableTarget]::Process)
+        $priorMode = [Environment]::GetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_MODE',
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+            $pidLog,
+            [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable(
+            'DEVPILOT_STALE_PR_TOKEN_MODE',
+            $Mode,
+            [EnvironmentVariableTarget]::Process)
+        $httpCalls = [ref]0
+        try {
+            $provider = New-StalePrAzureDevOpsProvider `
+                -Config $config -AzureCliPath $az `
+                -HttpInvoker {
+                    param($Request)
+                    $httpCalls.Value++
+                    throw 'HTTP must not be dispatched.'
+                }.GetNewClosure()
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            {
+                & $provider Identity @{}
+            } | Should -Throw '*stale-pr-token-response-too-large*'
+            $watch.Stop()
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_TOKEN_PID_LOG',
+                $priorLog,
+                [EnvironmentVariableTarget]::Process)
+            [Environment]::SetEnvironmentVariable(
+                'DEVPILOT_STALE_PR_TOKEN_MODE',
+                $priorMode,
+                [EnvironmentVariableTarget]::Process)
+        }
+
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 5
+        $httpCalls.Value | Should -Be 0
+        $pids = @(Get-Content $pidLog |
+            ForEach-Object {
+                [int]($_.Split('=')[1])
+            })
+        $pids | Should -HaveCount 1
+        Get-Process -Id $pids[0] `
+            -ErrorAction SilentlyContinue |
+            Should -BeNullOrEmpty
     }
 
     It 'constructs every lifecycle GET URI with one cached token' {
