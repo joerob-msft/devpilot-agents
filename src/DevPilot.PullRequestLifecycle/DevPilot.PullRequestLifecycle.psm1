@@ -84,6 +84,7 @@ function Get-StalePrWriteDiagnostic {
                 $kind = $candidate
             }
         }
+
         if ($exception.Data.Contains('stalePrHttpStatus')) {
             $candidateStatus = 0
             if ([int]::TryParse(
@@ -111,6 +112,178 @@ function Get-StalePrWriteDiagnostic {
         serverErrorCode = $serverErrorCode
     }
 }
+
+function Get-StalePrAzureCliLaunchPlan {
+    param(
+        [Parameter(Mandatory)][string]$AzureCliPath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $commands = @(Get-Command $AzureCliPath `
+        -CommandType Application -ErrorAction Stop)
+    if ($commands.Count -ne 1) {
+        throw 'stale-pr-token-command-invalid'
+    }
+    $tool = Get-Item -LiteralPath $commands[0].Source -Force
+    if ($tool.Attributes -band
+            [IO.FileAttributes]::ReparsePoint -or
+        $tool.Name -cne 'az.cmd' -or
+        $tool.Length -gt 4096) {
+        throw 'stale-pr-token-command-invalid'
+    }
+    $lines = @(Get-Content -LiteralPath $tool.FullName |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object {
+            $_ -and -not $_.StartsWith('::')
+        })
+    $expected = @(
+        '@IF EXIST "%~dp0\..\python.exe" (',
+        'SET AZ_INSTALLER=MSI',
+        '"%~dp0\..\python.exe" -IBm azure.cli %*',
+        ') ELSE (',
+        'echo Failed to load python executable.',
+        'exit /b 1',
+        ')'
+    )
+    if ($lines.Count -ne $expected.Count) {
+        throw 'stale-pr-token-command-invalid'
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($lines[$index] -cne $expected[$index]) {
+            throw 'stale-pr-token-command-invalid'
+        }
+    }
+    $python = Join-Path (
+        Split-Path -Parent (
+            Split-Path -Parent $tool.FullName)
+    ) 'python.exe'
+    $pythonItem = Get-Item -LiteralPath $python -Force `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $pythonItem -or
+        $pythonItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) {
+        throw 'stale-pr-token-command-invalid'
+    }
+    return [ordered]@{
+        fileName = $pythonItem.FullName
+        argumentList = [string[]]@(
+            '-X', 'utf8', '-I', '-B', '-m', 'azure.cli'
+        ) + $Arguments
+    }
+}
+
+function Invoke-StalePrTokenProcess {
+    param(
+        [Parameter(Mandatory)][string]$AzureCliPath,
+        [Parameter(Mandatory)][DateTime]$DeadlineUtc
+    )
+    $arguments = @(
+        'account', 'get-access-token',
+        '--resource',
+        '499b84ac-1321-427f-aa17-267ca6975798',
+        '--only-show-errors',
+        '-o', 'json'
+    )
+    $plan = Get-StalePrAzureCliLaunchPlan `
+        -AzureCliPath $AzureCliPath `
+        -Arguments $arguments
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = [string]$plan.fileName
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    [void]$start.Environment.Remove('AZURE_DEVOPS_EXT_PAT')
+    [void]$start.Environment.Remove('SYSTEM_ACCESSTOKEN')
+    $start.Environment['AZ_INSTALLER'] = 'MSI'
+    foreach ($argument in $plan.argumentList) {
+        [void]$start.ArgumentList.Add([string]$argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $output = [IO.MemoryStream]::new()
+    $error = [IO.MemoryStream]::new()
+    try {
+        if (-not $process.Start()) {
+            throw 'stale-pr-token-unavailable'
+        }
+        $outputTask =
+            $process.StandardOutput.BaseStream.CopyToAsync($output)
+        $errorTask =
+            $process.StandardError.BaseStream.CopyToAsync($error)
+        while (-not $process.WaitForExit(50)) {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) {
+                $process.Kill($true)
+                throw 'stale-pr-deadline-exhausted'
+            }
+            if ($output.Length -gt 1048576 -or
+                $error.Length -gt 65536) {
+                $process.Kill($true)
+                throw 'stale-pr-token-response-too-large'
+            }
+        }
+        [Threading.Tasks.Task]::WaitAll(
+            [Threading.Tasks.Task[]]@(
+                $outputTask, $errorTask))
+        if ($process.ExitCode -ne 0) {
+            throw 'stale-pr-token-unavailable'
+        }
+        if ($output.Length -gt 1048576 -or
+            $error.Length -gt 65536) {
+            throw 'stale-pr-token-response-too-large'
+        }
+        $text = [Text.UTF8Encoding]::new(
+            $false, $true).GetString(
+                $output.ToArray())
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            throw 'stale-pr-token-unavailable'
+        }
+        return $text |
+            ConvertFrom-Json -AsHashtable -Depth 16
+    }
+    finally {
+        $output.Dispose()
+        $error.Dispose()
+        $process.Dispose()
+    }
+}
+
+function Invoke-StalePrTokenInvokerBounded {
+    param(
+        [Parameter(Mandatory)][scriptblock]$TokenInvoker,
+        [Parameter(Mandatory)][DateTime]$DeadlineUtc,
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+    )
+    $powershell = [PowerShell]::Create()
+    try {
+        $runner = @'
+param($CallbackText, $Deadline, $Timeout)
+$callback = [scriptblock]::Create($CallbackText)
+& $callback $Deadline $Timeout
+'@
+        [void]$powershell.AddScript($runner).
+            AddArgument($TokenInvoker.ToString()).
+            AddArgument($DeadlineUtc).
+            AddArgument($TimeoutMilliseconds)
+        $async = $powershell.BeginInvoke()
+        if (-not $async.AsyncWaitHandle.WaitOne(
+                $TimeoutMilliseconds)) {
+            $powershell.Stop()
+            throw 'stale-pr-deadline-exhausted'
+        }
+        $output = @($powershell.EndInvoke($async))
+        if ($powershell.HadErrors) {
+            throw 'stale-pr-token-unavailable'
+        }
+        if ($output.Count -ne 1) {
+            throw 'stale-pr-token-unavailable'
+        }
+        return $output[0]
+    }
+    finally {
+        $powershell.Dispose()
+    }
+}
+
 
 function Get-StalePrLifecycleConfiguration {
     [CmdletBinding()]
@@ -578,6 +751,10 @@ function New-StalePrAzureDevOpsProvider {
         ${function:Get-StalePrFailureReason}
     $canonicalJsonCommand =
         ${function:ConvertTo-ApprovedOwnerV2CanonicalJson}
+    $tokenProcessCommand =
+        ${function:Invoke-StalePrTokenProcess}
+    $boundedTokenInvokerCommand =
+        ${function:Invoke-StalePrTokenInvokerBounded}
     $organizationUri = [Uri]$organization
     if ($organizationUri.Scheme -cne 'https' -or
         $organizationUri.Host -cne 'dev.azure.com' -or
@@ -590,30 +767,27 @@ function New-StalePrAzureDevOpsProvider {
         AccessToken = ''
     }
     $getAccessToken = {
+        param([DateTime]$DeadlineUtc)
         if (-not [string]::IsNullOrWhiteSpace(
                 [string]$tokenState.AccessToken)) {
             return [string]$tokenState.AccessToken
         }
+        $remainingMilliseconds = [int][Math]::Floor(
+            ($DeadlineUtc - (& $getUtcNow)).
+                TotalMilliseconds)
+        if ($remainingMilliseconds -le 0) {
+            throw 'stale-pr-deadline-exhausted'
+        }
         $response = if ($null -ne $TokenInvoker) {
-            & $TokenInvoker
+            & $boundedTokenInvokerCommand `
+                -TokenInvoker $TokenInvoker `
+                -DeadlineUtc $DeadlineUtc `
+                -TimeoutMilliseconds $remainingMilliseconds
         }
         else {
-            [void][Environment]::SetEnvironmentVariable(
-                'AZURE_DEVOPS_EXT_PAT', $null,
-                [EnvironmentVariableTarget]::Process)
-            [void][Environment]::SetEnvironmentVariable(
-                'SYSTEM_ACCESSTOKEN', $null,
-                [EnvironmentVariableTarget]::Process)
-            $output = @(& $AzureCliPath `
-                account get-access-token `
-                --resource `
-                    499b84ac-1321-427f-aa17-267ca6975798 `
-                --only-show-errors -o json 2>$null)
-            if ($LASTEXITCODE -ne 0) {
-                throw 'stale-pr-token-unavailable'
-            }
-            ($output -join "`n") |
-                ConvertFrom-Json -AsHashtable -Depth 16
+            & $tokenProcessCommand `
+                -AzureCliPath $AzureCliPath `
+                -DeadlineUtc $DeadlineUtc
         }
         $token = if ($response -is
                 [Collections.IDictionary]) {
@@ -653,7 +827,8 @@ function New-StalePrAzureDevOpsProvider {
         if ($Method -ceq 'GET') {
             $Budget.Count++
         }
-        $token = & $getAccessToken
+        $token = & $getAccessToken (
+            [DateTime]$Budget.DeadlineUtc)
         $afterTokenUtc = & $getUtcNow
         if ($afterTokenUtc -ge
             [DateTime]$Budget.DeadlineUtc) {
