@@ -61,7 +61,7 @@
     "includePullRequestTemplateAuthority": true,
     "activePrIntakeSha256": "e23252242ad3a541f4f9e3a2e1dab304bcc227afe21f33e992dd5f1307a2ccb4",
     "contextualBridgeSha256": "5ff7904ad6914104ef21ac522d99a7ff3448a61bf7eff7f4f44058dddada26d7",
-    "toolSha256": "f75fcb483aed8a54eb29f4e6a1bde63cd1661bd22617988640dd37af5b0197cf"
+    "toolSha256": "ed7ed6ff7423a78ae1f2dab4d82db9b2c61486fc988b4215e08de32609942cdf"
   },
   "autoCreateContextualConventionComments": false,
   "stalePullRequestLifecycle": false,

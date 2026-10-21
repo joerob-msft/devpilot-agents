@@ -53,6 +53,13 @@ detail, or readback. Exhaustion before a decision or prewrite defers that PR
 with zero writes and stops the run. Exhaustion after the single PATCH leaves
 the transition ambiguous and never authorizes a retry.
 
+The provider obtains the existing Azure DevOps AAD resource token once in
+memory and uses direct HTTPS for connection identity, every lifecycle GET, the
+single PATCH, and readback. Connection identity requires both authenticated
+and authorized user IDs plus the subject descriptor to match the signed actor.
+The token, headers, raw responses, and arbitrary server text are never written
+to lifecycle audit records.
+
 ## Checked transition
 
 The initial decision is read-only. Immediately before a write, the lifecycle
