@@ -23,7 +23,7 @@ readback + signed intent/outcome/event artifacts
 This repository change does not register or modify a scheduler, deploy a key,
 enable a policy, or post a live comment.
 
-Stale pull request status authority is a separate lifecycle lane described in
+Stale pull request status and bounded abandonment-explanation authority is a separate lifecycle lane described in
 [`stale-pr-lifecycle.md`](stale-pr-lifecycle.md). It does not reuse any Owner,
 Named, or contextual comment key, policy, quota, intent, outcome, or event.
 

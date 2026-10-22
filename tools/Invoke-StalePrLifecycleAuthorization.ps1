@@ -9,7 +9,8 @@ param(
     [Parameter(Mandatory)][string]$DeliveryRoot,
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$PolicyPath,
-    [ValidateRange(1, 2)][int]$MaxAbandonsPerRun = 2,
+    [ValidateRange(1, 1)][int]$MaxAbandonsPerRun = 1,
+    [switch]$EnableAbandonmentExplanation,
     [string]$GitPath = 'git',
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
 )
@@ -44,7 +45,8 @@ try {
     $policy = New-StalePrLifecyclePolicy `
         -Config $config -RepoRoot $RepoRoot `
         -GitPath $GitPath `
-        -MaxAbandonsPerRun $MaxAbandonsPerRun
+        -MaxAbandonsPerRun $MaxAbandonsPerRun `
+        -EnableAbandonmentExplanation:$EnableAbandonmentExplanation
     if ([string]::IsNullOrWhiteSpace($PolicyPath)) {
         $PolicyPath = Join-Path $context.Root `
             'policies\azureux-bpm-stale-pr-lifecycle-v1.json'

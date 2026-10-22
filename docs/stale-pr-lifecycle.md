@@ -74,7 +74,7 @@ large or temporarily unknown PR from pinning all review lanes indefinitely.
 
 The provider obtains the existing Azure DevOps AAD resource token once in
 memory and uses direct HTTPS for connection identity, every lifecycle GET, the
-single PATCH, and readback. Connection identity requires both authenticated
+single PATCH, optional explanation POST, and their readbacks. Connection identity requires both authenticated
 and authorized user IDs plus the subject descriptor to match the signed actor.
 The token, headers, raw responses, and arbitrary server text are never written
 to lifecycle audit records.
@@ -93,7 +93,7 @@ An eligible transition writes exactly this body once:
 ```
 
 It never deletes the source branch and cannot merge, transition work items,
-vote, label, edit PR metadata, create or edit comments, change thread status,
+vote, label, edit PR metadata, edit comments, change thread status,
 or send a notification. A GET readback must confirm `abandoned` before the PR
 ID is excluded from the same-cycle review cohort. Failed or ambiguous
 transitions remain `unknown` and are not excluded.
@@ -104,6 +104,59 @@ reread is therefore a best-effort checked transition, not an atomic compare
 and swap. A change can still occur between the last GET and PATCH. The signed
 event records this limitation, and an ambiguous send is never blindly
 retried.
+
+## Bounded abandonment explanation
+
+A new, explicit `authority.abandonmentExplanation` grant in the **lifecycle**
+policy permits one create-only explanation after this run's single confirmed
+status transition. Without that grant, including under existing status-only
+policies, no explanation is read or posted. Ordinary Owner, Named, and
+contextual comment authority and quotas are unchanged.
+
+The deterministic body says the PR was automatically abandoned because it
+was created more than one year ago and had no counted activity since the
+frozen cutoff. It includes UTC creation, cutoff and latest counted-activity
+timestamps, the counted/excluded activity definition, the frozen evidence
+digest, and `<!-- devpilot-stale-abandonment:v1:<status-intent-id> -->`.
+No mutable title, description, actor name, token, or server response is copied
+into the explanation. Eligibility and evidence remain frozen **before** either
+write. The explanation is a real non-system bot comment and counts as activity
+on subsequent evaluations; it is never exempted from the all-actor clock.
+
+Complete same-PR discussion reads check for that marker before the POST and
+confirm exactly one root text comment with the exact body and authorized
+actor afterward. Conflicting/duplicate markers or incomplete history fail
+closed. A permanent exclusive reservation and signed intent precede the
+attempt. There is at most one explanation attempt per transition and run,
+without increasing the one status-attempt cap, 200-candidate cap, 128-GET
+ceiling, 16 MiB response ceiling, or 240-second shared deadline. Lower
+configured read/time ceilings still apply. Explanation GETs share, rather
+than reset, the lifecycle provider's budget.
+
+Status success followed by comment failure remains a confirmed abandonment,
+with `health = unknown` and separate attempted and unconfirmed action counts.
+There is no rollback, blind POST retry, historical-abandonment backfill, or
+green result inferred from an unknown outcome. An unresolved explanation also
+blocks a later transition on the same PR until exact reconciliation.
+
+`Resolve-StalePrLifecycleExplanation` is read-only against Azure DevOps and
+accepts one exact PR/status-intent identity, the same policy/key, and the
+lifecycle provider. It verifies the signed status transition and explanation
+intent before rereading the exact marker/body/actor. It never posts. Local
+reconciliation events and confirmation receipts are additive and immutable;
+the original uncertain outcome is retained.
+
+Shared acquisition exposes `lifecycleStatusWrites`,
+`lifecycleExplanationWrites`, their `lifecycleUnconfirmed*` counterparts,
+`lifecycleProviderReadCount`, and `lifecycleExplanationReadCount`.
+`providerWrites` and `lifecycleProviderWrites` are the sum of attempted status
+and explanation actions, not the number of abandoned PRs.
+`unknownPossibleEffect` derives from unconfirmed actions, not from total
+writes minus confirmed abandonments. The aggregate `providerReadCount` also
+includes lifecycle GETs; `intakeProviderReadCount` retains the ordinary intake
+component. Both dictionary and native
+`PSCustomObject` results preserve those effects, confirmed exclusions, and
+event streams even if subsequent cursor validation fails.
 
 ## Separate authority and audit
 
@@ -118,7 +171,21 @@ It has a distinct HMAC key, signed policy, intents, outcomes, events, and
 lock namespace. The policy binds the exact actor, project, repository,
 master/non-draft scope, one-calendar-year thresholds, counted and excluded
 activity kinds, implementation digests, `status:abandoned` authority, and a
-maximum of two attempted status writes and 200 old candidates per run.
+maximum of one attempted status write and 200 old candidates per run. The
+optional explanation grant binds the exact template, one attempt per run and
+transition, mandatory exact readback, and no ambiguous POST retry. It does
+not relax `commentsOrThreads = false` for general-purpose comments.
+
+The existing `intents`, `outcomes`, and root `events` remain **status-only**.
+Explanation records use `explanations\intents`, `explanations\outcomes`, and
+`explanations\events`, with kind `stale-pr-abandonment-explanation-v1-*` and
+action `comment:create-after-confirmed-abandonment`. Read-only reconciliation
+events have `operation = reconcile`, `providerWriteCount = 0`, and retain
+`originalAttemptCount` (null if a crash left no original outcome, with an
+explicit `originalAttemptCeiling = 1`). Consumers must not treat them as new abandonments or
+ordinary rule comments with `finding`/`stateIdentity`. Confirmation receipts
+and reconciliation outcomes live under `explanations\confirmations` and
+`explanations\reconciliations`. All use the existing lifecycle key.
 
 Initialize the private key and create a signed policy only after review:
 
@@ -130,7 +197,7 @@ Initialize the private key and create a signed policy only after review:
 .\tools\Invoke-StalePrLifecycleAuthorization.ps1 authorize-policy `
     -DeliveryRoot C:\private\owner-v2-delivery `
     -ConfigPath C:\private\contextual-config.json `
-    -MaxAbandonsPerRun 2
+    -MaxAbandonsPerRun 1 -EnableAbandonmentExplanation
 ```
 
 Then bind the returned policy path and file SHA-256 in external deployment
@@ -148,3 +215,22 @@ configuration:
 ```
 
 Use the literal `false` to disable the phase. A bare `true` is invalid.
+
+## Operator-owned rollout
+
+This feature does not deploy itself. Review and install a clean, exact
+head/tree and the five raw implementation digests bound by the lifecycle
+policy. Reauthorize to a **new** policy file using the existing lifecycle key
+and `-EnableAbandonmentExplanation`; rebind its path/SHA-256 in the existing
+Named shared-acquisition configuration. Old policy files remain immutable.
+Rebind the existing deployment's exact toolkit/provider/runner digests as
+required by its validators; do not copy whole modules into other lineages.
+
+Before enabling, review private scheduler consumers for the disaggregated
+effect fields and additive explanation stream described above. Status-only
+root-ledger readers remain compatible, but operational reports need explicit
+explanation enumeration to report comment outcomes. Verify a normal current-PR
+transition and exact comment readback through the existing scheduled route.
+Synthetic providers and local checks are not evidence of production delivery.
+Never retry previously ambiguous status writes or backfill earlier abandoned
+PRs to obtain rollout evidence.
