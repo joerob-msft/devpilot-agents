@@ -351,7 +351,9 @@ function Get-NamedBridgeChangeDisposition {
     $result =
         Get-DevPilotChangeDerivationDisposition `
             -Entry $Entry -Head $Head
-    if ([bool]$result.knownEmptyIdentical) {
+    if ([bool]$result.knownEmptyIdentical -or
+        ($result.Contains('knownEmptyZeroAddedLines') -and
+            [bool]$result.knownEmptyZeroAddedLines)) {
         return 'known-empty-identical'
     }
     if ([bool]$result.knownEmptyDeletedFile) {
