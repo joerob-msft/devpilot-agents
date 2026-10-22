@@ -1144,6 +1144,18 @@ Describe 'Frozen shared intake zero-added-line proof' `
         $frozen142 = Get-Content -LiteralPath (
             Join-Path $FrozenIntakeRoot 'file-progress\14263755.json') -Raw |
             ConvertFrom-Json -AsHashtable -Depth 100
+        $generation145 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'generations\3dd9346ff38849d580f46abaf825b642.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $generation142 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'generations\7e449875e22b4d269b93856ecee90b1f.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $frozenHeads = @{
+            14598491 = @($generation145.heads |
+                Where-Object pullRequestId -EQ 14598491)[0]
+            14263755 = @($generation142.heads |
+                Where-Object pullRequestId -EQ 14263755)[0]
+        }
     }
 
     It 'revalidates persisted and fresh producer proof for PR <Id> entry <Ordinal>' `
@@ -1155,10 +1167,7 @@ Describe 'Frozen shared intake zero-added-line proof' `
         param($Id, $Ordinal, $Classification)
         $progress = if ($Id -eq 14598491) { $frozen145 } else { $frozen142 }
         $entry = $progress.entries[$Ordinal]
-        $head = [ordered]@{
-            sourceCommit = $entry.derivation.sourceCommit
-            targetCommit = $entry.derivation.targetCommit
-        }
+        $head = $frozenHeads[$Id]
         $before = Get-AgentCanonicalDigest -InputObject $entry
         $fresh = New-TestProducedEntry -Source $entry.content `
             -Target $entry.comparison.content -Path $entry.path -Head $head
@@ -1186,11 +1195,7 @@ Describe 'Frozen shared intake zero-added-line proof' `
     }
 
     It 'retains all four changed-line files and removes both proven zero-line entries in PR14598491' {
-        $entry = $frozen145.entries[1]
-        $head = [ordered]@{
-            sourceCommit = $entry.derivation.sourceCommit
-            targetCommit = $entry.derivation.targetCommit
-        }
+        $head = $frozenHeads[14598491]
         $changes = [ordered]@{
             changedFiles = $frozen145.entries.Count
             changedLines = $frozen145.changedLines
@@ -1227,10 +1232,7 @@ Describe 'Frozen shared intake zero-added-line proof' `
         param($Mutation)
         $entry = $frozen145.entries[1] | ConvertTo-Json -Depth 64 |
             ConvertFrom-Json -AsHashtable -Depth 64
-        $head = [ordered]@{
-            sourceCommit = $entry.derivation.sourceCommit
-            targetCommit = $entry.derivation.targetCommit
-        }
+        $head = $frozenHeads[14598491]
         switch ($Mutation) {
             added-content {
                 $entry = New-TestProducedEntry `
@@ -1259,10 +1261,7 @@ Describe 'Frozen shared intake zero-added-line proof' `
     It 'preserves the real capped entries and the 5000-line ceiling' {
         $entries = @($frozen142.entries[20], $frozen142.entries[21],
             $frozen142.entries[23])
-        $head = [ordered]@{
-            sourceCommit = $entries[0].derivation.sourceCommit
-            targetCommit = $entries[0].derivation.targetCommit
-        }
+        $head = $frozenHeads[14263755]
         $selected = Get-TestSerializedSelection -Entries $entries -Head $head
         $selected.changedFiles | Should -Be 3
         foreach ($entry in $selected.entries) {
