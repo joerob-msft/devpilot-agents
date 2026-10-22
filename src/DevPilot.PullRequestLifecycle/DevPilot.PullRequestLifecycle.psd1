@@ -13,6 +13,7 @@
         'Assert-StalePrLifecyclePolicy'
         'New-StalePrAzureDevOpsProvider'
         'Invoke-StalePrLifecycle'
+        'Resolve-StalePrLifecycleExplanation'
     )
     CmdletsToExport = @()
     VariablesToExport = @()

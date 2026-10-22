@@ -501,6 +501,174 @@ BeforeAll {
         }
         return New-StalePrAzureDevOpsProvider @arguments
     }
+
+    function New-ExplanationCase {
+        param(
+            [string]$Mode = 'confirmed',
+            [int]$MaximumReads = 128,
+            [switch]$StatusOnly,
+            [string]$RecentActivity = ''
+        )
+        $caseConfig = $config | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $caseConfig.subjectProvider.maximumReads = $MaximumReads
+        $policyArguments = @{
+            Config = $caseConfig
+            RepoRoot = $repo
+            AllowDirty = $true
+            MaxAbandonsPerRun = 1
+        }
+        if ((Get-Command New-StalePrLifecyclePolicy).
+            Parameters.ContainsKey('EnableAbandonmentExplanation')) {
+            $policyArguments.EnableAbandonmentExplanation = -not $StatusOnly
+        }
+        $casePolicy = New-StalePrLifecyclePolicy @policyArguments
+        $state = [pscustomobject]@{
+            Status = 'active'
+            StatusWrites = 0
+            Posts = 0
+            ExplanationReads = 0
+            Body = ''
+            Threads = @()
+            Mode = $Mode
+            Clock = [DateTime]::SpecifyKind(
+                [DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
+            Requests = [Collections.Generic.List[object]]::new()
+        }
+        $baseHttp = New-AzLifecycleInvoker `
+            -ActualCommentUtc $RecentActivity
+        $http = {
+            param($Request)
+            $uri = [uri]$Request.Uri
+            $path = $uri.AbsolutePath
+            $method = [string]$Request.Method
+            [void]$state.Requests.Add(@{
+                    method = $method; path = $path
+                })
+            if ($method -ceq 'PATCH') {
+                $state.StatusWrites++
+                if ($state.Mode -ceq 'status-failed') {
+                    throw 'synthetic-status-failure'
+                }
+                if ($state.Mode -cne 'status-unconfirmed') {
+                    $state.Status = 'abandoned'
+                }
+                return @{ status = $state.Status }
+            }
+            if ($method -ceq 'POST') {
+                $state.Posts++
+                $body = [Text.Encoding]::UTF8.GetString(
+                    [byte[]]$Request.Body) |
+                    ConvertFrom-Json -AsHashtable
+                @($body.Keys) | Should -HaveCount 1
+                @($body.comments) | Should -HaveCount 1
+                $body.comments[0].parentCommentId | Should -Be 0
+                $body.comments[0].commentType | Should -Be 1
+                $state.Body = [string]$body.comments[0].content
+                $comment = @{
+                    id = 1; parentCommentId = 0
+                    commentType = 'text'
+                    author = @{ id = $caseConfig.expectedAccount.id }
+                    content = $state.Body
+                    publishedDate = '2026-01-01T00:00:00Z'
+                    lastUpdatedDate = '2026-01-01T00:00:00Z'
+                    lastContentUpdatedDate = '2026-01-01T00:00:00Z'
+                }
+                if ($state.Mode -ceq 'wrong-body') {
+                    $comment.content += ' altered'
+                }
+                if ($state.Mode -ceq 'wrong-author') {
+                    $comment.author.id = '44444444-4444-4444-4444-444444444444'
+                }
+                if ($state.Mode -cnotin @('post-unknown', 'post-rejected')) {
+                    $state.Threads = @(@{ id = 81; comments = @($comment) })
+                }
+                if ($state.Mode -ceq 'duplicate') {
+                    $state.Threads += @{ id = 82; comments = @($comment) }
+                }
+                if ($state.Mode -ceq 'deadline-post') {
+                    $state.Clock = $state.Clock.AddSeconds(241)
+                }
+                if ($state.Mode -cin @('post-unknown', 'post-accepted-error',
+                        'post-rejected')) {
+                    throw 'synthetic-comment-send-failure'
+                }
+                return @{ id = 81 }
+            }
+            $response = & $baseHttp $Request
+            if ($method -ceq 'GET' -and
+                $path -match '/pullrequests/[0-9]+$') {
+                $response.status = $state.Status
+            }
+            if ($method -ceq 'GET' -and
+                $path -match '/pullrequests/[0-9]+/threads$' -and
+                $state.Status -ceq 'active' -and $state.Threads.Count -gt 0) {
+                $response.value = @($response.value) + @($state.Threads)
+                $response.count = @($response.value).Count
+            }
+            if ($method -ceq 'GET' -and
+                $path -match '/pullrequests/[0-9]+/threads$' -and
+                $state.Status -ceq 'abandoned') {
+                $state.ExplanationReads++
+                if ($state.Mode -ceq 'deadline-preflight') {
+                    $state.Clock = $state.Clock.AddSeconds(241)
+                }
+                if ($state.Mode -ceq 'oversized-readback' -and
+                    $state.Posts -gt 0) {
+                    return [pscustomobject]@{
+                        RawContentLength = 16777217L
+                        Content = '{}'
+                    }
+                }
+                if ($state.Mode -ceq 'readback-failed' -and
+                    $state.Posts -gt 0) {
+                    throw 'synthetic-comment-readback-failure'
+                }
+                return @{
+                    count = $state.Threads.Count
+                    continuation_token = $(if (
+                        $state.Mode -ceq 'incomplete'
+                    ) { 'more' } else { $null })
+                    value = $state.Threads
+                }
+            }
+            return $response
+        }.GetNewClosure()
+        $providerArguments = @{
+            Config = $caseConfig
+            TokenInvoker = { @{ accessToken = 't' * 120 } }
+            HttpInvoker = $http
+            UtcNowProvider = { $state.Clock }.GetNewClosure()
+        }
+        if ((Get-Command New-StalePrAzureDevOpsProvider).
+            Parameters.ContainsKey('Policy')) {
+            $providerArguments.Policy = $casePolicy
+        }
+        $nativeProvider = New-StalePrAzureDevOpsProvider @providerArguments
+        $root = New-LifecycleRoot
+        return @{
+            Config = $caseConfig
+            Policy = $casePolicy
+            State = $state
+            Root = $root
+            Arguments = @{
+                Inventory = @([ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    })
+                CutoffUtc = [DateTime]::SpecifyKind(
+                    [DateTime]'2025-01-01T00:00:00',
+                    [DateTimeKind]::Utc)
+                Policy = $casePolicy
+                LifecycleRoot = $root.Context.Root
+                Key = $root.Key
+                Provider = $nativeProvider
+            }
+        }
+    }
 }
 
 AfterAll {
@@ -876,7 +1044,7 @@ Describe 'Stale PR lifecycle decision and transition' {
             Should -BeExactly prior-ambiguous-write
     }
 
-    It 'caps confirmed lifecycle writes at two per run' {
+    It 'caps attempted lifecycle status writes at one per run' {
         $evidence = @{}
         $inventory = @(
             1..3 | ForEach-Object {
@@ -893,11 +1061,11 @@ Describe 'Stale PR lifecycle decision and transition' {
         $result = Invoke-LifecycleCase -Provider $provider.Handler `
             -Inventory $inventory
 
-        $result.providerWrites | Should -Be 2
-        $result.confirmedAbandonedIds | Should -Be @(1, 2)
+        $result.providerWrites | Should -Be 1
+        $result.confirmedAbandonedIds | Should -Be @(1)
         @($result.decisions | Where-Object {
                 [string]$_.reason -ceq 'run-cap-reached'
-            }) | Should -HaveCount 1
+            }) | Should -HaveCount 2
     }
 
     It 'consumes actual-provider-shaped canonical evidence through prewrite' {
@@ -2426,6 +2594,627 @@ Describe 'Named shared acquisition lifecycle route' {
             Should -Be 0
         $snapshot.intake.lifecycle.reviewEligibleIds |
             Should -HaveCount 0
+    }
+
+    Describe 'Native stale abandonment explanations' {
+        It 'confirms one transition then one deterministic same-PR explanation' {
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+
+            $result.health | Should -BeExactly healthy
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Status | Should -BeExactly abandoned
+            $result.providerWrites | Should -Be 2
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 1
+            $result.unconfirmedStatusWrites | Should -Be 0
+            $result.unconfirmedExplanationWrites | Should -Be 0
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $result.explanationReadCount | Should -Be 2
+            $result.providerReadCount | Should -Be 12
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+            $case.State.Body | Should -Match 'automatically abandoned'
+            $case.State.Body | Should -Match 'created more than one year ago'
+            $case.State.Body | Should -Match '2025-01-01T00:00:00.0000000Z'
+            $case.State.Body | Should -Match '2024-12-01T00:00:00.0000000Z'
+            $case.State.Body | Should -Match '<!-- devpilot-stale-abandonment:v1:[0-9a-f]{32} -->'
+            @($result.events) | Should -HaveCount 1
+            $result.events[0].action | Should -BeExactly 'status:abandoned'
+            @($result.explanationEvents) | Should -HaveCount 1
+            $result.explanationEvents[0].action |
+                Should -BeExactly 'comment:create-after-confirmed-abandonment'
+            $result.explanationEvents[0].readback.threadId | Should -Be 81
+            $result.explanationEvents[0].readback.markerMatchCount | Should -Be 1
+            $result.explanationEvents[0].readback.bodyDigest |
+                Should -BeExactly $result.explanationEvents[0].bodyDigest
+            $signedEvents = @(Get-ChildItem -LiteralPath (
+                    Join-Path $case.Root.Context.Root 'explanations\events') -File)
+            $signedEvents | Should -HaveCount 1
+            $signed = Read-StalePrLifecyclePolicy -Path $signedEvents[0].FullName `
+                -Key $case.Root.Key
+            $signed.bodyDigest | Should -BeExactly (
+                $result.explanationEvents[0].bodyDigest)
+            $second = Invoke-StalePrLifecycle @arguments
+            $second.providerWrites | Should -Be 0
+            $case.State.Posts | Should -Be 1
+            $case.State.StatusWrites | Should -Be 1
+            {
+                & $arguments.Provider CreateExplanation @{
+                    pullRequestId = 1
+                    statusIntentId = $result.explanationEvents[0].statusIntentId
+                    content = $case.State.Body
+                }
+            } | Should -Throw '*stale-pr-explanation-not-authorized*'
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'round-trips the signed additive explanation grant using the existing lifecycle key' {
+            $case = New-ExplanationCase
+            $path = Join-Path $case.Root.Context.Root 'policies\explanation.json'
+            [void](Write-StalePrLifecyclePolicy -Path $path `
+                -Policy $case.Policy -Key $case.Root.Key)
+            $signed = Read-StalePrLifecyclePolicy -Path $path -Key $case.Root.Key
+            $signed.authority.commentsOrThreads | Should -BeFalse
+            $signed.authority.abandonmentExplanation.action |
+                Should -BeExactly 'comment:create-after-confirmed-abandonment'
+            $signed.authority.abandonmentExplanation.maxPerRun | Should -Be 1
+        }
+
+        It 'preserves status-only authority without a new explanation grant' {
+            $case = New-ExplanationCase -StatusOnly
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 0
+            $result.providerWrites | Should -Be 1
+            $case.State.Posts | Should -Be 0
+            $case.State.ExplanationReads | Should -Be 0
+        }
+
+        It 'independently rejects malformed confirmed readback (<Mutation>)' `
+            -TestCases @(
+                @{ Mutation = 'wrong-pr' }
+                @{ Mutation = 'wrong-digest' }
+                @{ Mutation = 'wrong-actor' }
+                @{ Mutation = 'duplicate-marker-count' }
+                @{ Mutation = 'zero-marker-count' }
+                @{ Mutation = 'boolean-marker-count' }
+                @{ Mutation = 'zero-thread-id' }
+                @{ Mutation = 'negative-thread-id' }
+                @{ Mutation = 'zero-comment-id' }
+                @{ Mutation = 'negative-comment-id' }
+                @{ Mutation = 'boolean-pr-id' }
+                @{ Mutation = 'boolean-thread-id' }
+                @{ Mutation = 'fractional-comment-id' }
+                @{ Mutation = 'missing-field' }
+                @{ Mutation = 'extra-field' }
+                @{ Mutation = 'state-only-dictionary' }
+                @{ Mutation = 'state-only-pscustomobject' }
+                @{ Mutation = 'full-pscustomobject' }
+            ) {
+            param($Mutation)
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $nativeProvider = $arguments.Provider
+            $injectedProvider = {
+                param($Operation, $Request)
+                $response = & $nativeProvider $Operation $Request
+                if ($Operation -ceq 'ReadExplanation' -and $case.State.Posts -gt 0) {
+                    switch ($Mutation) {
+                        wrong-pr { $response.pullRequestId = 999L }
+                        wrong-digest { $response.bodyDigest = 'v1:sha256:' + ('0' * 64) }
+                        wrong-actor { $response.authorId = '44444444-4444-4444-4444-444444444444' }
+                        duplicate-marker-count { $response.markerMatchCount = 2 }
+                        zero-marker-count { $response.markerMatchCount = 0 }
+                        boolean-marker-count { $response.markerMatchCount = $true }
+                        zero-thread-id { $response.threadId = 0L }
+                        negative-thread-id { $response.threadId = -1L }
+                        zero-comment-id { $response.commentId = 0L }
+                        negative-comment-id { $response.commentId = -1L }
+                        boolean-pr-id { $response.pullRequestId = $true }
+                        boolean-thread-id { $response.threadId = $true }
+                        fractional-comment-id { $response.commentId = 1.5 }
+                        missing-field { $response.Remove('bodyDigest') }
+                        extra-field { $response['unexpected'] = 'outside-the-contract' }
+                        state-only-dictionary { $response = @{ state = 'confirmed' } }
+                        state-only-pscustomobject { $response = [pscustomobject]@{ state = 'confirmed' } }
+                        full-pscustomobject { $response = [pscustomobject]$response }
+                        default { throw 'Unexpected readback mutation.' }
+                    }
+                }
+                return $response
+            }.GetNewClosure()
+            $arguments.Provider = $injectedProvider
+            $result = Invoke-StalePrLifecycle @arguments
+
+            $result.health | Should -BeExactly unknown
+            $result.providerWrites | Should -Be 2
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 1
+            $result.unconfirmedStatusWrites | Should -Be 0
+            $result.unconfirmedExplanationWrites | Should -Be 1
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $result.decisions[0].explanation.state | Should -BeExactly unknown
+            $event = $result.explanationEvents[0]
+            $event.state | Should -BeExactly unknown
+            $event.providerWriteCount | Should -Be 1
+            $event.readback | Should -BeNullOrEmpty
+            $signed = Read-StalePrLifecyclePolicy -Key $case.Root.Key -Path (
+                Join-Path $case.Root.Context.Root "explanations\events\$($event.eventId).json")
+            $signed.state | Should -BeExactly unknown
+            $signed.providerWriteState | Should -BeExactly unknown
+            $signed.providerWriteCount | Should -Be 1
+            $signed.readback | Should -BeNullOrEmpty
+            $outcome = Read-StalePrLifecyclePolicy -Key $case.Root.Key -Path (
+                Join-Path $case.Root.Context.Root (
+                    "explanations\outcomes\1\$($event.statusIntentId).json"))
+            $outcome.state | Should -BeExactly unknown
+            $outcome.providerWriteCount | Should -Be 1
+            $outcome.retryAuthorized | Should -BeFalse
+
+            $second = Invoke-StalePrLifecycle @arguments
+            $second.providerWrites | Should -Be 0
+            $second.decisions[0].reason | Should -BeExactly prior-ambiguous-explanation
+            $resolved = Resolve-StalePrLifecycleExplanation `
+                -LifecycleRoot $case.Root.Context.Root -PullRequestId 1 `
+                -StatusIntentId $event.statusIntentId -Policy $case.Policy `
+                -Key $case.Root.Key -Provider $injectedProvider
+            $resolved.state | Should -BeExactly unknown
+            $resolved.providerWrites | Should -Be 0
+            $resolved.event.providerWriteState | Should -BeExactly unknown
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'never posts after a failed unconfirmed or absent transition (<Mode>)' `
+            -TestCases @(
+                @{ Mode = 'status-failed' }
+                @{ Mode = 'status-unconfirmed' }
+                @{ Mode = 'already-abandoned' }
+                @{ Mode = 'recent' }
+            ) {
+            param($Mode)
+            $case = New-ExplanationCase -Mode $Mode `
+                -RecentActivity $(if ($Mode -ceq 'recent') {
+                    '2026-01-01T00:00:00Z'
+                } else { '' })
+            if ($Mode -ceq 'already-abandoned') {
+                $case.State.Status = 'abandoned'
+            }
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.explanationWrites | Should -Be 0
+            $case.State.Posts | Should -Be 0
+        }
+
+        It 'retains confirmed status and locks uncertain explanation (<Mode>)' `
+            -TestCases @(
+                @{ Mode = 'post-unknown' }
+                @{ Mode = 'post-rejected' }
+                @{ Mode = 'readback-failed' }
+                @{ Mode = 'wrong-body' }
+                @{ Mode = 'wrong-author' }
+                @{ Mode = 'duplicate' }
+            ) {
+            param($Mode)
+            $case = New-ExplanationCase -Mode $Mode
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.health | Should -BeExactly unknown
+            $result.providerWrites | Should -Be 2
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 1
+            $result.unconfirmedStatusWrites | Should -Be 0
+            $result.unconfirmedExplanationWrites | Should -Be 1
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $result.decisions[0].explanation.state | Should -BeExactly unknown
+            $event = $result.explanationEvents[0]
+            $case.State.Status = 'active'
+            $second = Invoke-StalePrLifecycle @arguments
+            $second.providerWrites | Should -Be 0
+            $second.decisions[0].reason | Should -BeExactly prior-ambiguous-explanation
+            $case.State.Status = 'abandoned'
+            $reconcile = @{
+                LifecycleRoot = $case.Root.Context.Root
+                PullRequestId = 1
+                StatusIntentId = $event.statusIntentId
+                Policy = $case.Policy
+                Key = $case.Root.Key
+                Provider = $arguments.Provider
+            }
+            $resolved = Resolve-StalePrLifecycleExplanation @reconcile
+            $resolved.state | Should -BeExactly unknown
+            $resolved.providerWrites | Should -Be 0
+            $case.State.Posts | Should -Be 1
+            $case.State.StatusWrites | Should -Be 1
+        }
+
+        It 'reconciles accepted POST errors only by exact body and actor readback' {
+            $case = New-ExplanationCase -Mode post-accepted-error
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.health | Should -BeExactly healthy
+            $result.providerWrites | Should -Be 2
+            $result.unconfirmedExplanationWrites | Should -Be 0
+            $result.decisions[0].explanation.state | Should -BeExactly confirmed
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'does not POST when complete duplicate checking cannot be proven' {
+            $case = New-ExplanationCase -Mode incomplete
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.health | Should -BeExactly unknown
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 0
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $case.State.Posts | Should -Be 0
+        }
+
+        It 'keeps additional explanation reads inside the original shared budget (<Reads>)' `
+            -TestCases @(
+                @{ Reads = 10; ExpectedPosts = 0 }
+                @{ Reads = 11; ExpectedPosts = 1 }
+            ) {
+            param($Reads, $ExpectedPosts)
+            $case = New-ExplanationCase -MaximumReads $Reads
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.health | Should -BeExactly unknown
+            $result.providerReadCount | Should -Be $Reads
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be $ExpectedPosts
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $case.State.Posts | Should -Be $ExpectedPosts
+        }
+
+        It 'does not widen elapsed or response-size bounds for explanations (<Mode>)' `
+            -TestCases @(
+                @{ Mode = 'deadline-preflight'; ExpectedPosts = 0 }
+                @{ Mode = 'deadline-post'; ExpectedPosts = 1 }
+                @{ Mode = 'oversized-readback'; ExpectedPosts = 1 }
+            ) {
+            param($Mode, $ExpectedPosts)
+            $case = New-ExplanationCase -Mode $Mode
+            $arguments = $case.Arguments
+            $result = Invoke-StalePrLifecycle @arguments
+            $result.health | Should -BeExactly unknown
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be $ExpectedPosts
+            $case.State.Posts | Should -Be $ExpectedPosts
+            $case.State.StatusWrites | Should -Be 1
+        }
+
+        It 'retains the 128-GET and 240-second hard ceilings under broader config' {
+            $case = New-ExplanationCase
+            $case.Config.subjectProvider.maximumReads = 1000
+            $case.Config.limits.maxReads = 1000
+            $case.Config.limits.maxSeconds = 720
+            $clock = [ref]([DateTime]::UtcNow)
+            $provider = New-StalePrAzureDevOpsProvider `
+                -Config $case.Config -Policy $case.Policy `
+                -TokenInvoker { @{ accessToken = 't' * 120 } } `
+                -UtcNowProvider { $clock.Value }.GetNewClosure() `
+                -HttpInvoker (New-AzLifecycleInvoker)
+            1..128 | ForEach-Object { [void](& $provider Identity @{}) }
+            { & $provider Identity @{} } |
+                Should -Throw '*stale-pr-read-budget-exhausted*'
+            $provider.StalePrBudget.Count | Should -Be 128
+            ($provider.StalePrBudget.DeadlineUtc - $clock.Value).TotalSeconds |
+                Should -Be 240
+        }
+
+        It 'keeps old-candidate scans bounded at 200 with continuation' {
+            $casePolicy = New-StalePrLifecyclePolicy -Config $config `
+                -RepoRoot $repo -AllowDirty -EnableAbandonmentExplanation
+            $evidence = @{}
+            $inventory = @(1..201 | ForEach-Object {
+                    $evidence[$_] = New-LifecycleEvidence -Id $_ `
+                        -ActivityUtc '2026-01-01T00:00:00Z'
+                    [ordered]@{
+                        pullRequestId = $_; status = 'active'; isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }
+                })
+            $provider = New-LifecycleProvider -EvidenceById $evidence
+            $result = Invoke-LifecycleCase -Provider $provider.Handler `
+                -Inventory $inventory -InputPolicy $casePolicy
+            @($result.decisions) | Should -HaveCount 200
+            $result.nextPullRequestId | Should -Be 201
+            $result.providerWrites | Should -Be 0
+            @($provider.Calls | Where-Object { $_ -ceq 'ReadEvidence:201' }) |
+                Should -HaveCount 0
+        }
+
+        It 'never lets its own explanation bootstrap a later stale decision' {
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $first = Invoke-StalePrLifecycle @arguments
+            $first.confirmedAbandonedIds | Should -Be @(1)
+            $case.State.Status = 'active'
+            $second = Invoke-StalePrLifecycle @arguments
+            $second.providerWrites | Should -Be 0
+            $second.decisions[0].reason | Should -BeExactly recent-activity
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'reconciles a later visible exact comment without repeating either write' {
+            $case = New-ExplanationCase -Mode readback-failed
+            $arguments = $case.Arguments
+            $first = Invoke-StalePrLifecycle @arguments
+            $first.unconfirmedExplanationWrites | Should -Be 1
+            $case.State.Mode = 'confirmed'
+            $resolved = Resolve-StalePrLifecycleExplanation `
+                -LifecycleRoot $case.Root.Context.Root -PullRequestId 1 `
+                -StatusIntentId $first.explanationEvents[0].statusIntentId `
+                -Policy $case.Policy -Key $case.Root.Key `
+                -Provider $arguments.Provider
+            $resolved.state | Should -BeExactly confirmed -Because (
+                $resolved | ConvertTo-Json -Depth 16 -Compress)
+            $resolved.providerWrites | Should -Be 0
+            $resolved.event.operation | Should -BeExactly reconcile
+            $resolved.event.providerWriteCount | Should -Be 0
+            $case.State.Posts | Should -Be 1
+            $case.State.StatusWrites | Should -Be 1
+        }
+
+        It 'retains a missing original outcome as uncertain attempt accounting during reconciliation' {
+            $case = New-ExplanationCase -Mode readback-failed
+            $arguments = $case.Arguments
+            $first = Invoke-StalePrLifecycle @arguments
+            $transition = $first.explanationEvents[0].statusIntentId
+            Remove-Item -LiteralPath (
+                Join-Path $case.Root.Context.Root (
+                    "explanations\outcomes\1\$transition.json")) -Force
+            $case.State.Mode = 'confirmed'
+            $resolved = Resolve-StalePrLifecycleExplanation `
+                -LifecycleRoot $case.Root.Context.Root -PullRequestId 1 `
+                -StatusIntentId $transition -Policy $case.Policy `
+                -Key $case.Root.Key -Provider $arguments.Provider
+            $resolved.state | Should -BeExactly confirmed
+            $resolved.providerWrites | Should -Be 0
+            $resolved.event.originalAttemptCount | Should -BeNullOrEmpty
+            $resolved.event.originalAttemptCeiling | Should -Be 1
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'refuses to reconcile under a different policy identity' {
+            $case = New-ExplanationCase -Mode post-unknown
+            $arguments = $case.Arguments
+            $first = Invoke-StalePrLifecycle @arguments
+            $case.Policy.authority.maxCandidatesPerRun = 199
+            {
+                Resolve-StalePrLifecycleExplanation `
+                    -LifecycleRoot $case.Root.Context.Root -PullRequestId 1 `
+                    -StatusIntentId $first.explanationEvents[0].statusIntentId `
+                    -Policy $case.Policy -Key $case.Root.Key `
+                    -Provider $arguments.Provider
+            } | Should -Throw '*reconciliation-binding-changed*'
+            $case.State.Posts | Should -Be 1
+        }
+
+        It 'rejects widened or malformed explanation authority (<Field>)' `
+            -TestCases @(
+                @{ Field = 'maxPerRun'; Value = 2 }
+                @{ Field = 'maxPerTransition'; Value = $true }
+                @{ Field = 'retryAmbiguousPost'; Value = $true }
+                @{ Field = 'exactReadbackRequired'; Value = $false }
+                @{ Field = 'action'; Value = 'comment:any' }
+            ) {
+            param($Field, $Value)
+            $case = New-ExplanationCase
+            $case.Policy.authority.abandonmentExplanation[$Field] = $Value
+            $arguments = $case.Arguments
+            { Invoke-StalePrLifecycle @arguments } |
+                Should -Throw '*explanation authority is invalid*'
+            $case.State.StatusWrites | Should -Be 0
+            $case.State.Posts | Should -Be 0
+        }
+
+        It 'rejects partial lifecycle action protocols (<Shape>, <Mutation>)' `
+            -TestCases @(
+                foreach ($shape in @('native', 'dictionary')) {
+                    foreach ($mutation in @(
+                            'orphan-status', 'orphan-comment', 'orphan-null',
+                            'partial-missing', 'null-attempts', 'boolean-status',
+                            'boolean-comment', 'boolean-unconfirmed-status',
+                            'boolean-unconfirmed-comment', 'total-mismatch',
+                            'unconfirmed-status-exceeds', 'unconfirmed-comment-exceeds')) {
+                        @{ Shape = $shape; Mutation = $mutation }
+                    }
+                }
+            ) {
+            param($Shape, $Mutation)
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $arguments.Inventory += [ordered]@{
+                pullRequestId = 2; status = 'active'; isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2024-01-01T00:00:00Z'
+            }
+            $headCalls = [Collections.Generic.List[int]]::new()
+            $activeProvider = {
+                param($Operation, $Request)
+                switch ($Operation) {
+                    Identity { return $case.Config.expectedAccount }
+                    ListPage {
+                        $items = if ([int]$Request.skip -eq 0) {
+                            @($arguments.Inventory)
+                        } else { @() }
+                        return @{ items = @($items); count = @($items).Count; totalCount = 2 }
+                    }
+                    Head {
+                        [void]$headCalls.Add([int]$Request.pullRequestId)
+                        throw 'Unverified lifecycle eligibility must not reach acquisition.'
+                    }
+                    default { throw "Unexpected counter-protocol operation: $Operation" }
+                }
+            }.GetNewClosure()
+            $capture = @{}
+            $evaluator = {
+                param($Inventory)
+                $native = Invoke-StalePrLifecycle @arguments
+                $capture.native = $native
+                $value = [ordered]@{}
+                foreach ($property in $native.PSObject.Properties) {
+                    $value[$property.Name] = $property.Value
+                }
+                $value.reviewEligibleIds = @(2)
+                switch ($Mutation) {
+                    { $_ -cin @('orphan-status', 'orphan-comment', 'orphan-null') } {
+                        foreach ($name in @('statusWrites', 'explanationWrites',
+                                'unconfirmedStatusWrites', 'unconfirmedExplanationWrites')) {
+                            $value.Remove($name)
+                        }
+                        if ($Mutation -ceq 'orphan-comment') {
+                            $value['unconfirmedExplanationWrites'] = 1
+                        }
+                        else {
+                            $value['unconfirmedStatusWrites'] = $(if (
+                                $Mutation -ceq 'orphan-null'
+                            ) { $null } else { 1 })
+                        }
+                    }
+                    partial-missing { $value.Remove('unconfirmedExplanationWrites') }
+                    null-attempts { $value.statusWrites = $null; $value.explanationWrites = $null }
+                    boolean-status { $value.statusWrites = $true }
+                    boolean-comment { $value.explanationWrites = $true }
+                    boolean-unconfirmed-status { $value.unconfirmedStatusWrites = $false }
+                    boolean-unconfirmed-comment { $value.unconfirmedExplanationWrites = $false }
+                    total-mismatch { $value.explanationWrites = 0 }
+                    unconfirmed-status-exceeds { $value.statusWrites = 0; $value.unconfirmedStatusWrites = 1 }
+                    unconfirmed-comment-exceeds { $value.explanationWrites = 0; $value.unconfirmedExplanationWrites = 1 }
+                }
+                if ($Shape -ceq 'native') { return [pscustomobject]$value }
+                return $value
+            }.GetNewClosure()
+            $result = Invoke-ActivePrIntake -Config $case.Config `
+                -Provider $activeProvider -RepositoryRoot $repo `
+                -StateRoot (Join-Path $case.Root.Context.Root 'intake') `
+                -LifecycleEvaluator $evaluator -IncludeTransientSnapshots -Run
+            $capture.native.GetType().FullName |
+                Should -BeExactly 'System.Management.Automation.PSCustomObject'
+            $result.lifecycle.diagnostic | Should -BeExactly lifecycle-result-invalid
+            $result.lifecycle.health | Should -BeExactly unknown
+            $result.lifecycle.providerWrites | Should -Be 2
+            $result.lifecycle.statusWrites | Should -BeNullOrEmpty
+            $result.lifecycle.explanationWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unconfirmedStatusWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unconfirmedExplanationWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unknownPossibleEffect | Should -BeTrue
+            $result.lifecycle.confirmedAbandonedIds | Should -HaveCount 0
+            $result.lifecycle.reviewEligibleIds | Should -HaveCount 0
+            @($result.transientSnapshots.Keys) | Should -HaveCount 0
+            $headCalls | Should -HaveCount 0
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+            $tokens = $null
+            $parseErrors = $null
+            $toolAst = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $repo 'tools\Invoke-SharedReviewAcquisition.ps1'),
+                [ref]$tokens, [ref]$parseErrors)
+            $parseErrors | Should -HaveCount 0
+            $summaryAst = @($toolAst.FindAll({
+                        param($node)
+                        $node -is [Management.Automation.Language.HashtableAst] -and
+                        @($node.KeyValuePairs | Where-Object {
+                                $_.Item1.Extent.Text -ceq 'lifecycleStatusWrites'
+                            }).Count -eq 1
+                    }, $true))
+            $summaryAst | Should -HaveCount 1
+            $intake = $result
+            $generationFiles = @(Get-ChildItem -LiteralPath (
+                    Join-Path $case.Root.Context.Root 'intake') -Recurse -File `
+                    -Filter "$($result.generation).json")
+            $generationFiles | Should -HaveCount 1
+            $path = $generationFiles[0].FullName
+            $transientSnapshots = @{}
+            $blobKeys = @()
+            $summary = & ([scriptblock]::Create($summaryAst[0].Parent.Extent.Text)) |
+                ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+            $summary.providerWrites | Should -Be 2
+            $summary.lifecycleProviderWrites | Should -Be 2
+            foreach ($name in @('lifecycleStatusWrites', 'lifecycleExplanationWrites',
+                    'lifecycleUnconfirmedStatusWrites', 'lifecycleUnconfirmedExplanationWrites')) {
+                $summary.Contains($name) | Should -BeTrue
+                $summary[$name] | Should -BeNullOrEmpty
+            }
+            $summary.lifecycleReviewEligibleIds | Should -HaveCount 0
+        }
+
+        It 'keeps both native result shapes truthful on consumer failure (<Shape>, <Mode>, <BadCursor>)' `
+            -TestCases @(
+                @{ Shape = 'native'; Mode = 'confirmed'; BadCursor = $false }
+                @{ Shape = 'dictionary'; Mode = 'confirmed'; BadCursor = $false }
+                @{ Shape = 'native'; Mode = 'confirmed'; BadCursor = $true }
+                @{ Shape = 'dictionary'; Mode = 'confirmed'; BadCursor = $true }
+                @{ Shape = 'native'; Mode = 'post-unknown'; BadCursor = $true }
+                @{ Shape = 'dictionary'; Mode = 'post-unknown'; BadCursor = $true }
+            ) {
+            param($Shape, $Mode, $BadCursor)
+            $case = New-ExplanationCase -Mode $Mode
+            $arguments = $case.Arguments
+            $activeProvider = {
+                param($Operation, $Request)
+                switch ($Operation) {
+                    Identity { return $case.Config.expectedAccount }
+                    ListPage {
+                        $items = if ([int]$Request.skip -eq 0) {
+                            @($arguments.Inventory)
+                        } else { @() }
+                        return @{
+                            items = @($items)
+                            count = @($items).Count
+                            totalCount = 1
+                        }
+                    }
+                    default { throw "Unexpected acquisition after abandonment: $Operation" }
+                }
+            }.GetNewClosure()
+            $capture = @{}
+            $evaluator = {
+                param($Inventory)
+                $native = Invoke-StalePrLifecycle @arguments
+                $capture.native = $native
+                $result = if ($Shape -ceq 'dictionary') {
+                    $dictionary = [ordered]@{}
+                    foreach ($property in $native.PSObject.Properties) {
+                        $dictionary[$property.Name] = $property.Value
+                    }
+                    $dictionary
+                } else { $native }
+                if ($BadCursor) { $result.nextPullRequestId = 999L }
+                return $result
+            }.GetNewClosure()
+            $result = Invoke-ActivePrIntake -Config $case.Config `
+                -Provider $activeProvider `
+                -StateRoot (Join-Path $case.Root.Context.Root 'intake') `
+                -RepositoryRoot $repo -LifecycleEvaluator $evaluator `
+                -IncludeTransientSnapshots -Run
+            $capture.native.GetType().FullName |
+                Should -BeExactly 'System.Management.Automation.PSCustomObject'
+            $result.lifecycle.providerWrites | Should -Be 2
+            $result.lifecycle.statusWrites | Should -Be 1
+            $result.lifecycle.explanationWrites | Should -Be 1
+            $result.lifecycle.unconfirmedStatusWrites | Should -Be 0
+            $result.lifecycle.unconfirmedExplanationWrites |
+                Should -Be ([int]($Mode -ceq 'post-unknown'))
+            $result.lifecycle.confirmedAbandonedIds | Should -Be @(1)
+            $result.lifecycle.unknownPossibleEffect |
+                Should -Be ($Mode -ceq 'post-unknown')
+            @($result.transientSnapshots.Keys) | Should -HaveCount 0
+            if ($BadCursor) {
+                $result.lifecycle.diagnostic |
+                    Should -BeExactly lifecycle-cursor-invalid
+                $result.lifecycle.events | Should -HaveCount 1
+                $result.lifecycle.explanationEvents | Should -HaveCount 1
+            }
+        }
     }
 
     It 'fails the actual Named host closed for a bare true lifecycle switch' {

@@ -959,6 +959,58 @@ function Test-IntakeStateRootReadOnly {
     return $root
 }
 
+function Get-IntakeLifecycleEffects {
+    param([object]$Lifecycle)
+    $values = @{}
+    $actionCountNames = @(
+        'statusWrites', 'explanationWrites',
+        'unconfirmedStatusWrites', 'unconfirmedExplanationWrites'
+    )
+    $disaggregated = $false
+    foreach ($name in @($actionCountNames + @(
+                'providerReadCount', 'explanationReadCount', 'explanationEvents'))) {
+        $value = if ($Lifecycle -is [Collections.IDictionary]) {
+            if ($Lifecycle.Contains($name)) {
+                if ($name -cin $actionCountNames) { $disaggregated = $true }
+                $Lifecycle[$name]
+            }
+        }
+        elseif ($null -ne $Lifecycle) {
+            $property = $Lifecycle.PSObject.Properties[$name]
+            if ($null -ne $property) {
+                if ($name -cin $actionCountNames) { $disaggregated = $true }
+                $property.Value
+            }
+        }
+        $values[$name] = $value
+    }
+    $valid = $true
+    if ($disaggregated) {
+        foreach ($name in $actionCountNames) {
+            if ($values[$name] -is [bool] -or
+                [string]$values[$name] -cnotmatch '^[01]$') {
+                $valid = $false
+            }
+        }
+        if ($valid -and (
+            [int]$Lifecycle.providerWrites -ne
+                ([int]$values.statusWrites + [int]$values.explanationWrites) -or
+            [int]$values.unconfirmedStatusWrites -gt [int]$values.statusWrites -or
+            [int]$values.unconfirmedExplanationWrites -gt [int]$values.explanationWrites)) {
+            $valid = $false
+        }
+    }
+    else {
+        $values.statusWrites = [int]$Lifecycle.providerWrites
+        $values.explanationWrites = 0
+        $values.unconfirmedStatusWrites = $null
+        $values.unconfirmedExplanationWrites = 0
+    }
+    $values['valid'] = $valid
+    $values['disaggregated'] = $disaggregated
+    return $values
+}
+
 function New-IntakeDisabledSummary {
     param([Collections.IDictionary]$Config)
     $rules = @($Config.rules | ForEach-Object {
@@ -996,6 +1048,13 @@ function New-IntakeDisabledSummary {
             state = 'disabled'
             health = 'disabled'
             providerWrites = 0
+            statusWrites = 0
+            explanationWrites = 0
+            unconfirmedStatusWrites = 0
+            unconfirmedExplanationWrites = 0
+            unknownPossibleEffect = $false
+            providerReadCount = 0
+            explanationReadCount = 0
             modelWrites = 0
             confirmedAbandonedIds = @()
             reviewEligibleIds = @()
@@ -1419,6 +1478,13 @@ function Invoke-ActivePrIntake {
                 state = 'disabled'
                 health = 'disabled'
                 providerWrites = 0
+                statusWrites = 0
+                explanationWrites = 0
+                unconfirmedStatusWrites = 0
+                unconfirmedExplanationWrites = 0
+                unknownPossibleEffect = $false
+                providerReadCount = 0
+                explanationReadCount = 0
                 modelWrites = 0
                 confirmedAbandonedIds = @()
                 reviewEligibleIds = @()
@@ -1513,6 +1579,7 @@ function Invoke-ActivePrIntake {
                 $lifecycleGatingActive =
                     $null -ne $LifecycleEvaluator
                 if ($null -ne $LifecycleEvaluator) {
+                    $lifecycleEffects = $null
                     try {
                         $lifecycleValidationStage =
                             'inventory-order'
@@ -1564,11 +1631,18 @@ function Invoke-ActivePrIntake {
                             $lifecycle -isnot [pscustomobject]) -or
                             [string]$lifecycle.kind -cne
                                 'stale-pr-lifecycle-v1-run' -or
+                            $lifecycle.providerWrites -is [bool] -or
+                            [string]$lifecycle.providerWrites -cnotmatch '^[012]$' -or
                             [int]$lifecycle.providerWrites -lt 0 -or
                             [int]$lifecycle.providerWrites -gt 2 -or
                             [int]$lifecycle.modelWrites -ne 0 -or
+                            $lifecycle.modelWrites -is [bool] -or
                             $lifecycle.reviewEligibleIds -isnot
                                 [array]) {
+                            throw 'lifecycle-result-invalid'
+                        }
+                        $lifecycleEffects = Get-IntakeLifecycleEffects $lifecycle
+                        if (-not $lifecycleEffects.valid) {
                             throw 'lifecycle-result-invalid'
                         }
                         $lifecycleValidationStage =
@@ -1581,7 +1655,11 @@ function Invoke-ActivePrIntake {
                                     ([int]::MaxValue)))
                         }
                         if ($confirmedAbandoned.Count -gt
-                            [int]$lifecycle.providerWrites) {
+                            [int]$lifecycleEffects.statusWrites -or
+                            ($lifecycleEffects.disaggregated -and
+                                [int]$lifecycleEffects.unconfirmedStatusWrites -ne
+                                    ([int]$lifecycleEffects.statusWrites -
+                                        $confirmedAbandoned.Count))) {
                             throw 'lifecycle-result-invalid'
                         }
                         $lifecycleValidationStage =
@@ -1657,6 +1735,31 @@ function Invoke-ActivePrIntake {
                             $confirmedAbandoned.Clear()
                         }
                         $lifecycleReviewEligible.Clear()
+                        $reportedStatusWrites = $reportedProviderWrites
+                        $reportedExplanationWrites = 0
+                        $unconfirmedStatusWrites = [Math]::Max(
+                            0, $reportedStatusWrites - $confirmedAbandoned.Count)
+                        $unconfirmedExplanationWrites = 0
+                        $untrustedActionEffects = $null -ne $lifecycleEffects -and
+                            $lifecycleEffects.disaggregated -and
+                            -not $lifecycleEffects.valid
+                        if ($untrustedActionEffects) {
+                            $reportedStatusWrites = $null
+                            $reportedExplanationWrites = $null
+                            $unconfirmedStatusWrites = $null
+                            $unconfirmedExplanationWrites = $null
+                        }
+                        elseif ($null -ne $lifecycleEffects -and
+                            $lifecycleEffects.valid -and
+                            $lifecycleEffects.disaggregated) {
+                            $reportedStatusWrites = [int]$lifecycleEffects.statusWrites
+                            $reportedExplanationWrites = [int]$lifecycleEffects.explanationWrites
+                            $unconfirmedStatusWrites = [int]$lifecycleEffects.unconfirmedStatusWrites
+                            $unconfirmedExplanationWrites = [int]$lifecycleEffects.unconfirmedExplanationWrites
+                            if (-not $preserveConfirmedEffects) {
+                                $unconfirmedStatusWrites = $reportedStatusWrites
+                            }
+                        }
                         $lifecycleFailureReason =
                             [string]$_.Exception.Message
                         $envelope.lifecycle = [ordered]@{
@@ -1683,18 +1786,37 @@ function Invoke-ActivePrIntake {
                                 $lifecycleValidationStage
                             providerWrites =
                                 $reportedProviderWrites
+                            statusWrites = $reportedStatusWrites
+                            explanationWrites = $reportedExplanationWrites
+                            unconfirmedStatusWrites = $unconfirmedStatusWrites
+                            unconfirmedExplanationWrites = $unconfirmedExplanationWrites
+                            providerReadCount = $(if ($null -ne $lifecycleEffects) {
+                                    $lifecycleEffects.providerReadCount
+                                } else { $null })
+                            explanationReadCount = $(if ($null -ne $lifecycleEffects) {
+                                    $lifecycleEffects.explanationReadCount
+                                } else { $null })
                             modelWrites =
                                 $reportedModelWrites
                             confirmedAbandonedIds = @(
                                 $confirmedAbandoned |
                                     Sort-Object)
                             unknownPossibleEffect =
-                                $reportedProviderWrites -gt
-                                $confirmedAbandoned.Count
+                                $untrustedActionEffects -or
+                                ($unconfirmedStatusWrites +
+                                    $unconfirmedExplanationWrites) -gt 0
                             reviewEligibleIds = @()
                             nextPullRequestId = $null
-                            decisions = @()
-                            events = @()
+                            decisions = $(if ($preserveConfirmedEffects) {
+                                    @($lifecycle.decisions)
+                                } else { @() })
+                            events = $(if ($preserveConfirmedEffects) {
+                                    @($lifecycle.events)
+                                } else { @() })
+                            explanationEvents = $(if ($preserveConfirmedEffects -and
+                                $null -ne $lifecycleEffects.explanationEvents) {
+                                    @($lifecycleEffects.explanationEvents)
+                                } else { @() })
                         }
                     }
                 }

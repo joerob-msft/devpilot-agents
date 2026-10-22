@@ -61,7 +61,7 @@ if ($lifecycleConfig.Enabled) {
         -RepoRoot $RepoRoot
     $lifecycleProvider =
         New-StalePrAzureDevOpsProvider `
-            -Config $config -AzureCliPath $AzureCliPath
+            -Config $config -Policy $lifecyclePolicy -AzureCliPath $AzureCliPath
     $cutoffUtc = [DateTime]::UtcNow.AddYears(-1)
     $lifecycleEvaluator = {
         param([object[]]$Inventory)
@@ -173,10 +173,20 @@ $blobKeys = @($transientSnapshots.GetEnumerator() |
         @($transientSnapshots.Keys).Count
     uniqueContentBlobCount = $blobKeys.Count
     uniqueContentBlobKeys = $blobKeys
-    providerReadCount = [int]$intake.readCount
+    providerReadCount = [int]$intake.readCount +
+        [int]$intake.lifecycle.providerReadCount
+    intakeProviderReadCount = [int]$intake.readCount
     providerWrites = [int]$intake.lifecycle.providerWrites
     lifecycleProviderWrites =
         [int]$intake.lifecycle.providerWrites
+    lifecycleStatusWrites = $intake.lifecycle.statusWrites
+    lifecycleExplanationWrites = $intake.lifecycle.explanationWrites
+    lifecycleUnconfirmedStatusWrites =
+        $intake.lifecycle.unconfirmedStatusWrites
+    lifecycleUnconfirmedExplanationWrites =
+        $intake.lifecycle.unconfirmedExplanationWrites
+    lifecycleProviderReadCount = $intake.lifecycle.providerReadCount
+    lifecycleExplanationReadCount = $intake.lifecycle.explanationReadCount
     lifecycleHealth = [string]$intake.lifecycle.health
     lifecycleConfirmedAbandonedIds =
         @($intake.lifecycle.confirmedAbandonedIds)

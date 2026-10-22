@@ -572,12 +572,13 @@ function New-StalePrLifecyclePolicy {
         [string]$GitPath = 'git',
         [ValidatePattern('^[a-z0-9][a-z0-9_.-]{2,63}$')]
         [string]$PolicyId = 'azureux-bpm-stale-pr-lifecycle-v1',
-        [ValidateRange(1, 2)][int]$MaxAbandonsPerRun = 2,
+        [ValidateRange(1, 1)][int]$MaxAbandonsPerRun = 1,
+        [switch]$EnableAbandonmentExplanation,
         [Parameter(DontShow)][switch]$AllowDirty,
         [string]$CreatedUtc =
             ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))
     )
-    return [ordered]@{
+    $policy = [ordered]@{
         schemaVersion = 1
         kind = $script:PolicyKind
         enabled = $true
@@ -639,6 +640,49 @@ function New-StalePrLifecyclePolicy {
             -AllowDirty:$AllowDirty
         createdUtc = $CreatedUtc
     }
+    if ($EnableAbandonmentExplanation) {
+        $policy.authority['abandonmentExplanation'] = [ordered]@{
+            action = 'comment:create-after-confirmed-abandonment'
+            template = 'stale-abandonment-explanation-v1'
+            maxPerRun = 1
+            maxPerTransition = 1
+            exactReadbackRequired = $true
+            retryAmbiguousPost = $false
+        }
+    }
+    return $policy
+}
+
+function Test-StalePrExplanationAuthority {
+    param([AllowNull()][Collections.IDictionary]$Policy)
+    if ($null -eq $Policy -or
+        -not $Policy.authority.Contains('abandonmentExplanation')) {
+        return $false
+    }
+    $grant = $Policy.authority.abandonmentExplanation
+    if ($grant -isnot [Collections.IDictionary]) {
+        throw 'Stale PR explanation authority is invalid.'
+    }
+    Assert-ApprovedOwnerV2ExactKeys -Value $grant -Name explanation -Expected @(
+        'action', 'template', 'maxPerRun', 'maxPerTransition',
+        'exactReadbackRequired', 'retryAmbiguousPost'
+    )
+    if ([string]$grant.action -cne
+            'comment:create-after-confirmed-abandonment' -or
+        [string]$grant.template -cne 'stale-abandonment-explanation-v1' -or
+        $grant.maxPerRun -is [bool] -or
+        [string]$grant.maxPerRun -cne '1' -or
+        $grant.maxPerTransition -is [bool] -or
+        [string]$grant.maxPerTransition -cne '1' -or
+        $grant.exactReadbackRequired -isnot [bool] -or
+        -not $grant.exactReadbackRequired -or
+        $grant.retryAmbiguousPost -isnot [bool] -or
+        $grant.retryAmbiguousPost -or
+        [int]$Policy.authority.maxAbandonsPerRun -ne 1 -or
+        [bool]$Policy.authority.commentsOrThreads) {
+        throw 'Stale PR explanation authority is invalid.'
+    }
+    return $true
 }
 
 function Write-StalePrLifecyclePolicy {
@@ -727,6 +771,7 @@ function Assert-StalePrLifecyclePolicy {
                 -RepoRoot $RepoRoot -GitPath $GitPath))) {
         throw 'Stale PR lifecycle implementation binding changed.'
     }
+    [void](Test-StalePrExplanationAuthority $Policy)
 }
 
 function Get-StalePrEvidenceBinding {
@@ -837,6 +882,36 @@ function Get-StalePrPriorWriteBlock {
             return 'prior-ambiguous-write'
         }
     }
+    $explanationRoot = Join-Path $LifecycleRoot `
+        "explanations\intents\$PullRequestId"
+    foreach ($intentFile in @(Get-ChildItem -LiteralPath $explanationRoot `
+            -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        $explanationIntent = Read-StalePrLifecyclePolicy `
+            -Path $intentFile.FullName -Key $Key
+        $confirmationPath = Join-Path $LifecycleRoot (
+            "explanations\confirmations\$PullRequestId\$($intentFile.Name)")
+        if (Test-Path -LiteralPath $confirmationPath -PathType Leaf) {
+            $confirmation = Read-StalePrLifecyclePolicy `
+                -Path $confirmationPath -Key $Key
+            if ([string]$confirmation.state -cne 'confirmed' -or
+                [string]$confirmation.identity -cne
+                    [string]$explanationIntent.identity -or
+                [string]$confirmation.intentDigest -cne
+                    (Get-StalePrDigest $explanationIntent)) {
+                return 'prior-explanation-confirmation-invalid'
+            }
+            continue
+        }
+        $outcomePath = Join-Path $LifecycleRoot (
+            "explanations\outcomes\$PullRequestId\$($intentFile.Name)")
+        if (-not (Test-Path -LiteralPath $outcomePath -PathType Leaf)) {
+            return 'prior-explanation-intent-unresolved'
+        }
+        $outcome = Read-StalePrLifecyclePolicy -Path $outcomePath -Key $Key
+        if ([string]$outcome.state -cne 'confirmed') {
+            return 'prior-ambiguous-explanation'
+        }
+    }
     return ''
 }
 
@@ -845,6 +920,7 @@ function New-StalePrAzureDevOpsProvider {
     param(
         [Parameter(Mandatory)]
         [Collections.IDictionary]$Config,
+        [AllowNull()][Collections.IDictionary]$Policy,
         [string]$AzureCliPath = 'az',
         [Parameter(DontShow)]
         [AllowNull()][scriptblock]$TokenInvoker,
@@ -859,6 +935,15 @@ function New-StalePrAzureDevOpsProvider {
     $repositoryId =
         ([string]$Config.repositoryId).ToLowerInvariant()
     $actor = $Config.expectedAccount
+    $explanationAuthorized = Test-StalePrExplanationAuthority $Policy
+    $writeState = [pscustomobject]@{
+        StatusAttempts = 0
+        PullRequestId = 0L
+        StatusIntentId = ''
+        Confirmed = $false
+        ExplanationAttempts = 0
+        ApprovedContent = ''
+    }
     $configuredReadCeilings = @(
         [int]$Config.subjectProvider.maximumReads
         [int]$Config.limits.maxReads
@@ -870,10 +955,10 @@ function New-StalePrAzureDevOpsProvider {
         throw 'stale-pr-provider-budget-invalid'
     }
     $readCeiling = [int](
-        $configuredReadCeilings |
+        @($configuredReadCeilings + @(128)) |
             Measure-Object -Minimum).
         Minimum
-    $maximumSeconds = [int]$Config.limits.maxSeconds
+    $maximumSeconds = [Math]::Min(240, [int]$Config.limits.maxSeconds)
     $getUtcNow = if ($null -ne $UtcNowProvider) {
         [scriptblock]$UtcNowProvider
     }
@@ -882,6 +967,7 @@ function New-StalePrAzureDevOpsProvider {
     }
     $runBudget = [pscustomobject]@{
         Count = 0
+        ExplanationCount = 0
         DeadlineUtc = (& $getUtcNow).
             AddSeconds($maximumSeconds)
     }
@@ -975,7 +1061,7 @@ function New-StalePrAzureDevOpsProvider {
         param(
             [Parameter(Mandatory)][uri]$Uri,
             [Parameter(Mandatory)]
-            [ValidateSet('GET', 'PATCH')]
+            [ValidateSet('GET', 'PATCH', 'POST')]
             [string]$Method,
             [Parameter(Mandatory)]$Budget,
             [AllowNull()][byte[]]$Body = $null
@@ -1035,7 +1121,7 @@ function New-StalePrAzureDevOpsProvider {
             TimeoutSec = $remainingSeconds
             UseBasicParsing = $true
         }
-        if ($Method -ceq 'PATCH') {
+        if ($Method -cne 'GET') {
             if ($null -eq $Body) {
                 throw 'stale-pr-write-body-invalid'
             }
@@ -1055,7 +1141,8 @@ function New-StalePrAzureDevOpsProvider {
                 'stale-pr-provider-inaccessible')
             $failure.Data['stalePrFailureKind'] =
                 'http-request-failed'
-            if ($null -ne $_.Exception.Response) {
+            if ($null -ne $_.Exception.PSObject.Properties['Response'] -and
+                $null -ne $_.Exception.Response) {
                 $failure.Data['stalePrHttpStatus'] =
                     [int]$_.Exception.Response.StatusCode
             }
@@ -1387,6 +1474,11 @@ function New-StalePrAzureDevOpsProvider {
                 $pr = & $read '?api-version=7.1' `
                     ([long]$Arguments.pullRequestId) `
                     $runBudget
+                if ($writeState.StatusAttempts -eq 1 -and
+                    [long]$pr.pullRequestId -eq $writeState.PullRequestId -and
+                    [string]$pr.status -ceq 'abandoned') {
+                    $writeState.Confirmed = $true
+                }
                 return [ordered]@{
                     pullRequestId = [long]$pr.pullRequestId
                     status = [string]$pr.status
@@ -1399,6 +1491,12 @@ function New-StalePrAzureDevOpsProvider {
                     [string]$Arguments.body.status -cne 'abandoned') {
                     throw 'stale-pr-write-body-invalid'
                 }
+                if ($writeState.StatusAttempts -ge 1) {
+                    throw 'stale-pr-status-attempt-cap'
+                }
+                $writeState.StatusAttempts++
+                $writeState.PullRequestId = [long]$Arguments.pullRequestId
+                $writeState.StatusIntentId = [string]$Arguments.statusIntentId
                 $body = [Text.UTF8Encoding]::new(
                     $false).GetBytes(
                     (& $canonicalJsonCommand `
@@ -1416,12 +1514,436 @@ function New-StalePrAzureDevOpsProvider {
                     -Uri $uri -Method PATCH `
                     -Budget $runBudget -Body $body
             }
+            ReadExplanation {
+                if (-not $explanationAuthorized -or
+                    [string]$Arguments.statusIntentId -cnotmatch
+                        '^[0-9a-f]{32}$' -or
+                    [string]$Arguments.marker -cne (
+                        '<!-- devpilot-stale-abandonment:v1:' +
+                        [string]$Arguments.statusIntentId + ' -->') -or
+                    [string]$Arguments.content -cnotlike (
+                        '*' + [string]$Arguments.marker + '*') -or
+                    ([string]$Arguments.content).Length -gt 4096) {
+                    throw 'stale-pr-explanation-not-authorized'
+                }
+                $beforeReads = [int]$runBudget.Count
+                try {
+                    $threads = & $read '/threads?api-version=7.1' `
+                        ([long]$Arguments.pullRequestId) $runBudget
+                }
+                finally {
+                    $runBudget.ExplanationCount +=
+                        [int]$runBudget.Count - $beforeReads
+                }
+                if ($null -ne $threads.continuation_token -or
+                    [int]$threads.count -ne @($threads.value).Count) {
+                    throw 'stale-pr-explanation-history-incomplete'
+                }
+                $matches = [Collections.Generic.List[object]]::new()
+                foreach ($thread in @($threads.value)) {
+                    if ($thread.comments -isnot [array]) {
+                        throw 'stale-pr-explanation-history-incomplete'
+                    }
+                    foreach ($comment in @($thread.comments)) {
+                        if (([string]$comment.content).Contains(
+                                [string]$Arguments.marker,
+                                [StringComparison]::Ordinal)) {
+                            [void]$matches.Add(@{
+                                    threadId = [long]$thread.id
+                                    commentId = [long]$comment.id
+                                    exact = [string]$comment.content -ceq
+                                        [string]$Arguments.content -and
+                                        [string]$comment.author.id -ieq
+                                            [string]$actor.id -and
+                                        [string]$comment.commentType -ceq 'text' -and
+                                        [int]$comment.parentCommentId -eq 0
+                                })
+                        }
+                    }
+                }
+                $state = if ($matches.Count -eq 0) { 'absent' }
+                    elseif ($matches.Count -eq 1 -and $matches[0].exact -and
+                        $matches[0].threadId -gt 0 -and
+                        $matches[0].commentId -gt 0) { 'confirmed' }
+                    else { 'conflict' }
+                if ($state -ceq 'absent' -and $writeState.Confirmed -and
+                    $writeState.PullRequestId -eq [long]$Arguments.pullRequestId -and
+                    $writeState.StatusIntentId -ceq [string]$Arguments.statusIntentId) {
+                    $writeState.ApprovedContent = [string]$Arguments.content
+                }
+                return [ordered]@{
+                    state = $state
+                    pullRequestId = [long]$Arguments.pullRequestId
+                    markerMatchCount = $matches.Count
+                    bodyDigest = $(if ($state -ceq 'confirmed') {
+                            & $digestCommand ([string]$Arguments.content)
+                        } else { $null })
+                    authorId = $(if ($state -ceq 'confirmed') {
+                            [string]$actor.id
+                        } else { $null })
+                    threadId = $(if ($matches.Count -eq 1) {
+                            $matches[0].threadId
+                        } else { $null })
+                    commentId = $(if ($matches.Count -eq 1) {
+                            $matches[0].commentId
+                        } else { $null })
+                }
+            }
+            CreateExplanation {
+                if (-not $explanationAuthorized -or
+                    -not $writeState.Confirmed -or
+                    $writeState.PullRequestId -ne [long]$Arguments.pullRequestId -or
+                    $writeState.StatusIntentId -cne [string]$Arguments.statusIntentId -or
+                    $writeState.ExplanationAttempts -ge 1 -or
+                    [string]::IsNullOrWhiteSpace($writeState.ApprovedContent) -or
+                    $writeState.ApprovedContent -cne [string]$Arguments.content) {
+                    throw 'stale-pr-explanation-not-authorized'
+                }
+                $writeState.ExplanationAttempts++
+                $request = [ordered]@{
+                    comments = @([ordered]@{
+                            parentCommentId = 0
+                            content = [string]$Arguments.content
+                            commentType = 1
+                        })
+                }
+                $body = [Text.UTF8Encoding]::new($false).GetBytes(
+                    (& $canonicalJsonCommand $request))
+                $uri = [Uri](
+                    $organizationBase + '/' +
+                    [Uri]::EscapeDataString($projectName) +
+                    '/_apis/git/repositories/' +
+                    [Uri]::EscapeDataString($repositoryId) +
+                    '/pullRequests/' +
+                    [string][long]$Arguments.pullRequestId +
+                    '/threads?api-version=7.1')
+                return & $invokeHttp -Uri $uri -Method POST `
+                    -Budget $runBudget -Body $body
+            }
             default {
                 throw "Unsupported stale PR operation '$Operation'."
             }
         }
     }.GetNewClosure()
+    $handler | Add-Member -NotePropertyName StalePrBudget `
+        -NotePropertyValue $runBudget
     return $handler
+}
+
+function New-StalePrExplanationIntent {
+    param(
+        [Collections.IDictionary]$StatusIntent,
+        [Collections.IDictionary]$StatusOutcome
+    )
+    $format = 'yyyyMMddTHHmmssfffffffZ'
+    $style = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [Globalization.DateTimeStyles]::AdjustToUniversal
+    $times = @{}
+    foreach ($entry in @(
+            @{ Name = 'cutoff'; Value = $StatusIntent.cutoffUtc }
+            @{ Name = 'creation'; Value = $StatusIntent.subject.creationUtc }
+            @{ Name = 'activity'; Value = $StatusIntent.subject.latestActivityUtc }
+        )) {
+        $times[$entry.Name] = [DateTime]::ParseExact(
+            [string]$entry.Value, $format,
+            [Globalization.CultureInfo]::InvariantCulture, $style).ToString('o')
+    }
+    $marker = '<!-- devpilot-stale-abandonment:v1:' +
+        [string]$StatusIntent.intentId + ' -->'
+    $content = @(
+        'This pull request was automatically abandoned because it was created more than one year ago and has had no counted activity since the frozen cutoff.'
+        ''
+        "Frozen cutoff (UTC): $($times.cutoff)"
+        "Created (UTC): $($times.creation)"
+        "Latest counted activity (UTC): $($times.activity)"
+        'Counted activity includes source pushes, iterations, and non-system comments, replies, and edits by all actors, including bots. Metadata, votes, service statuses, and commit author dates do not count.'
+        "Frozen evidence: $($StatusIntent.evidenceDigest)"
+        $marker
+    ) -join "`n"
+    $intent = [ordered]@{
+        schemaVersion = 1
+        kind = 'stale-pr-abandonment-explanation-v1-intent'
+        action = 'comment:create-after-confirmed-abandonment'
+        runId = [string]$StatusIntent.runId
+        statusIntentId = [string]$StatusIntent.intentId
+        statusIntentDigest = Get-StalePrDigest $StatusIntent
+        statusOutcomeDigest = Get-StalePrDigest $StatusOutcome
+        policyDigest = [string]$StatusIntent.policyDigest
+        actor = $StatusIntent.actor
+        subject = $StatusIntent.subject
+        cutoffUtc = [string]$StatusIntent.cutoffUtc
+        marker = $marker
+        content = $content
+        bodyDigest = Get-StalePrDigest $content
+    }
+    $intent['identity'] = Get-StalePrDigest $intent
+    return $intent
+}
+
+function Complete-StalePrExplanation {
+    param(
+        [Collections.IDictionary]$Intent,
+        [string]$LifecycleRoot,
+        [byte[]]$Key,
+        [scriptblock]$Provider,
+        [AllowNull()][Nullable[int]]$AttemptedWrites,
+        [switch]$Reconcile,
+        [AllowNull()][object]$Diagnostic,
+        [AllowNull()][object]$KnownReadback
+    )
+    $readback = $KnownReadback
+    if ($null -eq $readback) {
+        try {
+            $readback = & $Provider ReadExplanation @{
+                pullRequestId = [long]$Intent.subject.pullRequestId
+                statusIntentId = [string]$Intent.statusIntentId
+                marker = [string]$Intent.marker
+                content = [string]$Intent.content
+            }
+        }
+        catch {
+            $Diagnostic = [ordered]@{
+                kind = 'explanation-readback-failed'
+                budget = Get-StalePrBudgetDiagnostic $_
+            }
+        }
+    }
+    $confirmed = $false
+    if ($readback -is [Collections.IDictionary]) {
+        $keys = @($readback.Keys | Sort-Object -CaseSensitive)
+        $exactShape = $keys.Count -eq 7 -and
+            ($keys -join ',') -ceq (
+                'authorId,bodyDigest,commentId,markerMatchCount,' +
+                'pullRequestId,state,threadId')
+        if ($exactShape) {
+            $integerFields = @(
+                'pullRequestId', 'markerMatchCount', 'threadId', 'commentId'
+            )
+            $integersValid = @($integerFields | Where-Object {
+                    $readback[$_] -isnot [int] -and
+                    $readback[$_] -isnot [long]
+                }).Count -eq 0
+            $confirmed = $integersValid -and
+                $readback.state -is [string] -and
+                $readback.state -ceq 'confirmed' -and
+                $readback.pullRequestId -eq [long]$Intent.subject.pullRequestId -and
+                $readback.markerMatchCount -eq 1 -and
+                $readback.bodyDigest -is [string] -and
+                $readback.bodyDigest -ceq [string]$Intent.bodyDigest -and
+                $readback.authorId -is [string] -and
+                $readback.authorId -ieq [string]$Intent.actor.id -and
+                $readback.threadId -gt 0 -and
+                $readback.commentId -gt 0
+        }
+    }
+    if (-not $confirmed -and $null -ne $readback) {
+        $Diagnostic = [ordered]@{
+            kind = 'explanation-readback-unconfirmed'
+            providerDiagnostic = $Diagnostic
+        }
+        $readback = $null
+    }
+    $state = if ($confirmed) { 'confirmed' } else { 'unknown' }
+    $event = [ordered]@{
+        schemaVersion = 1
+        kind = 'stale-pr-abandonment-explanation-v1-event'
+        action = [string]$Intent.action
+        operation = $(if ($Reconcile) { 'reconcile' } else { 'create' })
+        eventId = [guid]::NewGuid().ToString('N')
+        occurredUtc = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')
+        runId = [string]$Intent.runId
+        statusIntentId = [string]$Intent.statusIntentId
+        identity = [string]$Intent.identity
+        policyDigest = [string]$Intent.policyDigest
+        bodyDigest = [string]$Intent.bodyDigest
+        intentDigest = Get-StalePrDigest $Intent
+        actor = $Intent.actor
+        subject = $Intent.subject
+        readback = $readback
+        state = $state
+        diagnostic = $Diagnostic
+        providerWriteCount = $(if ($Reconcile) { 0 } else { $AttemptedWrites })
+        originalAttemptCount = $AttemptedWrites
+        originalAttemptCeiling = 1
+        providerWriteState = $state
+        modelWriteCount = 0
+        retryAuthorized = $false
+    }
+    $outcome = [ordered]@{
+        schemaVersion = 1
+        kind = 'stale-pr-abandonment-explanation-v1-outcome'
+        action = [string]$Intent.action
+        identity = [string]$Intent.identity
+        statusIntentId = [string]$Intent.statusIntentId
+        policyDigest = [string]$Intent.policyDigest
+        bodyDigest = [string]$Intent.bodyDigest
+        intentDigest = Get-StalePrDigest $Intent
+        eventId = [string]$event.eventId
+        state = $state
+        providerWriteCount = $AttemptedWrites
+        providerWriteState = $state
+        retryAuthorized = $false
+    }
+    try {
+        [void](Write-StalePrSignedRecord -LifecycleRoot $LifecycleRoot `
+            -RelativePath "explanations\events\$($event.eventId).json" `
+            -Payload $event -Key $Key)
+        $outcomePath = if ($Reconcile) {
+            "explanations\reconciliations\$($event.eventId).json"
+        }
+        else {
+            "explanations\outcomes\$($Intent.subject.pullRequestId)\" +
+                "$($Intent.statusIntentId).json"
+        }
+        [void](Write-StalePrSignedRecord -LifecycleRoot $LifecycleRoot `
+            -RelativePath $outcomePath -Payload $outcome -Key $Key)
+        if ($Reconcile -and $confirmed) {
+            [void](Write-StalePrSignedRecord -LifecycleRoot $LifecycleRoot `
+                -RelativePath (
+                    "explanations\confirmations\$($Intent.subject.pullRequestId)\" +
+                    "$($Intent.statusIntentId).json") -Key $Key -Payload ([ordered]@{
+                        schemaVersion = 1
+                        kind = 'stale-pr-abandonment-explanation-v1-confirmation'
+                        action = [string]$Intent.action
+                        identity = [string]$Intent.identity
+                        intentDigest = Get-StalePrDigest $Intent
+                        bodyDigest = [string]$Intent.bodyDigest
+                        state = 'confirmed'
+                        readback = $readback
+                        retryAuthorized = $false
+                    }))
+        }
+    }
+    catch {
+        $state = 'unknown'
+        $Diagnostic = @{ kind = 'explanation-audit-write-failed' }
+    }
+    return [ordered]@{
+        state = $state
+        providerWrites = $(if ($Reconcile) { 0 } else { $AttemptedWrites })
+        unconfirmedWrites = $(if ($confirmed -or $Reconcile) {
+                0
+            } else { $AttemptedWrites })
+        identity = [string]$Intent.identity
+        bodyDigest = [string]$Intent.bodyDigest
+        diagnostic = $Diagnostic
+        event = $event
+    }
+}
+
+function Invoke-StalePrExplanation {
+    param(
+        [Collections.IDictionary]$StatusIntent,
+        [Collections.IDictionary]$StatusOutcome,
+        [string]$LifecycleRoot,
+        [byte[]]$Key,
+        [scriptblock]$Provider
+    )
+    $attempts = 0
+    try {
+        $intent = New-StalePrExplanationIntent $StatusIntent $StatusOutcome
+        $id = [long]$intent.subject.pullRequestId
+        $transition = [string]$intent.statusIntentId
+        # Permanent, exclusive reservation: a crash never authorizes a second POST.
+        $lock = [IO.File]::Open(
+            (Join-Path $LifecycleRoot "locks\explanation-$id-$transition.lock"),
+            [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $lock.Dispose()
+        [void](Write-StalePrSignedRecord -LifecycleRoot $LifecycleRoot `
+            -RelativePath "explanations\intents\$id\$transition.json" `
+            -Payload $intent -Key $Key)
+        $arguments = @{
+            pullRequestId = $id
+            statusIntentId = $transition
+            marker = [string]$intent.marker
+            content = [string]$intent.content
+        }
+        $preflight = & $Provider ReadExplanation $arguments
+        if ([string]$preflight.state -cne 'absent') {
+            return Complete-StalePrExplanation -Intent $intent `
+                -LifecycleRoot $LifecycleRoot -Key $Key -Provider $Provider `
+                -AttemptedWrites 0 -KnownReadback $preflight
+        }
+        $attempts = 1
+        $diagnostic = $null
+        try {
+            [void](& $Provider CreateExplanation $arguments)
+        }
+        catch {
+            $diagnostic = Get-StalePrWriteDiagnostic $_
+        }
+        return Complete-StalePrExplanation -Intent $intent `
+            -LifecycleRoot $LifecycleRoot -Key $Key -Provider $Provider `
+            -AttemptedWrites $attempts -Diagnostic $diagnostic
+    }
+    catch {
+        return [ordered]@{
+            state = 'unknown'
+            providerWrites = $attempts
+            unconfirmedWrites = $attempts
+            diagnostic = @{
+                kind = 'explanation-preflight-or-audit-failed'
+                budget = Get-StalePrBudgetDiagnostic $_
+            }
+            event = $null
+        }
+    }
+}
+
+function Resolve-StalePrLifecycleExplanation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LifecycleRoot,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')]
+        [string]$StatusIntentId,
+        [Parameter(Mandatory)][Collections.IDictionary]$Policy,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [Parameter(Mandatory)][scriptblock]$Provider
+    )
+    if (-not (Test-StalePrExplanationAuthority $Policy) -or
+        $PullRequestId -lt 1 -or $Key.Length -ne 32) {
+        throw 'stale-pr-explanation-reconciliation-not-authorized'
+    }
+    $statusIntent = Read-StalePrLifecyclePolicy -Key $Key -Path (
+        Join-Path $LifecycleRoot "intents\$PullRequestId\$StatusIntentId.json")
+    $statusOutcome = Read-StalePrLifecyclePolicy -Key $Key -Path (
+        Join-Path $LifecycleRoot "outcomes\$PullRequestId\$StatusIntentId.json")
+    $intent = Read-StalePrLifecyclePolicy -Key $Key -Path (
+        Join-Path $LifecycleRoot (
+            "explanations\intents\$PullRequestId\$StatusIntentId.json"))
+    $expected = New-StalePrExplanationIntent $statusIntent $statusOutcome
+    $identity = & $Provider Identity @{}
+    if ([string]$statusOutcome.providerWriteState -cne 'confirmed' -or
+        [string]$statusOutcome.intentId -cne $StatusIntentId -or
+        [string]$statusOutcome.action -cne 'status:abandoned' -or
+        [string]$statusIntent.action -cne 'status:abandoned' -or
+        [string]$statusIntent.intentId -cne $StatusIntentId -or
+        [long]$statusIntent.subject.pullRequestId -ne $PullRequestId -or
+        [string]$statusIntent.policyDigest -cne (Get-StalePrDigest $Policy) -or
+        (Get-StalePrDigest $statusIntent.actor) -cne
+            (Get-StalePrDigest $Policy.actor) -or
+        (Get-StalePrDigest $intent) -cne (Get-StalePrDigest $expected) -or
+        [string]$identity.id -ine [string]$intent.actor.id -or
+        [string]$identity.descriptor -cne [string]$intent.actor.descriptor) {
+        throw 'stale-pr-explanation-reconciliation-binding-changed'
+    }
+    $originalAttempts = $null
+    $outcomePath = Join-Path $LifecycleRoot (
+        "explanations\outcomes\$PullRequestId\$StatusIntentId.json")
+    if (Test-Path -LiteralPath $outcomePath -PathType Leaf) {
+        $originalOutcome = Read-StalePrLifecyclePolicy -Path $outcomePath -Key $Key
+        if ([string]$originalOutcome.identity -cne [string]$intent.identity -or
+            [string]$originalOutcome.intentDigest -cne (Get-StalePrDigest $intent) -or
+            $originalOutcome.providerWriteCount -is [bool] -or
+            [string]$originalOutcome.providerWriteCount -cnotmatch '^[01]$') {
+            throw 'stale-pr-explanation-reconciliation-binding-changed'
+        }
+        $originalAttempts = [int]$originalOutcome.providerWriteCount
+    }
+    return Complete-StalePrExplanation -Intent $intent `
+        -LifecycleRoot $LifecycleRoot -Key $Key -Provider $Provider `
+        -AttemptedWrites $originalAttempts -Reconcile
 }
 
 function Invoke-StalePrLifecycle {
@@ -1440,6 +1962,7 @@ function Invoke-StalePrLifecycle {
         $Key.Length -ne 32) {
         throw 'Stale PR lifecycle requires one UTC cutoff and service key.'
     }
+    $explanationEnabled = Test-StalePrExplanationAuthority $Policy
     $identity = & $Provider Identity @{}
     if ([string]$identity.id -ine [string]$Policy.actor.id -or
         [string]$identity.descriptor -cne
@@ -1453,7 +1976,11 @@ function Invoke-StalePrLifecycle {
     $reviewEligible =
         [Collections.Generic.HashSet[long]]::new()
     $events = [Collections.Generic.List[object]]::new()
+    $explanationEvents = [Collections.Generic.List[object]]::new()
     $writes = 0
+    $explanationWrites = 0
+    $unconfirmedStatusWrites = 0
+    $unconfirmedExplanationWrites = 0
     $unknown = 0
     $oldCandidates =
         [Collections.Generic.List[object]]::new()
@@ -1562,7 +2089,7 @@ function Invoke-StalePrLifecycle {
             continue
         }
         if ($writes -ge
-            [int]$Policy.authority.maxAbandonsPerRun) {
+            [Math]::Min(1, [int]$Policy.authority.maxAbandonsPerRun)) {
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
                     state = 'deferred'
@@ -1577,6 +2104,9 @@ function Invoke-StalePrLifecycle {
             }
             Assert-StalePrEvidence `
                 -Evidence $evidence -Policy $Policy
+            if ([long]$evidence.pullRequestId -ne $id) {
+                throw 'stale-pr-subject-mismatch'
+            }
         }
         catch {
             $reason = [string](
@@ -1660,6 +2190,9 @@ function Invoke-StalePrLifecycle {
             }
             Assert-StalePrEvidence `
                 -Evidence $prewrite -Policy $Policy
+            if ([long]$prewrite.pullRequestId -ne $id) {
+                throw 'stale-pr-subject-mismatch'
+            }
             $prewriteDigest = Get-StalePrDigest (
                 Get-StalePrEvidenceBinding $prewrite)
         }
@@ -1708,6 +2241,7 @@ function Invoke-StalePrLifecycle {
         $intent = [ordered]@{
             schemaVersion = 1
             kind = 'stale-pr-lifecycle-v1-intent'
+            action = 'status:abandoned'
             runId = $runId
             intentId = $intentId
             createdUtc = [DateTime]::UtcNow.
@@ -1729,6 +2263,7 @@ function Invoke-StalePrLifecycle {
         try {
             [void](& $Provider AbandonStatus @{
                     pullRequestId = $id
+                    statusIntentId = $intentId
                     body = $request
                 })
         }
@@ -1749,6 +2284,12 @@ function Invoke-StalePrLifecycle {
             $readback -is [Collections.IDictionary] -and
             [long]$readback.pullRequestId -eq $id -and
             [string]$readback.status -ceq 'abandoned'
+        if ($confirmedWrite) {
+            [void]$confirmed.Add($id)
+        }
+        else {
+            $unconfirmedStatusWrites++
+        }
         $outcome = if ($confirmedWrite) {
             if ($null -eq $writeError) {
                 'abandoned'
@@ -1762,6 +2303,7 @@ function Invoke-StalePrLifecycle {
         $event = [ordered]@{
             schemaVersion = 1
             kind = 'stale-pr-lifecycle-v1-event'
+            action = 'status:abandoned'
             eventId = [guid]::NewGuid().ToString('N')
             runId = $runId
             intentId = $intentId
@@ -1788,6 +2330,7 @@ function Invoke-StalePrLifecycle {
         $outcomeRecord = [ordered]@{
             schemaVersion = 1
             kind = 'stale-pr-lifecycle-v1-outcome'
+            action = 'status:abandoned'
             runId = $runId
             intentId = $intentId
             completedUtc = [DateTime]::UtcNow.
@@ -1823,12 +2366,32 @@ function Invoke-StalePrLifecycle {
         }
         [void]$events.Add($event)
         if ($confirmedWrite) {
-            [void]$confirmed.Add($id)
+            $explanation = [ordered]@{
+                state = 'not-authorized'
+                providerWrites = 0
+                unconfirmedWrites = 0
+            }
+            if ($explanationEnabled) {
+                $explanation = Invoke-StalePrExplanation `
+                    -StatusIntent $intent -StatusOutcome $outcomeRecord `
+                    -LifecycleRoot $LifecycleRoot -Key $Key -Provider $Provider
+                $explanationWrites += [int]$explanation.providerWrites
+                $unconfirmedExplanationWrites += [int]$explanation.unconfirmedWrites
+                if ($null -ne $explanation.event) {
+                    [void]$explanationEvents.Add($explanation.event)
+                }
+                if ([string]$explanation.state -cne 'confirmed') {
+                    $unknown++
+                }
+            }
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
                     state = 'abandoned'
                     reason = 'readback-confirmed'
-                    providerWrites = 1
+                    providerWrites = 1 + [int]$explanation.providerWrites
+                    statusWrites = 1
+                    explanationWrites = [int]$explanation.providerWrites
+                    explanation = $explanation
                 })
         }
         else {
@@ -1854,7 +2417,19 @@ function Invoke-StalePrLifecycle {
                     }).Count -gt 0) {
                 'partial'
             } else { 'healthy' })
-        providerWrites = $writes
+        providerWrites = $writes + $explanationWrites
+        statusWrites = $writes
+        explanationWrites = $explanationWrites
+        unconfirmedStatusWrites = $unconfirmedStatusWrites
+        unconfirmedExplanationWrites = $unconfirmedExplanationWrites
+        unknownPossibleEffect =
+            ($unconfirmedStatusWrites + $unconfirmedExplanationWrites) -gt 0
+        providerReadCount = $(if (
+            $null -ne $Provider.PSObject.Properties['StalePrBudget']
+        ) { [int]$Provider.StalePrBudget.Count } else { $null })
+        explanationReadCount = $(if (
+            $null -ne $Provider.PSObject.Properties['StalePrBudget']
+        ) { [int]$Provider.StalePrBudget.ExplanationCount } else { $null })
         modelWrites = 0
         confirmedAbandonedIds = $confirmed.ToArray()
         reviewEligibleIds = @(
@@ -1863,6 +2438,7 @@ function Invoke-StalePrLifecycle {
         nextPullRequestId = $nextPullRequestId
         decisions = $results.ToArray()
         events = $events.ToArray()
+        explanationEvents = $explanationEvents.ToArray()
     }
 }
 
@@ -1876,4 +2452,5 @@ Export-ModuleMember -Function @(
     'Assert-StalePrLifecyclePolicy'
     'New-StalePrAzureDevOpsProvider'
     'Invoke-StalePrLifecycle'
+    'Resolve-StalePrLifecycleExplanation'
 )
