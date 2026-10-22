@@ -151,6 +151,44 @@ Describe 'Source-backed English identifier naming' {
         @(Invoke-EnglishNamingCase $content -AdditionalFiles @($shadow))[0].state | Should -BeExactly unknown
     }
 
+    It 'withholds inferred roles when unproven conditional overloads change lambda target typing' {
+        $content = @'
+using Newtonsoft.Json.Linq;
+class C {
+#if FEATURE
+    void Select(System.Func<int,bool> predicate) {}
+#else
+    void Select(System.Func<JProperty,bool> predicate) {}
+#endif
+    void M() { Select(q => q != null); }
+}
+'@
+        $result = @(Invoke-EnglishNamingCase $content -Spans @(@{startLine=8;endLine=8}))
+        $result[0].state | Should -BeExactly unknown
+        $peer = @{path='src/Selection.cs';state='complete';spans=@();content=$content.Replace(
+            '    void M() { Select(q => q != null); }', '')}
+        $source = 'using Newtonsoft.Json.Linq; partial class C { void M() { Select(x => x != null); } }'
+        $peer.content = $peer.content.Replace('class C', 'partial class C')
+        @(Invoke-EnglishNamingCase $source -AdditionalFiles @($peer))[0].state | Should -BeExactly unknown
+    }
+
+    It 'keeps explicit property roles independent of unrelated conditional method bodies' {
+        $content = @'
+using Newtonsoft.Json.Linq;
+class C {
+    void Trace() {
+#if FEATURE
+        System.Console.WriteLine(1);
+#endif
+    }
+    void M() { System.Func<JProperty,bool> predicate = (JProperty q) => q != null; }
+}
+'@
+        $result = @(Invoke-EnglishNamingCase $content -Spans @(@{startLine=8;endLine=8}))
+        $result[0].state | Should -BeExactly violation
+        $result[0].symbol | Should -BeExactly q
+    }
+
     It 'requires the actual parameter identifier line to change, not its body or enclosing declaration' {
         $content = @'
 using System;

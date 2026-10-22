@@ -340,6 +340,10 @@ not naming violations. Unresolved/dynamic targets, incomplete snapshot binding,
 and relevant conditional compilation are UNKNOWN. An old parameter does not
 become eligible because its body, enclosing call, or unrelated line changed.
 Generated paths, banners, and attributed ancestors reuse existing exclusions.
+Inferred roles are conservatively withheld if any conditional-compilation range
+remains in the bounded binding snapshot: unselected overload or local declarations
+can change lambda target typing without changing the lambda itself. Explicitly
+typed property roles are not withheld by unrelated conditional method bodies.
 
 This is not general English-name validation: other lambda names, method/local/
 field/type declarations, domain terms, common acronyms, loop counters, and discards

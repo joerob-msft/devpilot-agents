@@ -4307,6 +4307,7 @@ function Get-ContextualEnglishIdentifierOutcomes {
     }
     $conditional = Get-ContextualExceptionNamingConditionalState -Root $root -Spans @() -Source
     $bindingUnknown = $conditional.BindingUnknown
+    $inferredConditionalUnknown = $conditional.Spans.Count -gt 0
     $trees = [Collections.Generic.List[Microsoft.CodeAnalysis.SyntaxTree]]::new()
     [void]$trees.Add($sourceTree)
     foreach ($file in $SnapshotFiles) {
@@ -4324,8 +4325,12 @@ function Get-ContextualEnglishIdentifierOutcomes {
         $generated = Test-ContextualExceptionNamingGeneratedFile `
             -Path ([string]$file.path) -Content ([string]$file.content)
         $peerTree = Get-ContextualExceptionNamingBindingTree -Root $peerRoot -GeneratedFile:$generated
-        if ((Get-ContextualExceptionNamingConditionalState -Root $peerTree.GetRoot() -Spans @()).BindingUnknown) {
+        $peerConditional = Get-ContextualExceptionNamingConditionalState -Root $peerTree.GetRoot() -Spans @()
+        if ($peerConditional.BindingUnknown) {
             $bindingUnknown = $true
+        }
+        if ($peerConditional.Spans.Count -gt 0) {
+            $inferredConditionalUnknown = $true
         }
         [void]$trees.Add($peerTree)
     }
@@ -4367,6 +4372,7 @@ function Get-ContextualEnglishIdentifierOutcomes {
                 $model, $parameter, [Threading.CancellationToken]::None)
         } else { $null }
         if ($bindingUnknown -or $null -eq $symbol -or
+            ($null -eq $parameter.Type -and $inferredConditionalUnknown) -or
             @($conditional.Spans | Where-Object { $_.IntersectsWith($parameter.Span) }).Count -gt 0 -or
             $symbol.Type.TypeKind -in @(
                 [Microsoft.CodeAnalysis.TypeKind]::Error, [Microsoft.CodeAnalysis.TypeKind]::Dynamic) -or
