@@ -129,7 +129,8 @@ function New-OwnerSemanticRunner {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][scriptblock]$Handler
+        [Parameter(Mandatory)][scriptblock]$Handler,
+        [scriptblock]$TelemetryProvider
     )
 
     Assert-OwnerV2Text -Value $Name -Name Name -MaximumLength 128
@@ -137,6 +138,9 @@ function New-OwnerSemanticRunner {
         Name = $Name
         Semantics = $script:OwnerV2RunnerSemantics
         Handler = $Handler
+    }
+    if ($TelemetryProvider) {
+        $runner | Add-Member -NotePropertyName TelemetryProvider -NotePropertyValue $TelemetryProvider
     }
     $runner.PSTypeNames.Insert(0, 'DevPilot.OwnerCapability.SemanticRunner')
     return $runner
@@ -148,7 +152,9 @@ function Test-OwnerV2Runner {
     if ($Runner -isnot [pscustomobject] -or
         $Runner.PSTypeNames -cnotcontains 'DevPilot.OwnerCapability.SemanticRunner' -or
         $Runner.Semantics -cne $script:OwnerV2RunnerSemantics -or
-        $Runner.Handler -isnot [scriptblock]) {
+        $Runner.Handler -isnot [scriptblock] -or
+        ($null -ne $Runner.PSObject.Properties['TelemetryProvider'] -and
+            $Runner.TelemetryProvider -isnot [scriptblock])) {
         throw 'Expected a semantic runner created by New-OwnerSemanticRunner.'
     }
 }
@@ -1074,6 +1080,7 @@ function ConvertTo-OwnerV2Observation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$PipelineResult,
+        [object]$Runner,
         [string]$ImplementationId = 'owner-v2-preview',
         [string]$ImplementationVersion = '0.1'
     )
@@ -1172,6 +1179,45 @@ function ConvertTo-OwnerV2Observation {
     $runnerAttemptCount = @($methodAssessments | Where-Object {
             [string](Get-OwnerV2Member -Value $_ -Name assessmentId) -like 'method:r:*'
         }).Count
+    $modelStarts = $runnerAttemptCount
+    $latencyMs = 'unknown'
+    $refusalReason = 'unknown'
+    if ($null -ne $Runner) {
+        Test-OwnerV2Runner -Runner $Runner
+        if ($null -eq $Runner.PSObject.Properties['TelemetryProvider']) {
+            throw 'The supplied semantic runner does not expose observation telemetry.'
+        }
+        $telemetryValues = @(& $Runner.TelemetryProvider)
+        if ($telemetryValues.Count -ne 1 -or
+            $telemetryValues[0] -isnot [Collections.IDictionary]) {
+            throw 'Semantic runner telemetry violated the observation contract.'
+        }
+        $telemetry = $telemetryValues[0]
+        $attemptsValue = Get-OwnerV2Member -Value $telemetry -Name attempts
+        $modelStartsValue = Get-OwnerV2Member -Value $telemetry -Name modelStarts
+        $latencyValue = Get-OwnerV2Member -Value $telemetry -Name latencyMs
+        $refusalValue = Get-OwnerV2Member -Value $telemetry -Name refusalReason
+        if ($attemptsValue -is [bool] -or
+            $attemptsValue -isnot [int] -and $attemptsValue -isnot [long] -or
+            [long]$attemptsValue -lt 0 -or [long]$attemptsValue -gt 1024 -or
+            $modelStartsValue -is [bool] -or
+            $modelStartsValue -isnot [int] -and $modelStartsValue -isnot [long] -or
+            [long]$modelStartsValue -lt 0 -or [long]$modelStartsValue -gt [long]$attemptsValue -or
+            $latencyValue -is [bool] -or
+            $latencyValue -isnot [int] -and $latencyValue -isnot [long] -or
+            [long]$latencyValue -lt 0 -or [long]$latencyValue -gt 86400000 -or
+            $refusalValue -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$refusalValue) -or
+            [string]$refusalValue -cne ([string]$refusalValue).Trim() -or
+            ([string]$refusalValue).Length -gt 128 -or
+            [string]$refusalValue -match '[\r\n]') {
+            throw 'Semantic runner telemetry contained invalid aggregate values.'
+        }
+        $runnerAttemptCount = [int]$attemptsValue
+        $modelStarts = [int]$modelStartsValue
+        $latencyMs = [long]$latencyValue
+        $refusalReason = [string]$refusalValue
+    }
     $uncoveredCount = $unknownFileAssessments.Count + $unknownEvidenceAssessments.Count
     $pipelineState = [string](Get-OwnerV2Member -Value $PipelineResult -Name state)
     $completed = $pipelineState -ceq 'complete'
@@ -1231,9 +1277,9 @@ function ConvertTo-OwnerV2Observation {
         findings = $sortedFindings
         execution = [ordered]@{
             attempts = $runnerAttemptCount
-            modelStarts = $runnerAttemptCount
-            latencyMs = 'unknown'
-            refusalReason = 'unknown'
+            modelStarts = $modelStarts
+            latencyMs = $latencyMs
+            refusalReason = $refusalReason
             incompleteReason = if ($completed) { 'unknown' } else { 'semantic-or-evidence-unknown' }
         }
         effects = [ordered]@{
