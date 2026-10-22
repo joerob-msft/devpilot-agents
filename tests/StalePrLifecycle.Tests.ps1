@@ -2673,6 +2673,101 @@ Describe 'Named shared acquisition lifecycle route' {
             $case.State.ExplanationReads | Should -Be 0
         }
 
+        It 'independently rejects malformed confirmed readback (<Mutation>)' `
+            -TestCases @(
+                @{ Mutation = 'wrong-pr' }
+                @{ Mutation = 'wrong-digest' }
+                @{ Mutation = 'wrong-actor' }
+                @{ Mutation = 'duplicate-marker-count' }
+                @{ Mutation = 'zero-marker-count' }
+                @{ Mutation = 'boolean-marker-count' }
+                @{ Mutation = 'zero-thread-id' }
+                @{ Mutation = 'negative-thread-id' }
+                @{ Mutation = 'zero-comment-id' }
+                @{ Mutation = 'negative-comment-id' }
+                @{ Mutation = 'boolean-pr-id' }
+                @{ Mutation = 'boolean-thread-id' }
+                @{ Mutation = 'fractional-comment-id' }
+                @{ Mutation = 'missing-field' }
+                @{ Mutation = 'extra-field' }
+                @{ Mutation = 'state-only-dictionary' }
+                @{ Mutation = 'state-only-pscustomobject' }
+                @{ Mutation = 'full-pscustomobject' }
+            ) {
+            param($Mutation)
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $nativeProvider = $arguments.Provider
+            $injectedProvider = {
+                param($Operation, $Request)
+                $response = & $nativeProvider $Operation $Request
+                if ($Operation -ceq 'ReadExplanation' -and $case.State.Posts -gt 0) {
+                    switch ($Mutation) {
+                        wrong-pr { $response.pullRequestId = 999L }
+                        wrong-digest { $response.bodyDigest = 'v1:sha256:' + ('0' * 64) }
+                        wrong-actor { $response.authorId = '44444444-4444-4444-4444-444444444444' }
+                        duplicate-marker-count { $response.markerMatchCount = 2 }
+                        zero-marker-count { $response.markerMatchCount = 0 }
+                        boolean-marker-count { $response.markerMatchCount = $true }
+                        zero-thread-id { $response.threadId = 0L }
+                        negative-thread-id { $response.threadId = -1L }
+                        zero-comment-id { $response.commentId = 0L }
+                        negative-comment-id { $response.commentId = -1L }
+                        boolean-pr-id { $response.pullRequestId = $true }
+                        boolean-thread-id { $response.threadId = $true }
+                        fractional-comment-id { $response.commentId = 1.5 }
+                        missing-field { $response.Remove('bodyDigest') }
+                        extra-field { $response['unexpected'] = 'outside-the-contract' }
+                        state-only-dictionary { $response = @{ state = 'confirmed' } }
+                        state-only-pscustomobject { $response = [pscustomobject]@{ state = 'confirmed' } }
+                        full-pscustomobject { $response = [pscustomobject]$response }
+                        default { throw 'Unexpected readback mutation.' }
+                    }
+                }
+                return $response
+            }.GetNewClosure()
+            $arguments.Provider = $injectedProvider
+            $result = Invoke-StalePrLifecycle @arguments
+
+            $result.health | Should -BeExactly unknown
+            $result.providerWrites | Should -Be 2
+            $result.statusWrites | Should -Be 1
+            $result.explanationWrites | Should -Be 1
+            $result.unconfirmedStatusWrites | Should -Be 0
+            $result.unconfirmedExplanationWrites | Should -Be 1
+            $result.confirmedAbandonedIds | Should -Be @(1)
+            $result.decisions[0].explanation.state | Should -BeExactly unknown
+            $event = $result.explanationEvents[0]
+            $event.state | Should -BeExactly unknown
+            $event.providerWriteCount | Should -Be 1
+            $event.readback | Should -BeNullOrEmpty
+            $signed = Read-StalePrLifecyclePolicy -Key $case.Root.Key -Path (
+                Join-Path $case.Root.Context.Root "explanations\events\$($event.eventId).json")
+            $signed.state | Should -BeExactly unknown
+            $signed.providerWriteState | Should -BeExactly unknown
+            $signed.providerWriteCount | Should -Be 1
+            $signed.readback | Should -BeNullOrEmpty
+            $outcome = Read-StalePrLifecyclePolicy -Key $case.Root.Key -Path (
+                Join-Path $case.Root.Context.Root (
+                    "explanations\outcomes\1\$($event.statusIntentId).json"))
+            $outcome.state | Should -BeExactly unknown
+            $outcome.providerWriteCount | Should -Be 1
+            $outcome.retryAuthorized | Should -BeFalse
+
+            $second = Invoke-StalePrLifecycle @arguments
+            $second.providerWrites | Should -Be 0
+            $second.decisions[0].reason | Should -BeExactly prior-ambiguous-explanation
+            $resolved = Resolve-StalePrLifecycleExplanation `
+                -LifecycleRoot $case.Root.Context.Root -PullRequestId 1 `
+                -StatusIntentId $event.statusIntentId -Policy $case.Policy `
+                -Key $case.Root.Key -Provider $injectedProvider
+            $resolved.state | Should -BeExactly unknown
+            $resolved.providerWrites | Should -Be 0
+            $resolved.event.providerWriteState | Should -BeExactly unknown
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+        }
+
         It 'never posts after a failed unconfirmed or absent transition (<Mode>)' `
             -TestCases @(
                 @{ Mode = 'status-failed' }

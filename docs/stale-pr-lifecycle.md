@@ -133,6 +133,12 @@ ceiling, 16 MiB response ceiling, or 240-second shared deadline. Lower
 configured read/time ceilings still apply. Explanation GETs share, rather
 than reset, the lifecycle provider's budget.
 
+Before signing a confirmation, the native lifecycle consumer independently
+checks the provider's exact seven-field dictionary: matching PR, body digest
+and actor, exactly one marker, and positive integer thread/comment IDs.
+Malformed or mismatched readbacks remain unknown with the attempted write
+preserved; unverified provider payloads are not copied into the signed ledger.
+
 Status success followed by comment failure remains a confirmed abandonment,
 with `health = unknown` and separate attempted and unconfirmed action counts.
 There is no rollback, blind POST retry, historical-abandonment backfill, or

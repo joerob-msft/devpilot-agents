@@ -1708,8 +1708,41 @@ function Complete-StalePrExplanation {
             }
         }
     }
-    $confirmed = $null -ne $readback -and
-        [string]$readback.state -ceq 'confirmed'
+    $confirmed = $false
+    if ($readback -is [Collections.IDictionary]) {
+        $keys = @($readback.Keys | Sort-Object -CaseSensitive)
+        $exactShape = $keys.Count -eq 7 -and
+            ($keys -join ',') -ceq (
+                'authorId,bodyDigest,commentId,markerMatchCount,' +
+                'pullRequestId,state,threadId')
+        if ($exactShape) {
+            $integerFields = @(
+                'pullRequestId', 'markerMatchCount', 'threadId', 'commentId'
+            )
+            $integersValid = @($integerFields | Where-Object {
+                    $readback[$_] -isnot [int] -and
+                    $readback[$_] -isnot [long]
+                }).Count -eq 0
+            $confirmed = $integersValid -and
+                $readback.state -is [string] -and
+                $readback.state -ceq 'confirmed' -and
+                $readback.pullRequestId -eq [long]$Intent.subject.pullRequestId -and
+                $readback.markerMatchCount -eq 1 -and
+                $readback.bodyDigest -is [string] -and
+                $readback.bodyDigest -ceq [string]$Intent.bodyDigest -and
+                $readback.authorId -is [string] -and
+                $readback.authorId -ieq [string]$Intent.actor.id -and
+                $readback.threadId -gt 0 -and
+                $readback.commentId -gt 0
+        }
+    }
+    if (-not $confirmed -and $null -ne $readback) {
+        $Diagnostic = [ordered]@{
+            kind = 'explanation-readback-unconfirmed'
+            providerDiagnostic = $Diagnostic
+        }
+        $readback = $null
+    }
     $state = if ($confirmed) { 'confirmed' } else { 'unknown' }
     $event = [ordered]@{
         schemaVersion = 1
