@@ -1353,18 +1353,72 @@ function Invoke-AutomaticOwnerV2Comments {
         $repaired = @(Repair-AutomaticOwnerV2Intents `
                 -DeliveryRoot $DeliveryRoot -Key $Key -Provider $Provider `
                 -Evidence $Evidence)
-        $authenticatedPriorComments = if (
-            $contextual) {
-            @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+        $currentDelivery = if ($namedAreEqual) {
+            'named-areequal'
+        }
+        elseif ($contextual) {
+            'contextual-conventions'
+        }
+        else {
+            'owner'
+        }
+        $authenticatedPriorList = [Collections.Generic.List[object]]::new()
+        foreach ($item in @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
                 -DeliveryRoot $DeliveryRoot -Key $Key `
-                -Delivery contextual-conventions `
-                -RuleCompatibility $(if ($Policy.Contains(
-                            'historyCompatibility')) {
+                -Delivery $currentDelivery `
+                -RuleCompatibility $(if ($contextual -and
+                        $Policy.Contains('historyCompatibility')) {
                         $Policy.historyCompatibility
                     }
-                    else { $null }))
+                    else { $null }))) {
+            [void]$authenticatedPriorList.Add($item)
         }
-        else { @() }
+        $baseDeliveryRoot = if ($namedAreEqual -or $contextual) {
+            Split-Path -Parent $DeliveryRoot
+        }
+        else {
+            $DeliveryRoot
+        }
+        if (-not [string]::IsNullOrWhiteSpace($baseDeliveryRoot) -and
+            (Test-Path -LiteralPath $baseDeliveryRoot -PathType Container)) {
+            foreach ($siblingDelivery in @('owner', 'named-areequal', 'contextual-conventions')) {
+                if ($siblingDelivery -ceq $currentDelivery) {
+                    continue
+                }
+                $siblingRoot = if ($siblingDelivery -ceq 'named-areequal') {
+                    Join-Path $baseDeliveryRoot $script:AutomaticNamedAreEqualRoot
+                }
+                elseif ($siblingDelivery -ceq 'contextual-conventions') {
+                    Join-Path $baseDeliveryRoot $script:AutomaticContextualRoot
+                }
+                else {
+                    $baseDeliveryRoot
+                }
+                $siblingKeyFile = if ($siblingDelivery -ceq 'named-areequal') {
+                    'keys\named-areequal-service-authorization.hmac'
+                }
+                elseif ($siblingDelivery -ceq 'contextual-conventions') {
+                    'keys\contextual-conventions-service-authorization.hmac'
+                }
+                else {
+                    'keys\owner-v2-service-authorization.hmac'
+                }
+                $siblingKeyPath = Join-Path $siblingRoot $siblingKeyFile
+                if (-not (Test-Path -LiteralPath $siblingRoot -PathType Container) -or
+                    -not (Test-Path -LiteralPath (Join-Path $siblingRoot 'events') -PathType Container) -or
+                    -not (Test-Path -LiteralPath $siblingKeyPath -PathType Leaf)) {
+                    continue
+                }
+                $siblingKey = Get-AutomaticOwnerV2ServiceKey `
+                    -DeliveryRoot $siblingRoot -Delivery $siblingDelivery
+                foreach ($item in @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                        -DeliveryRoot $siblingRoot -Key $siblingKey `
+                        -Delivery $siblingDelivery)) {
+                    [void]$authenticatedPriorList.Add($item)
+                }
+            }
+        }
+        $authenticatedPriorComments = @($authenticatedPriorList.ToArray())
         $history = Get-AutomaticOwnerV2DeliveryHistory `
             -DeliveryRoot $DeliveryRoot -Key $Key -Evidence $Evidence
         if ($deterministic) {

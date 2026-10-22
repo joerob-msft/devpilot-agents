@@ -720,16 +720,42 @@ function Invoke-ContextualConventionsCurrentPrBridge {
     }
     $snapshots = $intake.transientSnapshots
     [void]$intake.Remove('transientSnapshots')
-    $selected = @($intake.heads | Where-Object {
+    $withheldHeadEntries = @($intake.heads | Where-Object {
             [string]$_.targetRef -ceq 'refs/heads/master' -and
             [string]$_.reasonCode -cnotin @(
-                'not-selected', 'target-out-of-policy')
+                'not-selected', 'target-out-of-policy') -and
+            ([string]$_.reasonCode -ceq 'lifecycle-activity-unverified' -or
+                ($_.Contains('automaticCommentEligible') -and
+                    -not [bool]$_.automaticCommentEligible))
+        })
+    $withheldHeads = @($withheldHeadEntries | ForEach-Object {
+            [ordered]@{
+                pullRequestId = [long]$_.pullRequestId
+                state = 'withheld'
+                reason = $(if (-not [string]::IsNullOrWhiteSpace([string]$_.reasonCode)) {
+                        [string]$_.reasonCode
+                    }
+                    else {
+                        'automatic-comment-ineligible'
+                    })
+                automaticCommentEligible = $false
+            }
+        })
+    $selected = @($intake.heads | Where-Object {
+            [string]$_.targetRef -ceq 'refs/heads/master' -and
+            (-not $_.Contains('automaticCommentEligible') -or
+                [bool]$_.automaticCommentEligible) -and
+            [string]$_.reasonCode -cnotin @(
+                'not-selected',
+                'target-out-of-policy',
+                'lifecycle-activity-unverified')
         })
     if ($selected.Count -lt 1) {
         $knownEmpty = [bool]$intake.populationKnown -and
             [string]$intake.inventory.state -ceq 'complete' -and
             [int]$intake.counts.error -eq 0 -and
-            [int]$intake.inventory.eligible -eq 0
+            [int]$intake.inventory.eligible -eq 0 -and
+            $withheldHeads.Count -eq 0
         return [pscustomobject][ordered]@{
             schemaVersion = 1
             kind = 'contextual-conventions-current-pr-bridge-result'
@@ -739,6 +765,12 @@ function Invoke-ContextualConventionsCurrentPrBridge {
             intake = $intake
             manifestPath = $null
             records = @()
+            outcomes = @()
+            selectedCount = 0
+            completedCount = 0
+            incompleteCount = 0
+            withheldHeadCount = $withheldHeads.Count
+            withheldHeads = @($withheldHeads)
             providerWrites = 0
             modelWrites = 0
         }
@@ -912,8 +944,11 @@ function Invoke-ContextualConventionsCurrentPrBridge {
             manifestPath = $null
             records = @()
             outcomes = $batchFailures.ToArray()
+            selectedCount = $selected.Count
             completedCount = 0
             incompleteCount = $batchFailures.Count
+            withheldHeadCount = $withheldHeads.Count
+            withheldHeads = @($withheldHeads)
             providerWrites = 0
             modelWrites = 0
         }
@@ -979,8 +1014,11 @@ function Invoke-ContextualConventionsCurrentPrBridge {
                 manifestPath = $null
                 records = @()
                 outcomes = $batchFailures.ToArray()
+                selectedCount = $selected.Count
                 completedCount = 0
                 incompleteCount = $batchFailures.Count
+                withheldHeadCount = $withheldHeads.Count
+                withheldHeads = @($withheldHeads)
                 providerWrites = 0
                 modelWrites = 0
             }
@@ -1139,10 +1177,13 @@ function Invoke-ContextualConventionsCurrentPrBridge {
         manifestPath = [IO.Path]::GetFullPath($ManifestPath)
         records = $records.ToArray()
         outcomes = @($outcomes)
+        selectedCount = $selected.Count
         completedCount = @($records.ToArray() | Where-Object {
                 [string]$_.state -ceq 'completed'
             }).Count
         incompleteCount = $incomplete.Count
+        withheldHeadCount = $withheldHeads.Count
+        withheldHeads = @($withheldHeads)
         providerWrites = 0
         modelWrites = 0
     }
