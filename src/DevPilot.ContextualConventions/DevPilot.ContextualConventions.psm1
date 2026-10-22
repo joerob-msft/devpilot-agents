@@ -44,7 +44,10 @@ function Test-ContextualConventionPriorRuleIds {
         [Parameter(Mandatory)][Collections.IDictionary]$Rule,
         [Parameter(Mandatory)][object[]]$RuleIds
     )
-    if (@($RuleIds | Where-Object {
+    if ('named-call-arguments' -cin $RuleIds) { return $false }
+    if ([string]$Rule.hash -cne
+            'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938' -and
+        @($RuleIds | Where-Object {
         [string]$_ -cin @('block-body-indentation', 'generic-exception-naming',
             'reused-string-literals', 'file-copyright-header')
     }).Count -gt 0) { return $false }
@@ -64,6 +67,10 @@ function Test-ContextualConventionPriorRuleIds {
         }
         'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac' {
             if ([long]$Rule.length -ne 6249) { return $false }
+            @()
+        }
+        'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938' {
+            if ([long]$Rule.length -ne 10287) { return $false }
             @()
         }
         default { @() }
@@ -1837,6 +1844,111 @@ function Get-ContextualNamedCallSignatures {
     return $signatures.ToArray()
 }
 
+function Get-ContextualNamedCallBinding {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $sourceTree = $Root.GetLocation().SourceTree
+    $trees = [Collections.Generic.List[Microsoft.CodeAnalysis.SyntaxTree]]::new()
+    [void]$trees.Add($sourceTree)
+    foreach ($file in $SnapshotFiles) {
+        if ([string]$file.path -inotmatch '\.cs$' -or
+            [string]$file.path -ieq $Path) {
+            continue
+        }
+        if ([string]$file.state -cne 'complete' -or $file.content -isnot [string]) {
+            return $null
+        }
+        [void]$trees.Add([Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+                [string]$file.content))
+    }
+    $conditionalSpans = @()
+    foreach ($tree in $trees) {
+        if (@($tree.GetDiagnostics() | Where-Object {
+                    $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            return $null
+        }
+        $conditional = Get-ContextualExceptionNamingConditionalState `
+            -Root $tree.GetRoot() -Spans @() -Source
+        if ($conditional.BindingUnknown) {
+            return $null
+        }
+        if ($tree -eq $sourceTree) {
+            $conditionalSpans = @($conditional.Spans)
+        }
+    }
+    $reference = [Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile(
+        [object].Assembly.Location)
+    $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+        'ContextualNamedCalls', $trees.ToArray(),
+        [Microsoft.CodeAnalysis.MetadataReference[]]@($reference),
+        [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+            [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary))
+    $core = [Microsoft.CodeAnalysis.IAssemblySymbol]$compilation.GetAssemblyOrModuleSymbol($reference)
+    return [pscustomobject]@{
+        Model = $compilation.GetSemanticModel($sourceTree)
+        StringType = $core.GetTypeByMetadataName('System.String')
+        ComparisonType = $core.GetTypeByMetadataName('System.StringComparison')
+        ConditionalSpans = $conditionalSpans
+    }
+}
+
+function Get-ContextualStringEqualsState {
+    param(
+        [Parameter(Mandatory)]$Node,
+        [AllowNull()]$Binding
+    )
+    if ($Node -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax]) {
+        return 'other'
+    }
+    $expression = $Node.Expression
+    $name = if ($expression -is [Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
+        [string]$expression.Name.Identifier.ValueText
+    }
+    elseif ($expression -is [Microsoft.CodeAnalysis.CSharp.Syntax.SimpleNameSyntax]) {
+        [string]$expression.Identifier.ValueText
+    }
+    else { '' }
+    if ($name -cne 'Equals') { return 'other' }
+    if ($null -eq $Binding -or
+        @($Binding.ConditionalSpans | Where-Object { $_.IntersectsWith($Node.Span) }).Count -gt 0) {
+        return 'unknown'
+    }
+    if (@($Node.ArgumentList.Arguments | Where-Object {
+                $type = $Binding.Model.GetTypeInfo($_.Expression).Type
+                $null -ne $type -and $type.TypeKind -eq [Microsoft.CodeAnalysis.TypeKind]::Dynamic
+            }).Count -gt 0) {
+        return 'unknown'
+    }
+    $symbol = $Binding.Model.GetSymbolInfo($Node).Symbol
+    if ($symbol -isnot [Microsoft.CodeAnalysis.IMethodSymbol] -or
+        @($Binding.Model.GetDiagnostics($Node.Span) | Where-Object {
+                $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+            }).Count -gt 0) {
+        return 'unknown'
+    }
+    $method = [Microsoft.CodeAnalysis.IMethodSymbol]$symbol
+    $same = [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default
+    if (-not $method.IsStatic -or $method.IsGenericMethod -or
+        $method.MethodKind -ne [Microsoft.CodeAnalysis.MethodKind]::Ordinary -or
+        $method.ReturnType.SpecialType -ne [Microsoft.CodeAnalysis.SpecialType]::System_Boolean -or
+        -not $same.Equals($method.ContainingType, $Binding.StringType) -or
+        $method.Parameters.Length -notin @(2, 3)) {
+        return 'not-exempt'
+    }
+    for ($index = 0; $index -lt $method.Parameters.Length; $index++) {
+        $expected = if ($index -lt 2) { $Binding.StringType } else { $Binding.ComparisonType }
+        if (-not $same.Equals($method.Parameters[$index].Type, $expected) -or
+            $method.Parameters[$index].RefKind -ne [Microsoft.CodeAnalysis.RefKind]::None) {
+            return 'not-exempt'
+        }
+    }
+    return 'exception'
+}
+
 function Get-ContextualNamedCallSignature {
     param(
         [Parameter(Mandatory)]$Node,
@@ -1863,53 +1975,6 @@ function Get-ContextualNamedCallSignature {
     if ($Node -is [
             Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax]) {
         $expression = $Node.Expression
-        $expressionText =
-            ([string]$expression.ToString()) -replace '^global::', ''
-        $knownStringReceiver = $expressionText -match
-                '^(?:string|System\.String)\.Equals$' -or
-            ($expressionText -ceq 'String.Equals' -and
-                (Get-ContextualNormalizedTypeName `
-                    -TypeName String `
-                    -ContextNode $Node) -ceq
-                    'System.String')
-        if ($knownStringReceiver -and
-            $arguments.Count -in @(2, 3)) {
-            $parameters = @(
-                [ordered]@{
-                    name = 'a'
-                    type = 'System.String'
-                    modifier = ''
-                    optional = $false
-                    params = $false
-                },
-                [ordered]@{
-                    name = 'b'
-                    type = 'System.String'
-                    modifier = ''
-                    optional = $false
-                    params = $false
-                })
-            if ($arguments.Count -eq 3) {
-                $parameters += [ordered]@{
-                    name = 'comparisonType'
-                    type = 'System.StringComparison'
-                    modifier = ''
-                    optional = $false
-                    params = $false
-                }
-            }
-            return [pscustomobject]@{
-                State = 'resolved'
-                Signature = [pscustomobject]@{
-                    Kind = 'method'
-                    Name = 'Equals'
-                    Container = 'String'
-                    GenericParameters = @()
-                    Parameters = $parameters
-                    Path = 'known-bcl'
-                }
-            }
-        }
         if ($expression -is [
                 Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax]) {
             $name = [string]$expression.Name.Identifier.ValueText
@@ -2504,7 +2569,8 @@ function Get-ContextualNamedCallOutcome {
         [Parameter(Mandatory)]$Language,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [object[]]$Constants
+        [object[]]$Constants,
+        [AllowNull()]$Binding
     )
     if (-not (Test-ContextualNodeChanged `
             -Node $Node -Spans $Spans)) {
@@ -2568,6 +2634,17 @@ function Get-ContextualNamedCallOutcome {
             -EndLine $anchor `
             -Symbol 'unresolved-call'
     }
+    $equality = Get-ContextualStringEqualsState -Node $Node -Binding $Binding
+    if ($equality -ceq 'exception') {
+        return New-ContextualOutcome -RuleId named-call-arguments `
+            -State compliant -Reason symmetric-string-equals-exception `
+            -Path $Path -Line $anchor -EndLine $anchor -Symbol Equals
+    }
+    if ($equality -ceq 'unknown') {
+        return New-ContextualOutcome -RuleId named-call-arguments `
+            -State unknown -Reason string-equals-binding-unproven `
+            -Path $Path -Line $anchor -EndLine $anchor -Symbol Equals
+    }
     $signatureResult =
         Get-ContextualNamedCallSignature `
             -Node $Node -Root $Root `
@@ -2577,7 +2654,7 @@ function Get-ContextualNamedCallOutcome {
         return $null
     }
     if ([string]$signatureResult.State -cne 'resolved') {
-        if (-not $literalTrigger -and
+        if ($equality -cne 'not-exempt' -and -not $literalTrigger -and
             -not $multilineTrigger -and
             -not ($arguments.Count -ge 2 -and
                 [string]$signatureResult.Reason -cin @(
@@ -4625,13 +4702,23 @@ function Get-ContextualRoslynOutcomes {
             $_ -is [
                 Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorInitializerSyntax]
         })
+    $namedCallBinding = if (@($callNodes | Where-Object {
+                $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax] -and
+                (($_.Expression -is [Microsoft.CodeAnalysis.CSharp.Syntax.MemberAccessExpressionSyntax] -and
+                    $_.Expression.Name.Identifier.ValueText -ceq 'Equals') -or
+                ($_.Expression -is [Microsoft.CodeAnalysis.CSharp.Syntax.SimpleNameSyntax] -and
+                    $_.Expression.Identifier.ValueText -ceq 'Equals'))
+            }).Count -gt 0) {
+        Get-ContextualNamedCallBinding -Root $root -Path $Path -SnapshotFiles $SnapshotFiles
+    }
+    else { $null }
     foreach ($call in $callNodes) {
         $outcome = Get-ContextualNamedCallOutcome `
             -Node $call -Root $root `
             -Path $Path -Spans $Spans `
             -Signatures $namedCallSignatures `
             -Language $namedCallLanguage `
-            -Constants $namedCallConstants
+            -Constants $namedCallConstants -Binding $namedCallBinding
         if ($null -eq $outcome) {
             continue
         }

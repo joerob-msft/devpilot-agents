@@ -1257,12 +1257,13 @@ Describe 'Owner capability module surface' {
         @($links.name) | Should -Be @(
             'Name same-type parameters',
             'Name parameters for multi-line method call',
-            'Name constant parameters')
-        foreach ($index in 0..2) {
+            'Name constant parameters',
+            'String equality exception')
+        foreach ($index in 0..3) {
             $links[$index].url | Should -Match (
-                '\?version=GC7cbaf3ef94e3bec3af10875b7c6a2690d111416b&path=' +
+                '\?version=GC6cc598bff64c224e60a7789de19f5d5d82d3764d&path=' +
                 '/documentation/EngineeringProcesses/Conventions/CodingStyle.md&line=' +
-                @(547, 590, 617)[$index] + '$')
+                @(547, 592, 662, 621)[$index] + '$')
         }
         $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
         $ruleLinks = @($links | ForEach-Object { "[$($_.name)]($($_.url))" }) -join '; '

@@ -1057,13 +1057,118 @@ class C : B { C() : base("a", "b") {} }
         }
     }
 
-    It 'resolves the pinned BCL string Equals signature without overlapping comparison semantics' {
-        $content = 'class C { bool M(string a, string b) { return string.Equals(a, b, System.StringComparison.Ordinal); } }'
+    It 'accepts the reviewed symmetric string equality call without naming its comparison mode' {
+        $content = @'
+using System;
+class XmlSchemaToJsonSchemaTests {
+    const string IntegerChildrenParticle = "integer";
+    bool M(string contentParticle) {
+        return string.Equals(contentParticle, XmlSchemaToJsonSchemaTests.IntegerChildrenParticle, StringComparison.Ordinal);
+    }
+}
+'@
         $outcome = Invoke-ConventionCase `
             -RuleId named-call-arguments `
             -Content $content
-        $outcome.state | Should -BeExactly violation
+        $outcome.state | Should -BeExactly compliant
+        $outcome.reason | Should -BeExactly symmetric-string-equals-exception
         $outcome.symbol | Should -BeExactly Equals
+    }
+
+    It 'accepts only bound static string equality: <Case>' -TestCases @(
+        @{ Case = 'two strings'; Source = 'class C { bool M(string a, string b) => string.Equals(a, b); }' },
+        @{ Case = 'constant strings'; Source = 'class C { bool M() => string.Equals("a", "b"); }' },
+        @{ Case = 'explicit comparison'; Source = 'using System; class C { bool M(string a, string b) => string.Equals(a, b, StringComparison.Ordinal); }' },
+        @{ Case = 'nonconstant comparison'; Source = 'using System; class C { bool M(string a, string b, StringComparison mode) => string.Equals(a, b, mode); }' },
+        @{ Case = 'qualified System.String'; Source = 'class C { bool M(string a, string b) => System.String.Equals(a, b, System.StringComparison.Ordinal); }' },
+        @{ Case = 'global qualification'; Source = 'class C { bool M(string a, string b) => global::System.String.Equals(a, b); }' },
+        @{ Case = 'receiver trivia'; Source = 'class C { bool M(string a, string b) => string /* receiver */ . Equals(a, b); }' },
+        @{ Case = 'imported String'; Source = 'using System; class C { bool M(string a, string b) => String.Equals(a, b); }' },
+        @{ Case = 'type alias'; Source = 'using Text = System.String; class C { bool M(string a, string b) => Text.Equals(a, b, System.StringComparison.Ordinal); }' },
+        @{ Case = 'one argument per line'; Source = "class C { bool M(string a, string b) => string.Equals(`n    a,`n    b,`n    System.StringComparison.Ordinal); }" },
+        @{ Case = 'mixed named operands'; Source = 'class C { bool M(string a, string b) => string.Equals(a: a, b, System.StringComparison.Ordinal); }' }
+    ) {
+        param($Case, $Source)
+        $outcome = Invoke-ConventionCase -RuleId named-call-arguments -Content $Source
+        $outcome.state | Should -BeExactly compliant
+        $outcome.reason | Should -BeExactly symmetric-string-equals-exception
+    }
+
+    It 'does not exempt other equality or ordinary named-argument triggers: <Case>' -TestCases @(
+        @{ Case = 'instance String.Equals'; State = 'unknown'; Source = 'class C { bool M(string a, string b) => a.Equals(b, System.StringComparison.Ordinal); }' },
+        @{ Case = 'Object.Equals'; State = 'unknown'; Source = 'class C { bool M(object a) => System.Object.Equals(a, null); }' },
+        @{ Case = 'object overload through string'; State = 'unknown'; Source = 'class C { bool M(object a, object b) => string.Equals(a, b); }' },
+        @{ Case = 'inherited Object.Equals beats a static import'; State = 'unknown'; Source = 'using static System.String; class C { bool M(string a, string b) => Equals(a, b); }' },
+        @{ Case = 'custom Equals'; State = 'violation'; Source = 'class Custom { public static bool Equals(string a, string b) => true; } class C { bool M(string a, string b) => Custom.Equals(a, b); }' },
+        @{ Case = 'shadowed String'; State = 'violation'; Source = 'using System; class String { public static bool Equals(string a, string b) => true; } class C { bool M(string a, string b) => String.Equals(a, b); }' },
+        @{ Case = 'shadowed System.String'; State = 'violation'; Source = 'namespace System { class String { public static bool Equals(string a, string b) => true; } } class C { bool M(string a, string b) => System.String.Equals(a, b); }' },
+        @{ Case = 'custom type alias'; State = 'unknown'; Source = 'using Text = Custom; class Custom { public static bool Equals(string a, string b) => true; } class C { bool M(string a, string b) => Text.Equals(a, b); }' },
+        @{ Case = 'dynamic operand'; State = 'unknown'; Source = 'class C { bool M(dynamic a, string b) => string.Equals(a, b); }' },
+        @{ Case = 'unresolved operand'; State = 'unknown'; Source = 'class C { bool M(string a) => string.Equals(a, missing); }' },
+        @{ Case = 'comparison is not a string operand'; State = 'unknown'; Source = 'class C { bool M(string a, string b) => string.Equals(a, System.StringComparison.Ordinal, b); }' },
+        @{ Case = 'unsupported overload'; State = 'unknown'; Source = 'class C { bool M(string a, string b) => string.Equals(a, b, 0, false); }' },
+        @{ Case = 'string ordering comparison'; State = 'unknown'; Source = 'class C { int M(string a, string b) => string.Compare(a, b, System.StringComparison.Ordinal); }' },
+        @{ Case = 'custom instance Equals'; State = 'violation'; Source = 'class C { bool Equals(string a, string b) => true; bool M(string a, string b) => this.Equals(a, b); }' },
+        @{ Case = 'MethodName boolean constant'; State = 'violation'; Source = 'class C { void MethodName(string foo, bool enabled) {} void M(string foo) { this.MethodName(foo, false); } }' },
+        @{ Case = 'ProcessException repeated types'; State = 'violation'; Source = 'class HostFileUtilities { public static void ProcessException(System.Exception ex, string hidxPath, string schema) {} } class C { void M(System.Exception ex, string hidxPath, string schema) { HostFileUtilities.ProcessException(ex, hidxPath, schema); } }' }
+    ) {
+        param($Case, $State, $Source)
+        $outcome = Invoke-ConventionCase -RuleId named-call-arguments -Content $Source
+        $outcome.state | Should -BeExactly $State
+        $outcome.reason | Should -Not -BeExactly symmetric-string-equals-exception
+    }
+
+    It 'binds string equality constants from the existing bounded snapshot' {
+        $content = 'using System; partial class C { bool M(string a) => string.Equals(a, Expected, StringComparison.Ordinal); }'
+        $files = @(
+            (New-LiteralComparisonFile -Content $content -Path 'src/Changed.cs'),
+            (New-LiteralComparisonFile -Content 'partial class C { const string Expected = "expected"; }' -Path 'src/Constants.cs')
+        )
+        $outcome = Invoke-ConventionCase -RuleId named-call-arguments `
+            -Content $content -SnapshotFiles $files
+        $outcome.state | Should -BeExactly compliant
+        $outcome.reason | Should -BeExactly symmetric-string-equals-exception
+        $files[1].state = 'unknown'
+        $outcome = Invoke-ConventionCase -RuleId named-call-arguments `
+            -Content $content -SnapshotFiles $files
+        $outcome.state | Should -BeExactly unknown
+        $outcome.reason | Should -BeExactly string-equals-binding-unproven
+    }
+
+    It 'does not suppress unrelated calls alongside a string equality exception' {
+        $content = 'class C { void Target(string a, string b) {} bool M(string a, string b) { Target(a, b); return string.Equals(a, b); } }'
+        (Invoke-ConventionCase -RuleId named-call-arguments -Content $content).state |
+            Should -BeExactly violation
+        $content = 'class C { void Target(string a, string b) {} bool M(string a, string b) { var result = string.Equals(a, b); Target(a, b); return result; } }'
+        (Invoke-ConventionCase -RuleId named-call-arguments -Content $content).state |
+            Should -BeExactly violation
+    }
+
+    It 'keeps explicit comparison enforcement independent of argument-name exemptions' {
+        $content = 'class C { bool M(string a, string b) => string.Equals(a, b); }'
+        (Invoke-ConventionCase -RuleId named-call-arguments -Content $content).state |
+            Should -BeExactly compliant
+        $content = 'class C { bool M(string a, string b) { var equal = string.Equals(a, b); return a == b; } }'
+        (Invoke-ConventionCase -RuleId explicit-string-comparison -Content $content).state |
+            Should -BeExactly violation
+        $content = 'class C { bool M(string a, string b) => string.Equals(a, b, System.StringComparison.Ordinal); }'
+        (Invoke-ConventionCase -RuleId explicit-string-comparison -Content $content).state |
+            Should -BeExactly compliant
+    }
+
+    It 'withholds the exception under conditional alias binding' {
+        $content = @'
+#if ALTERNATE
+using Text = Custom;
+#else
+using Text = System.String;
+#endif
+class Custom { public static bool Equals(string a, string b) => true; }
+class C { bool M(string a, string b) => Text.Equals(a, b); }
+'@
+        $outcome = Invoke-ConventionCase -RuleId named-call-arguments -Content $content
+        $outcome.state | Should -BeExactly unknown
+        $outcome.reason | Should -BeExactly string-equals-binding-unproven
     }
 
     It 'preserves ref out and in argument binding' {
@@ -1613,7 +1718,7 @@ internal const string Value = "same";
             Should -BeExactly expanded-params-binding-unproven
     }
 
-    It 'normalizes proven BCL type names and withholds generic instantiations' {
+    It 'normalizes ordinary BCL parameter types, accepts symmetric equality, and withholds generic instantiations' {
         $sameType = 'using System; class C { void Target(String a, string b) {} void M(string x, string y) { Target(x, y); } }'
         (Invoke-ConventionCase `
             -RuleId named-call-arguments `
@@ -1629,7 +1734,7 @@ internal const string Value = "same";
             (Invoke-ConventionCase `
                 -RuleId named-call-arguments `
                 -Content $content).state |
-                Should -BeExactly violation
+                Should -BeExactly compliant
         }
 
         $generic = 'class C { void Target<T1, T2>(T1 a, T2 b) {} void M(string x, string y) { Target(x, y); } }'

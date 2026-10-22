@@ -1096,6 +1096,71 @@ class Writer {
 }
 
 Describe 'Contextual convention current PR bridge' {
+    It 'evaluates the reviewed line 464 through the real bridge: <Case>' -TestCases @(
+        @{ Case = 'System.String exception'; Receiver = 'string'; Expected = 0 },
+        @{ Case = 'custom Equals remains enforced'; Receiver = 'Comparator'; Expected = 1 }
+    ) {
+        param($Case, $Receiver, $Expected)
+        $source = @'
+using System;
+class XmlSchemaToJsonSchemaTests
+{
+    const string IntegerChildrenParticle = "integer";
+    bool M(string contentParticle)
+    {
+        return string.Equals(contentParticle, XmlSchemaToJsonSchemaTests.IntegerChildrenParticle, StringComparison.Ordinal);
+    }
+}
+class Comparator { public static bool Equals(string a, string b, StringComparison mode) => true; }
+'@
+        $content = ("`n" * 457) + $source.Replace('return string.Equals', "return $Receiver.Equals")
+        $path = 'src/netStandard/Tests/Tests.BuiltIn.Xml/XmlSchemaToJsonSchemaTests.cs'
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $sample = Get-Content -LiteralPath (Join-Path $repoRoot `
+            'samples\contextual-conventions-current-pr.config.json') -Raw |
+            ConvertFrom-Json -AsHashtable
+        $config['commentRuleReferences'] = $sample.commentRuleReferences
+        $config['commentRuleRepository'] = $sample.commentRuleRepository
+        $prepared = New-ContextualPreparedIntake -Content $content
+        $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $entry.path = $path
+        $entry.spans[0].startLine = 464
+        $entry.spans[0].endLine = 464
+        $project = '<Project><PropertyGroup><LangVersion>7.2</LangVersion></PropertyGroup></Project>'
+        $entry['projectContext'] = @{
+            state = 'complete'; path = 'src/Tests.csproj'; content = $project
+            sourceDigest = Get-ContextualTestTextDigest $project
+            byteLength = [Text.Encoding]::UTF8.GetByteCount($project)
+        }
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared `
+            -Name "string-equals-$Receiver"
+        $result.records | Should -HaveCount 1
+        $result.providerWrites | Should -Be 0
+        $result.modelWrites | Should -Be 0
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $findings = @($observation.findings | Where-Object ruleId -CEQ named-call-arguments)
+        $findings | Should -HaveCount $Expected
+        if ($Expected -eq 1) {
+            $finding = $findings[0]
+            $finding.anchor.line | Should -Be 464
+            $finding.anchor.path.TrimStart('/') | Should -BeExactly $path
+            $finding.reconciliation.classification | Should -BeExactly wouldCreate
+            $finding.evidence | Should -Match 'repeated-formal-type.*compile-time-constant'
+            $contract = (New-ContextualUpgradeRecognitionCase).Contract
+            $contract | Add-Member -NotePropertyName CommentPresentation -NotePropertyValue @{
+                ruleReferences = $config.commentRuleReferences
+                ruleRepository = $config.commentRuleRepository
+            } -Force
+            $marker = Get-ContextualConventionMarkerKey -Contract $contract -Finding $finding
+            $body = Format-ContextualConventionComment -Contract $contract -Finding $finding -MarkerKey $marker
+            foreach ($link in $config.commentRuleReferences['named-call-arguments'].links) {
+                $body | Should -Match ([regex]::Escape("[$($link.name)]($($link.url))"))
+            }
+        }
+    }
+
     It 'carries the generic catch rule through acquisition, exact source binding, formatter, and reviewer readback' {
         $config = New-ContextualTestConfig
         $config.enabled = $true
@@ -1824,6 +1889,7 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                     -Depth 32).rules.id |
                     Where-Object {
                         [string]$_ -cnotin @(
+                            'named-call-arguments',
                             'pr-template-compliance',
                             'block-body-indentation',
                             'generic-exception-naming',
@@ -1876,6 +1942,14 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                     unchangedRuleIds = @(
                         $priorTwentyOne +
                         'pr-template-compliance')
+                },
+                [ordered]@{
+                    rule = [ordered]@{
+                        hash = 'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
+                        length = 10287
+                    }
+                    unchangedRuleIds = @(Get-ContextualConventionRuleIds |
+                        Where-Object { $_ -cne 'named-call-arguments' })
                 })
             currentRule = [ordered]@{
                 hash =
@@ -1886,8 +1960,9 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
         }
         @($compatibility.previousRules[0].unchangedRuleIds) | Should -HaveCount 18
         @($compatibility.previousRules[1].unchangedRuleIds) | Should -HaveCount 20
-        @($compatibility.previousRules[2].unchangedRuleIds) | Should -HaveCount 21
-        @($compatibility.previousRules[3].unchangedRuleIds) | Should -HaveCount 22
+        @($compatibility.previousRules[2].unchangedRuleIds) | Should -HaveCount 20
+        @($compatibility.previousRules[3].unchangedRuleIds) | Should -HaveCount 21
+        @($compatibility.previousRules[4].unchangedRuleIds) | Should -HaveCount 25
         $cases = @(
             [ordered]@{
                 ruleId =
@@ -1929,7 +2004,7 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                 prior =
                     $compatibility.
                         previousRules[2].rule
-                expected = 'noOp'
+                expected = 'unknown'
             },
             [ordered]@{
                 ruleId =
@@ -1944,11 +2019,21 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                 prior = $compatibility.previousRules[3].rule
                 expected = 'noOp'
             })
-        foreach ($entry in $compatibility.previousRules) {
+        foreach ($entry in @($compatibility.previousRules | Select-Object -First 4)) {
             $cases += [ordered]@{
                 ruleId = 'block-body-indentation'
                 prior = $entry.rule
                 expected = 'unknown'
+            }
+        }
+        foreach ($ruleId in @(Get-ContextualConventionRuleIds)) {
+            $cases += [ordered]@{
+                ruleId = $ruleId
+                prior = $compatibility.previousRules[4].rule
+                expected = $(if ($ruleId -cin @(
+                    'named-call-arguments', 'reused-string-literals', 'file-copyright-header')) {
+                    'unknown'
+                } else { 'noOp' })
             }
         }
         foreach ($control in $cases) {
@@ -1976,7 +2061,18 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
             $result.findings[0].
                 reconciliation.classification |
                 Should -BeExactly `
-                    $control.expected
+                    $control.expected -Because (
+                        "$($control.ruleId), prior $($control.prior.hash): " +
+                        ($result.findings[0].reconciliation | ConvertTo-Json -Compress -Depth 16))
+            if ($control.ruleId -ceq 'reused-string-literals' -and
+                $control.prior.length -eq 10287) {
+                $result.findings[0].reconciliation.reason |
+                    Should -BeExactly reused-string-proof-missing
+            }
+            if ($control.ruleId -ceq 'file-copyright-header') {
+                $result.findings[0].reconciliation.reason |
+                    Should -BeExactly marker-derivation-failed
+            }
         }
     }
 
