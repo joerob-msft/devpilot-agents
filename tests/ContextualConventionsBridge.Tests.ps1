@@ -3283,6 +3283,109 @@ class C
             Should -BeFalse
     }
 
+    It 'reads code-level actionable partial evidence beside an isolated PR-wide template discussion unknown' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared =
+            New-ContextualPreparedIntake `
+                -Content (
+                    'class C { void M() { try { X(); } catch (System.Exception ex) { Logger.Error(ex.Message); } } }') `
+                -Description (
+                    'Synthetic PR description without required sections.')
+        Add-SyntheticDiscussion `
+            -Prepared $prepared `
+            -Config $config `
+            -Body '[Dobby] Suggested PR description edit.' `
+            -Identity reviewer
+        $result =
+            Invoke-SyntheticContextualBridge `
+                -Config $config `
+                -Prepared $prepared `
+                -Name pr-template-unknown-code-actionable
+        $result.state |
+            Should -BeExactly partial
+        $identity =
+            [string]$result.records[0].identity
+        $configPath = Join-Path $TestDrive `
+            'pr-template-unknown-code-actionable-config.json'
+        [IO.File]::WriteAllText(
+            $configPath,
+            (ConvertTo-Json `
+                -InputObject $config `
+                -Depth 64),
+            [Text.UTF8Encoding]::new($false))
+
+        $evidence =
+            Read-ApprovedOwnerV2Evidence `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-unknown-code-actionable-state') `
+                -Identity $identity `
+                -RepoRoot $repoRoot `
+                -ToolkitConfigPath $configPath `
+                -Delivery contextual-conventions
+        $prFinding = @(
+            $evidence.Observation.findings |
+                Where-Object {
+                    [string]$_.ruleId -ceq
+                        'pr-template-compliance'
+                })[0]
+        $codeFinding = @(
+            $evidence.Observation.findings |
+                Where-Object {
+                    [string]$_.ruleId -ceq
+                        'exception-logging'
+                })[0]
+        $proposal =
+            Get-ApprovedOwnerV2Proposal `
+                -Evidence $evidence `
+                -Finding $codeFinding `
+                -Delivery contextual-conventions
+        $deliveryRoot = Join-Path $TestDrive `
+            'pr-template-unknown-code-actionable-delivery'
+        $producer = Join-Path $repoRoot `
+            'tools\Invoke-ContextualDeliveryBatchJson.ps1'
+        $automatic = Join-Path $repoRoot `
+            'tools\Invoke-AutomaticOwnerV2Delivery.ps1'
+        $output = @(& $producer `
+                -AutomaticDeliveryTool $automatic `
+                -DeliveryRoot $deliveryRoot `
+                -StateRoot (
+                    Join-Path $TestDrive `
+                        'pr-template-unknown-code-actionable-state') `
+                -Identity $identity `
+                -ToolkitConfigPath $configPath `
+                -AzureCliPath 'ignored' `
+                -GitPath 'git' `
+                -RepoRoot $repoRoot)
+        $envelope =
+            ($output -join "`n") |
+                ConvertFrom-Json `
+                    -AsHashtable -Depth 64
+
+        $prFinding.reconciliation.classification |
+            Should -BeExactly unknown
+        $prFinding.reconciliation.reason |
+            Should -BeExactly `
+                duplicate-or-foreign-reviewer-marker
+        $codeFinding.reconciliation.classification |
+            Should -BeExactly wouldCreate
+        $proposal.scope |
+            Should -BeExactly changed-line
+        $proposal.path |
+            Should -BeExactly src/Checks.cs
+        $envelope.toolExitCode |
+            Should -Be 0
+        $envelope.result.health |
+            Should -BeExactly disabled
+        $envelope.result.providerWrites |
+            Should -Be 0
+        $envelope.result.modelWrites |
+            Should -Be 0
+        Test-Path -LiteralPath $deliveryRoot |
+            Should -BeFalse
+    }
+
     It 'withholds a PR-template finding when description metadata changes without a head change' {
         $config = New-ContextualTestConfig
         $config.enabled = $true

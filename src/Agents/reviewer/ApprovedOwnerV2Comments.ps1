@@ -452,29 +452,62 @@ function Test-ApprovedContextualActionablePartial {
             [StringComparer]::Ordinal)
     $unknownConstructs = [Collections.Generic.HashSet[string]]::new(
         [StringComparer]::Ordinal)
+    $pullRequestUnknownReasons = @(
+        'duplicate-or-foreign-reviewer-marker',
+        'prior-pr-template-review-coverage-unproven',
+        'partial-human-pr-template-coverage',
+        'other-review-at-anchor'
+    )
     foreach ($finding in $unknown) {
         $anchor =
             Get-ApprovedOwnerV2Value `
                 $finding 'anchor'
+        $reason = [string]$finding.reconciliation.reason
         if ($anchor -is
                 [Collections.IDictionary] -and
             [string](Get-ApprovedOwnerV2Value `
                 $anchor 'scope' '') -ceq
                 'pull-request') {
+            $ruleId = [string](Get-ApprovedOwnerV2Value `
+                $finding 'ruleId' '')
+            $issueIdentity = [string](Get-ApprovedOwnerV2Value `
+                $finding 'issueIdentity' '')
+            if ([string](Get-ApprovedOwnerV2Value `
+                    $anchor 'subject' '') -cne
+                    'description' -or
+                $ruleId -cne
+                    'pr-template-compliance' -or
+                $issueIdentity -cnotmatch
+                    '^v1:sha256:[0-9a-f]{64}$' -or
+                [string]::IsNullOrWhiteSpace(
+                    [string](Get-ApprovedOwnerV2Value `
+                        $finding 'constructRef' '')) -or
+                $reason -cnotin
+                    $pullRequestUnknownReasons) {
+                return $false
+            }
             [void]$unknownPullRequests.Add(
-                "$([string]$finding.ruleId)|$(
-                    [string]$finding.issueIdentity)")
+                "$ruleId|$issueIdentity")
         }
         elseif ($anchor -is
                 [Collections.IDictionary]) {
+            if ($reason -cne
+                'other-review-at-anchor') {
+                return $false
+            }
             [void]$unknownAnchors.Add(
                 "$([string](Get-ApprovedOwnerV2Value $anchor 'path' ''))|$(
                     [int](Get-ApprovedOwnerV2Value $anchor 'line' 0))")
         }
+        else {
+            return $false
+        }
         if (-not [string]::IsNullOrWhiteSpace(
-                [string]$finding.constructRef)) {
+                [string](Get-ApprovedOwnerV2Value `
+                    $finding 'constructRef' ''))) {
             [void]$unknownConstructs.Add(
-                [string]$finding.constructRef)
+                [string](Get-ApprovedOwnerV2Value `
+                    $finding 'constructRef' ''))
         }
     }
     $overlap = @($actionable | Where-Object {
@@ -489,8 +522,8 @@ function Test-ApprovedContextualActionablePartial {
                     $anchor 'scope' '') -ceq
                     'pull-request' -and
                 $unknownPullRequests.Contains(
-                    "$([string]$candidate.ruleId)|$(
-                        [string]$candidate.issueIdentity)")
+                    "$([string](Get-ApprovedOwnerV2Value $candidate 'ruleId' ''))|$(
+                        [string](Get-ApprovedOwnerV2Value $candidate 'issueIdentity' ''))")
             $fileOverlap =
                 $anchor -is
                     [Collections.IDictionary] -and
@@ -503,9 +536,11 @@ function Test-ApprovedContextualActionablePartial {
             $pullRequestOverlap -or
             $fileOverlap -or
             (-not [string]::IsNullOrWhiteSpace(
-                    [string]$candidate.constructRef) -and
+                    [string](Get-ApprovedOwnerV2Value `
+                        $candidate 'constructRef' '')) -and
                 $unknownConstructs.Contains(
-                    [string]$candidate.constructRef))
+                    [string](Get-ApprovedOwnerV2Value `
+                        $candidate 'constructRef' '')))
         }).Count -gt 0
     return (
         -not [bool]$Observation.findingsComplete -and
@@ -517,10 +552,6 @@ function Test-ApprovedContextualActionablePartial {
         -not $overlap -and
         [int]$Observation.effects.dedupe.unknown -eq
             $unknown.Count -and
-        @($unknown | Where-Object {
-                [string]$_.reconciliation.reason -cne
-                    'other-review-at-anchor'
-            }).Count -eq 0 -and
         @($findings | Where-Object {
                 [string]$_.reconciliation.classification -cnotin @(
                     'wouldCreate', 'noOp', 'humanCovered', 'unknown')
