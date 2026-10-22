@@ -483,6 +483,33 @@ if ([int]$delivery.providerWrites -lt 0 -or
     withheldObservations =
         $withheldObservations.ToArray()
     withheldCount = $withheldObservations.Count
+    withheldHeadCount = $(if ($evaluation.Contains('withheldHeadCount')) {
+            [int]$evaluation.withheldHeadCount
+        }
+        else { 0 })
+    coverage = [ordered]@{
+        selectedHeadCount = $(if ($evaluation.Contains('selectedCount')) {
+                [int]$evaluation.selectedCount
+            }
+            else {
+                @($evaluation.records).Count
+            })
+        completedHeadCount = $(if ($evaluation.Contains('completedCount')) {
+                [int]$evaluation.completedCount
+            }
+            else {
+                $completed.Count
+            })
+        incompleteHeadCount = $(if ($evaluation.Contains('incompleteCount')) {
+                [int]$evaluation.incompleteCount
+            }
+            else { 0 })
+        withheldHeadCount = $(if ($evaluation.Contains('withheldHeadCount')) {
+                [int]$evaluation.withheldHeadCount
+            }
+            else { 0 })
+        withheldObservationCount = $withheldObservations.Count
+    }
     delivery = $delivery
     deliveryEnvelope = $deliveryEnvelope
     deliveryEnabled = $deliveryEnabled

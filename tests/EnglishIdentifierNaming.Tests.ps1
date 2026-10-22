@@ -32,6 +32,35 @@ class XmlComposer {
 }
 
 Describe 'Source-backed English identifier naming' {
+    It 'keeps the disabled sample bound to the exact integrated rule and implementation bytes' {
+        $sample = Get-Content -LiteralPath (Join-Path $repoRoot `
+            'samples\contextual-conventions-current-pr.config.json') -Raw | ConvertFrom-Json -AsHashtable
+        $sample.enabled | Should -BeFalse
+        $sample.readOnly | Should -BeTrue
+        $sample.dryRun | Should -BeTrue
+        $sample.autoCreateContextualConventionComments | Should -BeFalse
+        $sample.stalePullRequestLifecycle | Should -BeFalse
+        $policyBytes = [IO.File]::ReadAllBytes((Join-Path $repoRoot $sample.contextualRule.path))
+        $sample.contextualRule.length | Should -Be $policyBytes.Length
+        $sample.contextualRule.hash | Should -BeExactly (
+            'v1:sha256:' + [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($policyBytes)).ToLowerInvariant())
+        $paths = @{
+            activePrIntakeSha256 = 'src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psm1'
+            contextualBridgeSha256 = 'src\DevPilot.ContextualConventionsBridge\DevPilot.ContextualConventionsBridge.psm1'
+            toolSha256 = 'tools\Invoke-SharedReviewAcquisition.ps1'
+        }
+        foreach ($binding in $paths.GetEnumerator()) {
+            $sample.sharedAcquisition[$binding.Key] | Should -BeExactly (
+                Get-FileHash -LiteralPath (Join-Path $repoRoot $binding.Value) -Algorithm SHA256
+            ).Hash.ToLowerInvariant()
+        }
+        $sample.capability.implementationSha256 | Should -BeExactly (
+            Get-FileHash -LiteralPath (Join-Path $repoRoot `
+                'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1') -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+    }
+
     It 'registers the additive rule without promoting it into historical bundles' {
         . (Join-Path $repoRoot 'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
         $ids = @(Get-ContextualConventionRuleIds)

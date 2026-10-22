@@ -113,6 +113,185 @@ function Assert-DevPilotChangeInventory {
     }
 }
 
+function Get-DevPilotZeroAddedLineModifiedTextProof {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceContent,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TargetContent
+    )
+
+    if ($SourceContent.IndexOf([char]0) -ge 0 -or
+        $TargetContent.IndexOf([char]0) -ge 0) {
+        return $null
+    }
+    $normalizedSource = $SourceContent.Replace("`r`n", "`n")
+    $normalizedTarget = $TargetContent.Replace("`r`n", "`n")
+    if ($normalizedSource.IndexOf([char]"`r") -ge 0 -or
+        $normalizedTarget.IndexOf([char]"`r") -ge 0) {
+        return $null
+    }
+    if ($SourceContent -ceq $TargetContent) {
+        return 'identical-content'
+    }
+    if ($normalizedSource -ceq $normalizedTarget) {
+        return 'normalized-line-ending-only'
+    }
+    if ($normalizedSource.Length -gt 0 -and
+        ($normalizedSource.EndsWith("`n") -ne
+            $normalizedTarget.EndsWith("`n"))) {
+        return $null
+    }
+    $sourceLines = @(if ($normalizedSource.Length -eq 0) {
+            @()
+        }
+        else {
+            $normalizedSource.Split("`n")
+        })
+    $targetLines = @(if ($normalizedTarget.Length -eq 0) {
+            @()
+        }
+        else {
+            $normalizedTarget.Split("`n")
+        })
+    if ($sourceLines.Count -ge $targetLines.Count -or
+        $targetLines.Count -gt 200000) {
+        return $null
+    }
+    $sourceIndex = 0
+    for ($targetIndex = 0;
+        $targetIndex -lt $targetLines.Count -and
+        $sourceIndex -lt $sourceLines.Count;
+        $targetIndex++) {
+        if ($targetLines[$targetIndex] -ceq
+            $sourceLines[$sourceIndex]) {
+            $sourceIndex++
+        }
+    }
+    if ($sourceIndex -eq $sourceLines.Count) {
+        return 'deletion-only'
+    }
+    return $null
+}
+
+function Get-DevPilotValidatedModifiedZeroSpanProof {
+    param(
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Entry,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Head,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Derivation
+    )
+
+    if ([string]$Derivation.state -cne 'complete' -or
+        [string]$Entry.state -cne 'complete' -or
+        ($Entry.Contains('isBinary') -and
+            [bool]$Entry.isBinary) -or
+        ($Entry.Contains('truncated') -and
+            [bool]$Entry.truncated) -or
+        ($Entry.Contains('unavailableReason') -and
+            $null -ne $Entry.unavailableReason) -or
+        [string]$Derivation.changeType -cne 'modified' -or
+        [string]$Derivation.pathRelation -cne 'same-path' -or
+        [string]$Derivation.sourceContentState -cne 'available' -or
+        [string]$Derivation.targetContentState -cne 'available' -or
+        [string]$Derivation.sourceContentSha256 -cnotmatch
+            '^v1:sha256:[0-9a-f]{64}$' -or
+        [string]$Derivation.targetContentSha256 -cnotmatch
+            '^v1:sha256:[0-9a-f]{64}$' -or
+        [long]$Derivation.spanCount -ne 0 -or
+        [long]$Derivation.currentLineCount -ne 0 -or
+        $Entry.content -isnot [string]) {
+        return $null
+    }
+    $actualSource = Get-DevPilotUtf8Digest (
+        [string]$Entry.content)
+    if ([long]$Entry.byteLength -ne
+            [long]$actualSource.byteLength -or
+        [string]$Entry.sourceDigest -cne
+            [string]$actualSource.sha256 -or
+        [string]$Derivation.sourceContentSha256 -cne
+            [string]$actualSource.sha256 -or
+        [long]$Derivation.sourceByteLength -ne
+            [long]$actualSource.byteLength) {
+        throw 'change-derivation-content-mismatch'
+    }
+    if ([string]$Derivation.sourceContentSha256 -ceq
+            [string]$Derivation.targetContentSha256 -and
+        [long]$Derivation.sourceByteLength -eq
+            [long]$Derivation.targetByteLength) {
+        if ($Entry.Contains('comparison') -and
+            $null -ne $Entry.comparison) {
+            $comparison = $Entry.comparison
+            if ($comparison -isnot [Collections.IDictionary] -or
+                [string]$comparison.state -cne 'complete' -or
+                [string]$comparison.targetState -cne 'present' -or
+                ($comparison.Contains('truncated') -and
+                    [bool]$comparison.truncated) -or
+                [string]$comparison.path -cne [string]$Entry.path -or
+                [string]$comparison.targetPath -cne [string]$Entry.path -or
+                [string]$comparison.sourceCommit -cne
+                    [string]$Head.sourceCommit -or
+                [string]$comparison.targetCommit -cne
+                    [string]$Head.targetCommit -or
+                [string]$comparison.sourceDigest -cne
+                    [string]$actualSource.sha256 -or
+                $comparison.content -isnot [string]) {
+                return $null
+            }
+            $actualTarget = Get-DevPilotUtf8Digest (
+                [string]$comparison.content)
+            if ([long]$comparison.byteLength -ne
+                    [long]$actualTarget.byteLength -or
+                [long]$Derivation.targetByteLength -ne
+                    [long]$actualTarget.byteLength -or
+                [string]$comparison.targetDigest -cne
+                    [string]$actualTarget.sha256 -or
+                [string]$Derivation.targetContentSha256 -cne
+                    [string]$actualTarget.sha256) {
+                return $null
+            }
+        }
+        return 'identical-content'
+    }
+    $comparison = if ($Entry.Contains('comparison')) {
+        $Entry.comparison
+    }
+    else {
+        $null
+    }
+    if ($comparison -isnot [Collections.IDictionary] -or
+        [string]$comparison.state -cne 'complete' -or
+        [string]$comparison.targetState -cne 'present' -or
+        ($comparison.Contains('truncated') -and
+            [bool]$comparison.truncated) -or
+        [string]$comparison.path -cne [string]$Entry.path -or
+        [string]$comparison.targetPath -cne [string]$Entry.path -or
+        [string]$comparison.sourceCommit -cne
+            [string]$Head.sourceCommit -or
+        [string]$comparison.targetCommit -cne
+            [string]$Head.targetCommit -or
+        [string]$comparison.sourceDigest -cne
+            [string]$actualSource.sha256 -or
+        $comparison.content -isnot [string]) {
+        return $null
+    }
+    $actualTarget = Get-DevPilotUtf8Digest (
+        [string]$comparison.content)
+    if ([long]$comparison.byteLength -ne
+            [long]$actualTarget.byteLength -or
+        [long]$Derivation.targetByteLength -ne
+            [long]$actualTarget.byteLength -or
+        [string]$comparison.targetDigest -cne
+            [string]$actualTarget.sha256 -or
+        [string]$Derivation.targetContentSha256 -cne
+            [string]$actualTarget.sha256) {
+        return $null
+    }
+    return Get-DevPilotZeroAddedLineModifiedTextProof `
+        -SourceContent ([string]$Entry.content) `
+        -TargetContent ([string]$comparison.content)
+}
+
 function New-DevPilotChangeDerivation {
     param(
         [Parameter(Mandatory)][string]$ChangeType,
@@ -141,22 +320,40 @@ function New-DevPilotChangeDerivation {
             [long]$span.endLine -
             [long]$span.startLine + 1
     }
+    $zeroAddedProof = if ($IsText -and
+        -not $Deleted -and
+        $normalizedChangeType -ceq 'modified' -and
+        -not $Renamed -and
+        $Spans.Count -eq 0 -and
+        $currentLineCount -eq 0) {
+        if ([Collections.StructuralComparisons]::
+            StructuralEqualityComparer.Equals(
+                $source.bytes,
+                $target.bytes)) {
+            'identical-content'
+        }
+        else {
+            Get-DevPilotZeroAddedLineModifiedTextProof `
+                -SourceContent $SourceContent `
+                -TargetContent $TargetContent
+        }
+    }
+    else {
+        $null
+    }
     $classification = if (-not $IsText) {
         'derivation-unknown'
     }
     elseif ($Deleted) {
         'deletion-only'
     }
-    elseif ($normalizedChangeType -ceq
-            'modified' -and
-        -not $Renamed -and
-        $Spans.Count -eq 0 -and
-        $currentLineCount -eq 0 -and
-        [Collections.StructuralComparisons]::
-            StructuralEqualityComparer.Equals(
-                $source.bytes,
-                $target.bytes)) {
+    elseif ($zeroAddedProof -in @(
+            'identical-content',
+            'normalized-line-ending-only')) {
         'identical-content'
+    }
+    elseif ($zeroAddedProof -ceq 'deletion-only') {
+        'deletion-only'
     }
     elseif ($Spans.Count -gt 0 -and
         $currentLineCount -gt 0) {
@@ -326,10 +523,36 @@ function Get-DevPilotChangeDerivationDisposition {
         [string]$derivation.classification
     if ($classification -ceq
         'derivation-unknown') {
+        $migratedProof =
+            Get-DevPilotValidatedModifiedZeroSpanProof `
+                -Entry $Entry -Head $Head `
+                -Derivation $derivation
+        if ($migratedProof -in @(
+                'identical-content',
+                'normalized-line-ending-only')) {
+            return [ordered]@{
+                classification = 'identical-content'
+                knownEmptyIdentical = (
+                    $migratedProof -ceq 'identical-content')
+                knownEmptyDeletedFile = $false
+                knownEmptyZeroAddedLines = $true
+                forceUnknown = $false
+            }
+        }
+        if ($migratedProof -ceq 'deletion-only') {
+            return [ordered]@{
+                classification = 'deletion-only'
+                knownEmptyIdentical = $false
+                knownEmptyDeletedFile = $false
+                knownEmptyZeroAddedLines = $true
+                forceUnknown = $false
+            }
+        }
         return [ordered]@{
             classification = $classification
             knownEmptyIdentical = $false
             knownEmptyDeletedFile = $false
+            knownEmptyZeroAddedLines = $false
             forceUnknown = $true
         }
     }
@@ -385,35 +608,42 @@ function Get-DevPilotChangeDerivationDisposition {
     }
     if ($classification -ceq
         'identical-content') {
-        if ([string]$derivation.state -cne
-                'complete' -or
-            $expectedChangeType -cne
-                'modified' -or
-            [string]$derivation.pathRelation -cne
-                'same-path' -or
-            [string]$derivation.sourceContentState -cne
-                'available' -or
-            [string]$derivation.targetContentState -cne
-                'available' -or
-            [string]$derivation.sourceContentSha256 -cnotmatch
-                '^v1:sha256:[0-9a-f]{64}$' -or
-            [string]$derivation.sourceContentSha256 -cne
-                [string]$derivation.targetContentSha256 -or
-            [long]$derivation.sourceByteLength -ne
-                [long]$derivation.targetByteLength -or
-            [long]$derivation.spanCount -ne 0 -or
-            [long]$derivation.currentLineCount -ne 0) {
+        $identicalProof =
+            Get-DevPilotValidatedModifiedZeroSpanProof `
+                -Entry $Entry -Head $Head `
+                -Derivation $derivation
+        if ($identicalProof -notin @(
+                'identical-content',
+                'normalized-line-ending-only')) {
             throw 'change-derivation-identical-invalid'
         }
         return [ordered]@{
             classification = $classification
-            knownEmptyIdentical = $true
+            knownEmptyIdentical = (
+                $identicalProof -ceq 'identical-content')
             knownEmptyDeletedFile = $false
+            knownEmptyZeroAddedLines = $true
             forceUnknown = $false
         }
     }
     if ($classification -ceq
         'deletion-only') {
+        if ($expectedChangeType -ceq 'modified') {
+            $deletionProof =
+                Get-DevPilotValidatedModifiedZeroSpanProof `
+                    -Entry $Entry -Head $Head `
+                    -Derivation $derivation
+            if ($deletionProof -cne 'deletion-only') {
+                throw 'change-derivation-deleted-invalid'
+            }
+            return [ordered]@{
+                classification = $classification
+                knownEmptyIdentical = $false
+                knownEmptyDeletedFile = $false
+                knownEmptyZeroAddedLines = $true
+                forceUnknown = $false
+            }
+        }
         $emptyDigest = [string](
             Get-DevPilotUtf8Digest '').sha256
         if ($expectedChangeType -cne
@@ -447,6 +677,7 @@ function Get-DevPilotChangeDerivationDisposition {
             classification = $classification
             knownEmptyIdentical = $false
             knownEmptyDeletedFile = $true
+            knownEmptyZeroAddedLines = $true
             forceUnknown = $false
         }
     }
@@ -462,6 +693,7 @@ function Get-DevPilotChangeDerivationDisposition {
             classification = $classification
             knownEmptyIdentical = $false
             knownEmptyDeletedFile = $false
+            knownEmptyZeroAddedLines = $false
             forceUnknown = $false
         }
     }

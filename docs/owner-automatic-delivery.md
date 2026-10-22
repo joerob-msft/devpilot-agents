@@ -65,6 +65,16 @@ hash and construct remain identical. Copied, edited, deleted, moved, duplicate,
 foreign-identity, stale-head, or changed-rule evidence remains unknown and
 cannot authorize a create, update, or rewrite.
 
+Automatic preflight also authenticates sibling-lane create history from the
+existing Owner delivery root and its `named-areequal-v1` and
+`contextual-conventions-v1` children, using each lane's own key. It accepts a
+discussion snapshot difference only when removing exact authenticated,
+same-PR/head/target/ref/iteration/reviewer/body/marker/anchor active
+single-comment threads reproduces the original canonical snapshot digest.
+Unrelated baseline edits, replies, or unauthenticated drift still refuse
+delivery. Loaded sibling keys are cleared after every read, including failures;
+this does not share policies, quotas, or write authority between lanes.
+
 ## Finding presentation
 
 Contextual, named-assertion, and Owner findings use actionable bold titles,

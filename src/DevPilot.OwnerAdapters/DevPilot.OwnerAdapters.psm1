@@ -1918,6 +1918,60 @@ function ConvertTo-OwnerComparisonEvidence {
     return $normalized
 }
 
+function Test-OwnerZeroAddedLineModifiedTextProof {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceContent,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TargetContent
+    )
+
+    if ($SourceContent.IndexOf([char]0) -ge 0 -or
+        $TargetContent.IndexOf([char]0) -ge 0) {
+        return $false
+    }
+    $normalizedSource = $SourceContent.Replace("`r`n", "`n")
+    $normalizedTarget = $TargetContent.Replace("`r`n", "`n")
+    if ($normalizedSource.IndexOf([char]"`r") -ge 0 -or
+        $normalizedTarget.IndexOf([char]"`r") -ge 0) {
+        return $false
+    }
+    if ($SourceContent -ceq $TargetContent -or
+        $normalizedSource -ceq $normalizedTarget) {
+        return $true
+    }
+    if ($normalizedSource.Length -gt 0 -and
+        ($normalizedSource.EndsWith("`n") -ne
+            $normalizedTarget.EndsWith("`n"))) {
+        return $false
+    }
+    $sourceLines = @(if ($normalizedSource.Length -eq 0) {
+            @()
+        }
+        else {
+            $normalizedSource.Split("`n")
+        })
+    $targetLines = @(if ($normalizedTarget.Length -eq 0) {
+            @()
+        }
+        else {
+            $normalizedTarget.Split("`n")
+        })
+    if ($sourceLines.Count -ge $targetLines.Count -or
+        $targetLines.Count -gt 200000) {
+        return $false
+    }
+    $sourceIndex = 0
+    for ($targetIndex = 0;
+        $targetIndex -lt $targetLines.Count -and
+        $sourceIndex -lt $sourceLines.Count;
+        $targetIndex++) {
+        if ($targetLines[$targetIndex] -ceq
+            $sourceLines[$sourceIndex]) {
+            $sourceIndex++
+        }
+    }
+    return ($sourceIndex -eq $sourceLines.Count)
+}
+
 function ConvertTo-OwnerSpanData {
     param([Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]]$Spans)
 
@@ -2539,6 +2593,24 @@ function ConvertTo-OwnerAcquisitionResponse {
         if ($providerReason -ceq 'deleted' -and $change['changeType'] -cne 'deleted') {
             throw 'Only deleted changes may use the deleted unavailable reason.'
         }
+        $provenZeroAddedLineModification =
+            -not $contextOnly -and
+            $fileState -ceq 'complete' -and
+            -not $truncated -and
+            -not [bool]$change['isBinary'] -and
+            $null -eq $providerReason -and
+            [string]$change['changeType'] -ceq 'modified' -and
+            [string]$change['oldPath'] -ceq '' -and
+            $change['spans'].Count -eq 0 -and
+            $content -is [string] -and
+            $comparison -is [Collections.IDictionary] -and
+            [string]$comparison.state -ceq 'complete' -and
+            [string]$comparison.targetState -ceq 'present' -and
+            $comparison.content -is [string] -and
+            [string]$comparison.sourceDigest -ceq $fileDigest -and
+            (Test-OwnerZeroAddedLineModifiedTextProof `
+                -SourceContent ([string]$content) `
+                -TargetContent ([string]$comparison.content))
         $evidenceState = if (
             $fileState -cne 'complete' -or
             $truncated -or
@@ -2546,7 +2618,8 @@ function ConvertTo-OwnerAcquisitionResponse {
             $change['spans'].Count -eq 0 -and
                 $change['changeType'] -cne
                     'deleted' -and
-                -not $contextOnly -or
+                -not $contextOnly -and
+                -not $provenZeroAddedLineModification -or
             $spanStates -contains 'incomplete' -or
             $spanStates -contains 'unknown') {
             'unknown'
@@ -2567,7 +2640,8 @@ function ConvertTo-OwnerAcquisitionResponse {
             $providerReason
         }
         elseif ($change['spans'].Count -eq 0 -and
-            -not $contextOnly) {
+            -not $contextOnly -and
+            -not $provenZeroAddedLineModification) {
             'spans-missing'
         }
         elseif ($spanStates -contains 'incomplete' -or $spanStates -contains 'unknown') {
