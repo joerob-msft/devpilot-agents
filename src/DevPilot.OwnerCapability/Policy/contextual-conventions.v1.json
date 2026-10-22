@@ -77,6 +77,21 @@
       "pullRequestId": 17431492,
       "threadId": 267231965
     },
+    "englishIdentifierNaming": {
+      "authorityState": "canonical current EngHub coding style and user-directed review example",
+      "repositoryId": "c327c2f0-f3b6-4d2f-ba8f-ad7bf7977fde",
+      "commit": "ff0692776598b8eb07993e8c45e0be03b7e32fa3",
+      "path": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
+      "heading": "Use English terms",
+      "lines": [1734, 1737],
+      "clause": "Use complete, unabbreviated English terms to name classes, methods, properties and variables. Do not use uncommon abbreviations or uncommon acronyms for names in code.",
+      "pullRequestId": 14099142,
+      "threadId": 267600437,
+      "reviewSourceCommit": "71aa9b0e09f2747f75452eb665abd16879352df5",
+      "reviewPath": "src/netStandard/BuiltIn.Xml/XmlComposer.cs",
+      "reviewLine": 257,
+      "reviewExample": "Use an appropriate English term such as property for p."
+    },
     "reusedStringLiterals": {
       "authorityState": "user-directed canonical coding style and review example",
       "commit": "7cbaf3ef94e3bec3af10875b7c6a2690d111416b",
@@ -231,6 +246,14 @@
       "sourceSection": "Code documentation / Copyright header",
       "scope": "file-header",
       "severity": "nonblocking"
+    },
+    {
+      "id": "english-identifier-naming",
+      "name": "Use complete English names for proven JSON-property lambda parameters",
+      "sourceSection": "Naming guidelines / Naming classes, methods, properties and variables / Use English terms",
+      "scope": "changed single-ASCII-letter lambda parameter identifiers bound by Roslyn to the referenced Newtonsoft.Json.Linq.JProperty",
+      "replacement": "a descriptive complete English term such as property or currentProperty, updating all uses in that lambda",
+      "unsupported": "This bounded check is not a general English detector. Other names and declarations, common acronyms, domain terms, loop counters and discards are not classified. Proven foreign or source-shadowed types are outside the supported role; unresolved, incomplete or conditional role binding remains unknown."
     }
   ]
 }

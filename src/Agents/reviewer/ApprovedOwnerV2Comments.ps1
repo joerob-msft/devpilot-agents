@@ -41,7 +41,8 @@ $script:ApprovedContextualRuleIds = @(
     'pr-template-compliance',
     'block-body-indentation',
     'generic-exception-naming',
-    'file-copyright-header'
+    'file-copyright-header',
+    'english-identifier-naming'
 )
 $script:ApprovedOwnerV2MarkerPattern =
     '<!--\s*devpilot-owner-comment:v1:([0-9a-f]{64})\s*-->'

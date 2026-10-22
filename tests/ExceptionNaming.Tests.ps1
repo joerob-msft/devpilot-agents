@@ -30,7 +30,7 @@ Describe 'Generic exception catch naming' {
         . (Join-Path $repoRoot `
             'src\Agents\reviewer\ApprovedOwnerV2Comments.ps1')
         $ids = @(Get-ContextualConventionRuleIds)
-        $ids | Should -HaveCount 26
+        $ids | Should -HaveCount 27
         @($ids | Where-Object { $_ -ceq 'generic-exception-naming' }) |
             Should -HaveCount 1
         $policy = Get-Content -LiteralPath (Join-Path $repoRoot `

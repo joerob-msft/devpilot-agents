@@ -52,9 +52,9 @@ $script:NamedAreEqualDigest = 'v1:sha256:7ed3583591b43dbb351292ea9a37a53fc32fc9f
 $script:NamedAreEqualMarkerPrefix = 'devpilot-named-areequal:v1'
 $script:NamedAreEqualPolicyDigest = 'v1:sha256:8b9fa35bd2bc96e9f0dbfc878806b540603ab4f255ddf41bf120311913b831f4'
 $script:ContextualCapability = 'bpm-contextual-conventions@1'
-$script:ContextualDigest = 'v1:sha256:02e13df3a40486b71870de8cc596e8760b48e6d263ed0d2b074722c1b939a00d'
+$script:ContextualDigest = 'v1:sha256:266ebc5c3a4a1faa36cd2d88f8f2e3d40c632d6c06d0b81939c18231c7472e47'
 $script:ContextualMarkerPrefix = 'devpilot-contextual-convention:v1'
-$script:ContextualPolicyDigest = 'v1:sha256:9221ce2c9cb4777bb0cbfc0ed11dea9e0e68328ce98137a026c4b68b4c80c756'
+$script:ContextualPolicyDigest = 'v1:sha256:d89e4eb694c7df7bc45a615b693ffc9eada6fe47645c70d19505d535fb9d2d40'
 $script:OwnerV2AttributePattern = (
     '(?i)(?:^|[^A-Za-z0-9_])(?<name>TestClass|TestMethod|DataTestMethod|Owner)' +
     '(?:Attribute)?(?=\s*(?:\(|,|\]|\z))'
@@ -984,6 +984,15 @@ function Test-ContextualFindingHumanCoverage {
         [bool]$SameAnchor
     )
     switch ([string]$Finding.ruleId) {
+        'english-identifier-naming' {
+            $name = '(?<![A-Za-z0-9_])' + [regex]::Escape([string]$Finding.anchor.symbol) + '(?![A-Za-z0-9_])'
+            return $Finding.anchor.symbol -cmatch '^[A-Za-z]$' -and
+                $Body -cmatch $name -and
+                $Body -notmatch '(?i)\b(?:do\s+not|don''t|never)\s+(?:rename|name|use)\b' -and
+                ($Body -match ('(?is)\b(?:rename|name)\b[^\r\n.]{0,128}' + $name +
+                    '[^\r\n.]{0,80}\b(?:to|as)\s+[`''"]*(?:property|currentProperty)\b') -or
+                    $Body -match '(?is)\buse\s+(?:an?\s+appropriate\s+English\s+term\s+such\s+as\s+)?[`''"]*(?:property|currentProperty)\b')
+        }
         'generic-exception-naming' {
             return Test-ContextualExceptionNamingHumanCoverage -Body $Body -Variable ([string]$Finding.anchor.symbol)
         }
@@ -1691,7 +1700,7 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                             [regex]::IsMatch(
                                 [string]$comment.body,
                                 $anyMarkerPattern) -or
-                            ([string]$finding.ruleId -cin @('block-body-indentation', 'generic-exception-naming',
+                            ([string]$finding.ruleId -cin @('block-body-indentation', 'generic-exception-naming', 'english-identifier-naming',
                                 'reused-string-literals', 'file-copyright-header') -and [bool]$comment.reviewerOwned) -or
                             -not (Test-ContextualFindingHumanCoverage -Finding $finding `
                                 -Body ([string]$comment.body) -SameAnchor $sameAnchor) -or
@@ -1870,8 +1879,8 @@ function Resolve-ContextualConventionDiscussionReconciliation {
                         [bool]$comment.reviewerOwned) {
                         $unmarkedReviewerCurrent = $true
                     }
-                    elseif ([string]$finding.ruleId -ceq
-                            'generic-exception-naming' -and (
+                    elseif ([string]$finding.ruleId -cin @(
+                            'generic-exception-naming', 'english-identifier-naming') -and (
                             [bool]$comment.reviewerOwned -or
                             -not (
                                 Test-ContextualFindingHumanCoverage -Finding $finding -SameAnchor $sameAnchor `
@@ -4754,12 +4763,12 @@ function Invoke-ContextualConventionsCapabilityResponse {
         [void]$assessments.Add([ordered]@{
                 assessmentId = "method:c:$digest"
                 evidenceUnitIds = @('identity', 'rule')
-                state = $(if ($ruleId -ceq 'generic-exception-naming') {
+                state = $(if ($ruleId -cin @('generic-exception-naming', 'english-identifier-naming')) {
                     'unknown'
                 }
                 else { 'complete' })
                 data = [ordered]@{
-                    state = $(if ($ruleId -cin @('generic-exception-naming', 'reused-string-literals')) {
+                    state = $(if ($ruleId -cin @('generic-exception-naming', 'reused-string-literals', 'english-identifier-naming')) {
                         'unknown'
                     }
                     else { 'advisory' })

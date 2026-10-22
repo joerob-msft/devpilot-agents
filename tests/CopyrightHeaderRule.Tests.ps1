@@ -151,8 +151,8 @@ Describe 'Changed C# file copyright headers' {
 
     It 'keeps the integrated rule roster and exact old bundle maps separate' {
         $rules = @(Get-ContextualConventionRuleIds)
-        $rules | Should -HaveCount 26
-        $rules[-1] | Should -BeExactly file-copyright-header
+        $rules | Should -HaveCount 27
+        $rules[-2] | Should -BeExactly file-copyright-header
         $old = @(
             @{ hash = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'; length = 3706; count = 18 },
             @{ hash = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'; length = 5205; count = 20 },
@@ -162,7 +162,7 @@ Describe 'Changed C# file copyright headers' {
         )
         foreach ($prior in $old) {
             $binding = @{ hash = $prior.hash; length = $prior.length }
-            $excluded = @('named-call-arguments')
+            $excluded = @('named-call-arguments', 'english-identifier-naming')
             if ($prior.length -lt 10287) {
                 $excluded += @('block-body-indentation', 'generic-exception-naming',
                     'reused-string-literals', 'file-copyright-header')
@@ -176,6 +176,8 @@ Describe 'Changed C# file copyright headers' {
             (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('explicit-string-comparison')) |
                 Should -BeTrue
             (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('named-call-arguments')) |
+                Should -BeFalse
+            (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('english-identifier-naming')) |
                 Should -BeFalse
             $binding.length++
             (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds $unchanged) |
