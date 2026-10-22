@@ -1444,6 +1444,34 @@ Describe 'Approved Owner v2 review and approval packages' {
         Test-ApprovedContextualActionablePartial `
             -Observation $observation |
             Should -BeTrue
+        foreach ($prReason in @(
+                'duplicate-or-foreign-reviewer-marker',
+                'prior-pr-template-review-coverage-unproven',
+                'partial-human-pr-template-coverage'
+            )) {
+            $prUnknown.reconciliation.reason =
+                $prReason
+            Test-ApprovedContextualActionablePartial `
+                -Observation $observation |
+                Should -BeTrue
+        }
+        foreach ($invalidReason in @(
+                'discussion-snapshot-unavailable',
+                'duplicate-reviewer-markers'
+            )) {
+            $prUnknown.reconciliation.reason =
+                $invalidReason
+            Test-ApprovedContextualActionablePartial `
+                -Observation $observation |
+                Should -BeFalse
+        }
+        $prUnknown.reconciliation.reason =
+            'duplicate-or-foreign-reviewer-marker'
+        $prUnknown.anchor.subject = 'title'
+        Test-ApprovedContextualActionablePartial `
+            -Observation $observation |
+            Should -BeFalse
+        $prUnknown.anchor.subject = 'description'
 
         $prActionable =
             $prUnknown |
