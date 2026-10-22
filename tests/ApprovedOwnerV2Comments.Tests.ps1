@@ -2487,4 +2487,503 @@ Describe 'Automatic Owner v2 create-only delivery' {
         ($output -join "`n") | Should -Match 'disabled'
         Test-Path -LiteralPath $delivery | Should -BeFalse
     }
+
+    It 'loads native history and exercises real sibling discovery through the automatic caller for <Mode>' -TestCases @(
+        @{ Mode = 'exact' },
+        @{ Mode = 'baseline-drift' },
+        @{ Mode = 'reply' },
+        @{ Mode = 'invalid-hmac' }
+    ) {
+        param($Mode)
+        Set-StrictMode -Version Latest
+        $context = New-TestAutomaticOwnerV2Context
+        $evidence = $context.Evidence
+        $reviewer = New-OwnerAzureDevOpsReviewerIdentity `
+            -Id $evidence.Provider.reviewerIdentity.id `
+            -Descriptor $evidence.Provider.reviewerIdentity.descriptor `
+            -UniqueName $evidence.Provider.reviewerIdentity.uniqueName
+        $iteration = [ordered]@{
+            id = 2
+            sourceCommit = $evidence.Declaration.head.sourceCommit
+            targetCommit = $evidence.Declaration.target.targetCommit
+        }
+        $arguments = [ordered]@{
+            repositoryId = $evidence.Declaration.subject.repositoryId
+            projectId = $evidence.Declaration.subject.projectId
+            pullRequestId = $evidence.Declaration.subject.pullRequestId
+            sourceCommit = $evidence.Declaration.head.sourceCommit
+            targetCommit = $evidence.Declaration.target.targetCommit
+            targetRef = $evidence.Declaration.target.targetRef
+            pageOrdinal = 0
+            pageSize = 100
+            continuationToken = $null
+        }
+        $baseAuthor = [ordered]@{
+            id = $reviewer.Id
+            descriptor = $reviewer.Descriptor
+            uniqueName = $reviewer.UniqueName
+        }
+        $baseRaw = [ordered]@{
+            count = 1
+            continuation_token = $null
+            value = @(
+                [ordered]@{
+                    id = 100
+                    status = 'active'
+                    isDeleted = $false
+                    publishedDate = '2026-01-01T00:00:00.0000000Z'
+                    lastUpdatedDate = '2026-01-01T00:00:01.0000000Z'
+                    properties = [ordered]@{}
+                    threadContext = [ordered]@{
+                        filePath = '/src/Existing.cs'
+                        rightFileStart = [ordered]@{ line = 5; offset = 1 }
+                        rightFileEnd = [ordered]@{ line = 5; offset = 2 }
+                    }
+                    pullRequestThreadContext = [ordered]@{
+                        changeTrackingId = 1
+                        iterationContext = [ordered]@{
+                            firstComparingIteration = 1
+                            secondComparingIteration = 2
+                        }
+                    }
+                    comments = @(
+                        [ordered]@{
+                            id = 1
+                            parentCommentId = 0
+                            author = $baseAuthor
+                            content = 'Existing baseline comment.'
+                            commentType = 'text'
+                            publishedDate = '2026-01-01T00:00:00.0000000Z'
+                            lastUpdatedDate = '2026-01-01T00:00:01.0000000Z'
+                            usersLiked = @()
+                        }
+                    )
+                }
+            )
+        }
+        $basePage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $baseRaw `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        $evidence.Observation.sourceArtifacts[1].sha256 = ([string]$basePage.mappingDigest).Substring(10)
+        $evidence.Observation.sourceArtifacts[2].sha256 = ([string]$basePage.reviewerIdentityDigest).Substring(10)
+        $evidence.Provider.mappingDigest = [string]$basePage.mappingDigest
+        $evidence.Provider.reviewerIdentity.digest = [string]$basePage.reviewerIdentityDigest
+        $baseProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'base-ado' -ReviewerIdentity $reviewer -Handler {
+            param($Op, $ArgsMap)
+            return $basePage
+        }.GetNewClosure()
+        $baseSnapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+            -Provider $baseProvider -RequireAzureDevOpsProvenance
+        $baseSha256 = $baseSnapshot.Digest.Substring(10)
+        $evidence.Observation.sourceArtifacts[0].sha256 = $baseSha256
+        $evidence.Observation.findings[0].reconciliation.discussionSha256 = $baseSha256
+
+        $ownerRoot = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $context.Root -RepoRoot $repoRoot
+        $namedRoot = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $context.Root -RepoRoot $repoRoot -Delivery named-areequal
+        $contextualRoot = Initialize-AutomaticOwnerV2DeliveryRoot `
+            -DeliveryRoot $context.Root -RepoRoot $repoRoot -Delivery contextual-conventions
+        [IO.File]::WriteAllBytes($ownerRoot.KeyPath, $context.Key)
+        $namedKey = [byte[]](65..96)
+        [IO.File]::WriteAllBytes($namedRoot.KeyPath, $namedKey)
+        $namedRoot.Root | Should -BeExactly (Join-Path $ownerRoot.Root 'named-areequal-v1')
+        $contextualRoot.Root | Should -BeExactly (Join-Path $ownerRoot.Root 'contextual-conventions-v1')
+        $identity = $evidence.Identity
+        $subject = [ordered]@{
+            projectId = $evidence.Declaration.subject.projectId
+            repositoryId = $evidence.Declaration.subject.repositoryId
+            pullRequestId = 42
+            sourceCommit = $evidence.Declaration.head.sourceCommit
+            targetCommit = $evidence.Declaration.target.targetCommit
+            targetRef = $evidence.Declaration.target.targetRef
+        }
+        foreach ($lane in @(
+                @{ Root = $ownerRoot.Root; Key = $context.Key; Prefix = 'owner-v2'; Capability = 'bpm-test-ownership@1'; MarkerTag = 'devpilot-owner-comment'; ThreadId = 199; HexChar = 'a'; IncludeBodySha = $false },
+                @{ Root = $namedRoot.Root; Key = $namedKey; Prefix = 'named-areequal-v2'; Capability = 'bpm-named-areequal-arguments@1'; MarkerTag = 'devpilot-named-areequal'; ThreadId = 200; HexChar = 'b'; IncludeBodySha = $true }
+            )) {
+            $laneDir = $lane.Root
+            foreach ($leaf in @('events', "intents\$identity", "outcomes\$identity")) {
+                New-Item -ItemType Directory -Path (Join-Path $laneDir $leaf) -Force | Out-Null
+            }
+            $runId = ($lane.HexChar * 32)
+            $eventId = ('c' + ($lane.HexChar * 31))
+            $marker = ($lane.HexChar * 64)
+            $body = "Posted comment.`n`n<!-- $($lane.MarkerTag):v1:$marker -->"
+            $bodySha = Get-ApprovedOwnerV2TextSha256 $body
+            $selection = [ordered]@{
+                body = $body
+                classification = 'wouldCreate'
+                constructIdentity = 'v1:sha256:' + ('1' * 64)
+                constructRef = 'construct:' + ('2' * 64)
+                findingId = "$($lane.Prefix):" + ('3' * 64)
+                line = 20
+                marker = $marker
+                markerComment = "<!-- $($lane.MarkerTag):v1:$marker -->"
+                path = 'tests/WidgetTests.cs'
+                rationale = 'no-current-review-at-anchor'
+                semanticKey = 'v1:sha256:' + ('4' * 64)
+                symbol = 'CreatesWidget'
+            }
+            if ($lane.IncludeBodySha) {
+                $selection['bodySha256'] = $bodySha
+            }
+            $intentPayload = [ordered]@{
+                schemaVersion = 1
+                kind = "$($lane.Prefix)-service-create-intent"
+                runId = $runId
+                policyDigest = 'v1:sha256:' + ('5' * 64)
+                state = [ordered]@{ identity = $identity }
+                subject = $subject
+                currentIterationId = 2
+                discussionSnapshotSha256 = $baseSha256
+                rule = [ordered]@{
+                    repositoryId = 'devpilot-agents'
+                    path = 'docs/owner.md'
+                    commit = '7' * 40
+                    section = $lane.Capability
+                    hash = 'v1:sha256:' + ('8' * 64)
+                    length = 100
+                }
+                capability = [ordered]@{
+                    id = $lane.Capability
+                    digest = 'v1:sha256:' + ('9' * 64)
+                }
+                reviewerIdentity = [ordered]@{
+                    id = $reviewer.Id
+                    descriptor = $reviewer.Descriptor
+                    uniqueName = $reviewer.UniqueName
+                }
+                implementation = [ordered]@{}
+                selections = @($selection)
+                createdUtc = '20261018T000000Z'
+            }
+            $findingObj = [ordered]@{
+                stateIdentity = $identity
+                findingId = $selection.findingId
+                marker = $marker
+                path = $selection.path
+                line = $selection.line
+                symbol = $selection.symbol
+            }
+            if ($lane.IncludeBodySha) {
+                $findingObj['bodySha256'] = $bodySha
+            }
+            $eventPayload = [ordered]@{
+                schemaVersion = 1
+                kind = "$($lane.Prefix)-delivery-event"
+                eventId = $eventId
+                runId = $runId
+                occurredUtc = '20261018T000100Z'
+                runHealth = 'healthy'
+                capabilityId = $lane.Capability
+                subject = $subject
+                finding = $findingObj
+                action = 'create'
+                outcome = 'created'
+                threadId = $lane.ThreadId
+                commentId = 1
+                url = 'https://example.invalid'
+                modelWriteCount = 0
+                providerWriteCount = 1
+                providerWriteState = 'confirmed'
+                diagnostic = $null
+            }
+            $outcomePayload = [ordered]@{
+                schemaVersion = 1
+                kind = "$($lane.Prefix)-service-create-outcome"
+                runId = $runId
+                stateIdentity = $identity
+                status = 'completed'
+                providerWrites = 1
+                providerWritesConservative = 1
+                modelWrites = 0
+                eventIds = @($eventId)
+                remainingWouldCreate = 0
+                diagnostic = $null
+                createdUtc = '20261018T000100Z'
+            }
+            [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $laneDir "intents\$identity\$runId.json") `
+                -Payload $intentPayload -Key $lane.Key)
+            [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $laneDir "outcomes\$identity\$runId.json") `
+                -Payload $outcomePayload -Key $lane.Key)
+            [void](Write-ApprovedOwnerV2SignedRecord `
+                -Path (Join-Path $laneDir "events\$eventId.json") `
+                -Payload $eventPayload -Key $lane.Key)
+        }
+
+        $ownerPrior = @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+            -DeliveryRoot $ownerRoot.Root -Key $context.Key -Delivery owner)
+        $ownerPrior | Should -HaveCount 1
+        $ownerPrior[0].currentIterationId | Should -Be 2
+        $ownerPrior[0].selection.ruleId | Should -BeExactly ''
+
+        $namedPrior = @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+            -DeliveryRoot $namedRoot.Root -Key $namedKey -Delivery named-areequal)
+        $namedPrior | Should -HaveCount 1
+        $namedPrior[0].currentIterationId | Should -Be 2
+        $namedPrior[0].discussionSnapshotSha256 | Should -BeExactly $baseSha256
+        $namedPrior[0].selection.ruleId | Should -BeExactly ''
+
+        # Build live discussion response with the authenticated Named thread 200 added
+        $liveRaw = $baseRaw | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+        $liveRaw.value = @($liveRaw.value) + @(
+            [ordered]@{
+                id = 200
+                status = 'active'
+                isDeleted = $false
+                publishedDate = '2026-01-01T00:01:00.0000000Z'
+                lastUpdatedDate = '2026-01-01T00:01:01.0000000Z'
+                properties = [ordered]@{}
+                threadContext = [ordered]@{
+                    filePath = '/tests/WidgetTests.cs'
+                    rightFileStart = [ordered]@{ line = 20; offset = 1 }
+                    rightFileEnd = [ordered]@{ line = 20; offset = 2 }
+                }
+                pullRequestThreadContext = [ordered]@{
+                    changeTrackingId = 2
+                    iterationContext = [ordered]@{
+                        firstComparingIteration = 1
+                        secondComparingIteration = 2
+                    }
+                }
+                comments = @(
+                    [ordered]@{
+                        id = 1
+                        parentCommentId = 0
+                        author = $baseAuthor
+                        content = [string]$namedPrior[0].selection.body
+                        commentType = 'text'
+                        publishedDate = '2026-01-01T00:01:00.0000000Z'
+                        lastUpdatedDate = '2026-01-01T00:01:01.0000000Z'
+                        usersLiked = @()
+                    }
+                )
+            }
+        )
+        $liveRaw.count = $liveRaw.value.Count
+        $livePage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $liveRaw `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        $liveProvider = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+            -Name 'live-ado' -ReviewerIdentity $reviewer -Handler {
+            param($Op, $ArgsMap)
+            return $livePage
+        }.GetNewClosure()
+        $liveSnapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+            -Provider $liveProvider -RequireAzureDevOpsProvenance
+        $liveSnapshot.Digest.Substring(10) | Should -Not -BeExactly $baseSha256
+
+        $approval = [ordered]@{
+            state = [ordered]@{ identity = $identity }
+            subject = $subject
+            operator = [ordered]@{
+                id = $reviewer.Id
+                descriptor = $reviewer.Descriptor
+                uniqueName = $reviewer.UniqueName
+            }
+            provider = $evidence.Provider
+        }
+
+        # Positive: exact authenticated Named thread reconciles to baseline digest
+        (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+            -Approval $approval -Evidence $evidence -Live @{ Snapshot = $liveSnapshot } `
+            -ExpectedSnapshotSha256 $baseSha256 `
+            -AuthenticatedPriorComments $namedPrior) | Should -BeTrue
+
+        # Negative 1: duplicate proof refused
+        (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+            -Approval $approval -Evidence $evidence -Live @{ Snapshot = $liveSnapshot } `
+            -ExpectedSnapshotSha256 $baseSha256 `
+            -AuthenticatedPriorComments @($namedPrior[0], $namedPrior[0])) | Should -BeFalse
+
+        # Negative 2: mismatched or boolean currentIterationId proof refused
+        $badIterProof = $namedPrior[0] | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable -Depth 16
+        $badIterProof.currentIterationId = 1
+        (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+            -Approval $approval -Evidence $evidence -Live @{ Snapshot = $liveSnapshot } `
+            -ExpectedSnapshotSha256 $baseSha256 `
+            -AuthenticatedPriorComments @($badIterProof)) | Should -BeFalse
+        $boolIterProof = $namedPrior[0] | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable -Depth 16
+        $boolIterProof.currentIterationId = $true
+        (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+            -Approval $approval -Evidence $evidence -Live @{ Snapshot = $liveSnapshot } `
+            -ExpectedSnapshotSha256 $baseSha256 `
+            -AuthenticatedPriorComments @($boolIterProof)) | Should -BeFalse
+
+        # Negative 3: unexpected human/bot reply on authenticated thread refused
+        $replyRaw = $liveRaw | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+        $replyRaw.value[1].comments = @($replyRaw.value[1].comments) + @(
+            [ordered]@{
+                id = 2
+                parentCommentId = 1
+                author = $baseAuthor
+                content = 'Human follow-up reply'
+                commentType = 'text'
+                publishedDate = '2026-01-01T00:02:00.0000000Z'
+                lastUpdatedDate = '2026-01-01T00:02:01.0000000Z'
+                usersLiked = @()
+            }
+        )
+        $replyPage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+            -Arguments $arguments -RawResponse $replyRaw `
+            -CurrentIteration $iteration -ReviewerIdentity $reviewer
+        $replySnapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+            -Provider (New-OwnerAzureDevOpsReadOnlyProviderAdapter -Name 'reply-ado' -ReviewerIdentity $reviewer -Handler { return $replyPage }.GetNewClosure()) `
+            -RequireAzureDevOpsProvenance
+        (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+            -Approval $approval -Evidence $evidence -Live @{ Snapshot = $replySnapshot } `
+            -ExpectedSnapshotSha256 $baseSha256 `
+            -AuthenticatedPriorComments $namedPrior) | Should -BeFalse
+
+        # Negative 4: edited body / status drift / foreign author / unauthenticated new thread refused
+        foreach ($mut in @(
+                { param($r) $r.value[1].comments[0].content = ([string]$namedPrior[0].selection.body).Replace('Posted comment.', 'Edited comment.') },
+                { param($r) $r.value[1].status = 'closed' },
+                { param($r) $r.value[1].comments[0].author = [ordered]@{ id = '99999999-9999-9999-9999-999999999999'; descriptor = 'aad.foreign'; uniqueName = 'foreign@example.com' } },
+                { param($r) $extra = $r.value[0] | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable -Depth 16; $extra.id = 300; $r.value = @($r.value) + @($extra); $r.count = $r.value.Count }
+            )) {
+            $mutRaw = $liveRaw | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+            & $mut $mutRaw
+            $mutPage = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                -Arguments $arguments -RawResponse $mutRaw `
+                -CurrentIteration $iteration -ReviewerIdentity $reviewer
+            $mutSnapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+                -Provider (New-OwnerAzureDevOpsReadOnlyProviderAdapter -Name 'mut-ado' -ReviewerIdentity $reviewer -Handler { return $mutPage }.GetNewClosure()) `
+                -RequireAzureDevOpsProvenance
+            (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+                -Approval $approval -Evidence $evidence -Live @{ Snapshot = $mutSnapshot } `
+                -ExpectedSnapshotSha256 $baseSha256 `
+                -AuthenticatedPriorComments $namedPrior) | Should -BeFalse
+        }
+
+        $providerState = [ordered]@{
+            raw = $liveRaw | ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+            reads = 0
+            writes = 0
+        }
+        if ($Mode -ceq 'baseline-drift') {
+            $providerState.raw.value[0].comments[0].content = 'Unexpected baseline edit.'
+        }
+        elseif ($Mode -ceq 'reply') {
+            $providerState.raw = $replyRaw
+        }
+        elseif ($Mode -ceq 'invalid-hmac') {
+            $eventPath = Join-Path $namedRoot.Root ("events\c" + ('b' * 31) + '.json')
+            $eventPayload = Read-ApprovedOwnerV2SignedRecord -Path $eventPath -Key $namedKey
+            $eventPayload.subject.sourceCommit = '0' * 40
+            [void](Write-ApprovedOwnerV2SignedRecord -Path (Join-Path $namedRoot.Root 'events\unauthenticated.json') `
+                -Payload $eventPayload -Key ([byte[]](97..128)))
+        }
+        $discussionArguments = $arguments
+        $providerHandler = {
+            param([string]$Action, [hashtable]$Arguments)
+            if ($Action -ceq 'ReadCurrent') {
+                $providerState.reads++
+                $page = ConvertTo-OwnerAzureDevOpsDiscussionPage `
+                    -Arguments $discussionArguments -RawResponse $providerState.raw `
+                    -CurrentIteration $iteration -ReviewerIdentity $reviewer
+                $adapter = New-OwnerAzureDevOpsReadOnlyProviderAdapter `
+                    -Name 'caller-ado' -ReviewerIdentity $reviewer -Handler {
+                    param($Op, $ArgsMap)
+                    return $page
+                }.GetNewClosure()
+                return [pscustomobject]@{
+                    ProviderBinding = $evidence.Provider
+                    PullRequest = [ordered]@{
+                        pullRequestId = $subject.pullRequestId
+                        status = 'active'
+                        isDraft = $false
+                        repositoryId = $subject.repositoryId
+                        projectId = $subject.projectId
+                        sourceCommit = $subject.sourceCommit
+                        targetCommit = $subject.targetCommit
+                        targetRef = $subject.targetRef
+                    }
+                    Reviewer = $approval.operator
+                    Snapshot = Get-OwnerDiscussionSnapshot -Contract $evidence.Contract `
+                        -Provider $adapter -RequireAzureDevOpsProvenance
+                    Anchors = @([ordered]@{
+                        path = 'tests/WidgetTests.cs'
+                        startLine = 12
+                        endLine = 12
+                        changeTrackingId = 7
+                        iterationId = 2
+                    })
+                }
+            }
+            if ($Action -ceq 'CreateThread') {
+                $providerState.writes++
+                $created = $liveRaw.value[1] | ConvertTo-Json -Depth 32 |
+                    ConvertFrom-Json -AsHashtable -Depth 32
+                $created.id = 400
+                $created.comments[0].content = [string]$Arguments.selection.body
+                $created.threadContext.filePath = '/' + [string]$Arguments.selection.path
+                $created.threadContext.rightFileStart.line = [int]$Arguments.selection.line
+                $created.threadContext.rightFileEnd.line = [int]$Arguments.selection.line
+                $providerState.raw.value = @($providerState.raw.value) + @($created)
+                $providerState.raw.count = $providerState.raw.value.Count
+                return @{ id = 400 }
+            }
+            throw "Unexpected automatic caller operation '$Action'."
+        }.GetNewClosure()
+        $script:loadedSiblingKeys = [Collections.Generic.List[object]]::new()
+        $script:readSiblingServiceKey = ${function:Get-AutomaticOwnerV2ServiceKey}
+        Mock Get-AutomaticOwnerV2ServiceKey {
+            param($DeliveryRoot, $Delivery)
+            [byte[]]$bytes = & $script:readSiblingServiceKey -DeliveryRoot $DeliveryRoot -Delivery $Delivery
+            [void]$script:loadedSiblingKeys.Add(@{ Root = $DeliveryRoot; Bytes = $bytes })
+            return ,$bytes
+        }
+        $policy = New-AutomaticOwnerV2ServicePolicy -Evidence $evidence `
+            -PolicyId 'native-sibling-caller'
+        if ($Mode -ceq 'invalid-hmac') {
+            {
+                Invoke-AutomaticOwnerV2Comments -Evidence $evidence -Policy $policy `
+                    -DeliveryRoot $ownerRoot.Root -Key $context.Key -Provider $providerHandler
+            } | Should -Throw '*signature did not verify*'
+            $script:loadedSiblingKeys | Should -HaveCount 1
+            $providerState.reads | Should -Be 0
+        }
+        else {
+            $result = Invoke-AutomaticOwnerV2Comments -Evidence $evidence -Policy $policy `
+                -DeliveryRoot $ownerRoot.Root -Key $context.Key -Provider $providerHandler
+            $script:loadedSiblingKeys | Should -HaveCount 2
+            @($script:loadedSiblingKeys.Root) | Should -Contain $namedRoot.Root
+            @($script:loadedSiblingKeys.Root) | Should -Contain $contextualRoot.Root
+            if ($Mode -ceq 'exact') {
+                $result.health | Should -BeExactly healthy -Because ($result | ConvertTo-Json -Depth 16)
+                $result.providerWrites | Should -Be 1
+                $providerState.writes | Should -Be 1
+                $providerState.reads | Should -Be 3
+                $result.events | Should -HaveCount 1
+                $result.events[0].outcome | Should -BeExactly created
+                $result.events[0].providerWriteState | Should -BeExactly confirmed
+                $signedEvent = Read-ApprovedOwnerV2SignedRecord `
+                    -Path (Join-Path $ownerRoot.Root ("events\" + $result.events[0].eventId + '.json')) `
+                    -Key $context.Key
+                $signedEvent.threadId | Should -Be 400
+                $signedEvent.commentId | Should -Be 1
+            }
+            else {
+                $result.health | Should -BeExactly refused
+                $result.providerWrites | Should -Be 0
+                $result.diagnostic.code | Should -BeExactly live-discussion-drift
+            }
+        }
+        foreach ($loaded in $script:loadedSiblingKeys) {
+            $loaded.Bytes | Should -BeOfType ([byte])
+            @($loaded.Bytes | Where-Object { $_ -ne 0 }) | Should -HaveCount 0
+        }
+        [Convert]::ToHexString([IO.File]::ReadAllBytes($namedRoot.KeyPath)) |
+            Should -BeExactly ([Convert]::ToHexString($namedKey))
+        [Convert]::ToHexString($context.Key) |
+            Should -BeExactly ([Convert]::ToHexString([byte[]](33..64)))
+        if ($Mode -cne 'exact') {
+            $providerState.writes | Should -Be 0
+        }
+    }
 }

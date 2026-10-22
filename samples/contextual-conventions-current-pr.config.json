@@ -60,7 +60,7 @@
     "kind": "devpilot-shared-review-acquisition-v1",
     "includePullRequestTemplateAuthority": true,
     "activePrIntakeSha256": "ca44f1dd2384343839ad4438db5f1ee5eb0c74dd917bcc665f63c9257bcca6cc",
-    "contextualBridgeSha256": "60d4719115f1d4b4bf632c240df4b5f2598f4f6903a32bd4239b976b003484f7",
+    "contextualBridgeSha256": "f41fcde9287ab6c57e3a231e99d4a1db9a54770a63794de8fb75b5bd45c48538",
     "toolSha256": "ed7ed6ff7423a78ae1f2dab4d82db9b2c61486fc988b4215e08de32609942cdf"
   },
   "autoCreateContextualConventionComments": false,
