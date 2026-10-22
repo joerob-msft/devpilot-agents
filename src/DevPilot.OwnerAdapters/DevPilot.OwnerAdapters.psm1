@@ -3,7 +3,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1" -Force
+Import-Module "$PSScriptRoot\..\DevPilot.OwnerPipeline\DevPilot.OwnerPipeline.psd1"
 
 $adapterRequestTypeName = 'DevPilot.OwnerAdapters.OwnerAcquisitionRequest'
 if (-not ($adapterRequestTypeName -as [type])) {
