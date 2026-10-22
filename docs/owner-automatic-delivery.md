@@ -92,9 +92,9 @@ The dot-sourced approved writer imports its canonical harness dependency
 directly; provider preflight does not rely on a prior wrapper or test-suite
 import to make canonical digest helpers available.
 
-The integrated contextual policy has **26 rules**: the prior 22 definitions
-are unchanged, with `block-body-indentation`, `generic-exception-naming`,
-`reused-string-literals`, and `file-copyright-header` added. Readable
+The integrated contextual policy still has **26 rules**. The
+`named-call-arguments` definition now includes the narrowly bound static string
+equality exception; the other 25 rule definitions are unchanged. Readable
 presentation adds no rule. The sample remains disabled; source integration
 does not install a toolkit, authorize a policy, or enable production delivery.
 
@@ -108,11 +108,15 @@ fetch unchanged contextual reference files. A withheld newness check remains
 UNKNOWN while independently proven findings still receive discussion
 reconciliation; an incomplete evaluation is not relabeled completed.
 
-Historical compatibility retains four explicit signed unchanged-ID maps:
+Historical compatibility retains five explicit signed unchanged-ID maps:
 18 IDs for the original 18-rule bundle, 20 IDs for the pre-nuance 21-rule
-bundle (excluding `named-call-arguments`), 21 IDs for the post-nuance bundle,
-and 22 IDs for the template bundle. All four new IDs are excluded from every
-prior binding. The original 18-rule map includes `test-class-code-coverage`;
+bundle, 20 IDs for the post-nuance 21-rule bundle, 21 IDs for the template
+22-rule bundle, and 25 IDs for the preceding 26-rule bundle
+(`275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938`,
+10,287 canonical CRLF bytes). `named-call-arguments` is excluded from every
+prior generation: its changed semantics are not additive unchanged history.
+The four most recently added IDs remain excluded from the first four maps.
+The original 18-rule map includes `test-class-code-coverage`;
 do not replace these maps with a current-roster count or an inferred blanket
 compatibility grant.
 
@@ -179,13 +183,37 @@ contain exactly one recognized automation marker.
 The contextual bundle also enforces EngHub's general named-call convention as
 one rule group. A changed invocation, object construction, or `this`/`base`
 initializer requires every supplied argument to be named when selected formal
-parameters repeat a semantic type, each argument starts on its own line, or a
-supplied value is a proven literal/compile-time constant. The implementation
-uses a unique same-file/snapshot signature or a pinned known BCL signature and
+parameters repeat a semantic type or each argument starts on its own line.
+When only the constant trigger applies, only supplied proven compile-time
+constant arguments need names. The implementation
+uses a unique same-file/snapshot signature and
 never guesses parameter names. It excludes `Assert.AreEqual`, which remains
 owned by the separate MSTest rule. Ambiguous overloads, dynamic calls, expanded
 `params`, unsupported expression-tree syntax, or unknown language-version
 evidence remain unknown and cannot reach delivery.
+
+Argument names are optional for semantically bound static
+`System.String.Equals(string, string)` and
+`System.String.Equals(string, string, System.StringComparison)`, including
+`comparisonType`. This exception overrides all three triggers. Roslyn resolves
+the selected method against the existing bounded C# snapshot and framework
+reference; the declaring type and exact parameter types must match framework
+symbols. Qualified/global names and type aliases are supported when binding
+proves them, not because their text resembles `String.Equals`. Dynamic,
+unresolved, malformed, or relevant conditional binding remains UNKNOWN.
+Instance, object, custom equality, assertions, ordering comparisons, and other
+same-type/constant calls are not exempt. Only the two string operands are
+interchangeable; comparison mode is not another string operand.
+
+The source policy and disabled sample explicitly cite user-directed proposed
+[EngHub PR 17634453](https://msazure.visualstudio.com/DefaultCollection/One/_git/AzureUX-BPM-EngHub/pullrequest/17634453),
+commit `6cc598bff64c224e60a7789de19f5d5d82d3764d`, CodingStyle.md
+headings 547/592/662 and shared exception section 621-660. That PR is not
+merged/default-branch authority. Source integration does not authorize an
+installed mapping or policy to consume it: a later operator must explicitly
+accept that exact proposed commit, or repin to verified merged documentation.
+The existing exact repository/commit/path/line citation validator is unchanged;
+there is no fallback to `master` or decoded API text as raw Git-byte proof.
 
 The contextual bundle's `pr-template-compliance` rule is PR metadata, not
 changed-line analysis. It selects one effective
@@ -242,16 +270,10 @@ A markerless comment owned by the configured automation actor is not
 relabeled as human coverage: without authentic prior proof or an exact
 current marker, it is unknown and cannot authorize a duplicate create.
 
-When authorizing this additive bundle, retain the exact 18/20/21/22-rule
-bindings, each with its own explicitly unchanged rule-ID set. In particular,
-do not carry named-call semantics from a binding that predates the
-constant-trigger nuance. All 22 immediately prior rule meanings are unchanged
-by this addition. Use
-`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
-`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
-in an 18/20/21-rule binding. `block-body-indentation` is new and is rejected
-in every prior bundle's unchanged-ID list. These proofs are explicit and
-signed per rule; there is no blanket old-bundle compatibility.
+For authorization, use the five exact historical maps described above.
+`block-body-indentation` is accepted only in the immediately preceding
+26-rule map, never in the first four. These proofs are explicit and signed
+per rule; there is no blanket old-bundle compatibility.
 
 The additive `generic-exception-naming` rule requires `ex` only for a catch
 variable bound by Roslyn to the framework's `System.Exception`. It resolves
@@ -278,15 +300,10 @@ resolved catch type. A current human naming request must mention the same
 variable and request `ex` at the exact current anchor to suppress a duplicate.
 Unrelated or stale discussion does not establish naming coverage.
 
-When authorizing this additive bundle, retain four exact prior bindings:
-the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, the 21-rule bundle with its 21 existing IDs, and
-the prior 22-rule bundle with its 22 existing IDs. Preserve the prior signed
-unchanged-ID sets, including the general named-call semantics distinction:
-do not promote a rule into a bundle that did not accept it. Use `-PreviousRule*`,
-`-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and `-FourthPreviousRule*`
-respectively. Never include `generic-exception-naming` in any prior bundle's
-unchanged IDs; `pr-template-compliance` belongs only to the prior 22-rule set.
+Preserve the five exact historical maps and do not promote a rule into a
+bundle that did not accept it. `generic-exception-naming` belongs only in the
+preceding 26-rule map; `pr-template-compliance` belongs in the 22- and 26-rule
+maps. The changed named-call rule belongs in none.
 The existing schema-v2 signed compatibility format, create-only authority,
 zero model starts, two total contextual creates per run, five per PR, and four
 heads per scheduled run are unchanged. Adding the rule does not deploy it,
@@ -317,14 +334,10 @@ copyright request anywhere in the same file suppresses a duplicate; a
 markerless automation/reviewer-owned request or unproven prior context remains
 unknown. Exact current reviewer-owned marker/body readback is a no-op.
 
-When authorizing this additive bundle, retain four exact prior bindings:
-the 18-rule bundle with only its 18 unchanged IDs, the 20-rule bundle with
-only its 20 unchanged IDs, and the immediately prior 21-rule bundle with all
-21 existing IDs, plus the 22-rule bundle with all 22 existing IDs. Use
-`-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
-`-FourthPreviousRule*` respectively. Never include `file-copyright-header`
-in an old bundle's unchanged IDs, or `pr-template-compliance` in the 18/20/21
-bundles. Existing create ceilings, run/PR history, idempotency, Owner behavior,
+Use the five exact historical maps described above. `file-copyright-header`
+belongs only in the preceding 26-rule map, never the older four;
+`pr-template-compliance` is absent from the 18/20/21-rule bundles.
+Existing create ceilings, run/PR history, idempotency, Owner behavior,
 and model-free/create-only authority are unchanged. This source change does
 not enable a live policy or perform any provider writes.
 
@@ -382,15 +395,16 @@ An existing markerless comment from the configured reviewer is not human
 coverage: without authenticated prior delivery proof, it stays unknown and
 cannot authorize another create.
 
-When authorizing this additive bundle, retain four exact prior bindings:
-the 18-rule bundle with its 18 unchanged IDs, the pre-nuance bundle with only
-its 20 unchanged IDs (excluding `named-call-arguments`, whose constant-only
-semantics changed), the post-nuance 21-rule bundle with its 21 existing IDs,
-and the immediately prior 22-rule bundle with all 22 existing IDs. Use
+When authorizing this corrected bundle, retain the five exact prior bindings
+with 18/20/20/21/25 unchanged IDs. Use
 `-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
-`-FourthPreviousRule*` respectively. Never include `pr-template-compliance`
-in the older 18/20/21-rule sets, or `reused-string-literals` in any prior set.
-This source change does not enable or deploy the additional rule.
+`-FourthPreviousRule*` for the older four maps and `-FifthPreviousRule*` /
+`-FifthUnchangedRuleId` for the exact preceding 26-rule map. Never include
+`named-call-arguments` in any prior map or `pr-template-compliance` in the older
+18/20/21-rule sets. The preceding 26-rule map preserves all other 25 IDs,
+including `reused-string-literals`. An old named-call comment without current
+proof remains UNKNOWN/no-duplicate, not authenticated unchanged history.
+This source change does not enable or deploy the correction.
 
 The manual signed-selection writer remains available for human-controlled
 creates or explicitly approved updates. Automatic service authorization uses a

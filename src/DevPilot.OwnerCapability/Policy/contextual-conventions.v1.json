@@ -7,12 +7,25 @@
     "codingStyle": "documentation/EngineeringProcesses/Conventions/CodingStyle.md",
     "codingStyleCommit": "33bc630a76a60b5ec3435355d30ddc5cf1b883e4",
     "namedCallArguments": {
-      "lines": [550, 593, 620],
+      "authorityState": "user-directed proposed documentation and accepted review exception",
+      "commit": "6cc598bff64c224e60a7789de19f5d5d82d3764d",
+      "blob": "f9c8efb884bdd89bde349178644e70a415d72607",
+      "pullRequestId": 17634453,
+      "lines": [550, 595, 665],
       "clauses": [
         "Name each parameter when two or more parameters are of the same type.",
         "Name each parameter if you linefeed between each parameter.",
         "Use named parameters if one passed parameter values is a constant."
-      ]
+      ],
+      "stringEqualityException": {
+        "heading": "String equality exception",
+        "lines": [621, 660],
+        "triggerHeadings": [547, 592, 662],
+        "reviewPullRequestId": 17461258,
+        "reviewThreadId": 267526088,
+        "reviewCommit": "e303d2f3c6397e2f65797828f41f4ffa649d38fc",
+        "clause": "For static System.String.Equals(string, string) and System.String.Equals(string, string, StringComparison) calls, argument names are optional, including comparisonType when present. This exception applies even when arguments have the same type, are on separate lines, or are constants."
+      }
     },
     "xmlSummaryLayout": {
       "authorityState": "user-directed proposed documentation",
@@ -101,7 +114,8 @@
       "id": "named-call-arguments",
       "name": "Name arguments required by each documented call-site trigger",
       "sourceSection": "Named parameters / Name constant parameters",
-      "constantOnlyScope": "When only the constant trigger applies, name every supplied compile-time constant argument; unrelated distinct nonconstant arguments need not be named."
+      "constantOnlyScope": "When only the constant trigger applies, name every supplied compile-time constant argument; unrelated distinct nonconstant arguments need not be named.",
+      "positionalException": "Only semantically bound static System.String.Equals(string,string) and System.String.Equals(string,string,System.StringComparison) calls are exempt from all three triggers, including an explicitly supplied constant comparisonType. Instance, Object and custom Equals calls are not exempt; unproven binding remains unknown."
     },
     {
       "id": "xml-summary-layout",

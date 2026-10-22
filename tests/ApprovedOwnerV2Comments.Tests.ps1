@@ -999,7 +999,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                         length = 5399
                     }
                     unchangedRuleIds = @(
-                        'named-call-arguments')
+                        'exception-logging')
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -1042,8 +1042,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $evidence.Declaration.rule.section =
             'bpm-contextual-conventions@1'
         $evidence.Declaration.rule.hash =
-            'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'
-        $evidence.Declaration.rule.length = 10287
+            'v1:sha256:9221ce2c9cb4777bb0cbfc0ed11dea9e0e68328ce98137a026c4b68b4c80c756'
+        $evidence.Declaration.rule.length = 11517
         $implementationPaths = [ordered]@{
             parser = Join-Path $repoRoot `
                 'src\DevPilot.ContextualConventions\DevPilot.ContextualConventions.psm1'
@@ -1133,16 +1133,18 @@ Describe 'Approved Owner v2 review and approval packages' {
         $priorBindings = @(
             @{ hash = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'; length = 3706; count = 18 },
             @{ hash = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'; length = 5205; count = 20 },
-            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 21 },
-            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 22 }
+            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 20 },
+            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 21 },
+            @{ hash = 'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'; length = 10287; count = 25 }
         )
         $previousRules = @(foreach ($prior in $priorBindings) {
             $unchanged = @($script:ApprovedContextualRuleIds | Where-Object {
-                    $_ -cnotin @('block-body-indentation', 'generic-exception-naming',
-                        'reused-string-literals', 'file-copyright-header') -and
-                    ($prior.count -ge 22 -or $_ -cne 'pr-template-compliance') -and
-                    ($prior.count -ge 21 -or $_ -cne 'named-call-arguments') -and
-                    ($prior.count -ge 20 -or $_ -cnotin @(
+                    $_ -cne 'named-call-arguments' -and
+                    ($prior.length -eq 10287 -or $_ -cnotin @(
+                        'block-body-indentation', 'generic-exception-naming',
+                        'reused-string-literals', 'file-copyright-header')) -and
+                    ($prior.length -ge 6249 -or $_ -cne 'pr-template-compliance') -and
+                    ($prior.length -ge 5205 -or $_ -cnotin @(
                         'xml-summary-layout', 'duplicate-constant-declarations'))
                 })
             $unchanged | Should -HaveCount $prior.count
@@ -1151,24 +1153,24 @@ Describe 'Approved Owner v2 review and approval packages' {
                 unchangedRuleIds = $unchanged
             }
         })
-        $fourPrior = [ordered]@{
+        $fivePrior = [ordered]@{
             schemaVersion = 2
             kind = 'contextual-additive-rule-history-compatibility'
             previousRules = $previousRules
             currentRule = $compatibility.currentRule
         }
-        $fourPolicy = New-AutomaticOwnerV2ServicePolicy `
-            -Evidence $evidence -PolicyId contextual-four-prior-policy `
+        $fivePolicy = New-AutomaticOwnerV2ServicePolicy `
+            -Evidence $evidence -PolicyId contextual-five-prior-policy `
             -MaxCreatesPerRun 2 -MaxCreatesPerPullRequest 5 `
-            -HistoryCompatibility $fourPrior -CreatedUtc '20261021T000000Z'
+            -HistoryCompatibility $fivePrior -CreatedUtc '20261022T000000Z'
         $key = [byte[]](1..32)
-        $signedPath = Join-Path $TestDrive 'contextual-four-prior-signed.json'
+        $signedPath = Join-Path $TestDrive 'contextual-five-prior-signed.json'
         [void](Write-AutomaticOwnerV2ServicePolicy `
-            -Path $signedPath -Policy $fourPolicy -Key $key)
+            -Path $signedPath -Policy $fivePolicy -Key $key)
         $readback = Read-ApprovedOwnerV2SignedRecord -Path $signedPath -Key $key
         (Get-ApprovedOwnerV2Digest $readback.historyCompatibility) |
-            Should -BeExactly (Get-ApprovedOwnerV2Digest $fourPrior)
-        $readback.historyCompatibility.previousRules | Should -HaveCount 4
+            Should -BeExactly (Get-ApprovedOwnerV2Digest $fivePrior)
+        $readback.historyCompatibility.previousRules | Should -HaveCount 5
         $readback.limits.maxCreatesPerRun | Should -Be 2
         $readback.limits.maxCreatesPerPullRequest | Should -Be 5
         $readback.authority.action | Should -BeExactly create
@@ -1176,6 +1178,22 @@ Describe 'Approved Owner v2 review and approval packages' {
         $readback.authority.updates | Should -BeFalse
         { Assert-AutomaticOwnerV2ServicePolicy -Evidence $evidence -Policy $readback } |
             Should -Not -Throw
+        foreach ($index in 0..4) {
+            $invalid = $fivePrior | ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $invalid.previousRules[$index].unchangedRuleIds += 'named-call-arguments'
+            {
+                Assert-ApprovedOwnerV2RuleCompatibility -Compatibility $invalid `
+                    -CurrentRule $fivePrior.currentRule -AllowedRuleIds $script:ApprovedContextualRuleIds
+            } | Should -Throw '*unchangedRuleIds*invalid*'
+        }
+        $invalid = $fivePrior | ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $invalid.previousRules[4].rule.length++
+        {
+            Assert-ApprovedOwnerV2RuleCompatibility -Compatibility $invalid `
+                -CurrentRule $fivePrior.currentRule -AllowedRuleIds $script:ApprovedContextualRuleIds
+        } | Should -Throw '*unchangedRuleIds*invalid*'
     }
 
     It 'validates multiple exact prior bundles with rule-specific unchanged sets' {
@@ -1209,7 +1227,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                         length = 5399
                     }
                     unchangedRuleIds = @(
-                        'named-call-arguments')
+                        'exception-logging')
                 },
                 [ordered]@{
                     rule = [ordered]@{
@@ -1233,6 +1251,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
+                    'exception-logging',
                     'named-call-arguments',
                     'pr-template-compliance',
                     'block-body-indentation')
@@ -1248,6 +1267,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                     -Compatibility $invalid -CurrentRule $compatibility.currentRule `
                     -AllowedRuleIds @(
                         'explicit-string-comparison', 'http-client-lifetime',
+                        'exception-logging',
                         'named-call-arguments', 'pr-template-compliance',
                         'block-body-indentation')
             } | Should -Throw '*is invalid*'
@@ -1267,6 +1287,7 @@ Describe 'Approved Owner v2 review and approval packages' {
                 -AllowedRuleIds @(
                     'explicit-string-comparison',
                     'http-client-lifetime',
+                    'exception-logging',
                     'named-call-arguments',
                     'pr-template-compliance')
         } | Should -Throw '*duplicate or current*'
@@ -1288,7 +1309,8 @@ Describe 'Approved Owner v2 review and approval packages' {
         $command = Get-Command (Join-Path $repoRoot 'tools\Invoke-AutomaticOwnerV2Delivery.ps1')
         foreach ($parameter in @(
                 'FourthPreviousRuleHash', 'FourthPreviousRuleLength',
-                'FourthUnchangedRuleId')) {
+                'FourthUnchangedRuleId', 'FifthPreviousRuleHash',
+                'FifthPreviousRuleLength', 'FifthUnchangedRuleId')) {
             $command.Parameters.Keys | Should -Contain $parameter
         }
     }

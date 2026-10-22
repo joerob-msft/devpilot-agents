@@ -35,6 +35,10 @@ param(
     [string]$FourthPreviousRuleHash = '',
     [long]$FourthPreviousRuleLength = 0,
     [string[]]$FourthUnchangedRuleId = @(),
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$FifthPreviousRuleHash = '',
+    [long]$FifthPreviousRuleLength = 0,
+    [string[]]$FifthUnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -230,6 +234,10 @@ if ($Command -ceq 'authorize-policy') {
             $FourthPreviousRuleHash) -or
         $FourthPreviousRuleLength -ne 0 -or
         $FourthUnchangedRuleId.Count -ne 0
+    $fifthCompatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace($FifthPreviousRuleHash) -or
+        $FifthPreviousRuleLength -ne 0 -or
+        $FifthUnchangedRuleId.Count -ne 0
     if ($compatibilitySpecified -and (
             $Delivery -cne
                 'contextual-conventions' -or
@@ -262,6 +270,13 @@ if ($Command -ceq 'authorize-policy') {
             $FourthPreviousRuleLength -lt 1 -or
             $FourthUnchangedRuleId.Count -lt 1)) {
         throw 'Fourth additive history compatibility requires a fourth exact prior contextual rule and unchanged rule IDs.'
+    }
+    if ($fifthCompatibilitySpecified -and (
+            -not $fourthCompatibilitySpecified -or
+            [string]::IsNullOrWhiteSpace($FifthPreviousRuleHash) -or
+            $FifthPreviousRuleLength -lt 1 -or
+            $FifthUnchangedRuleId.Count -lt 1)) {
+        throw 'Fifth additive history compatibility requires a fifth exact prior contextual rule and unchanged rule IDs.'
     }
     $policyArguments = @{
         Evidence = $evidence
@@ -327,6 +342,15 @@ if ($Command -ceq 'authorize-policy') {
                         unchangedRuleIds =
                             @($FourthUnchangedRuleId)
                     }
+            }
+            if ($fifthCompatibilitySpecified) {
+                $previousRules += [ordered]@{
+                    rule = [ordered]@{
+                        hash = $FifthPreviousRuleHash
+                        length = $FifthPreviousRuleLength
+                    }
+                    unchangedRuleIds = @($FifthUnchangedRuleId)
+                }
             }
             [ordered]@{
                 schemaVersion = 2

@@ -156,26 +156,29 @@ Describe 'Changed C# file copyright headers' {
         $old = @(
             @{ hash = 'v1:sha256:0f6bd9dd21df64854bba7e2ba487c2639be15fa90f068da00df20f031ef9c749'; length = 3706; count = 18 },
             @{ hash = 'v1:sha256:6a7db82e68b407af4ed19aab4517973337592e757a32d5fa7a142b63ef75d22a'; length = 5205; count = 20 },
-            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 21 },
-            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 22 }
+            @{ hash = 'v1:sha256:9834f5ee38aefe532a9c2b5e05b90dd0f55faa8d87d743e2a650bb191c89506e'; length = 5399; count = 20 },
+            @{ hash = 'v1:sha256:e84ed0793dbabb4494a603fb445bea120af872b6df4477f2952148fc9bc3efac'; length = 6249; count = 21 },
+            @{ hash = 'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938'; length = 10287; count = 25 }
         )
         foreach ($prior in $old) {
             $binding = @{ hash = $prior.hash; length = $prior.length }
-            $excluded = @(switch ($prior.count) {
-                18 { @('named-call-arguments', 'xml-summary-layout', 'duplicate-constant-declarations', 'pr-template-compliance') }
-                20 { @('named-call-arguments', 'pr-template-compliance') }
-                21 { @('pr-template-compliance') }
-                22 { @() }
-            })
-            $excluded += @('block-body-indentation', 'generic-exception-naming',
-                'reused-string-literals', 'file-copyright-header')
+            $excluded = @('named-call-arguments')
+            if ($prior.length -lt 10287) {
+                $excluded += @('block-body-indentation', 'generic-exception-naming',
+                    'reused-string-literals', 'file-copyright-header')
+            }
+            if ($prior.length -lt 6249) { $excluded += 'pr-template-compliance' }
+            if ($prior.length -lt 5205) { $excluded += @('xml-summary-layout', 'duplicate-constant-declarations') }
             $unchanged = @($rules | Where-Object { $_ -cnotin $excluded })
             $unchanged | Should -HaveCount $prior.count
             (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds $unchanged) |
                 Should -BeTrue
             (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('explicit-string-comparison')) |
                 Should -BeTrue
-            (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('file-copyright-header')) |
+            (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds @('named-call-arguments')) |
+                Should -BeFalse
+            $binding.length++
+            (Test-ContextualConventionPriorRuleIds -Rule $binding -RuleIds $unchanged) |
                 Should -BeFalse
         }
     }
