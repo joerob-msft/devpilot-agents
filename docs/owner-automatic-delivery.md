@@ -92,10 +92,10 @@ The dot-sourced approved writer imports its canonical harness dependency
 directly; provider preflight does not rely on a prior wrapper or test-suite
 import to make canonical digest helpers available.
 
-The integrated contextual policy still has **26 rules**. The
-`named-call-arguments` definition now includes the narrowly bound static string
-equality exception; the other 25 rule definitions are unchanged. Readable
-presentation adds no rule. The sample remains disabled; source integration
+The integrated contextual policy has **27 rules**. The additive
+`english-identifier-naming` rule is distinct from `named-call-arguments`.
+The preceding 26 definitions, including the narrowly bound static string
+equality exception, are unchanged. The sample remains disabled; source integration
 does not install a toolkit, authorize a policy, or enable production delivery.
 
 Shared acquisition remains hosted by the Named-only roster and its existing
@@ -108,17 +108,25 @@ fetch unchanged contextual reference files. A withheld newness check remains
 UNKNOWN while independently proven findings still receive discussion
 reconciliation; an incomplete evaluation is not relabeled completed.
 
-Historical compatibility retains five explicit signed unchanged-ID maps:
+Historical compatibility retains the five older explicit signed unchanged-ID maps:
 18 IDs for the original 18-rule bundle, 20 IDs for the pre-nuance 21-rule
 bundle, 20 IDs for the post-nuance 21-rule bundle, 21 IDs for the template
 22-rule bundle, and 25 IDs for the preceding 26-rule bundle
 (`275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938`,
-10,287 canonical CRLF bytes). `named-call-arguments` is excluded from every
-prior generation: its changed semantics are not additive unchanged history.
+10,287 canonical CRLF bytes). `named-call-arguments` is excluded from those five
+older generations: its changed semantics are not additive unchanged history.
 The four most recently added IDs remain excluded from the first four maps.
 The original 18-rule map includes `test-class-code-coverage`;
 do not replace these maps with a current-roster count or an inferred blanket
 compatibility grant.
+
+An additional exact predecessor map for bundle
+`9221ce2c9cb4777bb0cbfc0ed11dea9e0e68328ce98137a026c4b68b4c80c756`
+(11,517 canonical CRLF bytes) permits its 26 unchanged IDs, including the
+already-updated named-call semantics. The new naming rule belongs in none of
+these six historical maps. The five older maps above retain exactly
+18/20/20/21/25 IDs; adding this map does not retroactively authorize the changed
+named-call rule in those older generations.
 
 File-header locations and related source occurrences use distinct labels;
 neither implies an unchanged line was changed. PR description findings remain
@@ -270,7 +278,7 @@ A markerless comment owned by the configured automation actor is not
 relabeled as human coverage: without authentic prior proof or an exact
 current marker, it is unknown and cannot authorize a duplicate create.
 
-For authorization, use the five exact historical maps described above.
+For authorization, preserve the five older exact historical maps described above.
 `block-body-indentation` is accepted only in the immediately preceding
 26-rule map, never in the first four. These proofs are explicit and signed
 per rule; there is no blanket old-bundle compatibility.
@@ -300,14 +308,54 @@ resolved catch type. A current human naming request must mention the same
 variable and request `ex` at the exact current anchor to suppress a duplicate.
 Unrelated or stale discussion does not establish naming coverage.
 
-Preserve the five exact historical maps and do not promote a rule into a
+Preserve the five older exact historical maps and do not promote a rule into a
 bundle that did not accept it. `generic-exception-naming` belongs only in the
 preceding 26-rule map; `pr-template-compliance` belongs in the 22- and 26-rule
-maps. The changed named-call rule belongs in none.
+maps. The changed named-call rule belongs in none of those five older maps;
+only the additional `9221ce2c...` predecessor preserves its current semantics.
 The existing schema-v2 signed compatibility format, create-only authority,
 zero model starts, two total contextual creates per run, five per PR, and four
 heads per scheduled run are unchanged. Adding the rule does not deploy it,
 rewrite installed configuration, authorize a policy, or change scheduled tasks.
+
+The additive `english-identifier-naming` rule implements a deliberately bounded
+part of **Use English terms** in canonical EngHub CodingStyle.md, commit
+`ff0692776598b8eb07993e8c45e0be03b7e32fa3`, heading 1734 and clause 1737.
+That clause requires complete, unabbreviated English terms and rejects uncommon
+abbreviations/acronyms. The user-supplied AzureUX-BPM PR 14099142, thread
+267600437, demonstrates `p` -> `property` in `XmlComposer.cs:257` at source
+`71aa9b0e09f2747f75452eb665abd16879352df5`:
+`holder.Properties().FirstOrDefault(p => p.Name.StartsWith(...))`.
+
+The supported finding requires an actually changed single-ASCII-letter
+lambda-parameter identifier (for example `p`, `x`, or `q`) whose Roslyn symbol
+type equals the referenced `Newtonsoft.Json.Linq.JProperty`. It asks for a
+descriptive English term such as `property` and updates to that
+lambda's uses. The existing PowerShell 7 runtime supplies Newtonsoft and framework
+metadata; no package, dictionary, model, or repository-wide naming heuristic is
+added. Qualified types, aliases, inferred parameters, and independent nested
+scopes are resolved semantically, not by the spelling `JProperty` or `Properties`.
+Source-defined lookalikes and proven foreign types are outside the supported role,
+not naming violations. Unresolved/dynamic targets, incomplete snapshot binding,
+and relevant conditional compilation are UNKNOWN. An old parameter does not
+become eligible because its body, enclosing call, or unrelated line changed.
+Generated paths, banners, and attributed ancestors reuse existing exclusions.
+Inferred roles are conservatively withheld if any conditional-compilation range
+remains in the bounded binding snapshot: unselected overload or local declarations
+can change lambda target typing without changing the lambda itself. Explicitly
+typed property roles are not withheld by unrelated conditional method bodies.
+
+This is not general English-name validation: other lambda names, method/local/
+field/type declarations, domain terms, common acronyms, loop counters, and discards
+are not classified by this supported check. Descriptive names such as `property`,
+`currentProperty`, and `candidate` are retained. A no-supported-candidate result does
+not certify their names as English. A current distinct-human request must mention
+the same variable and request `property` or `currentProperty` at the same current
+anchor to suppress a duplicate.
+Unrelated, negated, copied-marker, or markerless reviewer-owned discussion cannot
+establish human coverage; exact current reviewer marker/body readback is a no-op.
+No live policy, installed runtime, provider write, or timer is enabled by this
+source change. The parent operator still owns acceptance and production delivery.
 
 The additive `file-copyright-header` rule checks C# files in the current
 changed-file inventory, including modified existing test files. It implements
@@ -334,7 +382,7 @@ copyright request anywhere in the same file suppresses a duplicate; a
 markerless automation/reviewer-owned request or unproven prior context remains
 unknown. Exact current reviewer-owned marker/body readback is a no-op.
 
-Use the five exact historical maps described above. `file-copyright-header`
+Preserve the five older exact historical maps described above. `file-copyright-header`
 belongs only in the preceding 26-rule map, never the older four;
 `pr-template-compliance` is absent from the 18/20/21-rule bundles.
 Existing create ceilings, run/PR history, idempotency, Owner behavior,
@@ -395,14 +443,19 @@ An existing markerless comment from the configured reviewer is not human
 coverage: without authenticated prior delivery proof, it stays unknown and
 cannot authorize another create.
 
-When authorizing this corrected bundle, retain the five exact prior bindings
-with 18/20/20/21/25 unchanged IDs. Use
+When authorizing this additive bundle, retain all six exact prior bindings
+with 18/20/20/21/25/26 unchanged IDs. Use
 `-PreviousRule*`, `-AdditionalPreviousRule*`, `-ThirdPreviousRule*`, and
 `-FourthPreviousRule*` for the older four maps and `-FifthPreviousRule*` /
-`-FifthUnchangedRuleId` for the exact preceding 26-rule map. Never include
-`named-call-arguments` in any prior map or `pr-template-compliance` in the older
-18/20/21-rule sets. The preceding 26-rule map preserves all other 25 IDs,
-including `reused-string-literals`. An old named-call comment without current
+`-FifthUnchangedRuleId` for the older `275a62e2...` 26-rule map. Use
+`-SixthPreviousRule*` / `-SixthUnchangedRuleId` for the exact `9221ce2c...`
+26-rule predecessor. The existing schema-v2 maximum of eight maps is unchanged;
+the added CLI slot is needed to retain all five old maps alongside this new
+predecessor, not to create new authority. Never include `english-identifier-naming`
+in any prior map, `named-call-arguments` in the first five, or
+`pr-template-compliance` in the older 18/20/21-rule sets.
+The fifth map preserves the other 25 IDs, including `reused-string-literals`;
+the sixth preserves all 26 predecessor definitions. An old named-call comment without current
 proof remains UNKNOWN/no-duplicate, not authenticated unchanged history.
 This source change does not enable or deploy the correction.
 

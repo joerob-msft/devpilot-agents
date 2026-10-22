@@ -39,8 +39,10 @@ BeforeAll {
         $phasePath = Join-Path $toolkit 'tools\Invoke-ContextualConventionsScheduledPhase.ps1'
         [IO.File]::WriteAllBytes($phasePath, [IO.File]::ReadAllBytes($phase))
         $policyPath = Join-Path $toolkit 'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json'
+        [IO.File]::WriteAllBytes($policyPath, [IO.File]::ReadAllBytes(
+            (Join-Path $repoRoot 'src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json')))
         $policy = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json -AsHashtable
-        @($policy.rules) | Should -HaveCount 26
+        @($policy.rules) | Should -HaveCount 27
         switch ($Mode) {
             missing-rule { $policy.rules = @($policy.rules | Select-Object -SkipLast 1) }
             duplicate-rule { $policy.rules[-1] = $policy.rules[0] }
@@ -119,7 +121,7 @@ throw 'Disabled scheduled entrypoint invoked a provider.'
 }
 
 Describe 'Contextual scheduled source entrypoint' {
-    It 'accepts all 26 policy rules and reaches the actual disabled evaluation without provider or delivery writes' {
+    It 'accepts all 27 policy rules and reaches the actual disabled evaluation without provider or delivery writes' {
         $case = New-ContextualScheduledEntryCase
         $arguments = $case.Arguments
         $output = @(& (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -NoProfile -NonInteractive `

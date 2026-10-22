@@ -1161,6 +1161,139 @@ class Comparator { public static bool Equals(string a, string b, StringCompariso
         }
     }
 
+    It 'carries the original property lambda at changed line 257 through the real analyzer, bridge, citations and readback' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $sample = Get-Content -LiteralPath (Join-Path $repoRoot `
+            'samples\contextual-conventions-current-pr.config.json') -Raw | ConvertFrom-Json -AsHashtable
+        $config['commentRuleReferences'] = $sample.commentRuleReferences
+        $config['commentRuleRepository'] = $sample.commentRuleRepository
+        $lines = [Collections.Generic.List[string]]::new()
+        foreach ($line in @(
+                '// -----------------------------------------------------------',
+                '// Copyright (c) Microsoft Corporation.  All rights reserved.',
+                '// -----------------------------------------------------------',
+                'using System;', 'using System.Linq;', 'using Newtonsoft.Json.Linq;',
+                'class XmlComposer {',
+                '    static class XmlToJsonConstants { public const string JsonKeyGroupPrefix = ":group"; }',
+                '    void HandleGroup(JObject holder) {')) {
+            $lines.Add($line)
+        }
+        while ($lines.Count -lt 256) { $lines.Add('') }
+        $lines.Add('                var syntheticProp = holder.Properties().FirstOrDefault(p => p.Name.StartsWith(XmlToJsonConstants.JsonKeyGroupPrefix, StringComparison.Ordinal));')
+        $lines.Add('    }')
+        $lines.Add('}')
+        $content = $lines -join "`n"
+        foreach ($variant in @('original', 'renamed', 'body-only')) {
+            $current = if ($variant -ceq 'renamed') {
+                $content.Replace('p => p.Name', 'property => property.Name')
+            } else { $content }
+            $prepared = New-ContextualPreparedIntake -Content $current
+            $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+            $entry.path = 'src/netStandard/BuiltIn.Xml/XmlComposer.cs'
+            $entry.spans[0].startLine = if ($variant -ceq 'body-only') { 258 } else { 257 }
+            $entry.spans[0].endLine = $entry.spans[0].startLine
+            $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared `
+                -Name "english-property-$variant"
+            $result.records | Should -HaveCount 1
+            $result.providerWrites | Should -Be 0
+            $result.modelWrites | Should -Be 0
+            $configPath = Join-Path $TestDrive "english-property-$variant-config.json"
+            $config | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath $configPath
+            $evidence = Read-ApprovedOwnerV2Evidence `
+                -StateRoot (Join-Path $TestDrive "english-property-$variant-state") `
+                -Identity $result.records[0].identity -RepoRoot $repoRoot `
+                -ToolkitConfigPath $configPath -Delivery contextual-conventions
+            $findings = @($evidence.Observation.findings |
+                Where-Object ruleId -CEQ english-identifier-naming)
+            if ($variant -cne 'original') {
+                $findings | Should -HaveCount 0
+                continue
+            }
+            $findings | Should -HaveCount 1
+            $finding = $findings[0]
+            $finding.anchor.path | Should -BeExactly src/netStandard/BuiltIn.Xml/XmlComposer.cs
+            $finding.anchor.line | Should -Be 257
+            $finding.anchor.symbol | Should -BeExactly p
+            $finding.binding.source.representation.startLine | Should -Be 257
+            $finding.binding.source.sha256 | Should -Match '^[0-9a-f]{64}$'
+            $proposal = Get-ApprovedOwnerV2Proposal -Evidence $evidence -Finding $finding -Delivery contextual-conventions
+            $proposal.classification | Should -BeExactly wouldCreate
+            $proposal.scope | Should -BeExactly changed-line
+            $proposal.body | Should -Match 'JProperty'
+            $proposal.body | Should -Match 'update its uses'
+            $proposal.body | Should -Match 'Use English terms'
+            $proposal.body | Should -Match 'GCff0692776598b8eb07993e8c45e0be03b7e32fa3'
+            $proposal.body | Should -Match '&line=1734\b'
+            $readback = New-ContextualUpgradeRecognitionCase
+            $readback.Thread.anchor.path = $finding.anchor.path
+            $readback.Thread.anchor.line = $finding.anchor.line
+            $readback.Thread.comments[0].body = $proposal.body
+            $resolved = Resolve-OwnerV2DiscussionReconciliation `
+                -Observation $evidence.Observation -Contract $evidence.Contract -Snapshot $readback.Snapshot
+            $currentFinding = @($resolved.findings | Where-Object ruleId -CEQ english-identifier-naming)[0]
+            $currentFinding.reconciliation.classification | Should -BeExactly noOp
+            $currentFinding.reconciliation.reason | Should -BeExactly exact-current-comment
+        }
+    }
+
+    It 'requires variable-specific current human naming coverage for <Mode>' -TestCases @(
+        @{ Mode='original-review'; Expected='humanCovered' }
+        @{ Mode='rename-x'; Expected='humanCovered' }
+        @{ Mode='unrelated'; Expected='unknown' }
+        @{ Mode='wrong-variable'; Expected='unknown' }
+        @{ Mode='negated'; Expected='unknown' }
+        @{ Mode='reviewer-unmarked'; Expected='unknown' }
+        @{ Mode='ambiguous-author'; Expected='unknown' }
+        @{ Mode='wrong-line'; Expected='wouldCreate' }
+        @{ Mode='outdated'; Expected='wouldCreate' }
+        @{ Mode='cross-rule-marker'; Expected='unknown' }
+    ) {
+        param($Mode, $Expected)
+        $case = New-ContextualUpgradeRecognitionCase
+        $finding = $case.Observation.findings[0]
+        $finding.ruleId = 'english-identifier-naming'
+        $finding.anchor.symbol = if ($Mode -ceq 'rename-x') { 'x' } else { 'p' }
+        $comment = $case.Thread.comments[0]
+        $comment.body = '`p` is a violation of the English naming convention. Use an appropriate English term such as `property`.'
+        $comment.reviewerOwned = $false
+        $comment.reviewerIdentityState = 'foreign'
+        switch ($Mode) {
+            rename-x { $comment.body = 'Rename x to currentProperty and update its uses.' }
+            unrelated { $comment.body = 'Check p for null before reading its property.' }
+            wrong-variable { $comment.body = 'Rename q to property.' }
+            negated { $comment.body = 'Do not rename p to property.' }
+            reviewer-unmarked {
+                $comment.reviewerOwned = $true
+                $comment.reviewerIdentityState = 'matched'
+            }
+            ambiguous-author { $comment.reviewerIdentityState = 'ambiguous' }
+            wrong-line { $case.Thread.anchor.line++ }
+            outdated { $case.Thread.isOutdated = $true }
+            cross-rule-marker { $comment.body += "`n<!-- devpilot-named-areequal:v1:$('9' * 64) -->" }
+        }
+        $result = Resolve-OwnerV2DiscussionReconciliation `
+            -Observation $case.Observation -Contract $case.Contract -Snapshot $case.Snapshot
+        $result.findings[0].reconciliation.classification | Should -BeExactly $Expected
+        $result.effects.providerWrites | Should -Be 0
+    }
+
+    It 'does not turn an unbound property candidate into evaluated compliance' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ContextualPreparedIntake -Content (
+            'class C { void M(Missing holder) { var result = holder.Properties().FirstOrDefault(q => q.Name != null); } }')
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name english-unbound
+        $observation = Get-Content -LiteralPath $result.outcomes[0].observationPath -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        @($observation.findings | Where-Object ruleId -CEQ english-identifier-naming) |
+            Should -HaveCount 0
+        @($observation.outcomes | Where-Object {
+            $_.ruleId -ceq 'english-identifier-naming' -and $_.state -ceq 'unknown'
+        }) | Should -HaveCount 1
+        $observation.counts.unknown | Should -BeGreaterThan 0
+    }
+
     It 'carries the generic catch rule through acquisition, exact source binding, formatter, and reviewer readback' {
         $config = New-ContextualTestConfig
         $config.enabled = $true
@@ -1894,7 +2027,8 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                             'block-body-indentation',
                             'generic-exception-naming',
                             'file-copyright-header',
-                            'reused-string-literals')
+                            'reused-string-literals',
+                            'english-identifier-naming')
                     })
         $compatibility = [ordered]@{
             schemaVersion = 2
@@ -1949,7 +2083,7 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                         length = 10287
                     }
                     unchangedRuleIds = @(Get-ContextualConventionRuleIds |
-                        Where-Object { $_ -cne 'named-call-arguments' })
+                        Where-Object { $_ -cnotin @('named-call-arguments', 'english-identifier-naming') })
                 })
             currentRule = [ordered]@{
                 hash =
@@ -2031,7 +2165,7 @@ class C { bool Equal(string a, string b) { return a == b; } void Trace() {
                 ruleId = $ruleId
                 prior = $compatibility.previousRules[4].rule
                 expected = $(if ($ruleId -cin @(
-                    'named-call-arguments', 'reused-string-literals', 'file-copyright-header')) {
+                    'named-call-arguments', 'reused-string-literals', 'file-copyright-header', 'english-identifier-naming')) {
                     'unknown'
                 } else { 'noOp' })
             }

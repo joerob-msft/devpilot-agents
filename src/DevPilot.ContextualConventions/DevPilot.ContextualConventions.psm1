@@ -32,7 +32,8 @@ $script:RuleIds = @(
     'pr-template-compliance',
     'block-body-indentation',
     'generic-exception-naming',
-    'file-copyright-header'
+    'file-copyright-header',
+    'english-identifier-naming'
 )
 
 function Get-ContextualConventionRuleIds {
@@ -44,6 +45,11 @@ function Test-ContextualConventionPriorRuleIds {
         [Parameter(Mandatory)][Collections.IDictionary]$Rule,
         [Parameter(Mandatory)][object[]]$RuleIds
     )
+    if ('english-identifier-naming' -cin $RuleIds) { return $false }
+    if ([string]$Rule.hash -ceq
+            'v1:sha256:9221ce2c9cb4777bb0cbfc0ed11dea9e0e68328ce98137a026c4b68b4c80c756') {
+        return [long]$Rule.length -eq 11517
+    }
     if ('named-call-arguments' -cin $RuleIds) { return $false }
     if ([string]$Rule.hash -cne
             'v1:sha256:275a62e22d849913ea0da332fdb07dfb6ebed155231236c7704b94f4fb031938' -and
@@ -4241,6 +4247,158 @@ function Get-ContextualExceptionNamingOutcomes {
     }
 }
 
+function Get-ContextualEnglishIdentifierOutcomes {
+    param(
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][string]$Content,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object[]]$Spans,
+        [Parameter(Mandatory)][object[]]$SnapshotFiles
+    )
+    $ruleId = 'english-identifier-naming'
+    if (Test-ContextualExceptionNamingGeneratedFile -Path $Path -Content $Content) {
+        return New-ContextualOutcome -RuleId $ruleId -State compliant `
+            -Reason generated-code-excluded -Path $Path
+    }
+    $sourceTree = Get-ContextualExceptionNamingBindingTree -Root $Root
+    $root = $sourceTree.GetRoot()
+    $parameters = @($root.DescendantNodes() | Where-Object {
+            $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParameterSyntax] -and
+            $_.Identifier.ValueText -cmatch '^[A-Za-z]$' -and
+            ($_.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax] -or
+                ($_.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParameterListSyntax] -and
+                    $_.Parent.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParenthesizedLambdaExpressionSyntax])) -and
+            -not (Test-ContextualExceptionNamingGeneratedAncestor -Node $_) -and
+            (Test-ContextualChangedLine `
+                -Line ($_.Identifier.GetLocation().GetLineSpan().StartLinePosition.Line + 1) -Spans $Spans)
+        })
+    $inactiveCandidate = $false
+    foreach ($trivia in $root.DescendantTrivia(
+            [Func[Microsoft.CodeAnalysis.SyntaxNode, bool]]$null, $true)) {
+        if ($trivia.RawKind -ne [int][Microsoft.CodeAnalysis.CSharp.SyntaxKind]::DisabledTextTrivia) {
+            continue
+        }
+        $inactive = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText($trivia.ToString()).GetRoot()
+        foreach ($parameter in @($inactive.DescendantNodes() | Where-Object {
+                    $_ -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParameterSyntax] -and
+                    $_.Identifier.ValueText -cmatch '^[A-Za-z]$' -and
+                    ($_.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.SimpleLambdaExpressionSyntax] -or
+                        ($_.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParameterListSyntax] -and
+                            $_.Parent.Parent -is [Microsoft.CodeAnalysis.CSharp.Syntax.ParenthesizedLambdaExpressionSyntax]))
+                })) {
+            $position = $trivia.Span.Start + $parameter.Identifier.Span.Start
+            $line = $sourceTree.GetText([Threading.CancellationToken]::None).
+                Lines.GetLineFromPosition($position).LineNumber + 1
+            if (Test-ContextualChangedLine -Line $line -Spans $Spans) {
+                $inactiveCandidate = $true
+            }
+        }
+    }
+    if ($inactiveCandidate) {
+        New-ContextualOutcome -RuleId $ruleId -State unknown `
+            -Reason english-identifier-conditional-binding-unproven -Path $Path
+    }
+    if ($parameters.Count -eq 0) {
+        if (-not $inactiveCandidate) {
+            New-ContextualOutcome -RuleId $ruleId -State compliant `
+                -Reason no-supported-naming-candidate -Path $Path
+        }
+        return
+    }
+    $conditional = Get-ContextualExceptionNamingConditionalState -Root $root -Spans @() -Source
+    $bindingUnknown = $conditional.BindingUnknown
+    $inferredConditionalUnknown = $conditional.Spans.Count -gt 0
+    $trees = [Collections.Generic.List[Microsoft.CodeAnalysis.SyntaxTree]]::new()
+    [void]$trees.Add($sourceTree)
+    foreach ($file in $SnapshotFiles) {
+        if ([string]$file.path -inotmatch '\.cs$' -or [string]$file.path -ieq $Path -or
+            ([string]$file.path).Replace('\', '/') -imatch
+                '(^|/)(?:obj|Ignore-AddedForReferenceOnly)(/|$)') {
+            continue
+        }
+        if ([string]$file.state -cne 'complete' -or $file.content -isnot [string]) {
+            $bindingUnknown = $true
+            continue
+        }
+        $peerRoot = [Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree]::ParseText(
+            [string]$file.content).GetRoot()
+        $generated = Test-ContextualExceptionNamingGeneratedFile `
+            -Path ([string]$file.path) -Content ([string]$file.content)
+        $peerTree = Get-ContextualExceptionNamingBindingTree -Root $peerRoot -GeneratedFile:$generated
+        $peerConditional = Get-ContextualExceptionNamingConditionalState -Root $peerTree.GetRoot() -Spans @()
+        if ($peerConditional.BindingUnknown) {
+            $bindingUnknown = $true
+        }
+        if ($peerConditional.Spans.Count -gt 0) {
+            $inferredConditionalUnknown = $true
+        }
+        [void]$trees.Add($peerTree)
+    }
+    foreach ($tree in $trees) {
+        if (@($tree.GetDiagnostics() | Where-Object {
+                    $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            $bindingUnknown = $true
+        }
+    }
+    $model = $null
+    $propertyType = $null
+    if (-not $bindingUnknown) {
+        $references = [Collections.Generic.List[Microsoft.CodeAnalysis.MetadataReference]]::new()
+        $runtime = Split-Path -Parent ([object].Assembly.Location)
+        foreach ($assembly in @(
+                [object].Assembly.Location,
+                [System.Linq.Enumerable].Assembly.Location,
+                [Newtonsoft.Json.Linq.JProperty].Assembly.Location,
+                (Join-Path $runtime 'System.Runtime.dll'),
+                (Join-Path $runtime 'System.Collections.dll'),
+                (Join-Path $runtime 'System.Linq.Expressions.dll'),
+                (Join-Path $runtime 'System.ObjectModel.dll'))) {
+            [void]$references.Add([Microsoft.CodeAnalysis.MetadataReference]::CreateFromFile($assembly))
+        }
+        $compilation = [Microsoft.CodeAnalysis.CSharp.CSharpCompilation]::Create(
+            'ContextualEnglishIdentifiers', $trees.ToArray(), $references.ToArray(),
+            [Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions]::new(
+                [Microsoft.CodeAnalysis.OutputKind]::DynamicallyLinkedLibrary))
+        $jsonAssembly = [Microsoft.CodeAnalysis.IAssemblySymbol]$compilation.GetAssemblyOrModuleSymbol($references[2])
+        $propertyType = $jsonAssembly.GetTypeByMetadataName('Newtonsoft.Json.Linq.JProperty')
+        $model = $compilation.GetSemanticModel($sourceTree)
+    }
+    foreach ($parameter in $parameters) {
+        $line = $parameter.Identifier.GetLocation().GetLineSpan().StartLinePosition.Line + 1
+        $name = [string]$parameter.Identifier.ValueText
+        $symbol = if ($null -ne $model) {
+            [Microsoft.CodeAnalysis.CSharp.CSharpExtensions]::GetDeclaredSymbol(
+                $model, $parameter, [Threading.CancellationToken]::None)
+        } else { $null }
+        if ($bindingUnknown -or $null -eq $symbol -or
+            ($null -eq $parameter.Type -and $inferredConditionalUnknown) -or
+            @($conditional.Spans | Where-Object { $_.IntersectsWith($parameter.Span) }).Count -gt 0 -or
+            $symbol.Type.TypeKind -in @(
+                [Microsoft.CodeAnalysis.TypeKind]::Error, [Microsoft.CodeAnalysis.TypeKind]::Dynamic) -or
+            @($model.GetDiagnostics($parameter.Span) | Where-Object {
+                    $_.Severity -eq [Microsoft.CodeAnalysis.DiagnosticSeverity]::Error
+                }).Count -gt 0) {
+            New-ContextualOutcome -RuleId $ruleId -State unknown `
+                -Reason english-identifier-role-unproven -Path $Path `
+                -Line $line -EndLine $line -Symbol $name
+            continue
+        }
+        if (-not [Microsoft.CodeAnalysis.SymbolEqualityComparer]::Default.Equals($symbol.Type, $propertyType)) {
+            New-ContextualOutcome -RuleId $ruleId -State compliant `
+                -Reason unsupported-identifier-role -Path $Path `
+                -Line $line -EndLine $line -Symbol $name
+            continue
+        }
+        New-ContextualOutcome -RuleId $ruleId -State violation `
+            -Reason abbreviated-json-property-lambda-parameter -Path $Path `
+            -Line $line -EndLine $line -Symbol $name -Evidence (
+                "Name the Newtonsoft.Json.Linq.JProperty lambda parameter '$name' 'property' " +
+                '(or another descriptive English term) and update its uses. Use complete, unabbreviated English terms; ' +
+                'this supported check does not infer names for other roles or abbreviations.')
+    }
+}
+
 function Get-ContextualStringLiteralProject {
     param([AllowNull()]$File)
     if ($null -eq $File -or
@@ -4649,6 +4807,8 @@ function Get-ContextualRoslynOutcomes {
             New-ContextualOutcome -RuleId generic-exception-naming `
                 -State compliant -Reason no-applicable-violation -Path $Path)
     }
+    $englishNamingOutcomes = @(Get-ContextualEnglishIdentifierOutcomes `
+        -Root $root -Content $Content -Path $Path -Spans $Spans -SnapshotFiles $SnapshotFiles)
     $xmlSummaryOutcome =
         Get-ContextualXmlSummaryLayoutOutcome `
             -Root $root -Content $Content `
@@ -5906,13 +6066,17 @@ function Get-ContextualRoslynOutcomes {
         $reusedStringOutcomes = @(
             New-ContextualOutcome -RuleId reused-string-literals `
                 -State unknown -Reason csharp-syntax-incomplete -Path $Path)
+        $englishNamingOutcomes = @(
+            New-ContextualOutcome -RuleId english-identifier-naming `
+                -State unknown -Reason csharp-syntax-incomplete -Path $Path)
     }
     $baseOutcomes = @($script:RuleIds | Where-Object {
-            $_ -cnotin @('test-class-code-coverage', 'generic-exception-naming', 'reused-string-literals')
+            $_ -cnotin @('test-class-code-coverage', 'generic-exception-naming', 'reused-string-literals',
+                'english-identifier-naming')
         } | ForEach-Object {
             $results[$_]
         })
-    return @($baseOutcomes + $coverageOutcomes + $exceptionNamingOutcomes + $reusedStringOutcomes)
+    return @($baseOutcomes + $coverageOutcomes + $exceptionNamingOutcomes + $reusedStringOutcomes + $englishNamingOutcomes)
 }
 
 function Get-ContextualConventionOutcomes {

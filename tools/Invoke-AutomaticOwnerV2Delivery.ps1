@@ -39,6 +39,10 @@ param(
     [string]$FifthPreviousRuleHash = '',
     [long]$FifthPreviousRuleLength = 0,
     [string[]]$FifthUnchangedRuleId = @(),
+    [ValidatePattern('^$|^v1:sha256:[0-9a-f]{64}$')]
+    [string]$SixthPreviousRuleHash = '',
+    [long]$SixthPreviousRuleLength = 0,
+    [string[]]$SixthUnchangedRuleId = @(),
     [AllowNull()][object]$DeliveryProvider,
     [string]$AzureCliPath = 'az',
     [string]$GitPath = 'git',
@@ -238,6 +242,10 @@ if ($Command -ceq 'authorize-policy') {
         -not [string]::IsNullOrWhiteSpace($FifthPreviousRuleHash) -or
         $FifthPreviousRuleLength -ne 0 -or
         $FifthUnchangedRuleId.Count -ne 0
+    $sixthCompatibilitySpecified =
+        -not [string]::IsNullOrWhiteSpace($SixthPreviousRuleHash) -or
+        $SixthPreviousRuleLength -ne 0 -or
+        $SixthUnchangedRuleId.Count -ne 0
     if ($compatibilitySpecified -and (
             $Delivery -cne
                 'contextual-conventions' -or
@@ -277,6 +285,13 @@ if ($Command -ceq 'authorize-policy') {
             $FifthPreviousRuleLength -lt 1 -or
             $FifthUnchangedRuleId.Count -lt 1)) {
         throw 'Fifth additive history compatibility requires a fifth exact prior contextual rule and unchanged rule IDs.'
+    }
+    if ($sixthCompatibilitySpecified -and (
+            -not $fifthCompatibilitySpecified -or
+            [string]::IsNullOrWhiteSpace($SixthPreviousRuleHash) -or
+            $SixthPreviousRuleLength -lt 1 -or
+            $SixthUnchangedRuleId.Count -lt 1)) {
+        throw 'Sixth additive history compatibility requires a sixth exact prior contextual rule and unchanged rule IDs.'
     }
     $policyArguments = @{
         Evidence = $evidence
@@ -350,6 +365,15 @@ if ($Command -ceq 'authorize-policy') {
                         length = $FifthPreviousRuleLength
                     }
                     unchangedRuleIds = @($FifthUnchangedRuleId)
+                }
+            }
+            if ($sixthCompatibilitySpecified) {
+                $previousRules += [ordered]@{
+                    rule = [ordered]@{
+                        hash = $SixthPreviousRuleHash
+                        length = $SixthPreviousRuleLength
+                    }
+                    unchangedRuleIds = @($SixthUnchangedRuleId)
                 }
             }
             [ordered]@{

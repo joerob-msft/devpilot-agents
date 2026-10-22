@@ -556,9 +556,9 @@ class C { string A => "wire"; string B => "wire"; }
         $result[0].evidence | Should -Not -Match '^Reuse C.Key'
     }
 
-    It 'exports the fixed twenty-six-rule allow set' {
+    It 'exports the fixed twenty-seven-rule allow set' {
         @(Get-ContextualConventionRuleIds) |
-            Should -HaveCount 26
+            Should -HaveCount 27
         $policy = Get-Content "$PSScriptRoot\..\src\DevPilot.OwnerCapability\Policy\contextual-conventions.v1.json" -Raw |
             ConvertFrom-Json -AsHashtable
         @($policy.rules.id | Sort-Object) |
@@ -1666,11 +1666,11 @@ internal const string Value = "same";
                                     endLine = 1
                                 })
                         }))
-            $outcomes | Should -HaveCount 26
+            $outcomes | Should -HaveCount 27
             @($outcomes | Where-Object {
                     [string]$_.ruleId -cne
                         'named-call-arguments'
-                }) | Should -HaveCount 25
+                }) | Should -HaveCount 26
         }
     }
 
