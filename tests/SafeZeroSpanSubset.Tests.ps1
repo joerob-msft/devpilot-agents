@@ -1,5 +1,9 @@
 #requires -Version 7.0
 
+param(
+    [string]$FrozenIntakeRoot = ''
+)
+
 BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo `
@@ -156,6 +160,68 @@ BeforeAll {
         }
     }
 
+    function New-TestProducedEntry {
+        param(
+            [AllowEmptyString()][string]$Source,
+            [AllowEmptyString()][string]$Target,
+            [string]$Path = 'tests/Produced.cs',
+            [Collections.IDictionary]$Head = (New-TestHead)
+        )
+
+        $derivation = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Source, $Target, $Head)
+            New-DevPilotChangeDerivation `
+                -ChangeType edit -IsText $true `
+                -Deleted $false -Renamed $false `
+                -SourceContent $Source -TargetContent $Target `
+                -Spans @() -SourceCommit $Head.sourceCommit `
+                -TargetCommit $Head.targetCommit
+        } $Source $Target $Head
+        return [ordered]@{
+            path = $Path
+            changeType = 'edit'
+            state = 'complete'
+            spans = @()
+            unavailableReason = $null
+            content = $Source
+            byteLength = [Text.Encoding]::UTF8.GetByteCount($Source)
+            sourceDigest = Get-TestTextDigest $Source
+            comparison = [ordered]@{
+                schemaVersion = 1
+                state = 'complete'
+                path = $Path
+                targetPath = $Path
+                sourceCommit = $Head.sourceCommit
+                targetCommit = $Head.targetCommit
+                sourceDigest = Get-TestTextDigest $Source
+                targetDigest = Get-TestTextDigest $Target
+                byteLength = [Text.Encoding]::UTF8.GetByteCount($Target)
+                content = $Target
+                targetState = 'present'
+            }
+            derivation = $derivation
+        }
+    }
+
+    function Get-TestSerializedSelection {
+        param(
+            [object[]]$Entries,
+            [Collections.IDictionary]$Head = (New-TestHead)
+        )
+
+        $changes = [ordered]@{
+            changedFiles = $Entries.Count
+            changedLines = 0
+            entries = $Entries
+        } | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        return & (Get-Module DevPilot.NamedAreEqualBridge) {
+            param($Changes, $Head)
+            Get-NamedBridgeRelevantChangeSet `
+                -ChangeSet $Changes -Head $Head
+        } $changes $Head
+    }
+
     function New-TestPreparedIntake {
         param(
             [Parameter(Mandatory)]
@@ -238,6 +304,54 @@ BeforeAll {
 }
 
 Describe 'Safe zero-span subset' {
+    It 'consumes serialized producer proof for <Kind> without hiding the shared entry' `
+        -TestCases @(
+            @{ Kind = 'retained-file deletion'; Source = "class Kept {}`n"
+                Target = "// removed`nclass Kept {}`n"
+                Classification = 'deletion-only' }
+            @{ Kind = 'line endings'; Source = "class Kept {}`r`n"
+                Target = "class Kept {}`n"
+                Classification = 'identical-content' }
+        ) {
+        param($Kind, $Source, $Target, $Classification)
+        $entry = New-TestProducedEntry -Source $Source -Target $Target |
+            ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $entry.derivation.classification |
+            Should -BeExactly $Classification
+        $before = Get-AgentCanonicalDigest -InputObject $entry
+        $proof = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Entry, $Head)
+            Get-DevPilotChangeDerivationDisposition -Entry $Entry -Head $Head
+        } $entry (New-TestHead)
+        $proof.knownEmptyZeroAddedLines | Should -BeTrue
+        $proof.forceUnknown | Should -BeFalse
+        (Get-TestSerializedSelection -Entries @($entry)).changedFiles |
+            Should -Be 0
+        (Get-AgentCanonicalDigest -InputObject $entry) |
+            Should -BeExactly $before
+        $result = Invoke-TestBridge -Entry $entry -Name $Classification
+        $result.state | Should -BeExactly 'completed'
+        $result.records | Should -HaveCount 1
+        $result.records[0].state | Should -BeExactly 'completed'
+    }
+
+    It 'evaluates actual added content with empty spans as UNKNOWN after serialization' {
+        $entry = New-TestProducedEntry `
+            -Source "class Kept {}`n// added`n" -Target "class Kept {}`n" |
+            ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $entry.derivation.classification |
+            Should -BeExactly 'derivation-unknown'
+        $selected = Get-TestSerializedSelection -Entries @($entry)
+        $selected.entries | Should -HaveCount 1
+        $selected.entries[0].state | Should -BeExactly 'unknown'
+        $result = Invoke-TestBridge -Entry $entry -Name added-without-spans
+        $result.state | Should -BeExactly 'partial'
+        $result.records | Should -HaveCount 1
+        $result.records[0].state | Should -BeExactly 'unknown'
+    }
+
     It 'derives only the authorized fixed classifications' {
         $module = Get-Module DevPilot.ActivePrIntake
         $identical = & $module {
@@ -249,6 +363,7 @@ Describe 'Safe zero-span subset' {
                 -SourceCommit ('c' * 40) `
                 -TargetCommit ('d' * 40)
         }
+
         $identical.classification |
             Should -BeExactly 'identical-content'
         $identical.sourceContentSha256 |
@@ -1017,5 +1132,142 @@ class Checks {
         $unknownResult.state | Should -BeExactly 'partial'
         $unknownResult.records[0].state |
             Should -BeExactly 'unknown'
+    }
+}
+
+Describe 'Frozen shared intake zero-added-line proof' `
+    -Skip:([string]::IsNullOrWhiteSpace($FrozenIntakeRoot)) {
+    BeforeAll {
+        $frozen145 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'file-progress\14598491.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $frozen142 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'file-progress\14263755.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $generation145 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'generations\3dd9346ff38849d580f46abaf825b642.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $generation142 = Get-Content -LiteralPath (
+            Join-Path $FrozenIntakeRoot 'generations\7e449875e22b4d269b93856ecee90b1f.json') -Raw |
+            ConvertFrom-Json -AsHashtable -Depth 100
+        $frozenHeads = @{
+            14598491 = @($generation145.heads |
+                Where-Object pullRequestId -EQ 14598491)[0]
+            14263755 = @($generation142.heads |
+                Where-Object pullRequestId -EQ 14263755)[0]
+        }
+    }
+
+    It 'revalidates persisted and fresh producer proof for PR <Id> entry <Ordinal>' `
+        -TestCases @(
+            @{ Id = 14598491; Ordinal = 1; Classification = 'deletion-only' }
+            @{ Id = 14598491; Ordinal = 5; Classification = 'deletion-only' }
+            @{ Id = 14263755; Ordinal = 22; Classification = 'identical-content' }
+        ) {
+        param($Id, $Ordinal, $Classification)
+        $progress = if ($Id -eq 14598491) { $frozen145 } else { $frozen142 }
+        $entry = $progress.entries[$Ordinal]
+        $head = $frozenHeads[$Id]
+        $before = Get-AgentCanonicalDigest -InputObject $entry
+        $fresh = New-TestProducedEntry -Source $entry.content `
+            -Target $entry.comparison.content -Path $entry.path -Head $head
+        $fresh.derivation.classification | Should -BeExactly $Classification
+        foreach ($candidate in @($entry, $fresh)) {
+            $serialized = $candidate | ConvertTo-Json -Depth 64 |
+                ConvertFrom-Json -AsHashtable -Depth 64
+            $proof = & (Get-Module DevPilot.ActivePrIntake) {
+                param($Entry, $Head)
+                Get-DevPilotChangeDerivationDisposition -Entry $Entry -Head $Head
+            } $serialized $head
+            $proof.classification | Should -BeExactly $Classification
+            $proof.knownEmptyZeroAddedLines | Should -BeTrue
+            $proof.forceUnknown | Should -BeFalse
+            $disposition = & (Get-Module DevPilot.NamedAreEqualBridge) {
+                param($Entry, $Head)
+                Get-NamedBridgeChangeDisposition -Entry $Entry -Head $Head
+            } $serialized $head
+            $disposition | Should -BeExactly 'known-empty-identical'
+            (Get-TestSerializedSelection -Entries @($serialized) -Head $head).
+                changedFiles | Should -Be 0
+        }
+        (Get-AgentCanonicalDigest -InputObject $entry) |
+            Should -BeExactly $before
+    }
+
+    It 'retains all four changed-line files and removes both proven zero-line entries in PR14598491' {
+        $head = $frozenHeads[14598491]
+        $changes = [ordered]@{
+            changedFiles = $frozen145.entries.Count
+            changedLines = $frozen145.changedLines
+            entries = $frozen145.entries
+        }
+        $before = Get-AgentCanonicalDigest -InputObject $changes
+        $selected = & (Get-Module DevPilot.NamedAreEqualBridge) {
+            param($Changes, $Head)
+            Get-NamedBridgeRelevantChangeSet -ChangeSet $Changes -Head $Head
+        } ($changes | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64) $head
+        $selected.changedFiles | Should -Be 4
+        @($selected.entries | Where-Object state -CEQ unknown) |
+            Should -HaveCount 0
+        $selected.changedLines | Should -Be $frozen145.changedLines
+        (Get-AgentCanonicalDigest -InputObject $changes) |
+            Should -BeExactly $before
+        $changes.entries | Should -HaveCount 6
+    }
+
+    It 'keeps serialized <Mutation> evidence selected as UNKNOWN' `
+        -TestCases @(
+            @{ Mutation = 'added-content' }
+            @{ Mutation = 'missing-comparison' }
+            @{ Mutation = 'target-digest' }
+            @{ Mutation = 'source-digest' }
+            @{ Mutation = 'target-head' }
+            @{ Mutation = 'target-path' }
+            @{ Mutation = 'binary' }
+            @{ Mutation = 'truncated' }
+            @{ Mutation = 'comparison-truncated' }
+            @{ Mutation = 'cap-exhausted' }
+        ) {
+        param($Mutation)
+        $entry = $frozen145.entries[1] | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $head = $frozenHeads[14598491]
+        switch ($Mutation) {
+            added-content {
+                $entry = New-TestProducedEntry `
+                    -Source ($entry.comparison.content + "`n// added`n") `
+                    -Target $entry.comparison.content -Path $entry.path -Head $head
+            }
+            missing-comparison { $entry.Remove('comparison') }
+            target-digest { $entry.comparison.targetDigest = 'v1:sha256:' + ('0' * 64) }
+            source-digest { $entry.comparison.sourceDigest = 'v1:sha256:' + ('0' * 64) }
+            target-head { $entry.comparison.targetCommit = '0' * 40 }
+            target-path { $entry.comparison.targetPath = 'tests/Other.cs' }
+            binary { $entry['isBinary'] = $true }
+            truncated { $entry['truncated'] = $true }
+            comparison-truncated { $entry.comparison['truncated'] = $true }
+            cap-exhausted {
+                $entry.state = 'unknown'
+                $entry.unavailableReason = 'cap-exhausted'
+            }
+        }
+        $selected = Get-TestSerializedSelection -Entries @($entry) -Head $head
+        $selected.changedFiles | Should -Be 1
+        $selected.entries[0].state | Should -BeExactly 'unknown'
+        $selected.entries[0].content | Should -BeNullOrEmpty
+    }
+
+    It 'preserves the real capped entries and the 5000-line ceiling' {
+        $entries = @($frozen142.entries[20], $frozen142.entries[21],
+            $frozen142.entries[23])
+        $head = $frozenHeads[14263755]
+        $selected = Get-TestSerializedSelection -Entries $entries -Head $head
+        $selected.changedFiles | Should -Be 3
+        foreach ($entry in $selected.entries) {
+            $entry.state | Should -BeExactly 'unknown'
+            $entry.unavailableReason | Should -BeExactly 'cap-exhausted'
+        }
+        (New-TestConfig).limits.maxChangedLines | Should -Be 5000
     }
 }

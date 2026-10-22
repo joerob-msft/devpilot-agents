@@ -38,7 +38,39 @@ confidently. Unknown syntax,
 receiver shape, containment, or changed-line provenance is not actionable. The rule
 does not reorder arguments or change assertion values.
 
-The current-PR bridge accepts `devpilot-current-line-derivation-v1` evidence from the shared intake. It derives that evidence from already-fetched source/target content and the existing changed-span invocation, without another fetch or diff pass. Only same-path modified C# with complete, byte-identical source/target proof and zero current spans, or a complete whole-file C# deletion, can be filtered as known-empty for Named. Proof validation binds the head, actual UTF-8 content SHA-256 and length, path, change type, and exact inventory/span counts before filtering. Missing or inconsistent proof, derivation-unknown, pure renames, retained-file deletion-only changes, and malformed or unavailable relevant evidence remain UNKNOWN; zero spans alone are not proof of compliance. Derivation metadata participates in the snapshot digest and acquisition identity, so old observations cannot qualify a new binding. The frozen Owner runtime can consume a separately derived view that omits only proven identical C#; relation and other consumers retain the immutable full shared snapshot. This contract does not authorize delivery or change Owner body-coverage semantics.
+The current-PR bridge accepts `devpilot-current-line-derivation-v1` evidence from
+the shared intake. It derives that evidence from already-fetched source/target
+content and the existing changed-span invocation, without another fetch or diff
+pass. Complete whole-file C# deletions and same-path modified C# with zero current
+spans can be filtered as known-empty for the line-only Named rule only when the
+content proves no added lines: byte-identical content, CRLF/LF-only changes, or
+retained source lines forming an ordered subsequence of target lines. The latter
+comparison is bounded to 200,000 target lines and rejects NULs, bare carriage
+returns, and changed final-newline presence. Nonidentical content requires a
+complete target comparison bound to both commits, paths, actual source/target
+UTF-8 SHA-256 digests, and byte lengths. The consumer revalidates serialized
+records, including older `derivation-unknown` records, instead of trusting their
+classification or empty spans.
+
+Missing or inconsistent proof, real added lines, pure renames, binary or
+truncated content, and cap-exhausted evidence remain UNKNOWN; zero spans alone
+are not proof of compliance. Existing acquisition budgets, including the
+5,000-line ceiling, remain unchanged. Derivation metadata participates in the
+snapshot digest and acquisition identity, so old observations cannot qualify a
+new binding. Named filtering creates a separate view without modifying the full
+shared snapshot; it does not filter file-level rules or change the frozen Owner
+view. This contract does not authorize delivery or change Owner body-coverage
+semantics.
+
+`tests/SafeZeroSpanSubset.Tests.ps1` exercises actual producer records after JSON
+serialization and the Named consumer. Its additional frozen-evidence cases accept
+`FrozenIntakeRoot` through `New-PesterContainer -Data`; the directory must contain
+the private `file-progress` records for the motivating deletion-only and
+line-ending-only changes. Those cases are explicitly skipped when the directory
+is not supplied. Private content is never a committed fixture.
+`tests/ActivePrIntake.Tests.ps1` also checks the shared producer through the
+existing HTTP seam, including acceptance at 5,000 changed lines and UNKNOWN at
+5,001; neither case raises the acquisition limit.
 
 Fresh PR metadata remains uncached across head checks. Within one check, the
 shared intake acquires one bounded ADO token and reuses the existing

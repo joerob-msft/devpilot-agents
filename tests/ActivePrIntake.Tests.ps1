@@ -3037,6 +3037,107 @@ else {
                 -ErrorAction SilentlyContinue
         }
     }
+    It 'produces serialized bounded derivation through shared acquisition for <Mode>' `
+        -TestCases @(
+            @{ Mode = 'retained-deletion'; Classification = 'deletion-only' }
+            @{ Mode = 'line-endings'; Classification = 'identical-content' }
+            @{ Mode = '5000-line-boundary'; Classification = 'current-lines' }
+            @{ Mode = '5001-line-cap'; Classification = 'derivation-unknown' }
+        ) {
+        param($Mode, $Classification)
+        $c = New-IntakeCase -Count 1
+        $c.config.limits.maxChangedLines | Should -Be 5000
+        New-Item -ItemType Directory -Path $c.root -Force | Out-Null
+        $stub = Join-Path $c.root 'az-zero-added-lines.ps1'
+        @'
+if ($args -contains 'get-access-token') {
+    @{ accessToken = 'x' * 128 } | ConvertTo-Json -Compress
+}
+elseif ($args -contains 'pullRequestIterationChanges') {
+    if ($args -contains '$skip=1') {
+        '{"changeEntries":[],"count":0}'
+    }
+    else {
+        '{"changeEntries":[{"changeTrackingId":1,"changeType":"edit","item":{"path":"/tests/Produced.cs"}}],"count":1,"nextSkip":1}'
+    }
+}
+else { exit 7 }
+'@ | Set-Content -LiteralPath $stub -Encoding utf8
+        $target = "class Kept {}`n"
+        $source = switch ($Mode) {
+            retained-deletion { "class Kept {}`n" }
+            line-endings { "class Kept {}`r`n" }
+            5000-line-boundary { (1..5000 | ForEach-Object { "line-$_" }) -join "`n" }
+            5001-line-cap { (1..5001 | ForEach-Object { "line-$_" }) -join "`n" }
+        }
+        if ($Mode -ceq 'retained-deletion') {
+            $target = "// removed`nclass Kept {}`n"
+        }
+        $httpGet = {
+            param($Uri, $Method, $Headers, $TimeoutSec, $UseBasicParsing)
+            $Method | Should -BeExactly 'Get'
+            $Headers.Authorization | Should -BeExactly ('Bearer ' + ('x' * 128))
+            if ([string]$Uri -match 'scopePath=') {
+                return [pscustomobject]@{
+                    Content = '[]'
+                    RawContentLength = 2
+                    Headers = @{ 'Content-Type' = 'application/json' }
+                }
+            }
+            $content = if ([string]$Uri -match (
+                    'versionDescriptor\.version=' + ('a' * 40))) {
+                $source
+            } else { $target }
+            return [pscustomobject]@{
+                Content = $content
+                RawContentLength = [Text.Encoding]::UTF8.GetByteCount($content)
+                Headers = @{ 'Content-Type' = 'text/plain' }
+            }
+        }.GetNewClosure()
+        $provider = New-ActivePrAzureDevOpsProvider -Config $c.config `
+            -AzureCliPath $stub -HttpGetInvoker $httpGet
+        $head = @{ sourceCommit = 'a' * 40; targetCommit = 'b' * 40 }
+        $changes = & $provider Changes @{
+            pullRequestId = 1
+            iterationId = 1
+            sourceCommit = $head.sourceCommit
+            targetCommit = $head.targetCommit
+            timeoutMilliseconds = 15000
+        } | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $changes.entries | Should -HaveCount 1
+        $entry = $changes.entries[0]
+        $entry.derivation.classification | Should -BeExactly $Classification
+        if ($Mode -ceq '5000-line-boundary') {
+            $entry.spans | Should -HaveCount 1
+            $changes.changedLines | Should -Be 5000
+        }
+        else {
+            $entry.spans | Should -HaveCount 0
+        }
+        $proof = & (Get-Module DevPilot.ActivePrIntake) {
+            param($Entry, $Head)
+            Get-DevPilotChangeDerivationDisposition -Entry $Entry -Head $Head
+        } $entry $head
+        if ($Mode -ceq '5001-line-cap') {
+            $entry.state | Should -BeExactly 'unknown'
+            $entry.unavailableReason | Should -BeExactly 'cap-exhausted'
+            $proof.forceUnknown | Should -BeTrue
+        }
+        elseif ($Mode -ceq '5000-line-boundary') {
+            $entry.state | Should -BeExactly 'complete'
+            $proof.knownEmptyZeroAddedLines | Should -BeFalse
+            $proof.forceUnknown | Should -BeFalse
+        }
+        else {
+            $entry.state | Should -BeExactly 'complete'
+            $proof.knownEmptyZeroAddedLines | Should -BeTrue
+            $proof.forceUnknown | Should -BeFalse
+            $entry.comparison.targetCommit | Should -BeExactly $head.targetCommit
+        }
+        $c.config.limits.maxChangedLines | Should -Be 5000
+    }
+
     It 'normalizes real shared git spans for <Mode> changes' `
         -TestCases @(
             @{ Mode = 'multi'; ExpectedLines = 3
