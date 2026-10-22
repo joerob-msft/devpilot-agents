@@ -962,26 +962,31 @@ function Test-IntakeStateRootReadOnly {
 function Get-IntakeLifecycleEffects {
     param([object]$Lifecycle)
     $values = @{}
-    foreach ($name in @(
-            'statusWrites', 'explanationWrites',
-            'unconfirmedStatusWrites', 'unconfirmedExplanationWrites',
-            'providerReadCount', 'explanationReadCount', 'explanationEvents')) {
+    $actionCountNames = @(
+        'statusWrites', 'explanationWrites',
+        'unconfirmedStatusWrites', 'unconfirmedExplanationWrites'
+    )
+    $disaggregated = $false
+    foreach ($name in @($actionCountNames + @(
+                'providerReadCount', 'explanationReadCount', 'explanationEvents'))) {
         $value = if ($Lifecycle -is [Collections.IDictionary]) {
-            if ($Lifecycle.Contains($name)) { $Lifecycle[$name] }
+            if ($Lifecycle.Contains($name)) {
+                if ($name -cin $actionCountNames) { $disaggregated = $true }
+                $Lifecycle[$name]
+            }
         }
         elseif ($null -ne $Lifecycle) {
             $property = $Lifecycle.PSObject.Properties[$name]
-            if ($null -ne $property) { $property.Value }
+            if ($null -ne $property) {
+                if ($name -cin $actionCountNames) { $disaggregated = $true }
+                $property.Value
+            }
         }
         $values[$name] = $value
     }
-    $disaggregated = $null -ne $values.statusWrites -or
-        $null -ne $values.explanationWrites
     $valid = $true
     if ($disaggregated) {
-        foreach ($name in @(
-                'statusWrites', 'explanationWrites',
-                'unconfirmedStatusWrites', 'unconfirmedExplanationWrites')) {
+        foreach ($name in $actionCountNames) {
             if ($values[$name] -is [bool] -or
                 [string]$values[$name] -cnotmatch '^[01]$') {
                 $valid = $false
@@ -1735,7 +1740,16 @@ function Invoke-ActivePrIntake {
                         $unconfirmedStatusWrites = [Math]::Max(
                             0, $reportedStatusWrites - $confirmedAbandoned.Count)
                         $unconfirmedExplanationWrites = 0
-                        if ($null -ne $lifecycleEffects -and
+                        $untrustedActionEffects = $null -ne $lifecycleEffects -and
+                            $lifecycleEffects.disaggregated -and
+                            -not $lifecycleEffects.valid
+                        if ($untrustedActionEffects) {
+                            $reportedStatusWrites = $null
+                            $reportedExplanationWrites = $null
+                            $unconfirmedStatusWrites = $null
+                            $unconfirmedExplanationWrites = $null
+                        }
+                        elseif ($null -ne $lifecycleEffects -and
                             $lifecycleEffects.valid -and
                             $lifecycleEffects.disaggregated) {
                             $reportedStatusWrites = [int]$lifecycleEffects.statusWrites
@@ -1788,6 +1802,7 @@ function Invoke-ActivePrIntake {
                                 $confirmedAbandoned |
                                     Sort-Object)
                             unknownPossibleEffect =
+                                $untrustedActionEffects -or
                                 ($unconfirmedStatusWrites +
                                     $unconfirmedExplanationWrites) -gt 0
                             reviewEligibleIds = @()

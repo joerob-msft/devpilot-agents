@@ -164,6 +164,14 @@ component. Both dictionary and native
 `PSCustomObject` results preserve those effects, confirmed exclusions, and
 event streams even if subsequent cursor validation fails.
 
+Legacy status-only results remain supported only when all four new action
+counters are absent. Presence of any attempted or unconfirmed counter,
+including an explicit null, requires the complete valid four-counter group.
+Invalid groups withhold automatic review eligibility, retain bounded reported
+aggregate writes, and expose untrusted action counts as null with an unknown
+possible effect. Shared-acquisition output preserves those nulls rather than
+turning them into zero writes or attributing all writes to status transitions.
+
 ## Separate authority and audit
 
 Lifecycle authorization is independent of every comment writer. Its private

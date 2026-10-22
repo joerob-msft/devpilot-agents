@@ -3016,6 +3016,137 @@ Describe 'Named shared acquisition lifecycle route' {
             $case.State.Posts | Should -Be 0
         }
 
+        It 'rejects partial lifecycle action protocols (<Shape>, <Mutation>)' `
+            -TestCases @(
+                foreach ($shape in @('native', 'dictionary')) {
+                    foreach ($mutation in @(
+                            'orphan-status', 'orphan-comment', 'orphan-null',
+                            'partial-missing', 'null-attempts', 'boolean-status',
+                            'boolean-comment', 'boolean-unconfirmed-status',
+                            'boolean-unconfirmed-comment', 'total-mismatch',
+                            'unconfirmed-status-exceeds', 'unconfirmed-comment-exceeds')) {
+                        @{ Shape = $shape; Mutation = $mutation }
+                    }
+                }
+            ) {
+            param($Shape, $Mutation)
+            $case = New-ExplanationCase
+            $arguments = $case.Arguments
+            $arguments.Inventory += [ordered]@{
+                pullRequestId = 2; status = 'active'; isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2024-01-01T00:00:00Z'
+            }
+            $headCalls = [Collections.Generic.List[int]]::new()
+            $activeProvider = {
+                param($Operation, $Request)
+                switch ($Operation) {
+                    Identity { return $case.Config.expectedAccount }
+                    ListPage {
+                        $items = if ([int]$Request.skip -eq 0) {
+                            @($arguments.Inventory)
+                        } else { @() }
+                        return @{ items = @($items); count = @($items).Count; totalCount = 2 }
+                    }
+                    Head {
+                        [void]$headCalls.Add([int]$Request.pullRequestId)
+                        throw 'Unverified lifecycle eligibility must not reach acquisition.'
+                    }
+                    default { throw "Unexpected counter-protocol operation: $Operation" }
+                }
+            }.GetNewClosure()
+            $capture = @{}
+            $evaluator = {
+                param($Inventory)
+                $native = Invoke-StalePrLifecycle @arguments
+                $capture.native = $native
+                $value = [ordered]@{}
+                foreach ($property in $native.PSObject.Properties) {
+                    $value[$property.Name] = $property.Value
+                }
+                $value.reviewEligibleIds = @(2)
+                switch ($Mutation) {
+                    { $_ -cin @('orphan-status', 'orphan-comment', 'orphan-null') } {
+                        foreach ($name in @('statusWrites', 'explanationWrites',
+                                'unconfirmedStatusWrites', 'unconfirmedExplanationWrites')) {
+                            $value.Remove($name)
+                        }
+                        if ($Mutation -ceq 'orphan-comment') {
+                            $value['unconfirmedExplanationWrites'] = 1
+                        }
+                        else {
+                            $value['unconfirmedStatusWrites'] = $(if (
+                                $Mutation -ceq 'orphan-null'
+                            ) { $null } else { 1 })
+                        }
+                    }
+                    partial-missing { $value.Remove('unconfirmedExplanationWrites') }
+                    null-attempts { $value.statusWrites = $null; $value.explanationWrites = $null }
+                    boolean-status { $value.statusWrites = $true }
+                    boolean-comment { $value.explanationWrites = $true }
+                    boolean-unconfirmed-status { $value.unconfirmedStatusWrites = $false }
+                    boolean-unconfirmed-comment { $value.unconfirmedExplanationWrites = $false }
+                    total-mismatch { $value.explanationWrites = 0 }
+                    unconfirmed-status-exceeds { $value.statusWrites = 0; $value.unconfirmedStatusWrites = 1 }
+                    unconfirmed-comment-exceeds { $value.explanationWrites = 0; $value.unconfirmedExplanationWrites = 1 }
+                }
+                if ($Shape -ceq 'native') { return [pscustomobject]$value }
+                return $value
+            }.GetNewClosure()
+            $result = Invoke-ActivePrIntake -Config $case.Config `
+                -Provider $activeProvider -RepositoryRoot $repo `
+                -StateRoot (Join-Path $case.Root.Context.Root 'intake') `
+                -LifecycleEvaluator $evaluator -IncludeTransientSnapshots -Run
+            $capture.native.GetType().FullName |
+                Should -BeExactly 'System.Management.Automation.PSCustomObject'
+            $result.lifecycle.diagnostic | Should -BeExactly lifecycle-result-invalid
+            $result.lifecycle.health | Should -BeExactly unknown
+            $result.lifecycle.providerWrites | Should -Be 2
+            $result.lifecycle.statusWrites | Should -BeNullOrEmpty
+            $result.lifecycle.explanationWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unconfirmedStatusWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unconfirmedExplanationWrites | Should -BeNullOrEmpty
+            $result.lifecycle.unknownPossibleEffect | Should -BeTrue
+            $result.lifecycle.confirmedAbandonedIds | Should -HaveCount 0
+            $result.lifecycle.reviewEligibleIds | Should -HaveCount 0
+            @($result.transientSnapshots.Keys) | Should -HaveCount 0
+            $headCalls | Should -HaveCount 0
+            $case.State.StatusWrites | Should -Be 1
+            $case.State.Posts | Should -Be 1
+            $tokens = $null
+            $parseErrors = $null
+            $toolAst = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $repo 'tools\Invoke-SharedReviewAcquisition.ps1'),
+                [ref]$tokens, [ref]$parseErrors)
+            $parseErrors | Should -HaveCount 0
+            $summaryAst = @($toolAst.FindAll({
+                        param($node)
+                        $node -is [Management.Automation.Language.HashtableAst] -and
+                        @($node.KeyValuePairs | Where-Object {
+                                $_.Item1.Extent.Text -ceq 'lifecycleStatusWrites'
+                            }).Count -eq 1
+                    }, $true))
+            $summaryAst | Should -HaveCount 1
+            $intake = $result
+            $generationFiles = @(Get-ChildItem -LiteralPath (
+                    Join-Path $case.Root.Context.Root 'intake') -Recurse -File `
+                    -Filter "$($result.generation).json")
+            $generationFiles | Should -HaveCount 1
+            $path = $generationFiles[0].FullName
+            $transientSnapshots = @{}
+            $blobKeys = @()
+            $summary = & ([scriptblock]::Create($summaryAst[0].Parent.Extent.Text)) |
+                ConvertTo-Json -Depth 32 | ConvertFrom-Json -AsHashtable -Depth 32
+            $summary.providerWrites | Should -Be 2
+            $summary.lifecycleProviderWrites | Should -Be 2
+            foreach ($name in @('lifecycleStatusWrites', 'lifecycleExplanationWrites',
+                    'lifecycleUnconfirmedStatusWrites', 'lifecycleUnconfirmedExplanationWrites')) {
+                $summary.Contains($name) | Should -BeTrue
+                $summary[$name] | Should -BeNullOrEmpty
+            }
+            $summary.lifecycleReviewEligibleIds | Should -HaveCount 0
+        }
+
         It 'keeps both native result shapes truthful on consumer failure (<Shape>, <Mode>, <BadCursor>)' `
             -TestCases @(
                 @{ Shape = 'native'; Mode = 'confirmed'; BadCursor = $false }

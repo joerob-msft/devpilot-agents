@@ -179,12 +179,12 @@ $blobKeys = @($transientSnapshots.GetEnumerator() |
     providerWrites = [int]$intake.lifecycle.providerWrites
     lifecycleProviderWrites =
         [int]$intake.lifecycle.providerWrites
-    lifecycleStatusWrites = [int]$intake.lifecycle.statusWrites
-    lifecycleExplanationWrites = [int]$intake.lifecycle.explanationWrites
+    lifecycleStatusWrites = $intake.lifecycle.statusWrites
+    lifecycleExplanationWrites = $intake.lifecycle.explanationWrites
     lifecycleUnconfirmedStatusWrites =
-        [int]$intake.lifecycle.unconfirmedStatusWrites
+        $intake.lifecycle.unconfirmedStatusWrites
     lifecycleUnconfirmedExplanationWrites =
-        [int]$intake.lifecycle.unconfirmedExplanationWrites
+        $intake.lifecycle.unconfirmedExplanationWrites
     lifecycleProviderReadCount = $intake.lifecycle.providerReadCount
     lifecycleExplanationReadCount = $intake.lifecycle.explanationReadCount
     lifecycleHealth = [string]$intake.lifecycle.health
