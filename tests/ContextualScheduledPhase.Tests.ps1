@@ -131,6 +131,9 @@ Describe 'Contextual scheduled source entrypoint' {
         $result.toolkit.tree | Should -BeExactly $arguments.ExpectedToolkitTree
         $result.evaluation.state | Should -BeExactly disabled
         @($result.evaluation.records) | Should -HaveCount 0
+        $result.withheldHeadCount | Should -Be 0
+        $result.coverage.selectedHeadCount | Should -Be 0
+        $result.coverage.withheldHeadCount | Should -Be 0
         $result.deliveryEnabled | Should -BeFalse
         $result.delivery.health | Should -BeExactly disabled
         $result.delivery.remainingCreates | Should -Be 2

@@ -1491,12 +1491,24 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
             [string](Get-ApprovedOwnerV2Value `
                 $selection 'scope' '') -ceq
                 'pull-request'
+        $selectionRuleId = [string](Get-ApprovedOwnerV2Value `
+            $selection 'ruleId' '')
+        $eventFindingRuleId = [string](Get-ApprovedOwnerV2Value `
+            $event.finding 'ruleId' '')
+        $selectionBodySha256 = [string](Get-ApprovedOwnerV2Value `
+            $selection 'bodySha256' '')
+        $eventFindingBodySha256 = [string](Get-ApprovedOwnerV2Value `
+            $event.finding 'bodySha256' '')
         if ([Text.Encoding]::UTF8.GetByteCount(
                 [string]$selection.body) -gt 65536 -or
-            $bodySha256 -cne
-                [string]$selection.bodySha256 -or
-            $bodySha256 -cne
-                [string]$event.finding.bodySha256 -or
+            ($Delivery -cne 'owner' -and (
+                $bodySha256 -cne $selectionBodySha256 -or
+                $bodySha256 -cne $eventFindingBodySha256)) -or
+            ($Delivery -ceq 'owner' -and (
+                (-not [string]::IsNullOrEmpty($selectionBodySha256) -and
+                    $bodySha256 -cne $selectionBodySha256) -or
+                (-not [string]::IsNullOrEmpty($eventFindingBodySha256) -and
+                    $bodySha256 -cne $eventFindingBodySha256))) -or
             ($pullRequestScope -and (
                 [string](Get-ApprovedOwnerV2Value `
                     $event.finding 'scope' '') -cne
@@ -1514,8 +1526,9 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     [int]$event.finding.line -or
                 [string]$selection.symbol -cne
                     [string]$event.finding.symbol)) -or
-            [string]$selection.ruleId -cne
-                [string]$event.finding.ruleId) {
+            ($Delivery -ceq 'contextual-conventions' -and
+                [string]::IsNullOrWhiteSpace($selectionRuleId)) -or
+            $selectionRuleId -cne $eventFindingRuleId) {
             continue
         }
         if ((Get-ApprovedOwnerV2Digest $intent.subject) -cne
@@ -1548,7 +1561,7 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                         [string]$selection.constructRef
                     semanticKey =
                         [string]$selection.semanticKey
-                    ruleId = [string]$selection.ruleId
+                    ruleId = $selectionRuleId
                     scope = [string](Get-ApprovedOwnerV2Value $selection 'scope' 'changed-line')
                 }
                 event = [ordered]@{
@@ -1559,6 +1572,22 @@ function Get-ApprovedOwnerV2AuthenticatedPriorComments {
                     commentId = [long]$event.commentId
                 }
             }
+        $intentIterationId = Get-ApprovedOwnerV2Value `
+            $intent 'currentIterationId' $null
+        if ($intentIterationId -isnot [bool] -and
+            ($intentIterationId -is [int] -or
+                $intentIterationId -is [long]) -and
+            [long]$intentIterationId -ge 1 -and
+            [long]$intentIterationId -le [int]::MaxValue) {
+            $proof['currentIterationId'] =
+                [long]$intentIterationId
+        }
+        $intentSnapshotSha256 = [string](Get-ApprovedOwnerV2Value `
+            $intent 'discussionSnapshotSha256' '')
+        if ($intentSnapshotSha256 -cmatch '^[0-9a-f]{64}$') {
+            $proof['discussionSnapshotSha256'] =
+                $intentSnapshotSha256
+        }
         if ($pullRequestScope) {
             $proof.selection['subject'] =
                 [string]$selection.subject
@@ -1766,6 +1795,303 @@ function Get-ApprovedOwnerV2MarkerEntries {
     return $entries.ToArray()
 }
 
+function Get-ApprovedOwnerV2RecomputedSnapshotDigest {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Subject,
+        [Parameter(Mandatory)][string]$MappingDigest,
+        [Parameter(Mandatory)][string]$ReviewerIdentityDigest,
+        [Parameter(Mandatory)][long]$CurrentIterationId,
+        [AllowEmptyCollection()][object[]]$Threads = @(),
+        [int]$MaximumPages = 20,
+        [int]$PageSize = 100,
+        [int]$MaximumThreads = 1000,
+        [int]$MaximumComments = 5000,
+        [long]$MaximumBytes = 4194304
+    )
+    $baseArguments = [ordered]@{
+        repositoryId = [string]$Subject.repositoryId
+        projectId = [string]$Subject.projectId
+        pullRequestId = [long]$Subject.pullRequestId
+        sourceCommit = [string]$Subject.sourceCommit
+        targetCommit = [string]$Subject.targetCommit
+        targetRef = [string]$Subject.targetRef
+    }
+    $pageIdentity = [ordered]@{ schemaVersion = 1 }
+    foreach ($entry in $baseArguments.GetEnumerator()) {
+        $pageIdentity[$entry.Key] = $entry.Value
+    }
+    $orderedThreads = @($Threads | Sort-Object { [long]$_.threadId })
+    $sourceDigests = [Collections.Generic.List[string]]::new()
+    $pageOrdinal = 0
+    do {
+        $pageOffset = $pageOrdinal * $PageSize
+        $continuationToken = if ($pageOrdinal -eq 0) {
+            $null
+        }
+        else {
+            "skip:$pageOffset"
+        }
+        $pageThreads = @($orderedThreads | Select-Object -Skip $pageOffset -First $PageSize)
+        $nextOffset = $pageOffset + $pageThreads.Count
+        $nextToken = if ($nextOffset -lt $orderedThreads.Count) {
+            "skip:$nextOffset"
+        }
+        else {
+            $null
+        }
+        $pageMaterial = [ordered]@{
+            semantics = 'owner-azuredevops-discussion-v1'
+            mappingDigest = $MappingDigest
+            reviewerIdentityDigest = $ReviewerIdentityDigest
+            identity = $pageIdentity
+            pageOrdinal = $pageOrdinal
+            continuationToken = $continuationToken
+            nextToken = $nextToken
+            currentIterationId = $CurrentIterationId
+            threads = @($pageThreads)
+        }
+        [void]$sourceDigests.Add((Get-ApprovedOwnerV2Digest $pageMaterial))
+        $pageOrdinal++
+    } while ($null -ne $nextToken)
+
+    $digestMaterial = [ordered]@{
+        schemaVersion = 1
+        identity = $baseArguments
+        limits = [ordered]@{
+            maximumPages = $MaximumPages
+            pageSize = $PageSize
+            maximumThreads = $MaximumThreads
+            maximumComments = $MaximumComments
+            maximumBytes = $MaximumBytes
+        }
+        sourceDigests = @($sourceDigests)
+        mappingDigest = $MappingDigest
+        reviewerIdentityDigest = $ReviewerIdentityDigest
+        currentIterationId = $CurrentIterationId
+        threads = $orderedThreads
+    }
+    return Get-ApprovedOwnerV2Digest $digestMaterial
+}
+
+function Test-ApprovedOwnerV2ReconciledSnapshotDigest {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Approval,
+        [Parameter(Mandatory)]$Live,
+        [Parameter(Mandatory)][string]$ExpectedSnapshotSha256,
+        [AllowEmptyCollection()][object[]]$AuthenticatedPriorComments = @(),
+        [AllowNull()]$Evidence = $null
+    )
+    $snapshot = $Live.Snapshot
+    if ($null -eq $snapshot -or
+        [string]$snapshot.State -cne 'complete' -or
+        [string]$snapshot.Reason -cne 'complete' -or
+        @($AuthenticatedPriorComments).Count -eq 0) {
+        return $false
+    }
+    $subject = Get-ApprovedOwnerV2Value $Approval 'subject'
+    $operator = Get-ApprovedOwnerV2Value $Approval 'operator'
+    $provider = Get-ApprovedOwnerV2Value $Approval 'provider'
+    if ($subject -isnot [Collections.IDictionary] -or
+        $operator -isnot [Collections.IDictionary] -or
+        $provider -isnot [Collections.IDictionary] -or
+        (Get-ApprovedOwnerV2Value $provider 'reviewerIdentity') -isnot [Collections.IDictionary]) {
+        return $false
+    }
+    $mappingDigest = [string]$snapshot.MappingDigest
+    $reviewerIdentityDigest = [string]$snapshot.ReviewerIdentityDigest
+    if ($mappingDigest -cne [string]$provider.mappingDigest -or
+        $reviewerIdentityDigest -cne [string]$provider.reviewerIdentity.digest) {
+        return $false
+    }
+    if ($Approval.Contains('discussion') -and
+        $Approval.discussion -is [Collections.IDictionary]) {
+        if ($mappingDigest -cne ('v1:sha256:' + [string]$Approval.discussion.mappingSha256) -or
+            $reviewerIdentityDigest -cne ('v1:sha256:' + [string]$Approval.discussion.reviewerIdentitySha256)) {
+            return $false
+        }
+    }
+    if ($snapshot.CurrentIterationId -is [bool] -or
+        ($snapshot.CurrentIterationId -isnot [int] -and
+            $snapshot.CurrentIterationId -isnot [long])) {
+        return $false
+    }
+    $currentIterationId = [long]$snapshot.CurrentIterationId
+    if ($currentIterationId -lt 1 -or $currentIterationId -gt [int]::MaxValue) {
+        return $false
+    }
+    if ($subject.Contains('iterationId') -and $null -ne $subject['iterationId']) {
+        $subjectIterationId = $subject['iterationId']
+        if ($subjectIterationId -is [bool] -or
+            ($subjectIterationId -isnot [int] -and $subjectIterationId -isnot [long]) -or
+            [long]$subjectIterationId -ne $currentIterationId) {
+            return $false
+        }
+    }
+    if ($null -ne $Evidence -and
+        $Evidence.PSObject.Properties.Match('Declaration').Count -gt 0 -and
+        $Evidence.Declaration -is [Collections.IDictionary] -and
+        $Evidence.Declaration.Contains('head') -and
+        $Evidence.Declaration['head'] -is [Collections.IDictionary] -and
+        $Evidence.Declaration['head'].Contains('iterationId') -and
+        $null -ne $Evidence.Declaration['head']['iterationId']) {
+        $declIterationId = $Evidence.Declaration['head']['iterationId']
+        if ($declIterationId -is [bool] -or
+            ($declIterationId -isnot [int] -and $declIterationId -isnot [long]) -or
+            [long]$declIterationId -ne $currentIterationId) {
+            return $false
+        }
+    }
+
+    $proofByThreadId = @{}
+    $seenEventIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($proof in @($AuthenticatedPriorComments)) {
+        if ($proof -isnot [Collections.IDictionary] -or
+            [string](Get-ApprovedOwnerV2Value $proof 'kind' '') -cne
+                'owner-v2-authenticated-prior-comment' -or
+            $proof.subject -isnot [Collections.IDictionary] -or
+            $proof.reviewerIdentity -isnot [Collections.IDictionary] -or
+            $proof.selection -isnot [Collections.IDictionary] -or
+            $proof.event -isnot [Collections.IDictionary]) {
+            continue
+        }
+        if ([string]$proof.subject.repositoryId -cne [string]$subject.repositoryId -or
+            [string]$proof.subject.projectId -cne [string]$subject.projectId -or
+            [long]$proof.subject.pullRequestId -ne [long]$subject.pullRequestId -or
+            [string]$proof.subject.sourceCommit -cne [string]$subject.sourceCommit -or
+            [string]$proof.subject.targetCommit -cne [string]$subject.targetCommit -or
+            [string]$proof.subject.targetRef -cne [string]$subject.targetRef) {
+            continue
+        }
+        if ([string](Get-ApprovedOwnerV2Value $proof.reviewerIdentity 'id' '') -cne
+                [string](Get-ApprovedOwnerV2Value $operator 'id' '') -or
+            [string](Get-ApprovedOwnerV2Value $proof.reviewerIdentity 'descriptor' '') -cne
+                [string](Get-ApprovedOwnerV2Value $operator 'descriptor' '') -or
+            [string](Get-ApprovedOwnerV2Value $proof.reviewerIdentity 'uniqueName' '') -cne
+                [string](Get-ApprovedOwnerV2Value $operator 'uniqueName' '') -or
+            [string](Get-ApprovedOwnerV2Value $proof 'reviewerIdentityDigest' '') -cne $reviewerIdentityDigest) {
+            return $false
+        }
+        $proofIterationId = Get-ApprovedOwnerV2Value $proof 'currentIterationId' $null
+        if ($proofIterationId -is [bool] -or
+            ($proofIterationId -isnot [int] -and $proofIterationId -isnot [long]) -or
+            [long]$proofIterationId -ne $currentIterationId) {
+            return $false
+        }
+        $threadId = [long]$proof.event.threadId
+        $commentId = [long]$proof.event.commentId
+        $eventId = [string](Get-ApprovedOwnerV2Value $proof.event 'eventId' '')
+        if ($threadId -lt 1 -or $commentId -lt 1 -or $eventId -cnotmatch '^[0-9a-f]{32}$') {
+            return $false
+        }
+        if ($proofByThreadId.ContainsKey($threadId) -or -not $seenEventIds.Add($eventId)) {
+            return $false
+        }
+        $proofByThreadId[$threadId] = $proof
+    }
+    if ($proofByThreadId.Count -eq 0) {
+        return $false
+    }
+
+    $removableThreadIds = [Collections.Generic.List[long]]::new()
+    foreach ($thread in @($snapshot.Threads | Sort-Object { [long]$_.threadId })) {
+        if ($thread -isnot [Collections.IDictionary]) {
+            continue
+        }
+        $threadId = [long]$thread.threadId
+        if (-not $proofByThreadId.ContainsKey($threadId)) {
+            continue
+        }
+        if ([string]$thread.status -cne 'active' -or
+            [bool]$thread.isDeleted -or
+            [bool]$thread.isOutdated) {
+            return $false
+        }
+        $comments = @($thread.comments)
+        if ($comments.Count -ne 1 -or
+            $comments[0] -isnot [Collections.IDictionary]) {
+            return $false
+        }
+        $comment = $comments[0]
+        if ([bool]$comment.isDeleted -or
+            [string]$comment.commentType -cne 'text' -or
+            -not [bool]$comment.reviewerOwned -or
+            [string]$comment.reviewerIdentityState -cne 'matched') {
+            return $false
+        }
+        $commentBody = [string]$comment.body
+        $commentBodyDigest = [string]$comment.bodyDigest
+        $commentBodySha256 = Get-ApprovedOwnerV2TextSha256 -Text $commentBody
+        if ($commentBodyDigest -cne "v1:sha256:$commentBodySha256") {
+            return $false
+        }
+        $proof = $proofByThreadId[$threadId]
+        $proofDelivery = [string](Get-ApprovedOwnerV2Value $proof 'delivery' '')
+        $expectedMarkerPrefix = switch ($proofDelivery) {
+            'owner' { 'devpilot-owner-comment:v1' }
+            'named-areequal' { 'devpilot-named-areequal:v1' }
+            'contextual-conventions' { 'devpilot-contextual-convention:v1' }
+            default { '' }
+        }
+        $marker = [string](Get-ApprovedOwnerV2Value $proof.selection 'marker' '')
+        if ([string]::IsNullOrEmpty($expectedMarkerPrefix) -or
+            $marker -cnotmatch '^[0-9a-f]{64}$' -or
+            [long]$comment.commentId -ne [long]$proof.event.commentId -or
+            $commentBody -cne [string]$proof.selection.body -or
+            $commentBodySha256 -cne [string]$proof.selection.bodySha256 -or
+            $commentBody -cnotmatch (
+                '<!-- ' +
+                [regex]::Escape($expectedMarkerPrefix) +
+                ':' +
+                [regex]::Escape($marker) +
+                ' -->')) {
+            return $false
+        }
+        $scope = [string](Get-ApprovedOwnerV2Value $proof.selection 'scope' 'changed-line')
+        if ($scope -ceq 'pull-request') {
+            if ($null -ne $thread.anchor -or
+                [string]$thread.contextState -cne 'notApplicable' -or
+                $null -ne $thread.sourceCommit) {
+                return $false
+            }
+        }
+        else {
+            if ($thread.anchor -isnot [Collections.IDictionary] -or
+                [string]$thread.anchor.path -ine [string]$proof.selection.path -or
+                [long]$thread.anchor.line -ne [long]$proof.selection.line -or
+                [string]$thread.contextState -cne 'current' -or
+                [string]$thread.sourceCommit -cne [string]$subject.sourceCommit) {
+                return $false
+            }
+        }
+        [void]$removableThreadIds.Add($threadId)
+    }
+    if ($removableThreadIds.Count -eq 0) {
+        return $false
+    }
+
+    $expectedDigest = "v1:sha256:$ExpectedSnapshotSha256"
+    $orderedRemovable = @($removableThreadIds | Sort-Object)
+    for ($startIndex = 0; $startIndex -lt $orderedRemovable.Count; $startIndex++) {
+        $removeSet = [Collections.Generic.HashSet[long]]::new()
+        for ($idx = $startIndex; $idx -lt $orderedRemovable.Count; $idx++) {
+            [void]$removeSet.Add([long]$orderedRemovable[$idx])
+        }
+        $remainingThreads = @($snapshot.Threads | Where-Object {
+                -not $removeSet.Contains([long]$_.threadId)
+            })
+        $recomputedDigest = Get-ApprovedOwnerV2RecomputedSnapshotDigest `
+            -Subject $subject `
+            -MappingDigest $mappingDigest `
+            -ReviewerIdentityDigest $reviewerIdentityDigest `
+            -CurrentIterationId $currentIterationId `
+            -Threads $remainingThreads
+        if ($recomputedDigest -ceq $expectedDigest) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Assert-ApprovedOwnerV2LiveRead {
     param(
         [Parameter(Mandatory)]$Evidence,
@@ -1800,7 +2126,13 @@ function Assert-ApprovedOwnerV2LiveRead {
         [string]$Live.Reviewer.uniqueName -cne [string]$operator.uniqueName) {
         throw 'Live Azure DevOps reviewer identity is missing, ambiguous, or foreign.'
     }
-    if ([string]$Live.Snapshot.Digest -cne "v1:sha256:$ExpectedSnapshotSha256") {
+    if ([string]$Live.Snapshot.Digest -cne "v1:sha256:$ExpectedSnapshotSha256" -and
+        -not (Test-ApprovedOwnerV2ReconciledSnapshotDigest `
+                -Approval $Approval `
+                -Live $Live `
+                -ExpectedSnapshotSha256 $ExpectedSnapshotSha256 `
+                -AuthenticatedPriorComments $AuthenticatedPriorComments `
+                -Evidence $Evidence)) {
         throw 'Live discussion snapshot changed; require a fresh scheduled observation and approval.'
     }
     foreach ($selection in $Selections) {

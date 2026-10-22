@@ -4439,4 +4439,71 @@ class C
         $result.findings[0].reconciliation.reason | Should -BeExactly authenticated-prior-comment-conflict
         $result.effects.dedupe.wouldCreate | Should -Be 0
     }
+
+    It 'flags a deletion-only zero-span C# file that removes the copyright header while keeping changed-line rules compliant' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake
+        $entry = $prepared.Intake.transientSnapshots['42'].changes.entries[0]
+        $targetWithHeader = "// Copyright (c) Microsoft Corporation.`r`nnamespace Contoso;`r`npublic sealed class Widget { }`r`n"
+        $sourceDeletedHeader = "namespace Contoso;`r`npublic sealed class Widget { }`r`n"
+        $entry.spans = @()
+        $entry.content = $sourceDeletedHeader
+        $entry.byteLength = [Text.Encoding]::UTF8.GetByteCount($sourceDeletedHeader)
+        $entry.sourceDigest = Get-ContextualTestTextDigest $sourceDeletedHeader
+        $entry.comparison = [ordered]@{
+            schemaVersion = 1
+            state = 'complete'
+            targetState = 'present'
+            truncated = $false
+            path = $entry.path
+            targetPath = $entry.path
+            sourceCommit = $prepared.Intake.transientSnapshots['42'].head.sourceCommit
+            targetCommit = $prepared.Intake.transientSnapshots['42'].head.targetCommit
+            sourceDigest = $entry.sourceDigest
+            targetDigest = Get-ContextualTestTextDigest $targetWithHeader
+            byteLength = [Text.Encoding]::UTF8.GetByteCount($targetWithHeader)
+            content = $targetWithHeader
+        }
+        $prepared.Intake.transientSnapshots['42'].changes.entries = @($entry)
+        $prepared.Intake.transientSnapshots['42'].changes.changedFiles = 1
+        $prepared.Intake.transientSnapshots['42'].changes.changedLines = 0
+
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name 'zero-span-deleted-header'
+        $result.state | Should -BeExactly 'completed'
+        $observation = Get-Content $result.outcomes[0].observationPath -Raw | ConvertFrom-Json -AsHashtable -Depth 100
+        $headers = @($observation.findings | Where-Object { $_.ruleId -ceq 'file-copyright-header' })
+        $headers | Should -HaveCount 1
+        $headers[0].anchor.line | Should -Be 1
+        @($observation.findings | Where-Object { $_.ruleId -cne 'file-copyright-header' }) | Should -HaveCount 0
+    }
+
+    It 'partitions lifecycle-activity-unverified automaticCommentEligible=false heads into withheldHeads without forcing partial state' {
+        $config = New-ContextualTestConfig
+        $config.enabled = $true
+        $prepared = New-ReusedStringPreparedIntake
+        $withheld1 = [ordered]@{
+            pullRequestId = 9001
+            targetRef = 'refs/heads/master'
+            reasonCode = 'lifecycle-activity-unverified'
+            automaticCommentEligible = $false
+            declaration = $null
+        }
+        $withheld2 = [ordered]@{
+            pullRequestId = 9002
+            targetRef = 'refs/heads/master'
+            reasonCode = 'lifecycle-activity-unverified'
+            automaticCommentEligible = $false
+            declaration = $null
+        }
+        $prepared.Intake.heads = @($prepared.Intake.heads) + @($withheld1, $withheld2)
+        $result = Invoke-SyntheticContextualBridge -Config $config -Prepared $prepared -Name 'withheld-heads-partition'
+        $result.state | Should -BeExactly 'completed'
+        $result.selectedCount | Should -Be 1
+        $result.completedCount | Should -Be 1
+        $result.incompleteCount | Should -Be 0
+        $result.withheldHeadCount | Should -Be 2
+        @($result.outcomes) | Should -HaveCount 1
+        @($result.withheldHeads) | Should -HaveCount 2
+    }
 }

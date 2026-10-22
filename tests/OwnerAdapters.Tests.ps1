@@ -1525,6 +1525,102 @@ Describe 'Owner discussion acquisition' {
                     -MaximumThreads 3 -MaximumComments 3 -MaximumBytes 1000)
         } | Should -Throw
     }
+    It 'accepts modified zero-span files only when complete comparison proves deletion-only or newline normalization' {
+        . "$PSScriptRoot\..\src\DevPilot.ActivePrIntake\DevPilot.ChangeDerivation.ps1"
+        $contract = New-TestOwnerContract
+        $targetText = "line1`r`nline2-deleted`r`nline3`r`n"
+        $deletionSourceText = "line1`r`nline3`r`n"
+        $crlfSourceText = "line1`nline2-deleted`nline3`n"
+        $addedLineSourceText = "line1`r`nline2-deleted`r`nline3`r`nline4-added`r`n"
+
+        $head = [ordered]@{
+            sourceCommit = ('a' * 40)
+            targetCommit = ('b' * 40)
+        }
+        $delDeriv = New-DevPilotChangeDerivation `
+            -ChangeType 'edit' -IsText $true -Deleted $false -Renamed $false `
+            -SourceContent $deletionSourceText -TargetContent $targetText `
+            -Spans @() -SourceCommit $head.sourceCommit -TargetCommit $head.targetCommit
+        $delDeriv.classification | Should -BeExactly 'deletion-only'
+        $delDeriv.state | Should -BeExactly 'complete'
+
+        $delEntry = [ordered]@{
+            path = 'src/zeta.ps1'
+            changeType = 'edit'
+            state = 'complete'
+            byteLength = [Text.Encoding]::UTF8.GetByteCount($deletionSourceText)
+            sourceDigest = Get-TestOwnerDigest $deletionSourceText
+            content = $deletionSourceText
+            spans = @()
+            comparison = [ordered]@{
+                schemaVersion = 1
+                state = 'complete'
+                targetState = 'present'
+                truncated = $false
+                path = 'src/zeta.ps1'
+                targetPath = 'src/zeta.ps1'
+                sourceCommit = $head.sourceCommit
+                targetCommit = $head.targetCommit
+                sourceDigest = Get-TestOwnerDigest $deletionSourceText
+                targetDigest = Get-TestOwnerDigest $targetText
+                byteLength = [Text.Encoding]::UTF8.GetByteCount($targetText)
+                content = $targetText
+            }
+            derivation = $delDeriv
+        }
+        $delDisp = Get-DevPilotChangeDerivationDisposition -Entry $delEntry -Head $head
+        $delDisp.forceUnknown | Should -BeFalse
+        $delDisp.knownEmptyIdentical | Should -BeFalse
+        $delDisp.knownEmptyZeroAddedLines | Should -BeTrue
+
+        # Cached derivation-unknown migrates only when full source+target proof passes
+        $cachedEntry = Copy-TestOwnerValue $delEntry
+        $cachedEntry.derivation.classification = 'derivation-unknown'
+        $cachedDisp = Get-DevPilotChangeDerivationDisposition -Entry $cachedEntry -Head $head
+        $cachedDisp.forceUnknown | Should -BeFalse
+        $cachedDisp.classification | Should -BeExactly 'deletion-only'
+        $cachedDisp.knownEmptyZeroAddedLines | Should -BeTrue
+
+        # Negative: real added line with empty spans must remain forceUnknown
+        $tamperedEntry = Copy-TestOwnerValue $cachedEntry
+        $tamperedEntry.content = $addedLineSourceText
+        $tamperedEntry.byteLength = [Text.Encoding]::UTF8.GetByteCount($addedLineSourceText)
+        $tamperedEntry.sourceDigest = Get-TestOwnerDigest $addedLineSourceText
+        $tamperedEntry.comparison.sourceDigest = $tamperedEntry.sourceDigest
+        $tamperedEntry.derivation.sourceByteLength = $tamperedEntry.byteLength
+        $tamperedEntry.derivation.sourceContentSha256 = $tamperedEntry.sourceDigest
+        $tamperedDisp = Get-DevPilotChangeDerivationDisposition -Entry $tamperedEntry -Head $head
+        $tamperedDisp.forceUnknown | Should -BeTrue
+
+        # Adapter accepts proven deletion-only and newline-only zero-span files as complete without contextOnly
+        $changeDel = New-TestOwnerChange -Path 'src/zeta.ps1' -ChangeType modified -Spans @()
+        $fileDel = New-TestOwnerFile -Path 'src/zeta.ps1' -Content $deletionSourceText
+        $fileDel['comparison'] = Copy-TestOwnerValue $delEntry.comparison
+        $pkgDel = New-TestOwnerPackage -Changes @($changeDel) -Files @($fileDel)
+        $resDel = Invoke-TestOwnerReplay -Contract $contract -Package $pkgDel
+        $resDel.state | Should -BeExactly 'complete'
+        $unitDel = @($resDel.evidence.evidenceUnits | Where-Object { $_.unitId -like 'file:*' })[0]
+        $unitDel.state | Should -BeExactly 'complete'
+        $unitDel.data.Contains('contextOnly') | Should -BeFalse
+
+        $fileCrlf = New-TestOwnerFile -Path 'src/zeta.ps1' -Content $crlfSourceText
+        $fileCrlf['comparison'] = Copy-TestOwnerValue $delEntry.comparison
+        $fileCrlf['comparison'].sourceDigest = $fileCrlf.sourceDigest
+        $pkgCrlf = New-TestOwnerPackage -Changes @($changeDel) -Files @($fileCrlf)
+        $resCrlf = Invoke-TestOwnerReplay -Contract $contract -Package $pkgCrlf
+        $resCrlf.state | Should -BeExactly 'complete'
+
+        # Adapter refuses zero-span modified file with real added line or missing comparison
+        $fileAdded = New-TestOwnerFile -Path 'src/zeta.ps1' -Content $addedLineSourceText
+        $fileAdded['comparison'] = Copy-TestOwnerValue $delEntry.comparison
+        $fileAdded['comparison'].sourceDigest = $fileAdded.sourceDigest
+        $pkgAdded = New-TestOwnerPackage -Changes @($changeDel) -Files @($fileAdded)
+        $resAdded = Invoke-TestOwnerReplay -Contract $contract -Package $pkgAdded
+        $resAdded.state | Should -BeExactly 'unknown'
+        $unitAdded = @($resAdded.evidence.evidenceUnits | Where-Object { $_.unitId -like 'file:*' })[0]
+        $unitAdded.state | Should -BeExactly 'unknown'
+        $unitAdded.data.unknownReason | Should -BeExactly 'spans-missing'
+    }
 }
 
 Describe 'Owner adapter module surface' {
