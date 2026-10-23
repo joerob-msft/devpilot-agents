@@ -144,6 +144,21 @@ comment becomes `recovered-confirmed` with zero recovery writes. An absent or
 ambiguous comment becomes `operator-review-required`; recovery never guesses
 that a create is safe.
 
+When the live discussion snapshot digest differs from the observation baseline
+only because of HMAC-authenticated, readback-confirmed prior reviewer creates
+on the same pull request, head/target commits, target ref, current iteration,
+and reviewer identity—loaded from the Owner delivery root and sibling
+`<delivery-root>\named-areequal-v1` and
+`<delivery-root>\contextual-conventions-v1` roots—the live preflight removes
+only those exact active, non-deleted, non-outdated single-comment threads and
+requires the recomputed canonical snapshot digest to match the approved
+baseline digest before proceeding. Full fresh discussion threads are still used
+for Owner per-finding reconciliation, marker deduplication, and human-comment
+coverage checks. Any unauthenticated, edited, replied-to, status-changed,
+deleted, duplicated, foreign, or head/iteration-drifted thread remains a
+`live-discussion-drift` refusal with zero provider writes, and each newly
+loaded sibling service key byte array is cleared in a `finally` block.
+
 With nine eligible findings, isolated provider proof is:
 
 1. first invocation: five creates, four remain;
