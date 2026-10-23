@@ -4636,6 +4636,76 @@ Describe 'Signed lifecycle push-date and recent-activity proof persistence' {
                 PolDigest = $policyDigest
             }
             $strayProof | Should -BeNullOrEmpty
+
+            # Lazy streaming directory enumeration stops at max+1 without pre-materializing 400+ files
+            $overflowProofDir = Join-Path $root.Context.Root 'activity-proofs\991'
+            [void](New-Item -ItemType Directory -Path $overflowProofDir -Force)
+            for ($fileIdx = 1; $fileIdx -le 400; $fileIdx++) {
+                $fileName = ('seq-{0:D8}-{1}.json' -f $fileIdx, ('0' * 16))
+                [IO.File]::WriteAllText((Join-Path $overflowProofDir $fileName), '{}')
+            }
+            $proofClockTicks = [ref]0
+            $proofClock = {
+                $proofClockTicks.Value++
+                return [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
+            }.GetNewClosure()
+            $overflowProofState = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Clock)
+                Get-StalePrActivityProofState `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 991L `
+                    -Key $KeyBytes `
+                    -DeadlineUtc ([DateTime]::SpecifyKind([DateTime]'2026-01-01T00:05:00', [DateTimeKind]::Utc)) `
+                    -UtcNowProvider $Clock
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Clock = $proofClock
+            }
+            $overflowProofState.valid | Should -BeFalse
+            # 1 initial deadline check + 66 per-entry checks (stops at MaxActivityProofHistoryEntriesPerPr + 1 = 66) = 67 ticks (never 400+)
+            $proofClockTicks.Value | Should -Be 67
+
+            $overflowPushDir = Join-Path $root.Context.Root 'pushes\992'
+            [void](New-Item -ItemType Directory -Path $overflowPushDir -Force)
+            for ($fileIdx = 1; $fileIdx -le 400; $fileIdx++) {
+                $fileName = ('push-{0}-iter-{0}.json' -f $fileIdx)
+                [IO.File]::WriteAllText((Join-Path $overflowPushDir $fileName), '{}')
+            }
+            $pushClockTicks = [ref]0
+            $pushClock = {
+                $pushClockTicks.Value++
+                return [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
+            }.GetNewClosure()
+            $overflowPushErr = $null
+            try {
+                InModuleScope DevPilot.PullRequestLifecycle {
+                    param($RootPath, $KeyBytes, $Clock)
+                    Write-StalePrCachedPushDate `
+                        -LifecycleRoot $RootPath `
+                        -Key $KeyBytes `
+                        -ProjectId '22222222-2222-2222-2222-222222222222' `
+                        -RepositoryId '11111111-1111-1111-1111-111111111111' `
+                        -PullRequestId 992L `
+                        -IterationId 999 `
+                        -PushId 999L `
+                        -SourceCommit ('a' * 40) `
+                        -TargetCommit ('b' * 40) `
+                        -OccurredUtc '2026-03-01T00:00:00Z' `
+                        -DeadlineUtc ([DateTime]::SpecifyKind([DateTime]'2026-01-01T00:05:00', [DateTimeKind]::Utc)) `
+                        -UtcNowProvider $Clock
+                } -Parameters @{
+                    RootPath = $root.Context.Root
+                    KeyBytes = $root.Key
+                    Clock = $pushClock
+                }
+            }
+            catch {
+                $overflowPushErr = $_.Exception.Message
+            }
+            $overflowPushErr | Should -BeExactly 'stale-pr-push-cache-write-failed'
+            # 1 initial deadline check + 256 per-entry checks (stops at MaxCachedPushFilesPerPr = 256) = 257 ticks (never 400+)
+            $pushClockTicks.Value | Should -Be 257
         }
         finally {
             [Array]::Clear($root.Key, 0, $root.Key.Length)

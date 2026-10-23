@@ -73,8 +73,16 @@ fields (`projectId`, `repositoryId`, `pullRequestId`, `status`, `isDraft`,
 and evidence digests and `latestActivityUtc > CutoffUtc`. Partial inventory
 records (including the 5-key normalized inventory shape from
 `Discover-ActivePrInventory`) are never accepted as cached proofs and always
-require live provider evaluation. Cache reads and writes use bounded directory
-enumeration (`break` at `max + 1`) and enforce bounded per-PR file counts
+require live provider evaluation (at least 4 live GETs per non-locked old PR for
+metadata, iterations, threads, and source ref, plus 1 GET for the newest push
+on cold runs and 0 push GETs on warm runs once the push-date record is signed).
+Accordingly, on a 60-old-PR cohort (`57` non-locked old PRs), a single 128-GET
+cycle evaluates up to `31` non-locked old PRs per run and still ends with a
+budget deferral, traversing the full 60-PR cohort across 2–3 cursor-rotated
+runs rather than achieving zero global deferrals per run from 5-key inventory
+alone. Cache reads and writes use lazy `.NET` streaming directory enumeration
+(`[IO.Directory]::EnumerateFileSystemEntries` with `ReparsePoint` skipping,
+stopping immediately at `max + 1`) and enforce bounded per-PR file counts
 (`256` push files, `64` recent-activity proof files plus one terminal
 `withheld` retirement record), per-file (`64 KiB`) and per-PR total byte
 ceilings (`4 MiB` push cache, `1 MiB` activity-proof cache), shared provider

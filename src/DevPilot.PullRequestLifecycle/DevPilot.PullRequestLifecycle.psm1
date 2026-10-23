@@ -1095,7 +1095,10 @@ function Write-StalePrCachedPushDate {
         if (Test-Path -LiteralPath $pushRoot -PathType Container) {
             $entryCount = 0
             $totalBytes = 0L
-            foreach ($entry in (Get-ChildItem -LiteralPath $pushRoot -Force -ErrorAction Stop)) {
+            $enumOptions = [IO.EnumerationOptions]::new()
+            $enumOptions.RecurseSubdirectories = $false
+            $enumOptions.AttributesToSkip = [IO.FileAttributes]::ReparsePoint
+            foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($pushRoot, '*', $enumOptions)) {
                 if ($null -ne $DeadlineUtc -and
                     (& $getNow) -ge [DateTime]$DeadlineUtc) {
                     throw 'stale-pr-deadline-exhausted'
@@ -1104,13 +1107,19 @@ function Write-StalePrCachedPushDate {
                 if ($entryCount -ge $script:MaxCachedPushFilesPerPr) {
                     throw 'stale-pr-push-cache-write-failed'
                 }
-                if ($entry.PSIsContainer -or
-                    $entry.Name -cnotmatch '^push-[0-9]+-iter-[0-9]+\.json$' -or
-                    [long]$entry.Length -lt 1L -or
-                    [long]$entry.Length -gt $script:MaxCacheRecordBytes) {
+                if (-not (Test-AgentPathWithin -Root $pushRoot -Path $entryPath) -or
+                    (Test-Path -LiteralPath $entryPath -PathType Container)) {
                     throw 'stale-pr-push-cache-write-failed'
                 }
-                $totalBytes += [long]$entry.Length
+                $entryInfo = [IO.FileInfo]::new($entryPath)
+                if (-not $entryInfo.Exists -or
+                    (($entryInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                    $entryInfo.Name -cnotmatch '^push-[0-9]+-iter-[0-9]+\.json$' -or
+                    [long]$entryInfo.Length -lt 1L -or
+                    [long]$entryInfo.Length -gt $script:MaxCacheRecordBytes) {
+                    throw 'stale-pr-push-cache-write-failed'
+                }
+                $totalBytes += [long]$entryInfo.Length
                 if ($totalBytes -gt $script:MaxCachedPushTotalBytesPerPr) {
                     throw 'stale-pr-push-cache-write-failed'
                 }
@@ -1197,12 +1206,32 @@ function Get-StalePrActivityProofState {
     }
     $boundedEntries = [Collections.Generic.List[object]]::new()
     try {
-        foreach ($rawEntry in (Get-ChildItem -LiteralPath $proofRoot -Force -ErrorAction Stop)) {
+        $enumOptions = [IO.EnumerationOptions]::new()
+        $enumOptions.RecurseSubdirectories = $false
+        $enumOptions.AttributesToSkip = [IO.FileAttributes]::ReparsePoint
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($proofRoot, '*', $enumOptions)) {
             if ($null -ne $DeadlineUtc -and
                 (& $getNow) -ge [DateTime]$DeadlineUtc) {
                 throw 'stale-pr-deadline-exhausted'
             }
-            [void]$boundedEntries.Add($rawEntry)
+            if (-not (Test-AgentPathWithin -Root $proofRoot -Path $entryPath) -or
+                (Test-Path -LiteralPath $entryPath -PathType Container)) {
+                return [ordered]@{
+                    valid = $false
+                    maxSequence = 0L
+                    latest = $null
+                }
+            }
+            $entryInfo = [IO.FileInfo]::new($entryPath)
+            if (-not $entryInfo.Exists -or
+                (($entryInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                return [ordered]@{
+                    valid = $false
+                    maxSequence = 0L
+                    latest = $null
+                }
+            }
+            [void]$boundedEntries.Add($entryInfo)
             if ($boundedEntries.Count -gt $script:MaxActivityProofHistoryEntriesPerPr) {
                 return [ordered]@{
                     valid = $false
@@ -1237,8 +1266,7 @@ function Get-StalePrActivityProofState {
             (& $getNow) -ge [DateTime]$DeadlineUtc) {
             throw 'stale-pr-deadline-exhausted'
         }
-        if ($entry.PSIsContainer -or
-            -not (Test-AgentPathWithin -Root $proofRoot -Path $entry.FullName) -or
+        if (-not (Test-AgentPathWithin -Root $proofRoot -Path $entry.FullName) -or
             $entry.Name -cnotmatch '^seq-(?<seq>[0-9]{8})-(?<suffix>[0-9a-f]{16}|withheld)\.json$' -or
             [long]$entry.Length -lt 1L -or
             [long]$entry.Length -gt $script:MaxCacheRecordBytes) {
