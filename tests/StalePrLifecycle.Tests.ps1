@@ -3252,3 +3252,1659 @@ Describe 'Named shared acquisition lifecycle route' {
             '*requires an exact signed policy binding*')
     }
 }
+
+Describe 'Signed lifecycle push-date and recent-activity proof persistence' {
+    It 'preserves exact read-count diagnostic when push-detail GET exhausts the read budget' {
+        $boundedConfig = $config | ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $boundedConfig.subjectProvider.maximumReads = 5
+        $detailReads = 0
+        $provider = New-TestAzureDevOpsLifecycleProvider `
+            -InputConfig $boundedConfig -HttpInvoker (
+                New-AzLifecycleInvoker `
+                    -MissingSummaryPushDate `
+                    -PushDetailReads ([ref]$detailReads))
+
+        $result = Invoke-LifecycleCase `
+            -Provider $provider -InputPolicy $policy `
+            -Inventory @([ordered]@{
+                    pullRequestId = 1
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                })
+
+        $detailReads | Should -Be 0
+        $result.health | Should -BeExactly partial
+        $result.providerReadCount | Should -Be 5
+        @($result.decisions) | Should -HaveCount 1
+        $result.decisions[0].pullRequestId | Should -Be 1
+        $result.decisions[0].state | Should -BeExactly deferred
+        $result.decisions[0].reason |
+            Should -BeExactly 'stale-pr-read-budget-exhausted'
+        $result.decisions[0].diagnostic | Should -Not -BeNullOrEmpty
+        $result.decisions[0].diagnostic.kind |
+            Should -BeExactly 'read-count'
+        $result.decisions[0].diagnostic.readCount | Should -Be 5
+        $result.decisions[0].diagnostic.readCeiling | Should -Be 5
+        $result.decisions[0].diagnostic.responseByteCeiling |
+            Should -Be 16777216
+        $result.decisions[0].diagnostic.deadlineUtc |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'completes a 62-push PR in 1 run when the newest push is recent and resumes across 2 runs via write-once signed push dates when only the oldest push is recent' {
+        $boundedConfig = $config | ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $boundedConfig.subjectProvider.maximumReads = 40
+        $iterations = @(1..62 | ForEach-Object {
+                @{
+                    id = [int]$_
+                    createdDate = '2024-02-01T00:00:00Z'
+                    updatedDate = '2024-02-01T00:00:00Z'
+                    push = @{
+                        pushId = [long]$_
+                        date = $null
+                    }
+                    sourceRefCommit = @{ commitId = ('a' * 40) }
+                    targetRefCommit = @{ commitId = ('b' * 40) }
+                }
+            })
+        $recentPushId = [ref]62L
+        $pushReads = [Collections.Generic.List[long]]::new()
+        $invoker = {
+            param($Request)
+            $uri = [Uri]$Request.Uri
+            $path = $uri.AbsolutePath
+            $query = $uri.Query
+            $method = [string]$Request.Method
+            if ($path -clike '*/_apis/connectionData') {
+                return @{
+                    authenticatedUser = @{
+                        id = '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor = 'aad.synthetic-service-account'
+                    }
+                    authorizedUser = @{
+                        id = '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor = 'aad.synthetic-service-account'
+                    }
+                }
+            }
+            if ($path -match '/pullRequests/8453745$' -and $method -ceq 'GET') {
+                return @{
+                    pullRequestId = 8453745L
+                    status = 'active'
+                    isDraft = $false
+                    creationDate = '2024-01-01T00:00:00Z'
+                    sourceRefName = 'refs/heads/feature/8453745'
+                    targetRefName = 'refs/heads/master'
+                    lastMergeSourceCommit = @{ commitId = ('a' * 40) }
+                    lastMergeTargetCommit = @{ commitId = ('b' * 40) }
+                    repository = @{
+                        id = '11111111-1111-1111-1111-111111111111'
+                        project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                    }
+                }
+            }
+            if ($path -match '/pullRequests/8453745/iterations$') {
+                return @{
+                    value = $iterations
+                    count = $iterations.Count
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/pullRequests/8453745/threads$') {
+                return @{
+                    value = @()
+                    count = 0
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/refs$' -and $query -match 'heads%2Ffeature%2F8453745') {
+                return @{
+                    value = @(@{
+                            name = 'refs/heads/feature/8453745'
+                            objectId = ('a' * 40)
+                        })
+                    count = 1
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/pushes/(?<pushId>\d+)$') {
+                $pushId = [long]$Matches.pushId
+                [void]$pushReads.Add($pushId)
+                return @{
+                    pushId = $pushId
+                    date = $(if ($pushId -eq $recentPushId.Value) {
+                            '2026-02-01T00:00:00Z'
+                        } else {
+                            '2024-03-01T00:00:00Z'
+                        })
+                    repository = @{
+                        id = '11111111-1111-1111-1111-111111111111'
+                        project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                    }
+                }
+            }
+            throw "Unexpected request: $method $($uri.AbsoluteUri)"
+        }.GetNewClosure()
+
+        # Subcase A: newest iteration push (pushId=62) is recent -> completes in 1 run with 1 push GET
+        $rootNewest = New-LifecycleRoot
+        try {
+            $inventory = @([ordered]@{
+                    pullRequestId = 8453745
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                })
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $providerNewest = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $boundedConfig -HttpInvoker $invoker
+            $runNewest = Invoke-StalePrLifecycle `
+                -Inventory $inventory -CutoffUtc $cutoff `
+                -Policy $policy -LifecycleRoot $rootNewest.Context.Root `
+                -Key $rootNewest.Key -Provider $providerNewest
+
+            $runNewest.health | Should -BeExactly healthy
+            $runNewest.providerReadCount | Should -Be 6
+            $runNewest.decisions[0].state | Should -BeExactly 'no-op'
+            $runNewest.decisions[0].reason | Should -BeExactly 'recent-activity'
+            $runNewest.reviewEligibleIds | Should -Be @(8453745)
+            @($pushReads) | Should -Be @(62L)
+        }
+        finally {
+            [Array]::Clear($rootNewest.Key, 0, $rootNewest.Key.Length)
+        }
+
+        # Subcase B: only the oldest push (pushId=1) is recent while 62..2 are stale -> resumes across 2 runs under 40-GET ceiling
+        $pushReads.Clear()
+        $recentPushId.Value = 1L
+        $rootResume = New-LifecycleRoot
+        try {
+            $inventory = @([ordered]@{
+                    pullRequestId = 8453745
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                })
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $provider1 = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $boundedConfig -HttpInvoker $invoker
+            $run1 = Invoke-StalePrLifecycle `
+                -Inventory $inventory -CutoffUtc $cutoff `
+                -Policy $policy -LifecycleRoot $rootResume.Context.Root `
+                -Key $rootResume.Key -Provider $provider1
+
+            $run1.health | Should -BeExactly partial
+            $run1.providerReadCount | Should -Be 40
+            $run1.decisions[0].state | Should -BeExactly deferred
+            $run1.decisions[0].reason |
+                Should -BeExactly 'stale-pr-read-budget-exhausted'
+            $run1.decisions[0].diagnostic.kind |
+                Should -BeExactly 'read-count'
+            $run1.decisions[0].diagnostic.readCount | Should -Be 40
+            $run1.decisions[0].diagnostic.readCeiling | Should -Be 40
+            $pushReads.Count | Should -Be 35
+            $cachedFiles = @(Get-ChildItem -LiteralPath (
+                    Join-Path $rootResume.Context.Root 'pushes\8453745') `
+                    -Filter '*.json' -File)
+            $cachedFiles | Should -HaveCount 35
+            $firstSigned = Read-StalePrLifecyclePolicy `
+                -Path $cachedFiles[0].FullName -Key $rootResume.Key
+            $firstSigned.kind | Should -BeExactly 'stale-pr-push-date-v1'
+
+            $provider2 = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $boundedConfig -HttpInvoker $invoker
+            $run2 = Invoke-StalePrLifecycle `
+                -Inventory $inventory -CutoffUtc $cutoff `
+                -Policy $policy -LifecycleRoot $rootResume.Context.Root `
+                -Key $rootResume.Key -Provider $provider2
+
+            $run2.health | Should -BeExactly healthy
+            $run2.providerReadCount | Should -Be 32
+            $run2.decisions[0].state | Should -BeExactly 'no-op'
+            $run2.decisions[0].reason | Should -BeExactly 'recent-activity'
+            $run2.reviewEligibleIds | Should -Be @(8453745)
+            $pushReads.Count | Should -Be 62
+            @(Get-ChildItem -LiteralPath (
+                    Join-Path $rootResume.Context.Root 'pushes\8453745') `
+                    -Filter '*.json' -File) | Should -HaveCount 62
+            @(Get-ChildItem -LiteralPath (
+                    Join-Path $rootResume.Context.Root 'activity-proofs\8453745') `
+                    -Filter '*.json' -File) | Should -HaveCount 1
+        }
+        finally {
+            [Array]::Clear($rootResume.Key, 0, $rootResume.Key.Length)
+        }
+    }
+
+    It 'reproduces and resolves both parent 8960 review blockers (refuses 5-key inventory items without current head/iteration/activity identity and fails closed on directory-blocked invalidation)' {
+        $root = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $policyDigest = InModuleScope DevPilot.PullRequestLifecycle {
+                param($Pol)
+                Get-StalePrDigest $Pol
+            } -Parameters @{ Pol = $policy }
+
+            $evidence = [ordered]@{
+                projectId = '22222222-2222-2222-2222-222222222222'
+                repositoryId = '11111111-1111-1111-1111-111111111111'
+                pullRequestId = 42L
+                status = 'active'
+                isDraft = $false
+                sourceRef = 'refs/heads/feature-42'
+                targetRef = 'refs/heads/master'
+                sourceCommit = ('a' * 40)
+                targetCommit = ('b' * 40)
+                iterationId = 3
+                creationUtc = '2024-01-01T00:00:00.0000000Z'
+                latestActivityUtc = '2026-03-01T00:00:00.0000000Z'
+                activityDigest = 'v1:sha256:' + ('c' * 64)
+            }
+
+            InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Ev, $PolDigest)
+                Write-StalePrActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 42L `
+                    -Evidence $Ev `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Ev = $evidence
+                PolDigest = $policyDigest
+            }
+
+            # Real 5-key normalized inventory shape from Discover-ActivePrInventory MUST be refused
+            $fiveKeyInventoryItem = [ordered]@{
+                pullRequestId = 42L
+                status = 'active'
+                isDraft = $false
+                targetRef = 'refs/heads/master'
+                creationUtc = '2024-01-01T00:00:00.0000000Z'
+            }
+            $fiveKeyProof = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 42L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $fiveKeyInventoryItem
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $fiveKeyProof | Should -BeNullOrEmpty
+
+            # Full 13-key current identity item succeeds when all 13 fields match
+            $fullIdentityProof = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 42L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $evidence
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $fullIdentityProof | Should -Not -BeNullOrEmpty
+
+            # Explicit different head control refuses
+            $differentHead = [ordered]@{} + $evidence
+            $differentHead['sourceCommit'] = ('d' * 40)
+            $differentHeadProof = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 42L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $differentHead
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $differentHeadProof | Should -BeNullOrEmpty
+
+            # Blocker 2: directory collision at seq-00000002-withheld.json must surface error AND fail closed
+            $blockingDirectory = Join-Path $root.Context.Root (
+                'activity-proofs\42\seq-00000002-withheld.json')
+            [void](New-Item -ItemType Directory -Path $blockingDirectory -Force)
+
+            $invalidationError = $null
+            try {
+                InModuleScope DevPilot.PullRequestLifecycle {
+                    param($RootPath, $KeyBytes, $PolDigest)
+                    Disable-StalePrCachedActivityProof `
+                        -LifecycleRoot $RootPath `
+                        -PullRequestId 42L `
+                        -PolicyDigest $PolDigest `
+                        -Key $KeyBytes
+                } -Parameters @{
+                    RootPath = $root.Context.Root
+                    KeyBytes = $root.Key
+                    PolDigest = $policyDigest
+                }
+            }
+            catch {
+                $invalidationError = $_.Exception.Message
+            }
+            $invalidationError |
+                Should -BeExactly 'stale-pr-activity-proof-invalidation-failed'
+
+            $proofAfterFailedInvalidation = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 42L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $evidence
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $proofAfterFailedInvalidation | Should -BeNullOrEmpty
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+    }
+
+    It 'wires Discover-ActivePrInventory -> Invoke-ActivePrIntake -> Invoke-StalePrLifecycle safely on 5-key items and detects comment deletion, bot comment edits, new pushes, head drift, and cutoff drift' {
+        $intakeManifest = Join-Path $PSScriptRoot (
+            '..\src\DevPilot.ActivePrIntake\DevPilot.ActivePrIntake.psd1')
+        Import-Module $intakeManifest -Force
+
+        $root = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $pr8453745PushCount = [ref]62
+            $pr8453745NewestPushUtc = [ref]'2026-02-01T00:00:00Z'
+            $pr8453745SourceCommit = [ref]('a' * 40)
+            $pr8453745RefCommit = [ref]('a' * 40)
+            $pr8453745Threads = [ref]@()
+            $pr8453745Status = [ref]'active'
+            $patchCalls = [ref]0
+            $pushReads = [Collections.Generic.List[long]]::new()
+
+            $httpInvoker = {
+                param($Request)
+                $uri = [Uri]$Request.Uri
+                $path = $uri.AbsolutePath
+                $query = $uri.Query
+                $method = [string]$Request.Method
+                if ($path -clike '*/_apis/connectionData') {
+                    return @{
+                        authenticatedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor = 'aad.synthetic-service-account'
+                        }
+                        authorizedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor = 'aad.synthetic-service-account'
+                        }
+                    }
+                }
+                if ($path -match '/pullRequests/8453745$' -and $method -ceq 'PATCH') {
+                    $patchCalls.Value++
+                    $pr8453745Status.Value = 'abandoned'
+                    return @{
+                        pullRequestId = 8453745L
+                        status = 'abandoned'
+                    }
+                }
+                if ($path -match '/pullRequests/8453745$' -and $method -ceq 'GET') {
+                    return @{
+                        pullRequestId = 8453745L
+                        status = [string]$pr8453745Status.Value
+                        isDraft = $false
+                        creationDate = '2024-01-01T00:00:00Z'
+                        sourceRefName = 'refs/heads/feature/8453745'
+                        targetRefName = 'refs/heads/master'
+                        lastMergeSourceCommit = @{
+                            commitId = [string]$pr8453745SourceCommit.Value
+                        }
+                        lastMergeTargetCommit = @{ commitId = ('b' * 40) }
+                        repository = @{
+                            id = '11111111-1111-1111-1111-111111111111'
+                            project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                        }
+                    }
+                }
+                if ($path -match '/pullRequests/8453745/iterations$') {
+                    $count = [int]$pr8453745PushCount.Value
+                    $iters = @(1..$count | ForEach-Object {
+                            @{
+                                id = [int]$_
+                                createdDate = '2024-02-01T00:00:00Z'
+                                updatedDate = '2024-02-01T00:00:00Z'
+                                push = @{
+                                    pushId = [long]$_
+                                    date = $null
+                                }
+                                sourceRefCommit = @{
+                                    commitId = [string]$pr8453745SourceCommit.Value
+                                }
+                                targetRefCommit = @{ commitId = ('b' * 40) }
+                            }
+                        })
+                    return @{
+                        value = $iters
+                        count = $iters.Count
+                        continuation_token = $null
+                    }
+                }
+                if ($path -match '/pullRequests/8453745/threads$') {
+                    $threadsVal = @($pr8453745Threads.Value)
+                    return @{
+                        value = $threadsVal
+                        count = $threadsVal.Count
+                        continuation_token = $null
+                    }
+                }
+                if ($path -match '/refs$' -and $query -match 'heads%2Ffeature%2F8453745') {
+                    return @{
+                        value = @(@{
+                                name = 'refs/heads/feature/8453745'
+                                objectId = [string]$pr8453745RefCommit.Value
+                            })
+                        count = 1
+                        continuation_token = $null
+                    }
+                }
+                if ($path -match '/pushes/(?<pushId>\d+)$') {
+                    $pushId = [long]$Matches.pushId
+                    [void]$pushReads.Add($pushId)
+                    return @{
+                        pushId = $pushId
+                        date = $(if ($pushId -eq [long]$pr8453745PushCount.Value) {
+                                [string]$pr8453745NewestPushUtc.Value
+                            } else {
+                                '2024-03-01T00:00:00Z'
+                            })
+                        repository = @{
+                            id = '11111111-1111-1111-1111-111111111111'
+                            project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                        }
+                    }
+                }
+                throw "Unexpected request: $method $($uri.AbsoluteUri)"
+            }.GetNewClosure()
+
+            $discoverProvider = {
+                param($Verb, $Request)
+                if ([string]$Verb -cne 'ListPage') {
+                    throw "Unexpected verb: $Verb"
+                }
+                if ([int]$Request.skip -gt 0) {
+                    return @{ items = @(); count = 0; totalCount = 2 }
+                }
+                return @{
+                    items = @(
+                        [ordered]@{
+                            pullRequestId = 8453745
+                            status = 'active'
+                            isDraft = $false
+                            targetRef = 'refs/heads/master'
+                            creationUtc = '2024-01-01T00:00:00Z'
+                        }
+                        [ordered]@{
+                            pullRequestId = 13826052
+                            status = 'active'
+                            isDraft = $false
+                            targetRef = 'refs/heads/master'
+                            creationUtc = '2026-06-01T00:00:00Z'
+                        }
+                    )
+                    count = 2
+                    totalCount = 2
+                }
+            }.GetNewClosure()
+
+            $intakeReadConfig = [ordered]@{
+                limits = [ordered]@{
+                    maxPages = 5
+                    pageSize = 50
+                    maxPullRequests = 200
+                    maxReads = 64
+                    maxSeconds = 120
+                }
+            }
+            $readsRef = [ref]0
+            $pass1 = InModuleScope DevPilot.ActivePrIntake {
+                param($Prov, $Cfg, $Reads)
+                Get-IntakePass $Prov $Cfg $Reads ([Diagnostics.Stopwatch]::StartNew()) 1
+            } -Parameters @{
+                Prov = $discoverProvider
+                Cfg = $intakeReadConfig
+                Reads = $readsRef
+            }
+            $normalizedInventory = @($pass1.seen.Keys |
+                ForEach-Object { [int]$_ } |
+                Sort-Object |
+                ForEach-Object { $pass1.seen[[string]$_].value })
+            $normalizedInventory | Should -HaveCount 2
+            @($normalizedInventory[0].Keys) |
+                Should -Be @('pullRequestId', 'status', 'isDraft', 'targetRef', 'creationUtc')
+
+            $localConfig = $config
+            $localPolicy = $policy
+            $localCutoff = $cutoff
+            $localRoot = $root.Context.Root
+            $localKey = $root.Key
+            $lifecycleEvaluator = {
+                param($InventoryItems)
+                $lcProvider = New-StalePrAzureDevOpsProvider `
+                    -Config $localConfig `
+                    -TokenInvoker { @{ accessToken = 't' * 120 } } `
+                    -HttpInvoker $httpInvoker
+                return Invoke-StalePrLifecycle `
+                    -Inventory $InventoryItems `
+                    -CutoffUtc $localCutoff `
+                    -Policy $localPolicy `
+                    -LifecycleRoot $localRoot `
+                    -Key $localKey `
+                    -Provider $lcProvider
+            }.GetNewClosure()
+
+            # Cold run with normalized 5-key Get-IntakePass items -> Invoke-StalePrLifecycle
+            $lcCold = & $lifecycleEvaluator $normalizedInventory
+            $lcCold.health | Should -BeExactly healthy
+            $lcCold.providerReadCount | Should -Be 6
+            $lcCold.reviewEligibleIds | Should -Be @(8453745, 13826052)
+            @($pushReads) | Should -Be @(62L)
+
+            # Warm run with normalized 5-key Get-IntakePass items still refreshes live PR/iterations/threads/refs (5 GETs, 0 push GETs)
+            $pushReads.Clear()
+            $lcWarm = & $lifecycleEvaluator $normalizedInventory
+            $lcWarm.health | Should -BeExactly healthy
+            $lcWarm.providerReadCount | Should -Be 5
+            @($pushReads) | Should -HaveCount 0
+            $lcWarm.reviewEligibleIds | Should -Be @(8453745, 13826052)
+
+            # Drift 1: bot comment edit after cutoff when pushes are all stale -> counted live in 5 GETs (0 push GETs needed)
+            $pr8453745NewestPushUtc.Value = '2024-03-01T00:00:00Z'
+            $pr8453745Threads.Value = @(@{
+                    id = 10
+                    isDeleted = $false
+                    comments = @(@{
+                            id = 1
+                            commentType = 'text'
+                            isDeleted = $false
+                            content = 'automated bot update'
+                            publishedDate = '2024-05-01T00:00:00Z'
+                            lastUpdatedDate = '2026-04-01T00:00:00Z'
+                            lastContentUpdatedDate = '2026-04-01T00:00:00Z'
+                        })
+                })
+            $lcBot = & $lifecycleEvaluator $normalizedInventory
+            $lcBot.health | Should -BeExactly healthy
+            $lcBot.providerReadCount | Should -Be 5
+            $lcBot.reviewEligibleIds | Should -Contain 8453745L
+            @($pushReads) | Should -HaveCount 0
+
+            # Drift 2: new iteration/push (iterationId=63, pushId=63) -> fetched live
+            $pr8453745Threads.Value = @()
+            $pr8453745PushCount.Value = 63
+            $pr8453745NewestPushUtc.Value = '2026-05-01T00:00:00Z'
+            $lcNewPush = & $lifecycleEvaluator $normalizedInventory
+            $lcNewPush.health | Should -BeExactly healthy
+            $lcNewPush.providerReadCount | Should -Be 6
+            @($pushReads) | Should -Be @(63L)
+
+            # Drift 3: branch head mismatch (ref commit != sourceCommit) -> fails closed as unknown and withholds review eligibility
+            $pushReads.Clear()
+            $pr8453745RefCommit.Value = ('f' * 40)
+            $lcHeadDrift = & $lifecycleEvaluator $normalizedInventory
+            $lcHeadDrift.health | Should -BeExactly unknown
+            $lcHeadDrift.reviewEligibleIds | Should -Not -Contain 8453745L
+
+            # Drift 4: comment deleted / all activity <= cutoff -> re-verifies all pushes live during qualification and prewrite before abandoning
+            $pr8453745RefCommit.Value = ('a' * 40)
+            $pr8453745PushCount.Value = 2
+            $pr8453745NewestPushUtc.Value = '2024-03-01T00:00:00Z'
+            $pushReads.Clear()
+            $lcAbandoned = & $lifecycleEvaluator $normalizedInventory
+            $lcAbandoned.confirmedAbandonedIds | Should -Be @(8453745L)
+            $patchCalls.Value | Should -Be 1
+            $pushReads.Count | Should -BeGreaterOrEqual 2
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+    }
+
+    It 'evaluates the 5 pinned production slices and model-based 60-old-PR cohort within the 128-GET ceiling while preserving historical locks and unknowns' {
+        # Exact 60 old-PR IDs and 5 slices pinned in gemini-success-rate-evidence-f995-20261023T0457Z-v1 (ordinals 1036..1046).
+        # Note: The 65-file evidence pack does not retain raw historic push HTTP bodies or complete head snapshots for all 60 old PRs;
+        # non-pinned iteration counts below are a model-based simulation.
+        $lockedStatusIds = @(1637334L, 2681697L)
+        $lockedExplanationId = 2691719L
+        $unknownIds = @(8592483L, 8602037L, 8743173L, 10262620L, 11307914L)
+        $pinnedHeavyIterationsById = @{
+            8453745L = 62
+            10729576L = 83
+            13069676L = 19
+            1934663L = 16
+            5443375L = 50
+        }
+        $pinnedSlices = @(
+            , @(5510240L, 5748312L, 5791276L, 6174720L, 6232728L, 6587852L, 6759995L, 7058383L, 7194717L, 7251290L, 7829407L, 7984870L, 8125622L, 8388259L, 8453745L)
+            , @(8592483L, 8602037L, 8743173L, 9188004L, 9897505L, 10020985L, 10183659L, 10184215L, 10262620L, 10512716L, 10729576L)
+            , @(11182973L, 11307914L, 11313610L, 11316921L, 12397422L, 12624309L, 12783849L, 12821666L, 13017193L, 13069676L)
+            , @(13224986L, 13405394L, 13410658L, 13586598L, 13710511L, 13723428L, 1182097L, 1200303L, 1208434L, 1323955L, 1637334L, 1879239L, 1934663L)
+            , @(2612864L, 2681697L, 2691719L, 2822925L, 2943955L, 3834300L, 4335646L, 4980658L, 5411877L, 5430231L, 5443375L)
+        )
+        $sortedCohortIds = @($pinnedSlices | ForEach-Object { $_ } | Sort-Object -Unique)
+        $sortedCohortIds | Should -HaveCount 60
+        $pushCountById = @{}
+        foreach ($id in $sortedCohortIds) {
+            if ($pinnedHeavyIterationsById.ContainsKey($id)) {
+                $pushCountById[$id] = [int]$pinnedHeavyIterationsById[$id]
+            }
+            elseif ($id -in $lockedStatusIds -or
+                $id -eq $lockedExplanationId -or
+                $id -in $unknownIds) {
+                $pushCountById[$id] = 1
+            }
+            else {
+                $pushCountById[$id] = 4
+            }
+        }
+        $invoker = {
+            param($Request)
+            $uri = [Uri]$Request.Uri
+            $path = $uri.AbsolutePath
+            $query = $uri.Query
+            $method = [string]$Request.Method
+            if ($path -clike '*/_apis/connectionData') {
+                return @{
+                    authenticatedUser = @{
+                        id = '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor = 'aad.synthetic-service-account'
+                    }
+                    authorizedUser = @{
+                        id = '33333333-3333-3333-3333-333333333333'
+                        subjectDescriptor = 'aad.synthetic-service-account'
+                    }
+                }
+            }
+            if ($path -match '/pullRequests/(?<prId>\d+)$' -and $method -ceq 'GET') {
+                $prId = [long]$Matches.prId
+                return @{
+                    pullRequestId = $prId
+                    status = 'active'
+                    isDraft = $false
+                    creationDate = '2024-01-01T00:00:00Z'
+                    sourceRefName = "refs/heads/feature/$prId"
+                    targetRefName = 'refs/heads/master'
+                    lastMergeSourceCommit = @{ commitId = ('a' * 40) }
+                    lastMergeTargetCommit = @{ commitId = ('b' * 40) }
+                    repository = @{
+                        id = '11111111-1111-1111-1111-111111111111'
+                        project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                    }
+                }
+            }
+            if ($path -match '/pullRequests/(?<prId>\d+)/iterations$') {
+                $prId = [long]$Matches.prId
+                $count = [int]$pushCountById[$prId]
+                $iters = @(1..$count | ForEach-Object {
+                        @{
+                            id = [int]$_
+                            createdDate = '2024-02-01T00:00:00Z'
+                            updatedDate = $(if ($_ -eq $count) {
+                                    '2026-02-01T00:00:00Z'
+                                } else {
+                                    '2024-02-01T00:00:00Z'
+                                })
+                            push = @{
+                                pushId = ($prId * 100L) + [long]$_
+                                date = $null
+                            }
+                            sourceRefCommit = @{ commitId = ('a' * 40) }
+                            targetRefCommit = @{ commitId = ('b' * 40) }
+                        }
+                    })
+                return @{
+                    value = $iters
+                    count = $iters.Count
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/pullRequests/(?<prId>\d+)/threads$') {
+                $prId = [long]$Matches.prId
+                if ($prId -in $unknownIds) {
+                    return @{
+                        value = @()
+                        count = 0
+                        continuation_token = 'more-threads'
+                    }
+                }
+                return @{
+                    value = @()
+                    count = 0
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/refs$' -and
+                $query -match 'heads%2Ffeature%2F(?<prId>\d+)') {
+                $prId = [long]$Matches.prId
+                return @{
+                    value = @(@{
+                            name = "refs/heads/feature/$prId"
+                            objectId = ('a' * 40)
+                        })
+                    count = 1
+                    continuation_token = $null
+                }
+            }
+            if ($path -match '/pushes/(?<pushId>\d+)$') {
+                $pushId = [long]$Matches.pushId
+                return @{
+                    pushId = $pushId
+                    date = '2026-02-01T00:00:00Z'
+                    repository = @{
+                        id = '11111111-1111-1111-1111-111111111111'
+                        project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                    }
+                }
+            }
+            throw "Unexpected cohort request: $method $($uri.AbsoluteUri)"
+        }.GetNewClosure()
+
+        $root = New-LifecycleRoot
+        try {
+            foreach ($lockedId in $lockedStatusIds) {
+                $intentDir = Join-Path $root.Context.Root "intents\$lockedId"
+                [void](New-Item -ItemType Directory -Path $intentDir -Force)
+                [void](Write-StalePrLifecyclePolicy `
+                    -Path (Join-Path $intentDir ('a' * 32 + '.json')) `
+                    -Key $root.Key `
+                    -Policy ([ordered]@{
+                            schemaVersion = 1
+                            kind = 'stale-pr-lifecycle-v1-intent'
+                            action = 'status:abandoned'
+                            runId = ('b' * 32)
+                            intentId = ('a' * 32)
+                        }))
+                $lockDir = Join-Path $root.Context.Root "outcomes\$lockedId"
+                [void](New-Item -ItemType Directory -Path $lockDir -Force)
+                [void](Write-StalePrLifecyclePolicy `
+                    -Path (Join-Path $lockDir ('a' * 32 + '.json')) `
+                    -Key $root.Key `
+                    -Policy ([ordered]@{
+                            schemaVersion = 1
+                            kind = 'stale-pr-lifecycle-v1-outcome'
+                            action = 'status:abandoned'
+                            runId = ('b' * 32)
+                            intentId = ('a' * 32)
+                            completedUtc = '20260101T0000000000000Z'
+                            eventId = ('c' * 32)
+                            outcome = 'ambiguous-post-write'
+                            diagnostic = $null
+                            providerWriteCount = 1
+                            providerWriteState = 'unknown'
+                            retryAuthorized = $false
+                        }))
+            }
+            $expIntentDir = Join-Path $root.Context.Root (
+                "explanations\intents\$lockedExplanationId")
+            [void](New-Item -ItemType Directory -Path $expIntentDir -Force)
+            [void](Write-StalePrLifecyclePolicy `
+                -Path (Join-Path $expIntentDir ('d' * 32 + '.json')) `
+                -Key $root.Key `
+                -Policy ([ordered]@{
+                        schemaVersion = 1
+                        kind = 'stale-pr-abandonment-explanation-v1-intent'
+                        action = 'comment:create-after-confirmed-abandonment'
+                        identity = 'v1:sha256:' + ('e' * 64)
+                        statusIntentId = ('d' * 32)
+                    }))
+            $expLockDir = Join-Path $root.Context.Root (
+                "explanations\outcomes\$lockedExplanationId")
+            [void](New-Item -ItemType Directory -Path $expLockDir -Force)
+            [void](Write-StalePrLifecyclePolicy `
+                -Path (Join-Path $expLockDir ('d' * 32 + '.json')) `
+                -Key $root.Key `
+                -Policy ([ordered]@{
+                        schemaVersion = 1
+                        kind = 'stale-pr-abandonment-explanation-v1-outcome'
+                        action = 'comment:create-after-confirmed-abandonment'
+                        identity = 'v1:sha256:' + ('e' * 64)
+                        statusIntentId = ('d' * 32)
+                        policyDigest = 'v1:sha256:' + ('0' * 64)
+                        bodyDigest = 'v1:sha256:' + ('f' * 64)
+                        intentDigest = 'v1:sha256:' + ('1' * 64)
+                        eventId = ('2' * 32)
+                        state = 'unknown'
+                        providerWriteCount = 1
+                        providerWriteState = 'unknown'
+                        retryAuthorized = $false
+                    }))
+
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+
+            # Part 1: Each of the 5 pinned production slices completes in a single run under the 128-GET ceiling with 0 deferrals
+            foreach ($slice in $pinnedSlices) {
+                $sliceInventory = @($slice | ForEach-Object {
+                        [ordered]@{
+                            pullRequestId = [long]$_
+                            status = 'active'
+                            isDraft = $false
+                            targetRef = 'refs/heads/master'
+                            creationUtc = '2024-01-01T00:00:00Z'
+                        }
+                    })
+                $sliceProvider = New-TestAzureDevOpsLifecycleProvider `
+                    -InputConfig $config -HttpInvoker $invoker
+                $sliceRun = Invoke-StalePrLifecycle `
+                    -Inventory $sliceInventory -CutoffUtc $cutoff `
+                    -Policy $policy -LifecycleRoot $root.Context.Root `
+                    -Key $root.Key -Provider $sliceProvider
+                $sliceRun.providerReadCount | Should -BeLessOrEqual 128
+                @($sliceRun.decisions) | Should -HaveCount $slice.Count
+                @($sliceRun.decisions | Where-Object {
+                        [string]$_.state -ceq 'deferred'
+                    }) | Should -HaveCount 0
+                $heavyId = [long]$slice[-1]
+                $sliceRun.reviewEligibleIds | Should -Contain $heavyId
+            }
+
+            # Part 2: Across the full 60-old-PR cohort using 5-key inventory items, 3 cursor-rotated runs evaluate all 60 PRs live (57 non-locked PRs * 4 GETs = 228 GETs across runs of <= 128 GETs)
+            $baseInventory = @($sortedCohortIds | ForEach-Object {
+                    [ordered]@{
+                        pullRequestId = [long]$_
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }
+                })
+            $cursor = 5510240L
+            $twoRunDecisions = [Collections.Generic.List[object]]::new()
+            $twoRunEligible = [Collections.Generic.List[long]]::new()
+            for ($runIdx = 1; $runIdx -le 3; $runIdx++) {
+                $startIndex = 0
+                for ($i = 0; $i -lt $baseInventory.Count; $i++) {
+                    if ([long]$baseInventory[$i].pullRequestId -ge $cursor) {
+                        $startIndex = $i
+                        break
+                    }
+                }
+                $rotatedInventory = if ($startIndex -gt 0) {
+                    @($baseInventory[$startIndex..($baseInventory.Count - 1)]) +
+                    @($baseInventory[0..($startIndex - 1)])
+                }
+                else {
+                    $baseInventory
+                }
+                $provider = New-TestAzureDevOpsLifecycleProvider `
+                    -InputConfig $config -HttpInvoker $invoker
+                $runResult = Invoke-StalePrLifecycle `
+                    -Inventory $rotatedInventory -CutoffUtc $cutoff `
+                    -Policy $policy -LifecycleRoot $root.Context.Root `
+                    -Key $root.Key -Provider $provider
+                $runResult.providerReadCount | Should -BeLessOrEqual 128
+                $runResult.providerWrites | Should -Be 0
+                $runResult.unknownPossibleEffect | Should -BeFalse
+                foreach ($d in $runResult.decisions) {
+                    if ([string]$d.state -cne 'deferred') {
+                        [void]$twoRunDecisions.Add($d)
+                    }
+                }
+                foreach ($eligId in $runResult.reviewEligibleIds) {
+                    [void]$twoRunEligible.Add([long]$eligId)
+                }
+                $cursor = [long]$runResult.nextPullRequestId
+            }
+            $uniqueCompletedIds = @($twoRunDecisions |
+                ForEach-Object { [long]$_.pullRequestId } |
+                Sort-Object -Unique)
+            $uniqueCompletedIds | Should -HaveCount 60
+            $uniqueEligibleIds = @($twoRunEligible | Sort-Object -Unique)
+            $uniqueEligibleIds | Should -HaveCount 52
+            foreach ($heavyId in $pinnedHeavyIterationsById.Keys) {
+                $uniqueEligibleIds | Should -Contain ([long]$heavyId)
+            }
+            foreach ($lockedId in $lockedStatusIds) {
+                $decision = @($twoRunDecisions | Where-Object {
+                        [long]$_.pullRequestId -eq $lockedId
+                    })[0]
+                $decision.state | Should -BeExactly unknown
+                $decision.reason | Should -BeExactly 'prior-ambiguous-write'
+            }
+            $expDecision = @($twoRunDecisions | Where-Object {
+                    [long]$_.pullRequestId -eq $lockedExplanationId
+                })[0]
+            $expDecision.state | Should -BeExactly unknown
+            $expDecision.reason |
+                Should -BeExactly 'prior-ambiguous-explanation'
+            foreach ($unknownId in $unknownIds) {
+                $unkDecision = @($twoRunDecisions | Where-Object {
+                        [long]$_.pullRequestId -eq $unknownId
+                    })[0]
+                $unkDecision.state | Should -BeExactly unknown
+                $unkDecision.reason |
+                    Should -BeExactly 'activity-evidence-unknown'
+            }
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+    }
+
+    It 'never authorizes abandonment from cached push dates and re-verifies pushes live when activity is at or before cutoff' {
+        $root = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            # Pre-seed a valid signed push-date record with a STALE timestamp (2024-06-01)
+            $stalePushPayload = [ordered]@{
+                schemaVersion = 1
+                kind = 'stale-pr-push-date-v1'
+                projectId = '22222222-2222-2222-2222-222222222222'
+                repositoryId = '11111111-1111-1111-1111-111111111111'
+                pullRequestId = 1L
+                iterationId = 1
+                pushId = 7L
+                sourceCommit = ('a' * 40)
+                targetCommit = ('b' * 40)
+                occurredUtc = '20240601T0000000000000Z'
+            }
+            $pushDir = Join-Path $root.Context.Root 'pushes\1'
+            [void](New-Item -ItemType Directory -Path $pushDir -Force)
+            [void](Write-StalePrLifecyclePolicy `
+                -Path (Join-Path $pushDir 'push-7-iter-1.json') `
+                -Policy $stalePushPayload `
+                -Key $root.Key)
+
+            # Case A: live /pushes/7 returns a conflicting timestamp (2026-03-01) for the same immutable pushId=7 -> fails closed with cache-write-failed
+            $livePushReadsA = 0
+            $baseInvokerA = New-AzLifecycleInvoker `
+                -MissingSummaryPushDate `
+                -PushUtc '2024-06-01T00:00:00Z' `
+                -PushDetailReads ([ref]$livePushReadsA)
+            $invokerA = {
+                param($Request)
+                $response = & $baseInvokerA $Request
+                if ([string]$Request.Uri.AbsolutePath -match '/pushes/7$') {
+                    $response.date = '2026-03-01T00:00:00Z'
+                }
+                return $response
+            }.GetNewClosure()
+            $providerA = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $config -HttpInvoker $invokerA
+            $resultA = Invoke-StalePrLifecycle `
+                -Inventory @([ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc $cutoff -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $providerA
+
+            $livePushReadsA | Should -Be 1
+            $resultA.providerWrites | Should -Be 0
+            $resultA.decisions[0].state | Should -BeExactly 'unknown'
+            $resultA.decisions[0].reason |
+                Should -BeExactly 'activity-evidence-unknown'
+            $resultA.decisions[0].diagnostic.kind |
+                Should -BeExactly 'cache-write-failed'
+            $resultA.decisions[0].diagnostic.reason |
+                Should -BeExactly 'stale-pr-push-cache-write-failed'
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+
+        $rootB = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $pushDirB = Join-Path $rootB.Context.Root 'pushes\1'
+            [void](New-Item -ItemType Directory -Path $pushDirB -Force)
+            [void](Write-StalePrLifecyclePolicy `
+                -Path (Join-Path $pushDirB 'push-7-iter-1.json') `
+                -Policy $stalePushPayload `
+                -Key $rootB.Key)
+
+            # Case B: live /pushes/7 is also stale -> both decision AND prewrite must read /pushes/7 live
+            $livePushReadsB = [ref]0
+            $patchCallsB = [ref]0
+            $baseInvokerB = New-AzLifecycleInvoker `
+                -MissingSummaryPushDate `
+                -PushUtc '2024-06-01T00:00:00Z' `
+                -PushDetailReads $livePushReadsB `
+                -PatchCalls $patchCallsB
+            $invokerB = {
+                param($Request)
+                $resp = & $baseInvokerB $Request
+                if ([string]$Request.Method -ceq 'GET' -and
+                    ([uri]$Request.Uri).AbsolutePath -match '/pullrequests/[0-9]+$' -and
+                    $patchCallsB.Value -gt 0) {
+                    $resp.status = 'abandoned'
+                }
+                return $resp
+            }.GetNewClosure()
+            $providerB = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $config -HttpInvoker $invokerB
+            $resultB = Invoke-StalePrLifecycle `
+                -Inventory @([ordered]@{
+                        pullRequestId = 1
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    }) `
+                -CutoffUtc $cutoff -Policy $policy `
+                -LifecycleRoot $rootB.Context.Root `
+                -Key $rootB.Key -Provider $providerB
+
+            $livePushReadsB.Value | Should -Be 2
+            $patchCallsB.Value | Should -Be 1
+            $resultB.confirmedAbandonedIds | Should -Be @(1)
+        }
+        finally {
+            [Array]::Clear($rootB.Key, 0, $rootB.Key.Length)
+        }
+    }
+
+    It 'enforces bounded file counts, byte ceilings, caller-wired deadlines, 65+ head changes without permanent review block, non-bool integer guards, and idempotent activity proof writes' {
+        $root = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $policyDigest = InModuleScope DevPilot.PullRequestLifecycle {
+                param($Pol)
+                Get-StalePrDigest $Pol
+            } -Parameters @{ Pol = $policy }
+
+            $evidence = [ordered]@{
+                projectId = '22222222-2222-2222-2222-222222222222'
+                repositoryId = '11111111-1111-1111-1111-111111111111'
+                pullRequestId = 77L
+                status = 'active'
+                isDraft = $false
+                sourceRef = 'refs/heads/feature-77'
+                targetRef = 'refs/heads/master'
+                sourceCommit = ('a' * 40)
+                targetCommit = ('b' * 40)
+                iterationId = 1
+                creationUtc = '2024-01-01T00:00:00.0000000Z'
+                latestActivityUtc = '2026-03-01T00:00:00.0000000Z'
+                activityDigest = 'v1:sha256:' + ('c' * 64)
+            }
+
+            # Repeated identical recent-activity writes are idempotent and do not append extra seq files
+            for ($i = 0; $i -lt 3; $i++) {
+                InModuleScope DevPilot.PullRequestLifecycle {
+                    param($RootPath, $KeyBytes, $Ev, $PolDigest)
+                    Write-StalePrActivityProof `
+                        -LifecycleRoot $RootPath `
+                        -PullRequestId 77L `
+                        -Evidence $Ev `
+                        -PolicyDigest $PolDigest `
+                        -Key $KeyBytes
+                } -Parameters @{
+                    RootPath = $root.Context.Root
+                    KeyBytes = $root.Key
+                    Ev = $evidence
+                    PolDigest = $policyDigest
+                }
+            }
+            @(Get-ChildItem -LiteralPath (
+                    Join-Path $root.Context.Root 'activity-proofs\77') `
+                    -Filter '*.json' -File) | Should -HaveCount 1
+
+            # Expired deadline throws stale-pr-deadline-exhausted when reading cached proof
+            $expiredError = $null
+            try {
+                [void](InModuleScope DevPilot.PullRequestLifecycle {
+                        param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                        Get-StalePrCachedActivityProof `
+                            -LifecycleRoot $RootPath `
+                            -PullRequestId 77L `
+                            -Item $Item `
+                            -CutoffUtc $Cut `
+                            -Policy $Pol `
+                            -PolicyDigest $PolDigest `
+                            -Key $KeyBytes `
+                            -DeadlineUtc ([DateTime]::SpecifyKind([DateTime]'2020-01-01T00:00:00', [DateTimeKind]::Utc)) `
+                            -UtcNowProvider { [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc) }
+                    } -Parameters @{
+                        RootPath = $root.Context.Root
+                        KeyBytes = $root.Key
+                        Item = $evidence
+                        Cut = $cutoff
+                        Pol = $policy
+                        PolDigest = $policyDigest
+                    })
+            }
+            catch {
+                $expiredError = $_.Exception.Message
+            }
+            $expiredError | Should -BeExactly 'stale-pr-deadline-exhausted'
+
+            # Boolean passed as integer field (iterationId = $true) is rejected by static type guard
+            $boolIterationItem = [ordered]@{} + $evidence
+            $boolIterationItem['iterationId'] = $true
+            $boolProof = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 77L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $boolIterationItem
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $boolProof | Should -BeNullOrEmpty
+
+            # 65+ head changes through Invoke-StalePrLifecycle retire the cached proof to withheld at sequence 65 and keep the live-recent PR reviewEligible without throwing proof-write-failed
+            $headIndex = [ref]1
+            $headChangeInvoker = {
+                param($Request)
+                $uri = [Uri]$Request.Uri
+                $path = $uri.AbsolutePath
+                $query = $uri.Query
+                $commitHex = ('{0:x40}' -f [int]$headIndex.Value)
+                if ($path -clike '*/_apis/connectionData') {
+                    return @{
+                        authenticatedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor = 'aad.synthetic-service-account'
+                        }
+                        authorizedUser = @{
+                            id = '33333333-3333-3333-3333-333333333333'
+                            subjectDescriptor = 'aad.synthetic-service-account'
+                        }
+                    }
+                }
+                if ($path -match '/pullRequests/88$') {
+                    return @{
+                        pullRequestId = 88L
+                        status = 'active'
+                        isDraft = $false
+                        creationDate = '2024-01-01T00:00:00Z'
+                        sourceRefName = 'refs/heads/feature-88'
+                        targetRefName = 'refs/heads/master'
+                        lastMergeSourceCommit = @{ commitId = $commitHex }
+                        lastMergeTargetCommit = @{ commitId = ('b' * 40) }
+                        repository = @{
+                            id = '11111111-1111-1111-1111-111111111111'
+                            project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                        }
+                    }
+                }
+                if ($path -match '/pullRequests/88/iterations$') {
+                    return @{
+                        value = @(@{
+                                id = [int]$headIndex.Value
+                                createdDate = '2026-03-01T00:00:00Z'
+                                updatedDate = '2026-03-01T00:00:00Z'
+                                push = @{
+                                    pushId = [long]$headIndex.Value
+                                }
+                                sourceRefCommit = @{ commitId = $commitHex }
+                                targetRefCommit = @{ commitId = ('b' * 40) }
+                            })
+                        count = 1
+                        continuation_token = $null
+                    }
+                }
+                if ($path -match '/pushes/(?<pushId>\d+)$') {
+                    return @{
+                        pushId = [long]$Matches.pushId
+                        date = '2026-03-01T00:00:00Z'
+                        repository = @{
+                            id = '11111111-1111-1111-1111-111111111111'
+                            project = @{ id = '22222222-2222-2222-2222-222222222222' }
+                        }
+                    }
+                }
+                if ($path -match '/pullRequests/88/threads$') {
+                    return @{
+                        value = @()
+                        count = 0
+                        continuation_token = $null
+                    }
+                }
+                if ($path -match '/refs$' -and $query -match 'heads%2Ffeature-88') {
+                    return @{
+                        value = @(@{
+                                name = 'refs/heads/feature-88'
+                                objectId = $commitHex
+                            })
+                        count = 1
+                        continuation_token = $null
+                    }
+                }
+                throw "Unexpected request: $path"
+            }.GetNewClosure()
+
+            for ($iter = 1; $iter -le 66; $iter++) {
+                $headIndex.Value = $iter
+                $iterProvider = New-TestAzureDevOpsLifecycleProvider `
+                    -InputConfig $config -HttpInvoker $headChangeInvoker
+                $iterRun = Invoke-StalePrLifecycle `
+                    -Inventory @([ordered]@{
+                            pullRequestId = 88L
+                            status = 'active'
+                            isDraft = $false
+                            targetRef = 'refs/heads/master'
+                            creationUtc = '2024-01-01T00:00:00Z'
+                        }) `
+                    -CutoffUtc $cutoff -Policy $policy `
+                    -LifecycleRoot $root.Context.Root `
+                    -Key $root.Key -Provider $iterProvider
+                $iterRun.health | Should -BeExactly healthy
+                $iterRun.reviewEligibleIds | Should -Be @(88)
+                $iterRun.decisions[0].state | Should -BeExactly 'no-op'
+                $iterRun.decisions[0].reason | Should -BeExactly 'recent-activity'
+            }
+            $pr88Files = @(Get-ChildItem -LiteralPath (
+                    Join-Path $root.Context.Root 'activity-proofs\88') `
+                    -Filter '*.json' -File | Sort-Object Name)
+            $pr88Files | Should -HaveCount 65
+            $lastPr88Record = Read-StalePrLifecyclePolicy `
+                -Path $pr88Files[-1].FullName -Key $root.Key
+            $lastPr88Record.sequence | Should -Be 65L
+            $lastPr88Record.state | Should -BeExactly 'withheld'
+
+            # Caller-level shared provider clock deadline wired through Invoke-StalePrLifecycle -> Get-StalePrCachedActivityProof (and ReadEvidence -> Read-StalePrCachedPushDate)
+            $callerTicks = [ref]0
+            $callerHttpGetCount = [ref]0
+            $callerClock = {
+                $callerTicks.Value++
+                # Tick 1 = provider init, Ticks 2..4 = Identity GET; advance past 240s on Tick 8 (end of PR GET #1) so provider clock is expired when Read-StalePrCachedPushDate runs
+                if ($callerTicks.Value -ge 8) {
+                    return [DateTime]::SpecifyKind(
+                        [DateTime]'2026-01-01T00:05:00',
+                        [DateTimeKind]::Utc)
+                }
+                return [DateTime]::SpecifyKind(
+                    [DateTime]'2026-01-01T00:00:00',
+                    [DateTimeKind]::Utc)
+            }.GetNewClosure()
+            $baseClockInvoker = New-AzLifecycleInvoker -PushUtc '2026-03-01T00:00:00Z' -MissingSummaryPushDate
+            $clockInvoker = {
+                param($Request)
+                $callerHttpGetCount.Value++
+                return (& $baseClockInvoker $Request)
+            }.GetNewClosure()
+            $clockProvider = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $config `
+                -HttpInvoker $clockInvoker `
+                -UtcNowProvider $callerClock
+            $clockRun = Invoke-StalePrLifecycle `
+                -Inventory @(
+                    [ordered]@{
+                        pullRequestId = 88L
+                        status = 'active'
+                        isDraft = $false
+                        targetRef = 'refs/heads/master'
+                        creationUtc = '2024-01-01T00:00:00Z'
+                    },
+                    $evidence
+                ) `
+                -CutoffUtc $cutoff -Policy $policy `
+                -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $clockProvider
+            $clockRun.decisions | Should -HaveCount 1
+            $clockRun.decisions[0].state | Should -BeExactly deferred
+            $clockRun.decisions[0].reason | Should -BeExactly 'stale-pr-deadline-exhausted'
+
+            # Unexpected non-json file in activity-proofs\77 invalidates cache state
+            $strayFile = Join-Path $root.Context.Root 'activity-proofs\77\unexpected.txt'
+            [IO.File]::WriteAllText($strayFile, 'stray')
+            $strayProof = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Item, $Cut, $Pol, $PolDigest)
+                Get-StalePrCachedActivityProof `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 77L `
+                    -Item $Item `
+                    -CutoffUtc $Cut `
+                    -Policy $Pol `
+                    -PolicyDigest $PolDigest `
+                    -Key $KeyBytes
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Item = $evidence
+                Cut = $cutoff
+                Pol = $policy
+                PolDigest = $policyDigest
+            }
+            $strayProof | Should -BeNullOrEmpty
+
+            # Lazy streaming directory enumeration stops at max+1 without pre-materializing 400+ files
+            $overflowProofDir = Join-Path $root.Context.Root 'activity-proofs\991'
+            [void](New-Item -ItemType Directory -Path $overflowProofDir -Force)
+            for ($fileIdx = 1; $fileIdx -le 400; $fileIdx++) {
+                $fileName = ('seq-{0:D8}-{1}.json' -f $fileIdx, ('0' * 16))
+                [IO.File]::WriteAllText((Join-Path $overflowProofDir $fileName), '{}')
+            }
+            $proofClockTicks = [ref]0
+            $proofClock = {
+                $proofClockTicks.Value++
+                return [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
+            }.GetNewClosure()
+            $overflowProofState = InModuleScope DevPilot.PullRequestLifecycle {
+                param($RootPath, $KeyBytes, $Clock)
+                Get-StalePrActivityProofState `
+                    -LifecycleRoot $RootPath `
+                    -PullRequestId 991L `
+                    -Key $KeyBytes `
+                    -DeadlineUtc ([DateTime]::SpecifyKind([DateTime]'2026-01-01T00:05:00', [DateTimeKind]::Utc)) `
+                    -UtcNowProvider $Clock
+            } -Parameters @{
+                RootPath = $root.Context.Root
+                KeyBytes = $root.Key
+                Clock = $proofClock
+            }
+            $overflowProofState.valid | Should -BeFalse
+            # 1 initial deadline check + 66 per-entry checks (stops at MaxActivityProofHistoryEntriesPerPr + 1 = 66) = 67 ticks (never 400+)
+            $proofClockTicks.Value | Should -Be 67
+
+            $overflowPushDir = Join-Path $root.Context.Root 'pushes\992'
+            [void](New-Item -ItemType Directory -Path $overflowPushDir -Force)
+            for ($fileIdx = 1; $fileIdx -le 400; $fileIdx++) {
+                $fileName = ('push-{0}-iter-{0}.json' -f $fileIdx)
+                [IO.File]::WriteAllText((Join-Path $overflowPushDir $fileName), '{}')
+            }
+            $pushClockTicks = [ref]0
+            $pushClock = {
+                $pushClockTicks.Value++
+                return [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
+            }.GetNewClosure()
+            $overflowPushErr = $null
+            try {
+                InModuleScope DevPilot.PullRequestLifecycle {
+                    param($RootPath, $KeyBytes, $Clock)
+                    Write-StalePrCachedPushDate `
+                        -LifecycleRoot $RootPath `
+                        -Key $KeyBytes `
+                        -ProjectId '22222222-2222-2222-2222-222222222222' `
+                        -RepositoryId '11111111-1111-1111-1111-111111111111' `
+                        -PullRequestId 992L `
+                        -IterationId 999 `
+                        -PushId 999L `
+                        -SourceCommit ('a' * 40) `
+                        -TargetCommit ('b' * 40) `
+                        -OccurredUtc '2026-03-01T00:00:00Z' `
+                        -DeadlineUtc ([DateTime]::SpecifyKind([DateTime]'2026-01-01T00:05:00', [DateTimeKind]::Utc)) `
+                        -UtcNowProvider $Clock
+                } -Parameters @{
+                    RootPath = $root.Context.Root
+                    KeyBytes = $root.Key
+                    Clock = $pushClock
+                }
+            }
+            catch {
+                $overflowPushErr = $_.Exception.Message
+            }
+            $overflowPushErr | Should -BeExactly 'stale-pr-push-cache-write-failed'
+            # 1 initial deadline check + 256 per-entry checks (stops at MaxCachedPushFilesPerPr = 256) = 257 ticks (never 400+)
+            $pushClockTicks.Value | Should -Be 257
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+    }
+
+    It 'fails closed and forces live evaluation on stale, tampered, drifted, or superseded cache state (<Mode>)' `
+        -TestCases @(
+            @{ Mode = 'tampered-activity-proof' }
+            @{ Mode = 'sequence-gap-activity-proof' }
+            @{ Mode = 'source-commit-drift-dictionary' }
+            @{ Mode = 'source-commit-drift-pscustomobject' }
+            @{ Mode = 'target-commit-drift' }
+            @{ Mode = 'iteration-id-drift' }
+            @{ Mode = 'cutoff-drift' }
+            @{ Mode = 'policy-digest-drift' }
+            @{ Mode = 'superseded-by-unknown' }
+        ) {
+        param($Mode)
+        $root = New-LifecycleRoot
+        try {
+            $cutoff = [DateTime]::SpecifyKind(
+                [DateTime]'2025-01-01T00:00:00',
+                [DateTimeKind]::Utc)
+            $baseInventory = @(
+                [ordered]@{
+                    pullRequestId = 1L
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                }
+                [ordered]@{
+                    pullRequestId = 2L
+                    status = 'active'
+                    isDraft = $false
+                    targetRef = 'refs/heads/master'
+                    creationUtc = '2024-01-01T00:00:00Z'
+                }
+            )
+            $multiPrBase = New-AzLifecycleInvoker -PushUtc '2026-03-01T00:00:00Z'
+            $multiPrInvoker = {
+                param($Request)
+                $response = & $multiPrBase $Request
+                $uri = [Uri]$Request.Uri
+                if ($uri.AbsolutePath -match '/refs$' -and
+                    $uri.Query -match 'heads%2Ffeature-(?<id>\d+)') {
+                    $response.value[0].name = "refs/heads/feature-$($Matches.id)"
+                }
+                return $response
+            }.GetNewClosure()
+            $warmProvider = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $config -HttpInvoker $multiPrInvoker
+            $warmRun = Invoke-StalePrLifecycle `
+                -Inventory $baseInventory -CutoffUtc $cutoff `
+                -Policy $policy -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $warmProvider
+            $warmRun.reviewEligibleIds | Should -Be @(1, 2)
+
+            $pr1Signed = Read-StalePrLifecyclePolicy `
+                -Path (@(Get-ChildItem -LiteralPath (Join-Path $root.Context.Root 'activity-proofs\1') -Filter '*.json' -File)[0].FullName) `
+                -Key $root.Key
+            $pr2Signed = Read-StalePrLifecyclePolicy `
+                -Path (@(Get-ChildItem -LiteralPath (Join-Path $root.Context.Root 'activity-proofs\2') -Filter '*.json' -File)[0].FullName) `
+                -Key $root.Key
+
+            # Supply full 13-key identity items so unmodified PR 2 tests cached proof acceptance while PR 1 tests drift/tampering
+            $testInventory = @(
+                ([ordered]@{} + $pr1Signed.subject)
+                ([ordered]@{} + $pr2Signed.subject)
+            )
+            $testCutoff = $cutoff
+            $testPolicy = $policy | ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable -Depth 32
+
+            switch ($Mode) {
+                'tampered-activity-proof' {
+                    $proofFile = @(Get-ChildItem -LiteralPath (
+                            Join-Path $root.Context.Root 'activity-proofs\1') `
+                            -Filter '*.json' -File)[0]
+                    $raw = [IO.File]::ReadAllText($proofFile.FullName)
+                    [IO.File]::WriteAllText(
+                        $proofFile.FullName,
+                        ($raw -replace '"signature"\s*:\s*"[0-9a-f]{64}"', ('"signature": "' + ('0' * 64) + '"')))
+                }
+                'sequence-gap-activity-proof' {
+                    $proofDir = Join-Path $root.Context.Root 'activity-proofs\1'
+                    $proofFile = @(Get-ChildItem -LiteralPath $proofDir `
+                            -Filter '*.json' -File)[0]
+                    $existing = Read-StalePrLifecyclePolicy `
+                        -Path $proofFile.FullName -Key $root.Key
+                    $gapPayload = [ordered]@{
+                        schemaVersion = 1
+                        kind = 'stale-pr-activity-proof-v1'
+                        sequence = 3L
+                        pullRequestId = 1L
+                        state = 'recent-activity'
+                        policyDigest = [string]$existing.policyDigest
+                        evidenceDigest = [string]$existing.evidenceDigest
+                        subject = [ordered]@{} + $existing.subject
+                    }
+                    [void](Write-StalePrLifecyclePolicy `
+                        -Path (Join-Path $proofDir 'seq-00000003-gap.json') `
+                        -Policy $gapPayload -Key $root.Key)
+                }
+                'source-commit-drift-dictionary' {
+                    $testInventory[0]['sourceCommit'] = ('c' * 40)
+                }
+                'source-commit-drift-pscustomobject' {
+                    $customSubject = [ordered]@{} + $pr1Signed.subject
+                    $customSubject['sourceCommit'] = ('c' * 40)
+                    $testInventory[0] = [pscustomobject]$customSubject
+                }
+                'target-commit-drift' {
+                    $testInventory[0]['targetCommit'] = ('d' * 40)
+                }
+                'iteration-id-drift' {
+                    $testInventory[0]['iterationId'] = 99
+                }
+                'cutoff-drift' {
+                    $testCutoff = [DateTime]::SpecifyKind(
+                        [DateTime]'2026-06-01T00:00:00',
+                        [DateTimeKind]::Utc)
+                }
+                'policy-digest-drift' {
+                    $testPolicy.authority.maxCandidatesPerRun = 150
+                }
+                'superseded-by-unknown' {
+                    $unknownInvoker = {
+                        param($Request)
+                        $response = & $multiPrInvoker $Request
+                        if ([string]$Request.Uri.AbsolutePath -match '/threads$') {
+                            $response.continuation_token = 'more'
+                        }
+                        return $response
+                    }.GetNewClosure()
+                    $unknownProvider = New-TestAzureDevOpsLifecycleProvider `
+                        -InputConfig $config -HttpInvoker $unknownInvoker
+                    $unkRun = Invoke-StalePrLifecycle `
+                        -Inventory @($baseInventory[0]) -CutoffUtc $cutoff `
+                        -Policy $policy -LifecycleRoot $root.Context.Root `
+                        -Key $root.Key -Provider $unknownProvider
+                    $unkRun.decisions[0].reason |
+                        Should -BeExactly 'activity-evidence-unknown'
+                    @(Get-ChildItem -LiteralPath (
+                            Join-Path $root.Context.Root 'activity-proofs\1') `
+                            -Filter '*.json' -File) | Should -HaveCount 2
+                }
+            }
+
+            $tightConfig = $config | ConvertTo-Json -Depth 32 |
+                ConvertFrom-Json -AsHashtable -Depth 32
+            $tightConfig.subjectProvider.maximumReads = 5
+            $verifyBase = New-AzLifecycleInvoker -PushUtc '2026-07-01T00:00:00Z'
+            $verifyInvoker = {
+                param($Request)
+                $response = & $verifyBase $Request
+                $uri = [Uri]$Request.Uri
+                if ($uri.AbsolutePath -match '/refs$' -and
+                    $uri.Query -match 'heads%2Ffeature-(?<id>\d+)') {
+                    $response.value[0].name = "refs/heads/feature-$($Matches.id)"
+                }
+                return $response
+            }.GetNewClosure()
+            $tightProvider = New-TestAzureDevOpsLifecycleProvider `
+                -InputConfig $tightConfig -HttpInvoker $verifyInvoker
+            $verifyRun = Invoke-StalePrLifecycle `
+                -Inventory $testInventory -CutoffUtc $testCutoff `
+                -Policy $testPolicy -LifecycleRoot $root.Context.Root `
+                -Key $root.Key -Provider $tightProvider
+
+            $verifyRun.providerReadCount | Should -Be 5
+            $pr1Decision = @($verifyRun.decisions | Where-Object {
+                    [long]$_.pullRequestId -eq 1L
+                })[0]
+            $pr2Decision = @($verifyRun.decisions | Where-Object {
+                    [long]$_.pullRequestId -eq 2L
+                })[0]
+            if ($Mode -cin @('cutoff-drift', 'policy-digest-drift')) {
+                $pr2Decision.state | Should -BeExactly deferred
+                $pr2Decision.reason |
+                    Should -BeExactly 'stale-pr-read-budget-exhausted'
+            }
+            elseif ($Mode -cin @('tampered-activity-proof', 'sequence-gap-activity-proof')) {
+                $pr1Decision.state | Should -BeExactly 'unknown'
+                $pr1Decision.reason |
+                    Should -BeExactly 'activity-evidence-unknown'
+                $pr1Decision.diagnostic.kind |
+                    Should -BeExactly 'cache-write-failed'
+                $pr1Decision.diagnostic.reason |
+                    Should -BeExactly 'stale-pr-activity-proof-write-failed'
+                $verifyRun.reviewEligibleIds | Should -Be @(2)
+            }
+            else {
+                $verifyRun.reviewEligibleIds | Should -Be @(1, 2)
+            }
+        }
+        finally {
+            [Array]::Clear($root.Key, 0, $root.Key.Length)
+        }
+    }
+}

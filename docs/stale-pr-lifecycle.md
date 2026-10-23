@@ -43,6 +43,59 @@ loads that exact Git push once per push ID and requires the returned push ID,
 repository, project, and date to match. It does not request or require optional
 ref updates. Missing or mismatched push details remain unknown.
 
+During initial qualification (`Phase = 'decision'`), after loading live PR
+metadata, iterations, discussion threads, and the source branch ref, the
+provider evaluates iterations newest-first for a counted activity witness
+strictly after the frozen cutoff. If live discussion comments or iteration
+timestamps already prove recent activity after the cutoff, or once the newest
+iteration push proves activity after the cutoff, older iteration push-detail
+GETs are not required to establish `recent-activity`. In that early-witness
+qualification branch, `complete = true` and `latestActivityUtc` record the
+proven recent-activity witness strictly after the cutoff (rather than an
+exhaustive maximum across older skipped pushes), and `activityDigest` binds the
+observed recent-witness activity set. When `-LifecycleRoot` and
+`-Key` are supplied, verified push timestamps are persisted as write-once
+HMAC-signed records under `pushes\<pullRequestId>\push-<pushId>-iter-<iterationId>.json`
+(kind `stale-pr-push-date-v1`) so interrupted multi-push PRs can resume across
+runs and previously verified push timestamps do not require repeated live
+`/pushes/{pushId}` GETs on subsequent qualification runs. Cached push dates
+never authorize a transition: when no counted activity is strictly after the
+cutoff, or during `Phase = 'prewrite'` immediately before any status write,
+every push date omitted by the iteration summary is verified live across all
+iterations before computing `activityDigest` or authorizing abandonment.
+
+Signed per-PR activity proof records under
+`activity-proofs\<pullRequestId>\seq-<NNNNNNNN>-<state>.json` (kind
+`stale-pr-activity-proof-v1`) require all 13 current identity and freshness
+fields (`projectId`, `repositoryId`, `pullRequestId`, `status`, `isDraft`,
+`sourceRef`, `targetRef`, `sourceCommit`, `targetCommit`, `iterationId`,
+`creationUtc`, `latestActivityUtc`, and `activityDigest`) plus matching policy
+and evidence digests and `latestActivityUtc > CutoffUtc`. Partial inventory
+records (including the 5-key normalized inventory shape from
+`Discover-ActivePrInventory`) are never accepted as cached proofs and always
+require live provider evaluation (at least 4 live GETs per non-locked old PR for
+metadata, iterations, threads, and source ref, plus 1 GET for the newest push
+on cold runs and 0 push GETs on warm runs once the push-date record is signed).
+Accordingly, on a 60-old-PR cohort (`57` non-locked old PRs), a single 128-GET
+cycle evaluates up to `31` non-locked old PRs per run and still ends with a
+budget deferral, traversing the full 60-PR cohort across 2–3 cursor-rotated
+runs rather than achieving zero global deferrals per run from 5-key inventory
+alone. Cache reads and writes use lazy `.NET` streaming directory enumeration
+(`[IO.Directory]::EnumerateFileSystemEntries` with `ReparsePoint` skipping,
+stopping immediately at `max + 1`) and enforce bounded per-PR file counts
+(`256` push files, `64` recent-activity proof files plus one terminal
+`withheld` retirement record), per-file (`64 KiB`) and per-PR total byte
+ceilings (`4 MiB` push cache, `1 MiB` activity-proof cache), shared provider
+clock deadlines wired through all caller sites, and static non-boolean integer
+and safe-ID validation. When a PR's valid activity-proof history reaches the
+64-version cap on subsequent head/activity changes, the chain appends a
+terminal `withheld` record (`seq-00000065-withheld.json`) and continues using
+the live recent-activity witness without failing closed or blocking review
+eligibility. Any cache corruption, tampering, or invalidation-write failure
+fails closed (`unknown` / `activity-evidence-unknown` with structured
+`cache-write-failed` or `cache-invalidation-failed` diagnostics) and never
+leaves a superseded proof reusable.
+
 Missing continuation proof, count mismatches, malformed timestamps, unknown
 comment types, inconsistent source refs, unavailable endpoints, or any other
 ambiguous required evidence produce `unknown` and zero writes.
