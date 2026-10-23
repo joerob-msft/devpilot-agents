@@ -23,11 +23,22 @@ function ConvertTo-StalePrUtc {
         [Parameter(Mandatory)][string]$Name
     )
     $parsed = [DateTime]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor
+        [Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([DateTime]::TryParseExact(
+            $Value,
+            [string[]]@(
+                'yyyyMMddTHHmmssfffffffZ',
+                'yyyyMMddTHHmmssZ'),
+            [Globalization.CultureInfo]::InvariantCulture,
+            $styles,
+            [ref]$parsed)) {
+        return $parsed.ToUniversalTime()
+    }
     if (-not [DateTime]::TryParse(
             $Value,
             [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::AssumeUniversal -bor
-                [Globalization.DateTimeStyles]::AdjustToUniversal,
+            $styles,
             [ref]$parsed)) {
         throw "Invalid stale PR $Name."
     }
@@ -68,7 +79,8 @@ function Get-StalePrFailureReason {
 function Get-StalePrBudgetDiagnostic {
     param(
         [Parameter(Mandatory)]
-        [Management.Automation.ErrorRecord]$ErrorRecord
+        [Management.Automation.ErrorRecord]$ErrorRecord,
+        [AllowNull()]$Budget = $null
     )
     $reason = Get-StalePrFailureReason $ErrorRecord
     if ($reason -cnotin @(
@@ -100,6 +112,33 @@ function Get-StalePrBudgetDiagnostic {
             }
         }
         $exception = $exception.InnerException
+    }
+    if ($null -ne $Budget) {
+        if ($null -eq $diagnostic.readCount -and
+            $null -ne $Budget.PSObject.Properties['Count']) {
+            $diagnostic.readCount = [int]$Budget.Count
+        }
+        if ($null -eq $diagnostic.readCeiling -and
+            $null -ne $Budget.PSObject.Properties['Ceiling']) {
+            $diagnostic.readCeiling = [int]$Budget.Ceiling
+        }
+        if ($null -eq $diagnostic.deadlineUtc -and
+            $null -ne $Budget.PSObject.Properties['DeadlineUtc'] -and
+            $Budget.DeadlineUtc -is [DateTime]) {
+            $diagnostic.deadlineUtc = (
+                [DateTime]$Budget.DeadlineUtc).ToString('o')
+        }
+        if ([string]$diagnostic.kind -ceq 'unknown') {
+            if ($reason -ceq 'stale-pr-deadline-exhausted') {
+                $diagnostic.kind = 'deadline'
+            }
+            elseif ($null -ne $diagnostic.readCount -and
+                $null -ne $diagnostic.readCeiling -and
+                [int]$diagnostic.readCount -ge
+                    [int]$diagnostic.readCeiling) {
+                $diagnostic.kind = 'read-count'
+            }
+        }
     }
     return $diagnostic
 }
@@ -854,6 +893,406 @@ function Write-StalePrSignedRecord {
     return $path
 }
 
+function Read-StalePrCachedPushDate {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [AllowNull()][byte[]]$Key,
+        [Parameter(Mandatory)][string]$ProjectId,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)][int]$IterationId,
+        [Parameter(Mandatory)][long]$PushId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$TargetCommit
+    )
+    if ([string]::IsNullOrWhiteSpace($LifecycleRoot) -or
+        $null -eq $Key -or $Key.Length -ne 32 -or
+        $PullRequestId -lt 1 -or $IterationId -lt 1 -or $PushId -lt 1 -or
+        $SourceCommit -cnotmatch '^[0-9a-fA-F]{40}$' -or
+        $TargetCommit -cnotmatch '^[0-9a-fA-F]{40}$') {
+        return $null
+    }
+    $relativePath = (
+        "pushes\$PullRequestId\push-$PushId-iter-$IterationId.json")
+    $path = Join-Path $LifecycleRoot $relativePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $record = Read-StalePrLifecyclePolicy -Path $path -Key $Key
+        Assert-ApprovedOwnerV2ExactKeys -Value $record `
+            -Name pushDateRecord -Expected @(
+                'schemaVersion', 'kind', 'projectId', 'repositoryId',
+                'pullRequestId', 'iterationId', 'pushId',
+                'sourceCommit', 'targetCommit', 'occurredUtc'
+            )
+        if ([int]$record.schemaVersion -ne 1 -or
+            [string]$record.kind -cne 'stale-pr-push-date-v1' -or
+            [string]$record.projectId -ine $ProjectId -or
+            [string]$record.repositoryId -ine $RepositoryId -or
+            [long]$record.pullRequestId -ne $PullRequestId -or
+            [int]$record.iterationId -ne $IterationId -or
+            [long]$record.pushId -ne $PushId -or
+            [string]$record.sourceCommit -ine $SourceCommit -or
+            [string]$record.targetCommit -ine $TargetCommit) {
+            return $null
+        }
+        $occurredUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$record.occurredUtc) -Name occurredUtc
+        return $occurredUtc.ToString('o')
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-StalePrCachedPushDate {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [AllowNull()][byte[]]$Key,
+        [Parameter(Mandatory)][string]$ProjectId,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)][int]$IterationId,
+        [Parameter(Mandatory)][long]$PushId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$TargetCommit,
+        [Parameter(Mandatory)][string]$OccurredUtc
+    )
+    if ([string]::IsNullOrWhiteSpace($LifecycleRoot) -or
+        $null -eq $Key -or $Key.Length -ne 32 -or
+        $PullRequestId -lt 1 -or $IterationId -lt 1 -or $PushId -lt 1 -or
+        $SourceCommit -cnotmatch '^[0-9a-fA-F]{40}$' -or
+        $TargetCommit -cnotmatch '^[0-9a-fA-F]{40}$') {
+        return
+    }
+    try {
+        $normalizedUtc = (ConvertTo-StalePrUtc `
+            -Value $OccurredUtc -Name occurredUtc).
+            ToString('yyyyMMddTHHmmssfffffffZ')
+        $payload = [ordered]@{
+            schemaVersion = 1
+            kind = 'stale-pr-push-date-v1'
+            projectId = $ProjectId.ToLowerInvariant()
+            repositoryId = $RepositoryId.ToLowerInvariant()
+            pullRequestId = [long]$PullRequestId
+            iterationId = [int]$IterationId
+            pushId = [long]$PushId
+            sourceCommit = $SourceCommit.ToLowerInvariant()
+            targetCommit = $TargetCommit.ToLowerInvariant()
+            occurredUtc = $normalizedUtc
+        }
+        $relativePath = (
+            "pushes\$PullRequestId\push-$PushId-iter-$IterationId.json")
+        [void](Write-StalePrSignedRecord `
+            -LifecycleRoot $LifecycleRoot `
+            -RelativePath $relativePath `
+            -Payload $payload `
+            -Key $Key)
+    }
+    catch {
+    }
+}
+
+function Get-StalePrActivityProofState {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [AllowNull()][byte[]]$Key
+    )
+    if ([string]::IsNullOrWhiteSpace($LifecycleRoot) -or
+        $null -eq $Key -or $Key.Length -ne 32 -or
+        $PullRequestId -lt 1) {
+        return [ordered]@{
+            valid = $false
+            maxSequence = 0L
+            latest = $null
+        }
+    }
+    $proofRoot = Join-Path $LifecycleRoot (
+        "activity-proofs\$PullRequestId")
+    if (-not (Test-Path -LiteralPath $proofRoot -PathType Container)) {
+        return [ordered]@{
+            valid = $true
+            maxSequence = 0L
+            latest = $null
+        }
+    }
+    $files = @(Get-ChildItem -LiteralPath $proofRoot `
+            -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        return [ordered]@{
+            valid = $true
+            maxSequence = 0L
+            latest = $null
+        }
+    }
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($file in $files) {
+        try {
+            $record = Read-StalePrLifecyclePolicy `
+                -Path $file.FullName -Key $Key
+            Assert-ApprovedOwnerV2ExactKeys -Value $record `
+                -Name activityProof -Expected @(
+                    'schemaVersion', 'kind', 'sequence',
+                    'pullRequestId', 'state', 'policyDigest',
+                    'evidenceDigest', 'subject'
+                )
+            if ([int]$record.schemaVersion -ne 1 -or
+                [string]$record.kind -cne 'stale-pr-activity-proof-v1' -or
+                $record.sequence -is [bool] -or
+                [long]$record.sequence -lt 1 -or
+                [long]$record.pullRequestId -ne $PullRequestId -or
+                [string]$record.state -cnotin @(
+                    'recent-activity', 'withheld')) {
+                return [ordered]@{
+                    valid = $false
+                    maxSequence = 0L
+                    latest = $null
+                }
+            }
+            [void]$records.Add($record)
+        }
+        catch {
+            return [ordered]@{
+                valid = $false
+                maxSequence = 0L
+                latest = $null
+            }
+        }
+    }
+    $ordered = @($records | Sort-Object { [long]$_.sequence })
+    for ($idx = 0; $idx -lt $ordered.Count; $idx++) {
+        if ([long]$ordered[$idx].sequence -ne ($idx + 1)) {
+            return [ordered]@{
+                valid = $false
+                maxSequence = 0L
+                latest = $null
+            }
+        }
+    }
+    $latest = $ordered[-1]
+    return [ordered]@{
+        valid = $true
+        maxSequence = [long]$latest.sequence
+        latest = $latest
+    }
+}
+
+function Get-StalePrCachedActivityProof {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][DateTime]$CutoffUtc,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Policy,
+        [Parameter(Mandatory)][string]$PolicyDigest,
+        [AllowNull()][byte[]]$Key
+    )
+    $state = Get-StalePrActivityProofState `
+        -LifecycleRoot $LifecycleRoot `
+        -PullRequestId $PullRequestId `
+        -Key $Key
+    if (-not [bool]$state.valid -or $null -eq $state.latest) {
+        return $null
+    }
+    $record = $state.latest
+    if ([string]$record.state -cne 'recent-activity' -or
+        [string]$record.policyDigest -cne $PolicyDigest -or
+        $record.subject -isnot [Collections.IDictionary]) {
+        return $null
+    }
+    try {
+        $subject = [ordered]@{} + $record.subject
+        $subject['complete'] = $true
+        Assert-StalePrEvidence `
+            -Evidence $subject -Policy $Policy
+        $binding = Get-StalePrEvidenceBinding $subject
+        $expectedDigest = Get-StalePrDigest $binding
+        if ([string]$record.evidenceDigest -cne $expectedDigest) {
+            return $null
+        }
+        if ([long]$subject.pullRequestId -ne $PullRequestId -or
+            [string]$subject.status -cne 'active' -or
+            [bool]$subject.isDraft -or
+            [string]$subject.targetRef -cne
+                [string]$Policy.scope.targetRef) {
+            return $null
+        }
+        $subjectCreationUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$subject.creationUtc) `
+            -Name creationUtc
+        $itemCreationUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$Item.creationUtc) `
+            -Name creationUtc
+        $subjectLatestActivityUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$subject.latestActivityUtc) `
+            -Name latestActivityUtc
+        if ($subjectCreationUtc -ne $itemCreationUtc -or
+            $subjectCreationUtc -ge $CutoffUtc -or
+            $subjectLatestActivityUtc -le $CutoffUtc) {
+            return $null
+        }
+        $itemDict = if ($Item -is [Collections.IDictionary]) {
+            $Item
+        } else { $null }
+        foreach ($check in @(
+                @{ Name = 'projectId'; CaseSensitive = $false }
+                @{ Name = 'repositoryId'; CaseSensitive = $false }
+                @{ Name = 'sourceRef'; CaseSensitive = $true }
+                @{ Name = 'sourceCommit'; CaseSensitive = $false }
+                @{ Name = 'targetCommit'; CaseSensitive = $false }
+                @{ Name = 'activityDigest'; CaseSensitive = $true }
+            )) {
+            $hasProp = if ($null -ne $itemDict) {
+                $itemDict.Contains($check.Name) -and
+                $null -ne $itemDict[$check.Name]
+            }
+            else {
+                $null -ne $Item.PSObject.Properties[$check.Name] -and
+                $null -ne $Item.($check.Name)
+            }
+            if ($hasProp) {
+                $itemVal = [string]$Item.($check.Name)
+                $subjVal = [string]$subject[$check.Name]
+                if ($check.CaseSensitive) {
+                    if ($itemVal -cne $subjVal) { return $null }
+                }
+                else {
+                    if ($itemVal -ine $subjVal) { return $null }
+                }
+            }
+        }
+        $hasIteration = if ($null -ne $itemDict) {
+            $itemDict.Contains('iterationId') -and
+            $null -ne $itemDict['iterationId']
+        }
+        else {
+            $null -ne $Item.PSObject.Properties['iterationId'] -and
+            $null -ne $Item.iterationId
+        }
+        if ($hasIteration) {
+            if ($Item.iterationId -is [bool] -or
+                [int]$Item.iterationId -ne [int]$subject.iterationId) {
+                return $null
+            }
+        }
+        $hasActivityUtc = if ($null -ne $itemDict) {
+            $itemDict.Contains('latestActivityUtc') -and
+            $null -ne $itemDict['latestActivityUtc']
+        }
+        else {
+            $null -ne $Item.PSObject.Properties['latestActivityUtc'] -and
+            $null -ne $Item.latestActivityUtc
+        }
+        if ($hasActivityUtc) {
+            $itemActivityUtc = ConvertTo-StalePrUtc `
+                -Value ([string]$Item.latestActivityUtc) `
+                -Name latestActivityUtc
+            if ($itemActivityUtc -ne $subjectLatestActivityUtc) {
+                return $null
+            }
+        }
+        return $record
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-StalePrActivityProof {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)]
+        [Collections.IDictionary]$Evidence,
+        [Parameter(Mandatory)][string]$PolicyDigest,
+        [AllowNull()][byte[]]$Key
+    )
+    $state = Get-StalePrActivityProofState `
+        -LifecycleRoot $LifecycleRoot `
+        -PullRequestId $PullRequestId `
+        -Key $Key
+    if (-not [bool]$state.valid) {
+        return
+    }
+    try {
+        $binding = Get-StalePrEvidenceBinding $Evidence
+        $evidenceDigest = Get-StalePrDigest $binding
+        if ($null -ne $state.latest -and
+            [string]$state.latest.state -ceq 'recent-activity' -and
+            [string]$state.latest.policyDigest -ceq $PolicyDigest -and
+            [string]$state.latest.evidenceDigest -ceq $evidenceDigest) {
+            return
+        }
+        $nextSequence = [long]$state.maxSequence + 1L
+        $shortHash = $evidenceDigest.Substring(
+            'v1:sha256:'.Length, 16)
+        $payload = [ordered]@{
+            schemaVersion = 1
+            kind = 'stale-pr-activity-proof-v1'
+            sequence = $nextSequence
+            pullRequestId = [long]$PullRequestId
+            state = 'recent-activity'
+            policyDigest = $PolicyDigest
+            evidenceDigest = $evidenceDigest
+            subject = $binding
+        }
+        $relativePath = (
+            "activity-proofs\$PullRequestId\" +
+            "seq-$('{0:D8}' -f $nextSequence)-$shortHash.json")
+        [void](Write-StalePrSignedRecord `
+            -LifecycleRoot $LifecycleRoot `
+            -RelativePath $relativePath `
+            -Payload $payload `
+            -Key $Key)
+    }
+    catch {
+    }
+}
+
+function Disable-StalePrCachedActivityProof {
+    param(
+        [AllowNull()][string]$LifecycleRoot,
+        [Parameter(Mandatory)][long]$PullRequestId,
+        [Parameter(Mandatory)][string]$PolicyDigest,
+        [AllowNull()][byte[]]$Key
+    )
+    $state = Get-StalePrActivityProofState `
+        -LifecycleRoot $LifecycleRoot `
+        -PullRequestId $PullRequestId `
+        -Key $Key
+    if (-not [bool]$state.valid -or
+        $null -eq $state.latest -or
+        [string]$state.latest.state -cne 'recent-activity') {
+        return
+    }
+    try {
+        $nextSequence = [long]$state.maxSequence + 1L
+        $payload = [ordered]@{
+            schemaVersion = 1
+            kind = 'stale-pr-activity-proof-v1'
+            sequence = $nextSequence
+            pullRequestId = [long]$PullRequestId
+            state = 'withheld'
+            policyDigest = $PolicyDigest
+            evidenceDigest = [string]$state.latest.evidenceDigest
+            subject = [ordered]@{} + $state.latest.subject
+        }
+        $relativePath = (
+            "activity-proofs\$PullRequestId\" +
+            "seq-$('{0:D8}' -f $nextSequence)-withheld.json")
+        [void](Write-StalePrSignedRecord `
+            -LifecycleRoot $LifecycleRoot `
+            -RelativePath $relativePath `
+            -Payload $payload `
+            -Key $Key)
+    }
+    catch {
+    }
+}
+
 function Get-StalePrPriorWriteBlock {
     param(
         [Parameter(Mandatory)][string]$LifecycleRoot,
@@ -967,9 +1406,17 @@ function New-StalePrAzureDevOpsProvider {
     }
     $runBudget = [pscustomobject]@{
         Count = 0
+        Ceiling = $readCeiling
         ExplanationCount = 0
         DeadlineUtc = (& $getUtcNow).
             AddSeconds($maximumSeconds)
+    }
+    $providerPushDates = @{}
+    $cacheState = [pscustomobject]@{
+        LifecycleRoot = ''
+        Key = $null
+        CutoffUtc = $null
+        Stage = 'decision'
     }
     $convertUtcCommand =
         ${function:ConvertTo-StalePrUtc}
@@ -979,6 +1426,10 @@ function New-StalePrAzureDevOpsProvider {
         ${function:Get-StalePrFailureReason}
     $canonicalJsonCommand =
         ${function:ConvertTo-ApprovedOwnerV2CanonicalJson}
+    $readCachedPushDateCommand =
+        ${function:Read-StalePrCachedPushDate}
+    $writeCachedPushDateCommand =
+        ${function:Write-StalePrCachedPushDate}
     $tokenProcessCommand =
         (Get-Command Invoke-StalePrTokenProcess `
             -CommandType Function).ScriptBlock
@@ -1219,6 +1670,7 @@ function New-StalePrAzureDevOpsProvider {
     $readEvidence = {
         param([long]$PullRequestId)
         $pushDates = @{}
+        $cachedPushEntries = [Collections.Generic.List[object]]::new()
         $pr = & $read '?api-version=7.1' `
             $PullRequestId $runBudget
         if ($pr.repository -isnot [Collections.IDictionary] -or
@@ -1310,13 +1762,56 @@ function New-StalePrAzureDevOpsProvider {
                 if ($pushId -lt 1) {
                     throw 'stale-pr-push-time-unknown'
                 }
+                $iterId = [int]$iteration.id
+                $iterSourceCommit = if (
+                    $iteration.sourceRefCommit -is
+                        [Collections.IDictionary]
+                ) {
+                    ([string]$iteration.sourceRefCommit.commitId).
+                        ToLowerInvariant()
+                }
+                else { $sourceCommit.ToLowerInvariant() }
+                $iterTargetCommit = if (
+                    $iteration.targetRefCommit -is
+                        [Collections.IDictionary]
+                ) {
+                    ([string]$iteration.targetRefCommit.commitId).
+                        ToLowerInvariant()
+                }
+                else { $targetCommit.ToLowerInvariant() }
+                $providerPushKey = (
+                    "$projectId|$repositoryId|$PullRequestId|" +
+                    "$iterId|$pushId|$iterSourceCommit|$iterTargetCommit")
+                $usedCachedPush = $false
                 $pushDate = [string]$iteration.push.date
                 if ([string]::IsNullOrWhiteSpace($pushDate)) {
                     $pushKey = [string]$pushId
                     if ($pushDates.ContainsKey($pushKey)) {
                         $pushDate = [string]$pushDates[$pushKey]
                     }
-                    else {
+                    elseif ([string]$cacheState.Stage -cne 'prewrite' -and
+                        $providerPushDates.ContainsKey($providerPushKey)) {
+                        $pushDate = [string]$providerPushDates[$providerPushKey]
+                        $usedCachedPush = $true
+                    }
+                    elseif ([string]$cacheState.Stage -cne 'prewrite') {
+                        $cachedPushDate = & $readCachedPushDateCommand `
+                            -LifecycleRoot ([string]$cacheState.LifecycleRoot) `
+                            -Key $cacheState.Key `
+                            -ProjectId $projectId `
+                            -RepositoryId $repositoryId `
+                            -PullRequestId $PullRequestId `
+                            -IterationId $iterId `
+                            -PushId $pushId `
+                            -SourceCommit $iterSourceCommit `
+                            -TargetCommit $iterTargetCommit
+                        if (-not [string]::IsNullOrWhiteSpace($cachedPushDate)) {
+                            $pushDate = $cachedPushDate
+                            $providerPushDates[$providerPushKey] = $pushDate
+                            $usedCachedPush = $true
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($pushDate)) {
                         try {
                             $push = & $readPush $pushId $runBudget
                         }
@@ -1326,7 +1821,7 @@ function New-StalePrAzureDevOpsProvider {
                             if ($pushFailure -cin @(
                                     'stale-pr-read-budget-exhausted',
                                     'stale-pr-deadline-exhausted')) {
-                                throw $pushFailure
+                                throw
                             }
                             throw 'stale-pr-push-time-unknown'
                         }
@@ -1347,6 +1842,18 @@ function New-StalePrAzureDevOpsProvider {
                         }
                         $pushDate = [string]$push.date
                         $pushDates[$pushKey] = $pushDate
+                        $providerPushDates[$providerPushKey] = $pushDate
+                        & $writeCachedPushDateCommand `
+                            -LifecycleRoot ([string]$cacheState.LifecycleRoot) `
+                            -Key $cacheState.Key `
+                            -ProjectId $projectId `
+                            -RepositoryId $repositoryId `
+                            -PullRequestId $PullRequestId `
+                            -IterationId $iterId `
+                            -PushId $pushId `
+                            -SourceCommit $iterSourceCommit `
+                            -TargetCommit $iterTargetCommit `
+                            -OccurredUtc $pushDate
                     }
                 }
                 try {
@@ -1355,6 +1862,16 @@ function New-StalePrAzureDevOpsProvider {
                 }
                 catch {
                     throw 'stale-pr-push-time-unknown'
+                }
+                if ($usedCachedPush) {
+                    [void]$cachedPushEntries.Add(@{
+                            ActivityIndex = $activity.Count
+                            IterationId = $iterId
+                            PushId = $pushId
+                            ProviderPushKey = $providerPushKey
+                            SourceCommit = $iterSourceCommit
+                            TargetCommit = $iterTargetCommit
+                        })
                 }
                 [void]$activity.Add([ordered]@{
                         kind = 'source-push'
@@ -1411,6 +1928,79 @@ function New-StalePrAzureDevOpsProvider {
             @($activityTimes) + @($creationUtc) |
                 Sort-Object |
                 Select-Object -Last 1)[0]
+        if ($cachedPushEntries.Count -gt 0 -and
+            ([string]$cacheState.Stage -ceq 'prewrite' -or
+                ($null -ne $cacheState.CutoffUtc -and
+                    $latestActivity -le ([DateTime]$cacheState.CutoffUtc)))) {
+            foreach ($cachedEntry in $cachedPushEntries) {
+                $pushId = [long]$cachedEntry.PushId
+                $pushKey = [string]$pushId
+                if (-not $pushDates.ContainsKey($pushKey)) {
+                    try {
+                        $push = & $readPush $pushId $runBudget
+                    }
+                    catch {
+                        $pushFailure =
+                            & $failureReasonCommand $_
+                        if ($pushFailure -cin @(
+                                'stale-pr-read-budget-exhausted',
+                                'stale-pr-deadline-exhausted')) {
+                            throw
+                        }
+                        throw 'stale-pr-push-time-unknown'
+                    }
+                    if ($push -isnot
+                            [Collections.IDictionary] -or
+                        [long]$push.pushId -ne $pushId -or
+                        $push.repository -isnot
+                            [Collections.IDictionary] -or
+                        [string]$push.repository.id -ine
+                            $repositoryId -or
+                        $push.repository.project -isnot
+                            [Collections.IDictionary] -or
+                        [string]$push.repository.project.id -ine
+                            $projectId -or
+                        [string]::IsNullOrWhiteSpace(
+                            [string]$push.date)) {
+                        throw 'stale-pr-push-time-unknown'
+                    }
+                    $pushDates[$pushKey] = [string]$push.date
+                }
+                $livePushDate = [string]$pushDates[$pushKey]
+                try {
+                    $livePushUtc = & $convertUtcCommand `
+                        -Value $livePushDate -Name pushDate
+                }
+                catch {
+                    throw 'stale-pr-push-time-unknown'
+                }
+                $providerPushDates[[string]$cachedEntry.ProviderPushKey] =
+                    $livePushUtc.ToString('o')
+                & $writeCachedPushDateCommand `
+                    -LifecycleRoot ([string]$cacheState.LifecycleRoot) `
+                    -Key $cacheState.Key `
+                    -ProjectId $projectId `
+                    -RepositoryId $repositoryId `
+                    -PullRequestId $PullRequestId `
+                    -IterationId ([int]$cachedEntry.IterationId) `
+                    -PushId $pushId `
+                    -SourceCommit ([string]$cachedEntry.SourceCommit) `
+                    -TargetCommit ([string]$cachedEntry.TargetCommit) `
+                    -OccurredUtc ($livePushUtc.ToString('o'))
+                $activity[[int]$cachedEntry.ActivityIndex].occurredUtc =
+                    $livePushUtc.ToString('o')
+            }
+            $activityTimes = @($activity |
+                ForEach-Object {
+                    & $convertUtcCommand `
+                        -Value ([string]$_.occurredUtc) `
+                        -Name activityUtc
+                })
+            $latestActivity = @(
+                @($activityTimes) + @($creationUtc) |
+                    Sort-Object |
+                    Select-Object -Last 1)[0]
+        }
         return [ordered]@{
             schemaVersion = 1
             projectId = $projectId
@@ -1627,6 +2217,8 @@ function New-StalePrAzureDevOpsProvider {
     }.GetNewClosure()
     $handler | Add-Member -NotePropertyName StalePrBudget `
         -NotePropertyValue $runBudget
+    $handler | Add-Member -NotePropertyName StalePrCache `
+        -NotePropertyValue $cacheState
     return $handler
 }
 
@@ -1691,6 +2283,12 @@ function Complete-StalePrExplanation {
         [AllowNull()][object]$Diagnostic,
         [AllowNull()][object]$KnownReadback
     )
+    $providerBudget = if (
+        $null -ne $Provider.PSObject.Properties['StalePrBudget']
+    ) {
+        $Provider.StalePrBudget
+    }
+    else { $null }
     $readback = $KnownReadback
     if ($null -eq $readback) {
         try {
@@ -1704,7 +2302,8 @@ function Complete-StalePrExplanation {
         catch {
             $Diagnostic = [ordered]@{
                 kind = 'explanation-readback-failed'
-                budget = Get-StalePrBudgetDiagnostic $_
+                budget = Get-StalePrBudgetDiagnostic $_ `
+                    -Budget $providerBudget
             }
         }
     }
@@ -1877,13 +2476,20 @@ function Invoke-StalePrExplanation {
             -AttemptedWrites $attempts -Diagnostic $diagnostic
     }
     catch {
+        $providerBudget = if (
+            $null -ne $Provider.PSObject.Properties['StalePrBudget']
+        ) {
+            $Provider.StalePrBudget
+        }
+        else { $null }
         return [ordered]@{
             state = 'unknown'
             providerWrites = $attempts
             unconfirmedWrites = $attempts
             diagnostic = @{
                 kind = 'explanation-preflight-or-audit-failed'
-                budget = Get-StalePrBudgetDiagnostic $_
+                budget = Get-StalePrBudgetDiagnostic $_ `
+                    -Budget $providerBudget
             }
             event = $null
         }
@@ -1962,6 +2568,24 @@ function Invoke-StalePrLifecycle {
         $Key.Length -ne 32) {
         throw 'Stale PR lifecycle requires one UTC cutoff and service key.'
     }
+    $providerBudget = if (
+        $null -ne $Provider.PSObject.Properties['StalePrBudget']
+    ) {
+        $Provider.StalePrBudget
+    }
+    else { $null }
+    $providerCache = if (
+        $null -ne $Provider.PSObject.Properties['StalePrCache']
+    ) {
+        $Provider.StalePrCache
+    }
+    else { $null }
+    if ($null -ne $providerCache) {
+        $providerCache.LifecycleRoot = $LifecycleRoot
+        $providerCache.Key = $Key
+        $providerCache.CutoffUtc = $CutoffUtc
+        $providerCache.Stage = 'decision'
+    }
     $explanationEnabled = Test-StalePrExplanationAuthority $Policy
     $identity = & $Provider Identity @{}
     if ([string]$identity.id -ine [string]$Policy.actor.id -or
@@ -2017,12 +2641,79 @@ function Invoke-StalePrLifecycle {
     $candidateLimit = [Math]::Min(
         $candidateCount,
         [int]$Policy.authority.maxCandidatesPerRun)
+    $cachedProofById = @{}
+    $unprovenCandidateIds =
+        [Collections.Generic.HashSet[long]]::new()
+    if ($null -ne $providerBudget) {
+        for ($scanIndex = 0;
+            $scanIndex -lt $candidateLimit;
+            $scanIndex++) {
+            $scanItem = $oldCandidates[$scanIndex]
+            if ([string]$scanItem.status -cne 'active' -or
+                [bool]$scanItem.isDraft -or
+                [string]$scanItem.targetRef -cne
+                    [string]$Policy.scope.targetRef) {
+                continue
+            }
+            try {
+                $scanCreation = ConvertTo-StalePrUtc `
+                    -Value ([string]$scanItem.creationUtc) `
+                    -Name creationUtc
+            }
+            catch {
+                continue
+            }
+            if ($scanCreation -ge $CutoffUtc) { continue }
+            $scanId = [long]$scanItem.pullRequestId
+            $scanPriorBlock = $null
+            try {
+                $scanPriorBlock =
+                    Get-StalePrPriorWriteBlock `
+                        -LifecycleRoot $LifecycleRoot `
+                        -PullRequestId $scanId -Key $Key
+            }
+            catch {
+                $scanPriorBlock = 'prior-audit-unknown'
+            }
+            if ($scanPriorBlock) { continue }
+            $cachedProof = Get-StalePrCachedActivityProof `
+                -LifecycleRoot $LifecycleRoot `
+                -PullRequestId $scanId `
+                -Item $scanItem `
+                -CutoffUtc $CutoffUtc `
+                -Policy $Policy `
+                -PolicyDigest $policyDigest `
+                -Key $Key
+            if ($null -ne $cachedProof) {
+                $cachedProofById[$scanId] = $cachedProof
+            }
+            else {
+                [void]$unprovenCandidateIds.Add($scanId)
+            }
+        }
+    }
+    $remainingUnproven = $unprovenCandidateIds.Count
+    $budgetExhausted = $false
+    $deferredNextPullRequestId = $null
+    $firstCachedPullRequestId = $null
     $nextPullRequestId = $null
     for ($candidateIndex = 0;
         $candidateIndex -lt $candidateLimit;
         $candidateIndex++) {
         $item = $oldCandidates[$candidateIndex]
         $id = [long]$item.pullRequestId
+        if ($budgetExhausted) {
+            if ($cachedProofById.ContainsKey($id)) {
+                [void]$reviewEligible.Add($id)
+                [void]$results.Add([ordered]@{
+                        pullRequestId = $id
+                        state = 'no-op'
+                        reason = 'recent-activity'
+                        providerWrites = 0
+                    })
+            }
+            continue
+        }
         if ($candidateCount -gt 0) {
             $nextPullRequestId = [long]$oldCandidates[
                 ($candidateIndex + 1) % $candidateCount
@@ -2054,9 +2745,12 @@ function Invoke-StalePrLifecycle {
                         reason = $reason
                         providerWrites = 0
                         diagnostic =
-                            Get-StalePrBudgetDiagnostic $_
+                            Get-StalePrBudgetDiagnostic $_ `
+                                -Budget $providerBudget
                     })
-                break
+                $budgetExhausted = $true
+                $deferredNextPullRequestId = $nextPullRequestId
+                continue
             }
             $unknown++
             [void]$results.Add([ordered]@{
@@ -2098,7 +2792,46 @@ function Invoke-StalePrLifecycle {
                 })
             continue
         }
+        if ($unprovenCandidateIds.Contains($id)) {
+            $remainingUnproven--
+        }
+        $useCachedProof = $false
+        if ($null -ne $providerBudget -and
+            $cachedProofById.ContainsKey($id)) {
+            if ($null -ne $firstCachedPullRequestId) {
+                $useCachedProof = $true
+            }
+            else {
+                $remainingReads = [int]$providerBudget.Ceiling -
+                    [int]$providerBudget.Count
+                $requiredReads = if ($remainingUnproven -gt 0) {
+                    ($remainingUnproven * 4) + 4
+                }
+                else {
+                    4
+                }
+                if ($remainingReads -lt $requiredReads) {
+                    $useCachedProof = $true
+                }
+            }
+        }
+        if ($useCachedProof) {
+            if ($null -eq $firstCachedPullRequestId) {
+                $firstCachedPullRequestId = $id
+            }
+            [void]$reviewEligible.Add($id)
+            [void]$results.Add([ordered]@{
+                    pullRequestId = $id
+                    state = 'no-op'
+                    reason = 'recent-activity'
+                    providerWrites = 0
+                })
+            continue
+        }
         try {
+            if ($null -ne $providerCache) {
+                $providerCache.Stage = 'decision'
+            }
             $evidence = & $Provider ReadEvidence @{
                 pullRequestId = $id
             }
@@ -2123,10 +2856,18 @@ function Invoke-StalePrLifecycle {
                         reason = $reason
                         providerWrites = 0
                         diagnostic =
-                            Get-StalePrBudgetDiagnostic $_
+                            Get-StalePrBudgetDiagnostic $_ `
+                                -Budget $providerBudget
                     })
-                break
+                $budgetExhausted = $true
+                $deferredNextPullRequestId = $nextPullRequestId
+                continue
             }
+            Disable-StalePrCachedActivityProof `
+                -LifecycleRoot $LifecycleRoot `
+                -PullRequestId $id `
+                -PolicyDigest $policyDigest `
+                -Key $Key
             $unknown++
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
@@ -2137,6 +2878,11 @@ function Invoke-StalePrLifecycle {
             continue
         }
         if (-not [bool]$evidence.complete) {
+            Disable-StalePrCachedActivityProof `
+                -LifecycleRoot $LifecycleRoot `
+                -PullRequestId $id `
+                -PolicyDigest $policyDigest `
+                -Key $Key
             $unknown++
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
@@ -2147,6 +2893,11 @@ function Invoke-StalePrLifecycle {
             continue
         }
         if ([string]$evidence.status -ceq 'abandoned') {
+            Disable-StalePrCachedActivityProof `
+                -LifecycleRoot $LifecycleRoot `
+                -PullRequestId $id `
+                -PolicyDigest $policyDigest `
+                -Key $Key
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
                     state = 'no-op'
@@ -2159,6 +2910,11 @@ function Invoke-StalePrLifecycle {
             [bool]$evidence.isDraft -or
             [string]$evidence.targetRef -cne
                 [string]$Policy.scope.targetRef) {
+            Disable-StalePrCachedActivityProof `
+                -LifecycleRoot $LifecycleRoot `
+                -PullRequestId $id `
+                -PolicyDigest $policyDigest `
+                -Key $Key
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
                     state = 'no-op'
@@ -2167,12 +2923,23 @@ function Invoke-StalePrLifecycle {
                 })
             continue
         }
-        if ((ConvertTo-StalePrUtc `
-                -Value ([string]$evidence.creationUtc) `
-                -Name creationUtc) -ge $CutoffUtc -or
-            (ConvertTo-StalePrUtc `
-                -Value ([string]$evidence.latestActivityUtc) `
-                -Name latestActivityUtc) -gt $CutoffUtc) {
+        $evidenceCreationUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$evidence.creationUtc) `
+            -Name creationUtc
+        $evidenceLatestActivityUtc = ConvertTo-StalePrUtc `
+            -Value ([string]$evidence.latestActivityUtc) `
+            -Name latestActivityUtc
+        if ($evidenceCreationUtc -ge $CutoffUtc -or
+            $evidenceLatestActivityUtc -gt $CutoffUtc) {
+            if ($evidenceCreationUtc -lt $CutoffUtc -and
+                $evidenceLatestActivityUtc -gt $CutoffUtc) {
+                Write-StalePrActivityProof `
+                    -LifecycleRoot $LifecycleRoot `
+                    -PullRequestId $id `
+                    -Evidence $evidence `
+                    -PolicyDigest $policyDigest `
+                    -Key $Key
+            }
             [void]$reviewEligible.Add($id)
             [void]$results.Add([ordered]@{
                     pullRequestId = $id
@@ -2182,9 +2949,17 @@ function Invoke-StalePrLifecycle {
                 })
             continue
         }
+        Disable-StalePrCachedActivityProof `
+            -LifecycleRoot $LifecycleRoot `
+            -PullRequestId $id `
+            -PolicyDigest $policyDigest `
+            -Key $Key
         $decisionDigest = Get-StalePrDigest (
             Get-StalePrEvidenceBinding $evidence)
         try {
+            if ($null -ne $providerCache) {
+                $providerCache.Stage = 'prewrite'
+            }
             $prewrite = & $Provider ReadEvidence @{
                 pullRequestId = $id
             }
@@ -2211,9 +2986,12 @@ function Invoke-StalePrLifecycle {
                         reason = $reason
                         providerWrites = 0
                         diagnostic =
-                            Get-StalePrBudgetDiagnostic $_
+                            Get-StalePrBudgetDiagnostic $_ `
+                                -Budget $providerBudget
                     })
-                break
+                $budgetExhausted = $true
+                $deferredNextPullRequestId = $nextPullRequestId
+                continue
             }
             $unknown++
             [void]$results.Add([ordered]@{
@@ -2404,6 +3182,12 @@ function Invoke-StalePrLifecycle {
                 })
             break
         }
+    }
+    if ($budgetExhausted) {
+        $nextPullRequestId = $deferredNextPullRequestId
+    }
+    elseif ($null -ne $firstCachedPullRequestId) {
+        $nextPullRequestId = $firstCachedPullRequestId
     }
     return [pscustomobject][ordered]@{
         schemaVersion = 1
