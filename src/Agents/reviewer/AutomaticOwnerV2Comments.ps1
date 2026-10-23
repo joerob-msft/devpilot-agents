@@ -4,6 +4,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:AutomaticOwnerV2Capability = 'bpm-test-ownership@1'
+$script:AutomaticNamedAreEqualRoot = 'named-areequal-v1'
+$script:AutomaticContextualRoot = 'contextual-conventions-v1'
 $script:AutomaticOwnerV2MaximumCreatesPerRun = 5
 $script:AutomaticOwnerV2MaximumCreatesPerPullRequest = 50
 
@@ -63,8 +65,20 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$DeliveryRoot,
-        [Parameter(Mandatory)][string]$RepoRoot
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
+        [string]$Delivery = 'owner'
     )
+    if ($Delivery -ceq 'named-areequal') {
+        $base = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
+            -Kind durable-state -RepositoryRoot $RepoRoot -Create
+        $DeliveryRoot = Join-Path $base $script:AutomaticNamedAreEqualRoot
+    }
+    elseif ($Delivery -ceq 'contextual-conventions') {
+        $base = Resolve-AgentTrustedRoot -Path $DeliveryRoot `
+            -Kind durable-state -RepositoryRoot $RepoRoot -Create
+        $DeliveryRoot = Join-Path $base $script:AutomaticContextualRoot
+    }
     $created = $false
     $root = Resolve-AgentTrustedRoot -Path $DeliveryRoot -Kind durable-state `
         -RepositoryRoot $RepoRoot -Create -CreatedByCaller ([ref]$created)
@@ -76,7 +90,12 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
             New-Item -ItemType Directory -Path $path | Out-Null
         }
     }
-    $keyPath = Join-Path $root 'keys\owner-v2-service-authorization.hmac'
+    $keyPath = Join-Path $root (
+        'keys\' + $(if ($Delivery -ceq 'named-areequal') {
+            'named-areequal-service-authorization.hmac'
+        } elseif ($Delivery -ceq 'contextual-conventions') {
+            'contextual-conventions-service-authorization.hmac'
+        } else { 'owner-v2-service-authorization.hmac' }))
     if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
         $bytes = [byte[]]::new(32)
         [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
@@ -87,8 +106,17 @@ function Initialize-AutomaticOwnerV2DeliveryRoot {
 }
 
 function Get-AutomaticOwnerV2ServiceKey {
-    param([Parameter(Mandatory)][string]$DeliveryRoot)
-    $path = Join-Path $DeliveryRoot 'keys\owner-v2-service-authorization.hmac'
+    param(
+        [Parameter(Mandatory)][string]$DeliveryRoot,
+        [ValidateSet('owner', 'named-areequal', 'contextual-conventions')]
+        [string]$Delivery = 'owner'
+    )
+    $path = Join-Path $DeliveryRoot (
+        'keys\' + $(if ($Delivery -ceq 'named-areequal') {
+            'named-areequal-service-authorization.hmac'
+        } elseif ($Delivery -ceq 'contextual-conventions') {
+            'contextual-conventions-service-authorization.hmac'
+        } else { 'owner-v2-service-authorization.hmac' }))
     [void](Assert-AgentTrustedFile -Path $path -AllowedRoot $DeliveryRoot -Private)
     $key = [IO.File]::ReadAllBytes($path)
     if ($key.Length -ne 32) {
@@ -665,6 +693,51 @@ function Invoke-AutomaticOwnerV2Comments {
         $repaired = @(Repair-AutomaticOwnerV2Intents `
                 -DeliveryRoot $DeliveryRoot -Key $Key -Provider $Provider `
                 -Evidence $Evidence)
+        $authenticatedPriorList = [Collections.Generic.List[object]]::new()
+        foreach ($item in @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                -DeliveryRoot $DeliveryRoot -Key $Key `
+                -Delivery 'owner')) {
+            [void]$authenticatedPriorList.Add($item)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DeliveryRoot) -and
+            (Test-Path -LiteralPath $DeliveryRoot -PathType Container)) {
+            foreach ($siblingDelivery in @('named-areequal', 'contextual-conventions')) {
+                $siblingRoot = if ($siblingDelivery -ceq 'named-areequal') {
+                    Join-Path $DeliveryRoot $script:AutomaticNamedAreEqualRoot
+                }
+                else {
+                    Join-Path $DeliveryRoot $script:AutomaticContextualRoot
+                }
+                $siblingKeyFile = if ($siblingDelivery -ceq 'named-areequal') {
+                    'keys\named-areequal-service-authorization.hmac'
+                }
+                else {
+                    'keys\contextual-conventions-service-authorization.hmac'
+                }
+                $siblingKeyPath = Join-Path $siblingRoot $siblingKeyFile
+                if (-not (Test-Path -LiteralPath $siblingRoot -PathType Container) -or
+                    -not (Test-Path -LiteralPath (Join-Path $siblingRoot 'events') -PathType Container) -or
+                    -not (Test-Path -LiteralPath $siblingKeyPath -PathType Leaf)) {
+                    continue
+                }
+                [byte[]]$siblingKey = $null
+                try {
+                    $siblingKey = Get-AutomaticOwnerV2ServiceKey `
+                        -DeliveryRoot $siblingRoot -Delivery $siblingDelivery
+                    foreach ($item in @(Get-ApprovedOwnerV2AuthenticatedPriorComments `
+                            -DeliveryRoot $siblingRoot -Key $siblingKey `
+                            -Delivery $siblingDelivery)) {
+                        [void]$authenticatedPriorList.Add($item)
+                    }
+                }
+                finally {
+                    if ($null -ne $siblingKey) {
+                        [Array]::Clear($siblingKey, 0, $siblingKey.Length)
+                    }
+                }
+            }
+        }
+        $authenticatedPriorComments = @($authenticatedPriorList.ToArray())
         $history = Get-AutomaticOwnerV2DeliveryHistory `
             -DeliveryRoot $DeliveryRoot -Key $Key -Evidence $Evidence
         $prRemaining = if ($history.BlockedMarkers.Count -gt 0) {
@@ -782,7 +855,8 @@ function Invoke-AutomaticOwnerV2Comments {
                 -Kind 'owner-v2-discussion-snapshot'
             $liveState = Assert-ApprovedOwnerV2LiveRead `
                 -Evidence $Evidence -Approval $authorization -Live $initial `
-                -Selections $selections -ExpectedSnapshotSha256 $snapshot
+                -Selections $selections -ExpectedSnapshotSha256 $snapshot `
+                -AuthenticatedPriorComments $authenticatedPriorComments
             $iterationId = [int]$initial.Snapshot.CurrentIterationId
             if ($iterationId -lt 1) {
                 throw 'Current pull request iteration is missing.'
@@ -857,7 +931,8 @@ function Invoke-AutomaticOwnerV2Comments {
                 $freshState = Assert-ApprovedOwnerV2LiveRead `
                     -Evidence $Evidence -Approval $authorization -Live $fresh `
                     -Selections @($selection) `
-                    -ExpectedSnapshotSha256 $expectedSnapshot
+                    -ExpectedSnapshotSha256 $expectedSnapshot `
+                    -AuthenticatedPriorComments $authenticatedPriorComments
                 Assert-AutomaticOwnerV2EvidenceCurrent `
                     -Evidence $Evidence -Intent $intent
                 $classification = [string]$freshState.Classifications[
