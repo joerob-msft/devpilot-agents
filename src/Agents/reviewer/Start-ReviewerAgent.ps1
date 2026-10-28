@@ -1785,12 +1785,25 @@ function New-ReviewerDeliveryPayload {
     param(
         [AllowEmptyString()][string]$Summary, [hashtable]$Presentation, [object[]]$Findings = @(),
         [object[]]$Postable = @(), [object[]]$ThreadReplies = @(), [string]$RecommendedVote,
-        [hashtable]$Counts, [int]$Reported, [int]$Publishable
+        [hashtable]$Counts, [int]$Reported, [int]$Publishable,
+        [int]$PrId = 0, [string]$SourceCommit = '', [string]$SummaryContext = ''
     )
     $payload = @{
         schemaVersion = 1; comments = @{}; replies = @{}
         summary = (Format-ReviewerSummaryComment -Summary $Summary -Presentation $Presentation `
             -Findings $Findings -RecommendedVote $RecommendedVote -Counts $Counts -Reported $Reported -Publishable $Publishable)
+    }
+    if ($PrId -gt 0 -and $SourceCommit -match '^[0-9a-fA-F]{40}$') {
+        $signal = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value @{
+                sourceCommit = $SourceCommit.ToLowerInvariant(); findings = @($Findings)
+                recommendedVote = $RecommendedVote; publishable = $Publishable
+                risk = $Presentation.RiskLevel; securityApplied = $Presentation.SecurityReviewApplied
+                capReached = $Presentation.FindingLimitReached; omitted = $Presentation.OmittedFindingCount
+                validation = @($Presentation.ValidationItems | Where-Object { $null -ne $_ } |
+                    ForEach-Object { $_.status } | Sort-Object -Unique)
+                context = $SummaryContext
+            })
+        $payload.summary += "`n`n<!-- devpilot-review-summary:v1:$cfgRepoId`:$PrId`:$signal -->"
     }
     foreach ($finding in $Postable) {
         $payload.comments[(Get-ReviewerDeliveryItemKey -Kind finding -Item $finding)] = Format-ReviewerFindingComment -Finding $finding
@@ -2740,6 +2753,7 @@ function ConvertTo-ReviewerThread {
                 contentFingerprint = (Get-ReviewerTextSha256 -Text ([string](Get-ReviewerHashValue -Container $rc -Key 'content' -Default '')))
                 commentType       = (Get-ReviewerHashValue -Container $rc -Key 'commentType' -Default '')
                 isDeleted         = [bool](Get-ReviewerHashValue -Container $rc -Key 'isDeleted' -Default $false)
+                publishedDate     = [string](Get-ReviewerHashValue -Container $rc -Key 'publishedDate' -Default '')
             })
     }
     return @{
@@ -3083,6 +3097,7 @@ function Write-ReviewerPreview {
         [hashtable]$Presentation = $null,
         [object[]]$ReviewSections = @(),
         [bool]$SecurityReviewApplied = $false,
+        [string]$SummaryContext = '',
         [object[]]$Postable = @(),
         [object[]]$Withheld = @(),
         [object[]]$AllFindings = @(),
@@ -3119,7 +3134,8 @@ function Write-ReviewerPreview {
     }
     $deliveryPayload = New-ReviewerDeliveryPayload -Summary $Summary -Presentation $Presentation `
         -Findings $AllFindings -Postable $Postable -ThreadReplies $ThreadReplies -RecommendedVote $RecommendedVote `
-        -Counts $counts -Reported @($AllFindings).Count -Publishable @($Postable).Count
+        -Counts $counts -Reported @($AllFindings).Count -Publishable @($Postable).Count `
+        -PrId $PrId -SourceCommit $SourceCommit -SummaryContext $SummaryContext
     [void]$lines.Add($deliveryPayload.summary)
     [void]$lines.Add("")
     [void]$lines.Add("## Candidate comments ($(@($Postable).Count))")
@@ -3352,6 +3368,112 @@ function Add-ReviewerThreadReply {
     catch {
         return @{ Attempted = $true; Error = $_.Exception.Message }
     }
+}
+
+function Get-ReviewerSummaryMarker {
+    param([string]$Content)
+    $markers = [regex]::Matches($Content, '(?m)^<!-- devpilot-review-summary:v1:[A-Za-z0-9._-]+:[1-9][0-9]*:[0-9a-f]{64} -->$')
+    if ($markers.Count -eq 1) { return $markers[0].Value }
+    return ''
+}
+
+function Get-ReviewerSummaryTarget {
+    param([object[]]$Threads, [string]$OwnerAlias, [int]$PrId)
+    if (-not $OwnerAlias) { throw 'Cannot identify the summary owner; refusing summary publication.' }
+    $candidates = @(
+        foreach ($thread in $Threads) {
+            if ([string](Get-ReviewerHashValue $thread filePath '') -or [int](Get-ReviewerHashValue $thread line 0) -gt 0) { continue }
+            $comments = @((Get-ReviewerHashValue $thread comments @()) | Where-Object { $null -ne $_ })
+            if ($comments.Count -eq 0) { continue }
+            $root = $comments[0]
+            $body = [string](Get-ReviewerHashValue $root content '')
+            $author = [string](Get-ReviewerHashValue $root authorUniqueName '')
+            $marker = Get-ReviewerSummaryMarker -Content $body
+            $marked = $marker -and $marker.StartsWith("<!-- devpilot-review-summary:v1:$cfgRepoId`:$PrId`:", [StringComparison]::Ordinal)
+            $legacy = -not $marker -and $body.StartsWith("$script:ReviewerSummaryHeading`n", [StringComparison]::Ordinal) -and
+                $body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::Ordinal) -ge 0
+            if ([bool](Get-ReviewerHashValue $root isDeleted $false) -or
+                (Get-ReviewerAlias -UniqueName $author) -ine $OwnerAlias -or
+                -not ($marked -or $legacy)) { continue }
+            $published = [DateTimeOffset]::MinValue
+            [void][DateTimeOffset]::TryParse([string](Get-ReviewerHashValue $root publishedDate ''), [ref]$published)
+            [pscustomobject]@{
+                Thread = $thread; Root = $root; Author = $author; Published = $published
+                ThreadId = [int](Get-ReviewerHashValue $thread threadId 0)
+                CommentId = [int](Get-ReviewerHashValue $root commentId 0)
+                CommentCount = $comments.Count; Content = $body
+            }
+        }
+    )
+    if (@($candidates | ForEach-Object { $_.Author } | Sort-Object -Unique).Count -gt 1) {
+        throw 'Multiple provider identities match the summary owner; refusing to guess.'
+    }
+    $target = $candidates | Sort-Object @{ Expression = 'Published'; Descending = $true },
+        @{ Expression = 'ThreadId'; Descending = $true } | Select-Object -First 1
+    if ($target -and ($target.CommentCount -ne 1 -or $target.ThreadId -le 0 -or $target.CommentId -le 0)) {
+        throw 'The current automated summary has discussion or invalid identity; refusing to replace it or create another.'
+    }
+    return $target
+}
+
+function Set-ReviewerSummaryComment {
+    param(
+        [hashtable]$Session, [int]$PrId, [string]$SourceCommit,
+        [string]$Content, [int]$ReportedFindingCount
+    )
+    $expectedStatus = Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount
+    try {
+        $threads = @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId)
+        $target = Get-ReviewerSummaryTarget -Threads $threads -OwnerAlias $OperatorAlias -PrId $PrId
+        $marker = Get-ReviewerSummaryMarker -Content $Content
+        $sameResult = $target -and $marker -and (Get-ReviewerSummaryMarker -Content $target.Content) -ceq $marker
+        $sameBody = $target -and (Get-ReviewerCommentFingerprint -Content $target.Content) -ceq
+            (Get-ReviewerCommentFingerprint -Content $Content)
+        if ($target -and ($sameResult -or $sameBody) -and $target.Thread.status -ieq $expectedStatus) {
+            return @{ Delivered = $true; Error = '' }
+        }
+        $fresh = Test-ReviewerDeliveryStillValid -Session $Session -PrId $PrId -ExpectedSourceCommit $SourceCommit
+        if (-not $fresh.Ok) { return @{ Delivered = $false; Error = $fresh.Reason } }
+        $justInTime = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+            -OwnerAlias $OperatorAlias -PrId $PrId
+        if (($target -and (-not $justInTime -or $target.ThreadId -ne $justInTime.ThreadId -or
+                    $target.CommentId -ne $justInTime.CommentId -or $target.Content -cne $justInTime.Content)) -or
+            (-not $target -and $justInTime)) {
+            return @{ Delivered = $false; Error = 'The summary changed before publication; retry the sealed review instead of creating or replacing another comment.' }
+        }
+        $writeError = ''
+        try {
+            if ($target) {
+                if (-not ($sameResult -or $sameBody)) {
+                    Invoke-AgentMcpTool -Session $Session -Name repo_pull_request_thread_write -RawText -Arguments @{
+                        action = 'update'; project = $ExpectedProject; repositoryId = $RepositoryName
+                        pullRequestId = $PrId; threadId = $target.ThreadId; commentId = $target.CommentId; content = $Content
+                    } | Out-Null
+                }
+                if ($target.Thread.status -ine $expectedStatus) {
+                    Invoke-AgentMcpTool -Session $Session -Name repo_pull_request_thread_write -RawText -Arguments @{
+                        action = 'update_status'; project = $ExpectedProject; repositoryId = $RepositoryName
+                        pullRequestId = $PrId; threadId = $target.ThreadId; status = $expectedStatus
+                    } | Out-Null
+                }
+            }
+            else {
+                $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $Content -Status $expectedStatus
+                $writeError = [string]$post.Error
+            }
+        }
+        catch { $writeError = $_.Exception.Message }
+        # A failed/uncertain update never falls back to creating another thread.
+        $confirmed = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+            -OwnerAlias $OperatorAlias -PrId $PrId
+        $expectedBody = if ($sameResult -or $sameBody) { $target.Content } else { $Content }
+        $delivered = $confirmed -and (-not $target -or ($confirmed.ThreadId -eq $target.ThreadId -and
+                $confirmed.CommentId -eq $target.CommentId)) -and
+            (Get-ReviewerCommentFingerprint -Content $confirmed.Content) -ceq (Get-ReviewerCommentFingerprint -Content $expectedBody) -and
+            $confirmed.Thread.status -ieq $expectedStatus
+        return @{ Delivered = [bool]$delivered; Error = $(if ($delivered) { '' } elseif ($writeError) { $writeError } else { 'Summary publication did not confirm on the PR.' }) }
+    }
+    catch { return @{ Delivered = $false; Error = $_.Exception.Message } }
 }
 
 function Set-ReviewerVote {
@@ -5435,16 +5557,12 @@ function Invoke-ReviewerDelivery {
         $summaryBody = if ($DeliveryPayload) { [string]$DeliveryPayload.summary } else { Format-ReviewerSummaryComment -Summary $SummaryText -Presentation $Presentation `
             -Findings $SummaryFindings -RecommendedVote $RecommendedVote -Counts $Counts -Reported $ReportedFindingCount `
             -Publishable (Get-ReviewerPublishableCount -SealedCount $SealedPublishableCount -PostableCount (@($Postable).Count)) }
-        $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
-        if ($ExistingFingerprints.Contains($summaryFingerprint)) {
-            Write-Host "  (the summary is already on the PR, not re-posted)" -ForegroundColor DarkGray
-            $outcome.SummaryPosted = $true
-        }
-        else {
-            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $summaryBody `
-                -Status (Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount)
-            if ($post.Error) { Write-Warning "  could not post the summary on PR ${PrId}: $($post.Error)" }
-            else { $outcome.SummaryPosted = $true; Write-Host "  posted the review summary." -ForegroundColor Green }
+        $summaryResult = Set-ReviewerSummaryComment -Session $Session -PrId $PrId -SourceCommit $SourceCommit `
+            -Content $summaryBody -ReportedFindingCount $ReportedFindingCount
+        $outcome.SummaryPosted = [bool]$summaryResult.Delivered
+        if ($summaryResult.Error) {
+            $outcome.Reason = "summary publication incomplete: $($summaryResult.Error)"
+            Write-Warning "  could not publish the summary on PR ${PrId}: $($summaryResult.Error)"
         }
     }
 
@@ -5500,7 +5618,7 @@ function Invoke-ReviewerDelivery {
     $summaryOk = (-not $EnableSummaryComment) -or $outcome.SummaryDelivered
     $voteOk = (-not $EnableApprovalVote) -or $outcome.VoteResolved
     $outcome.Delivered = ($commentsOk -and $threadRepliesOk -and $summaryOk -and $voteOk)
-    if (-not $outcome.Delivered) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
+    if (-not $outcome.Delivered -and -not $outcome.Reason) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
     return $outcome
 }
 
@@ -6185,7 +6303,7 @@ function Invoke-ReviewerPullRequest {
     # itself.
     $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
     $preview = Write-ReviewerPreview -PrId $prId -SourceCommit $sourceCommit -PrTitle $prTitle `
-        -Summary $summaryText -Presentation $presentation `
+        -Summary $summaryText -Presentation $presentation -SummaryContext ([string]$Bound.DigestText) `
         -Postable $postable -Withheld $withheld -AllFindings $allFindings `
         -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
         -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested

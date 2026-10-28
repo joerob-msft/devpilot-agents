@@ -782,6 +782,17 @@ Other properties worth knowing:
   finding that failed the first time would never be mentioned again. The plan is
   written to state *before* the first ADO call, so a crash mid-delivery leaves a
   retryable plan rather than an invisible partial review.
+- **One current summary per PR and operator.** New feedback can reopen a review,
+  but it updates the operator's existing automated summary instead of creating
+  another full-summary thread. A sealed result marker suppresses prose-only
+  changes when the source, findings, recommendation, risk, validation status,
+  and thread context are unchanged. Full per-run reports remain in local previews.
+  Existing automation-only summaries are adopted by provider author identity
+  and the newest publication time; other operators' comments are never edited.
+  A summary with discussion or ambiguous ownership is left unchanged and reports
+  an actionable delivery error rather than overwriting the conversation or
+  creating a fallback duplicate. Updates and status changes are independently
+  re-read; an uncertain update never falls back to creating another thread.
 - **The summary describes the review, not the delivery.** Its bounded,
   structured sections record the applied review guidance, verified behavior,
   rollout and validation analysis, security assessment, and recommendation.
