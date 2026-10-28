@@ -98,6 +98,7 @@ export function simpleInstanceRow(state: InstanceState): SimpleRow {
     details: [
       `${simpleRole(state.agent)} | ${reference}`,
       ...(failure ? [`Action needed: ${failure}`] : []),
+      ...(state.blocked?.nextRetry ? [`Recovery: ${state.blocked.nextRetry}`] : []),
       state.pullRequestTitle || "Title not reported",
       ...(state.pullRequestAuthor ? [`Author: ${state.pullRequestAuthor}`] : []),
       `Phase: ${state.phase || "Not reported"}${showLiveTiming ? ` (${phaseTiming})` : ""}`,

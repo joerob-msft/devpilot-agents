@@ -33,6 +33,12 @@ const STATUS_ORDER: Record<InstanceStatus, number> = {
   exited: 5,
 };
 
+const PR_CONTEXT_EVENTS = new Set([
+  "phase.changed", "candidate.selected", "candidate.skipped", "reviewer.started",
+  "delivery.retrying", "delivery.blocked", "work.concurrent",
+  "review.completed", "work.completed", "cycle.completed", "cycle.failed",
+]);
+
 function statusOrder(state: InstanceState): number {
   if (state.lifecycle === "stopped" || state.status === "completed") {
     return state.status === "failed" ? 5 : 6;
@@ -284,8 +290,27 @@ export class OperationsReducer {
     state.processId = event.processId || state.processId;
     state.schemaVersion = event.schemaVersion;
     state.cycleNumber = event.cycleNumber || state.cycleNumber;
-    state.pullRequestId = event.pullRequestId || state.pullRequestId;
-    state.sourceCommit = event.sourceCommit || state.sourceCommit;
+    if (PR_CONTEXT_EVENTS.has(event.eventType)) {
+      const prId = event.pullRequestId || getNumber(event.data, "pullRequestId") || getNumber(event.data, "id");
+      if (prId > 0 && prId !== state.pullRequestId) {
+        state.pullRequestTitle = "";
+        state.pullRequestAuthor = "";
+        state.pullRequestUrl = "";
+        state.sourceBranch = "";
+        state.targetBranch = "";
+        state.threadCount = 0;
+        state.actionableThreadCount = 0;
+        state.changedFileCount = 0;
+        state.sourceCommit = "";
+        state.blocked = null;
+        state.completion = null;
+        state.retryable = false;
+        state.outstanding = [];
+        state.waiting = null;
+      }
+      state.pullRequestId = prId || state.pullRequestId;
+      state.sourceCommit = event.sourceCommit || state.sourceCommit;
+    }
     if (event.eventType !== "agent.heartbeat") {
       state.timeline = addBounded(state.timeline, event, TIMELINE_LIMIT);
     }
@@ -386,6 +411,23 @@ export class OperationsReducer {
           ? `Selected PR #${state.pullRequestId} after scanning ${state.candidates.scanned || "available"} candidate(s)`
           : "Candidate selected";
         break;
+      case "candidate.skipped": {
+        this.reducePullRequestContext(state, data);
+        const reason = getString(data, "reason");
+        state.modelActivity = reason ? `Skipped: ${reason}` : "Candidate skipped";
+        if (getString(data, "normalizedReason") === "delivered" || reason === "already reviewed and delivered") {
+          state.blocked = null;
+          state.retryable = false;
+          state.outstanding = [];
+          state.completion ??= {
+            result: "delivered", requested: [], delivered: [], reason,
+            findings: { critical: 0, important: 0, suggestion: 0 },
+            summary: "", previewArtifact: "", nextScan: "", elapsedMilliseconds: 0,
+            timestampMs: event.timestampMs,
+          };
+        }
+        break;
+      }
       case "candidates.enumerated":
         state.candidates = {
           scanned: getNumber(data, "scanned"),
@@ -501,7 +543,6 @@ export class OperationsReducer {
   }
 
   private reducePullRequestContext(state: InstanceState, data: Record<string, unknown>): void {
-    state.pullRequestId = Math.max(state.pullRequestId, getNumber(data, "pullRequestId"), getNumber(data, "id"));
     state.pullRequestTitle = getString(data, "title") || state.pullRequestTitle;
     state.pullRequestAuthor = getString(data, "author") || state.pullRequestAuthor;
     state.pullRequestUrl = getString(data, "url") || state.pullRequestUrl;

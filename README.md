@@ -798,17 +798,18 @@ Other properties worth knowing:
   comes from the **sealed** artifact, not from promotion's fresh re-scope of the
   change set, which could otherwise legitimately shrink and render a different
   body on a retry.
-- **An artifact sealed by a different build of the agent is refused.** Comment
-  text is rendered by the *running* script, so if a heading, footer or format
-  string changed between builds, a comment the artifact already posted no longer
-  fingerprints equal to the one about to be written and would be posted twice.
-  The manifest is still intact in that case, so the seal cannot catch it - the
-  recorded `scriptSha256` does. `-AcceptArtifactFromDifferentAgentVersion`
-  overrides it. An unattended cycle **skips** such a PR rather than replaying or
-  re-reviewing it: the plan is the only record of which findings still owe
-  delivery, so discarding it could lose one, and re-reviewing under a changed
-  comment format could duplicate one that already landed. A new commit
-  supersedes the plan naturally.
+- **Retries preserve delivery text across agent upgrades.** Version 7 artifacts
+  seal the rendered finding, reply, and summary bodies as well as their approved
+  item bindings. Initial delivery and promotion use those same bodies for both
+  posting and duplicate detection, even if a later build changes its formatting.
+  Legacy artifacts can also resume automatically when every regenerated body
+  matches the original preview whose digest is covered by the artifact seal.
+  An unverifiable legacy plan remains intact and blocked, with recovery guidance
+  for its actual PR. Use the original build or an attended recovery; do not delete
+  the plan or re-review the same commit to force progress. The existing
+  `-AcceptArtifactFromDifferentAgentVersion` override is explicit and is never
+  enabled by an unattended retry. Repository, source-commit, capability, lease,
+  preview-digest, and artifact-signature checks still apply.
 - **A vote declined for a reason a retry could fix stays open; every other
   decline is final.** Only an actual comment-delivery gap - a failed post, or a
   post that did not confirm at its anchor - leaves the vote unresolved. Findings
