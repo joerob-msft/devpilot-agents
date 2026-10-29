@@ -84,6 +84,43 @@ Describe 'source-scoped failure attempts' {
         $record.DeterministicCount | Should -Be 1
     }
 
+    It 'preserves UTC recovery deadlines across repeated state-file round trips' {
+        $path = Join-Path $TestDrive 'retry-deadlines.json'
+        $attempts = @{}
+        $deadline = [DateTime]::UtcNow.AddSeconds(-30)
+        Set-AgentSourceScopedAttemptRecord -AttemptsState $attempts -PullRequestId 42 `
+            -SourceCommit ('a' * 40) -FailureClass source-changed -Reason 'source advanced' `
+            -NextRetryAtUtc $deadline | Out-Null
+        $lastAt = $attempts['42'].lastAt
+        foreach ($roundTrip in 1..2) {
+            Set-JsonState -Path $path -State $attempts
+            $attempts = Get-JsonState -Path $path
+            $record = Get-AgentSourceScopedAttemptRecord -Record $attempts['42'] -SourceCommit ('a' * 40)
+            $record.NextRetryAt | Should -BeExactly $deadline.ToString('o')
+            $record.LastAt | Should -BeExactly $lastAt
+            $parsed = [DateTime]::MinValue
+            [DateTime]::TryParse($record.NextRetryAt, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed) | Should -BeTrue
+            $parsed.Kind | Should -Be ([DateTimeKind]::Utc)
+            $parsed.ToUniversalTime() | Should -BeLessThan ([DateTime]::UtcNow)
+        }
+    }
+
+    It 'preserves the instant of a typed <Name> retry timestamp' -ForEach @(
+        @{ Name = 'UTC DateTime'; Timestamp = [DateTime]::new(2026, 10, 29, 3, 24, 0, [DateTimeKind]::Utc) },
+        @{ Name = 'local DateTime'; Timestamp = [DateTime]::new(2026, 10, 29, 3, 24, 0, [DateTimeKind]::Utc).ToLocalTime() },
+        @{ Name = 'DateTimeOffset'; Timestamp = [DateTimeOffset]::new(2026, 10, 29, 8, 54, 0, [TimeSpan]::FromHours(5.5)) }
+    ) {
+        $attempts = @{}
+        Set-AgentSourceScopedAttemptRecord -AttemptsState $attempts -PullRequestId 42 `
+            -SourceCommit ('a' * 40) -FailureClass environment -Reason 'transport unavailable' | Out-Null
+        $attempts['42'].lastAt = $Timestamp
+        $attempts['42'].nextRetryAt = $Timestamp
+        $record = Get-AgentSourceScopedAttemptRecord -Record $attempts['42'] -SourceCommit ('a' * 40)
+        $record.NextRetryAt | Should -BeExactly $Timestamp.ToUniversalTime().ToString('o')
+        $record.LastAt | Should -BeExactly $Timestamp.ToUniversalTime().ToString('o')
+    }
+
     It 'carries deterministic validation count across an agent-authored pushed commit' {
         $attempts = @{}
         1..2 | ForEach-Object {
