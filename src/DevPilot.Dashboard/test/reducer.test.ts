@@ -37,6 +37,47 @@ function event(
   });
 }
 
+test("a later candidate never inherits another PR's blocker, completion, or metadata", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("scope", 1, "cycle.started"));
+  reducer.apply(event("scope", 2, "candidate.selected", {
+    pullRequestId: 202, data: { title: "Blocked PR", author: "Prior author", changedFileCount: 4 },
+  }));
+  reducer.apply(event("scope", 3, "delivery.blocked", {
+    pullRequestId: 202, data: { reason: "old build", retryable: true, outstanding: ["comments"] },
+  }));
+  reducer.apply(event("scope", 4, "work.completed", {
+    pullRequestId: 202, data: { result: "partially delivered" },
+  }));
+  reducer.apply(event("scope", 5, "phase.changed", {
+    pullRequestId: 101, data: { title: "Delivered PR", phase: "reading metadata" },
+  }));
+  const next = reducer.get("reviewer:scope", BASE_TIME + 1_000)!;
+  assert.equal(next.pullRequestId, 101);
+  assert.equal(next.pullRequestTitle, "Delivered PR");
+  assert.equal(next.pullRequestAuthor, "");
+  assert.equal(next.changedFileCount, 0);
+  assert.equal(next.blocked, null);
+  assert.equal(next.completion, null);
+  assert.equal(next.retryable, false);
+  assert.deepEqual(next.outstanding, []);
+  reducer.apply(event("scope", 6, "candidate.skipped", {
+    pullRequestId: 101, data: { reason: "already reviewed and delivered", normalizedReason: "delivered" },
+  }));
+  reducer.apply(event("scope", 7, "agent.waiting"));
+  assert.equal(reducer.get("reviewer:scope", BASE_TIME + 1_000)?.completion?.result, "delivered");
+  assert.equal(reducer.get("reviewer:scope", BASE_TIME + 1_000)?.status, "waiting");
+  assert.equal(next.timeline.some((item) => item.eventType === "delivery.blocked" && item.pullRequestId === 202), true);
+});
+
+test("notification maintenance for another PR does not change the active PR's context", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(event("maintenance", 1, "candidate.selected", { pullRequestId: 101, data: { title: "Active" } }));
+  reducer.apply(event("maintenance", 2, "notification.delivery", { pullRequestId: 202, sourceCommit: "other" }));
+  assert.equal(reducer.get("reviewer:maintenance", BASE_TIME + 1_000)?.pullRequestId, 101);
+  assert.equal(reducer.get("reviewer:maintenance", BASE_TIME + 1_000)?.sourceCommit, "");
+});
+
 test("Teams notification diagnostics preserve completed work for both agent roles", () => {
   for (const agent of ["reviewer", "review-handler"] as const) {
     const reducer = new OperationsReducer();

@@ -1768,6 +1768,157 @@ function Get-ReviewerCommentFingerprint {
     return ("{0}|{1}|{2}" -f $anchor, $Line, $body)
 }
 
+function Get-ReviewerDeliveryItemKey {
+    param([ValidateSet('finding', 'reply')][string]$Kind, [Parameter(Mandatory)]$Item)
+    $fields = if ($Kind -eq 'finding') { @('severity', 'filePath', 'line', 'comment') }
+    else { @('threadId', 'commentId', 'disposition', 'comment') }
+    $identity = @{}
+    foreach ($field in $fields) {
+        $identity[$field] = if ($field -in @('line', 'threadId', 'commentId')) {
+            [int](Get-ReviewerHashValue -Container $Item -Key $field -Default 0)
+        } else { [string](Get-ReviewerHashValue -Container $Item -Key $field -Default '') }
+    }
+    return (Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $identity))
+}
+
+function New-ReviewerDeliveryPayload {
+    param(
+        [AllowEmptyString()][string]$Summary, [hashtable]$Presentation, [object[]]$Findings = @(),
+        [object[]]$Postable = @(), [object[]]$ThreadReplies = @(), [string]$RecommendedVote,
+        [hashtable]$Counts, [int]$Reported, [int]$Publishable,
+        [int]$PrId = 0, [string]$SourceCommit = '', [string]$SummaryContext = ''
+    )
+    $payload = @{
+        schemaVersion = 1; comments = @{}; replies = @{}
+        summary = (Format-ReviewerSummaryComment -Summary $Summary -Presentation $Presentation `
+            -Findings $Findings -RecommendedVote $RecommendedVote -Counts $Counts -Reported $Reported -Publishable $Publishable)
+    }
+    if ($PrId -gt 0 -and $SourceCommit -match '^[0-9a-fA-F]{40}$') {
+        $signal = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value @{
+                sourceCommit = $SourceCommit.ToLowerInvariant(); findings = @($Findings)
+                recommendedVote = $RecommendedVote; publishable = $Publishable
+                risk = $Presentation.RiskLevel; securityApplied = $Presentation.SecurityReviewApplied
+                capReached = $Presentation.FindingLimitReached; omitted = $Presentation.OmittedFindingCount
+                validation = @($Presentation.ValidationItems | Where-Object { $null -ne $_ } |
+                    ForEach-Object { $_.status } | Sort-Object -Unique)
+                context = $SummaryContext
+            })
+        $payload.summary += "`n`n<!-- devpilot-review-summary:v1:$cfgRepoId`:$PrId`:$signal -->"
+    }
+    foreach ($finding in $Postable) {
+        $payload.comments[(Get-ReviewerDeliveryItemKey -Kind finding -Item $finding)] = Format-ReviewerFindingComment -Finding $finding
+    }
+    foreach ($reply in $ThreadReplies) {
+        $payload.replies[(Get-ReviewerDeliveryItemKey -Kind reply -Item $reply)] = Format-ReviewerThreadReply -Reply $reply
+    }
+    return $payload
+}
+
+function Get-ReviewerDeliveryBody {
+    param([hashtable]$Payload, [ValidateSet('finding', 'reply')][string]$Kind, [Parameter(Mandatory)]$Item)
+    if (-not $Payload) {
+        if ($Kind -eq 'finding') { return (Format-ReviewerFindingComment -Finding $Item) }
+        return (Format-ReviewerThreadReply -Reply $Item)
+    }
+    $collection = if ($Kind -eq 'finding') { $Payload.comments } else { $Payload.replies }
+    $key = Get-ReviewerDeliveryItemKey -Kind $Kind -Item $Item
+    if ($collection -isnot [hashtable] -or -not $collection.ContainsKey($key) -or
+        $collection[$key] -isnot [string] -or [string]::IsNullOrWhiteSpace($collection[$key])) {
+        throw 'The sealed delivery payload does not contain the approved item.'
+    }
+    return $collection[$key]
+}
+
+function Test-ReviewerPayloadMatchesPreview {
+    # Called only with a preview whose digest was verified against the signed manifest.
+    param([Parameter(Mandatory)]$Manifest, [hashtable]$Payload, [AllowEmptyString()][string]$PreviewText)
+    if (-not $PreviewText) { return $false }
+    $text = Get-ReviewerNormalizedDocumentText -Text $PreviewText
+    $comments = @($Manifest.approvedComments | Where-Object { $null -ne $_ })
+    $replies = @($Manifest.approvedThreadReplies | Where-Object { $null -ne $_ })
+    $summaryHeader = "`n## Summary the agent would post`n`n"
+    $commentsHeader = "`n## Candidate comments ($($comments.Count))`n`n"
+    $repliesHeader = "`n## Human comment assessments ($($replies.Count))`n`n"
+    $summaryAt = $text.IndexOf($summaryHeader, [StringComparison]::Ordinal)
+    $commentsAt = $text.IndexOf($commentsHeader, [StringComparison]::Ordinal)
+    $repliesAt = $text.IndexOf($repliesHeader, [StringComparison]::Ordinal)
+    if ($summaryAt -lt 0 -or $commentsAt -le $summaryAt -or $repliesAt -le $commentsAt) { return $false }
+    foreach ($header in @($summaryHeader, $commentsHeader, $repliesHeader)) {
+        if ($text.IndexOf($header, [StringComparison]::Ordinal) -ne $text.LastIndexOf($header, [StringComparison]::Ordinal)) { return $false }
+    }
+    $summaryStart = $summaryAt + $summaryHeader.Length
+    if ((Get-ReviewerNormalizedDocumentText -Text $text.Substring($summaryStart, $commentsAt - $summaryStart)) -cne
+        (Get-ReviewerNormalizedDocumentText -Text ([string]$Payload.summary))) { return $false }
+    $commentLines = [Collections.Generic.List[string]]::new()
+    if ($comments.Count -eq 0) { $commentLines.Add('(none above this repository''s posting threshold)') }
+    foreach ($finding in $comments) {
+        $where = if ([string]$finding.filePath) { "$($finding.filePath):$($finding.line)" } else { '(pr-level)' }
+        $commentLines.Add("### $where")
+        $commentLines.Add('')
+        $commentLines.Add((Get-ReviewerDeliveryBody -Payload $Payload -Kind finding -Item $finding))
+        $commentLines.Add('')
+    }
+    $commentsStart = $commentsAt + $commentsHeader.Length
+    $commentsEnd = $text.IndexOf("`n## ", $commentsStart, [StringComparison]::Ordinal)
+    if ($commentsEnd -lt $commentsStart -or
+        (Get-ReviewerNormalizedDocumentText -Text $text.Substring($commentsStart, $commentsEnd - $commentsStart)) -cne
+        (Get-ReviewerNormalizedDocumentText -Text ($commentLines -join "`n"))) { return $false }
+    $replyLines = [Collections.Generic.List[string]]::new()
+    if ($replies.Count -eq 0) { $replyLines.Add('(none)') }
+    foreach ($reply in $replies) {
+        $replyLines.Add("### Thread $($reply.threadId), human comment $($reply.commentId)")
+        $replyLines.Add('')
+        $replyLines.Add((Get-ReviewerDeliveryBody -Payload $Payload -Kind reply -Item $reply))
+        $replyLines.Add('')
+    }
+    return ((Get-ReviewerNormalizedDocumentText -Text $text.Substring($repliesAt + $repliesHeader.Length)) -ceq
+        (Get-ReviewerNormalizedDocumentText -Text ($replyLines -join "`n")))
+}
+
+function Get-ReviewerPromotionPayload {
+    param(
+        [Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][hashtable]$Marker,
+        [AllowEmptyString()][string]$VerifiedPreviewText, [bool]$SameBuild,
+        [bool]$AcceptDifferentBuild = $false
+    )
+    $comments = @($Manifest.approvedComments | Where-Object { $null -ne $_ })
+    $replies = @($Manifest.approvedThreadReplies | Where-Object { $null -ne $_ })
+    if ([int]$Manifest.artifactVersion -ge 7) {
+        $payload = ConvertTo-ReviewerHashtable -Value $Manifest.renderedDelivery
+        if ($payload.schemaVersion -ne 1 -or $payload.summary -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($payload.summary)) { throw 'Unsupported or incomplete sealed delivery payload.' }
+    }
+    else {
+        $presentation = if ([int]$Manifest.artifactVersion -ge 6) {
+            ConvertTo-ReviewerHashtable -Value $Manifest.approvedPresentation
+        } else { Get-ReviewerPresentationFromMarker -Marker $Marker }
+        foreach ($field in @('ScopeItems', 'Strengths', 'RolloutItems', 'ValidationItems', 'SkillsApplied')) {
+            if ($null -eq $presentation[$field]) { $presentation[$field] = @() }
+        }
+        $payload = New-ReviewerDeliveryPayload -Summary ([string]$Manifest.approvedSummary) -Presentation $presentation `
+            -Findings @($Marker.findings) -Postable $comments -ThreadReplies $replies `
+            -RecommendedVote ([string]$Manifest.approvedVote) -Counts (Get-ReviewerSeverityCounts -Findings @($Marker.findings)) `
+            -Reported ([int](Get-ReviewerHashValue -Container $Manifest -Key reportedFindings -Default @($Marker.findings).Count)) `
+            -Publishable $comments.Count
+        if (-not $SameBuild -and -not $AcceptDifferentBuild -and
+            -not (Test-ReviewerPayloadMatchesPreview -Manifest $Manifest -Payload $payload -PreviewText $VerifiedPreviewText)) {
+            throw 'Legacy delivery text cannot be verified against its original sealed preview; use the original reviewer build or an attended recovery.'
+        }
+    }
+    foreach ($pair in @(@{ Kind = 'finding'; Items = $comments; Bodies = $payload.comments },
+            @{ Kind = 'reply'; Items = $replies; Bodies = $payload.replies })) {
+        $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($item in $pair.Items) {
+            [void](Get-ReviewerDeliveryBody -Payload $payload -Kind $pair.Kind -Item $item)
+            [void]$keys.Add((Get-ReviewerDeliveryItemKey -Kind $pair.Kind -Item $item))
+        }
+        if ($pair.Bodies -isnot [hashtable] -or $pair.Bodies.Count -ne $keys.Count) {
+            throw 'The sealed delivery payload does not match the approved item set.'
+        }
+    }
+    return $payload
+}
+
 function Test-ReviewerShouldVote {
     <#
         Decides the ADO vote to cast, or "" for none. Fails closed on every
@@ -2602,6 +2753,7 @@ function ConvertTo-ReviewerThread {
                 contentFingerprint = (Get-ReviewerTextSha256 -Text ([string](Get-ReviewerHashValue -Container $rc -Key 'content' -Default '')))
                 commentType       = (Get-ReviewerHashValue -Container $rc -Key 'commentType' -Default '')
                 isDeleted         = [bool](Get-ReviewerHashValue -Container $rc -Key 'isDeleted' -Default $false)
+                publishedDate     = [string](Get-ReviewerHashValue -Container $rc -Key 'publishedDate' -Default '')
             })
     }
     return @{
@@ -2822,13 +2974,14 @@ function Get-ReviewerThreadReplyFingerprint {
 }
 
 function Get-ReviewerExistingThreadReplyFingerprints {
-    param([object[]]$Threads)
+    param([object[]]$Threads, [hashtable]$DeliveryPayload)
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($t in @($Threads)) {
         $threadId = [int](Get-ReviewerHashValue -Container $t -Key 'threadId' -Default 0)
         foreach ($c in @(Get-ReviewerHashValue -Container $t -Key 'comments' -Default @())) {
             $body = [string](Get-ReviewerHashValue -Container $c -Key 'content' -Default '')
-            if ($body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            if (-not $DeliveryPayload -and
+                $body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             $fp = Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content $body
             if ($fp) { [void]$set.Add($fp) }
         }
@@ -2856,8 +3009,8 @@ function Get-ReviewerFindingFingerprint {
     <# The single place that decides how a finding maps onto the fingerprint
        space, so the pre-post check, the post-post confirmation and the existing
        thread scan can never drift apart. #>
-    param([Parameter(Mandatory)]$Finding)
-    return (Get-ReviewerCommentFingerprint -Content (Format-ReviewerFindingComment -Finding $Finding) `
+    param([Parameter(Mandatory)]$Finding, [hashtable]$DeliveryPayload)
+    return (Get-ReviewerCommentFingerprint -Content (Get-ReviewerDeliveryBody -Payload $DeliveryPayload -Kind finding -Item $Finding) `
             -FilePath ([string](Get-ReviewerHashValue -Container $Finding -Key 'filePath' -Default '')) `
             -Line ([int](Get-ReviewerHashValue -Container $Finding -Key 'line' -Default 0)))
 }
@@ -2944,6 +3097,7 @@ function Write-ReviewerPreview {
         [hashtable]$Presentation = $null,
         [object[]]$ReviewSections = @(),
         [bool]$SecurityReviewApplied = $false,
+        [string]$SummaryContext = '',
         [object[]]$Postable = @(),
         [object[]]$Withheld = @(),
         [object[]]$AllFindings = @(),
@@ -2978,9 +3132,11 @@ function Write-ReviewerPreview {
             securityReviewApplied = [bool]$SecurityReviewApplied
         }
     }
-    [void]$lines.Add((Format-ReviewerSummaryComment -Summary $Summary -Presentation $Presentation `
-            -Findings $AllFindings -RecommendedVote $RecommendedVote -Counts $counts `
-            -Reported @($AllFindings).Count -Publishable @($Postable).Count))
+    $deliveryPayload = New-ReviewerDeliveryPayload -Summary $Summary -Presentation $Presentation `
+        -Findings $AllFindings -Postable $Postable -ThreadReplies $ThreadReplies -RecommendedVote $RecommendedVote `
+        -Counts $counts -Reported @($AllFindings).Count -Publishable @($Postable).Count `
+        -PrId $PrId -SourceCommit $SourceCommit -SummaryContext $SummaryContext
+    [void]$lines.Add($deliveryPayload.summary)
     [void]$lines.Add("")
     [void]$lines.Add("## Candidate comments ($(@($Postable).Count))")
     [void]$lines.Add("")
@@ -2993,7 +3149,7 @@ function Write-ReviewerPreview {
         $where = if ($loc) { "$loc`:$ln" } else { "(pr-level)" }
         [void]$lines.Add("### $where")
         [void]$lines.Add("")
-        [void]$lines.Add((Format-ReviewerFindingComment -Finding $f))
+        [void]$lines.Add((Get-ReviewerDeliveryBody -Payload $deliveryPayload -Kind finding -Item $f))
         [void]$lines.Add("")
     }
     if (@($Withheld).Count -gt 0) {
@@ -3024,7 +3180,7 @@ function Write-ReviewerPreview {
         $commentId = [int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0)
         [void]$lines.Add("### Thread $threadId, human comment $commentId")
         [void]$lines.Add("")
-        [void]$lines.Add((Format-ReviewerThreadReply -Reply $reply))
+        [void]$lines.Add((Get-ReviewerDeliveryBody -Payload $deliveryPayload -Kind reply -Item $reply))
         [void]$lines.Add("")
     }
     $text = ($lines.ToArray() -join "`n")
@@ -3050,7 +3206,8 @@ function Write-ReviewerPreview {
         if ($Marker) {
             $artifactPath = Join-Path $artifactDirectory "$baseName.json"
             $manifest = @{
-                artifactVersion  = 6
+                artifactVersion  = 7
+                renderedDelivery = $deliveryPayload
                 organization     = $Organization
                 project          = $ExpectedProject
                 repositoryName   = $RepositoryName
@@ -3129,7 +3286,7 @@ function Write-ReviewerPreview {
         }
     }
     Write-Host ""
-    return @{ MarkdownPath = $path; ArtifactPath = $artifactPath }
+    return @{ MarkdownPath = $path; ArtifactPath = $artifactPath; DeliveryPayload = $deliveryPayload }
 }
 
 # ---------------------------------------------------------------------------
@@ -3211,6 +3368,112 @@ function Add-ReviewerThreadReply {
     catch {
         return @{ Attempted = $true; Error = $_.Exception.Message }
     }
+}
+
+function Get-ReviewerSummaryMarker {
+    param([string]$Content)
+    $markers = [regex]::Matches($Content, '(?m)^<!-- devpilot-review-summary:v1:[A-Za-z0-9._-]+:[1-9][0-9]*:[0-9a-f]{64} -->$')
+    if ($markers.Count -eq 1) { return $markers[0].Value }
+    return ''
+}
+
+function Get-ReviewerSummaryTarget {
+    param([object[]]$Threads, [string]$OwnerAlias, [int]$PrId)
+    if (-not $OwnerAlias) { throw 'Cannot identify the summary owner; refusing summary publication.' }
+    $candidates = @(
+        foreach ($thread in $Threads) {
+            if ([string](Get-ReviewerHashValue $thread filePath '') -or [int](Get-ReviewerHashValue $thread line 0) -gt 0) { continue }
+            $comments = @((Get-ReviewerHashValue $thread comments @()) | Where-Object { $null -ne $_ })
+            if ($comments.Count -eq 0) { continue }
+            $root = $comments[0]
+            $body = [string](Get-ReviewerHashValue $root content '')
+            $author = [string](Get-ReviewerHashValue $root authorUniqueName '')
+            $marker = Get-ReviewerSummaryMarker -Content $body
+            $marked = $marker -and $marker.StartsWith("<!-- devpilot-review-summary:v1:$cfgRepoId`:$PrId`:", [StringComparison]::Ordinal)
+            $legacy = -not $marker -and $body.StartsWith("$script:ReviewerSummaryHeading`n", [StringComparison]::Ordinal) -and
+                $body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::Ordinal) -ge 0
+            if ([bool](Get-ReviewerHashValue $root isDeleted $false) -or
+                (Get-ReviewerAlias -UniqueName $author) -ine $OwnerAlias -or
+                -not ($marked -or $legacy)) { continue }
+            $published = [DateTimeOffset]::MinValue
+            [void][DateTimeOffset]::TryParse([string](Get-ReviewerHashValue $root publishedDate ''), [ref]$published)
+            [pscustomobject]@{
+                Thread = $thread; Root = $root; Author = $author; Published = $published
+                ThreadId = [int](Get-ReviewerHashValue $thread threadId 0)
+                CommentId = [int](Get-ReviewerHashValue $root commentId 0)
+                CommentCount = $comments.Count; Content = $body
+            }
+        }
+    )
+    if (@($candidates | ForEach-Object { $_.Author } | Sort-Object -Unique).Count -gt 1) {
+        throw 'Multiple provider identities match the summary owner; refusing to guess.'
+    }
+    $target = $candidates | Sort-Object @{ Expression = 'Published'; Descending = $true },
+        @{ Expression = 'ThreadId'; Descending = $true } | Select-Object -First 1
+    if ($target -and ($target.CommentCount -ne 1 -or $target.ThreadId -le 0 -or $target.CommentId -le 0)) {
+        throw 'The current automated summary has discussion or invalid identity; refusing to replace it or create another.'
+    }
+    return $target
+}
+
+function Set-ReviewerSummaryComment {
+    param(
+        [hashtable]$Session, [int]$PrId, [string]$SourceCommit,
+        [string]$Content, [int]$ReportedFindingCount
+    )
+    $expectedStatus = Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount
+    try {
+        $threads = @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId)
+        $target = Get-ReviewerSummaryTarget -Threads $threads -OwnerAlias $OperatorAlias -PrId $PrId
+        $marker = Get-ReviewerSummaryMarker -Content $Content
+        $sameResult = $target -and $marker -and (Get-ReviewerSummaryMarker -Content $target.Content) -ceq $marker
+        $sameBody = $target -and (Get-ReviewerCommentFingerprint -Content $target.Content) -ceq
+            (Get-ReviewerCommentFingerprint -Content $Content)
+        if ($target -and ($sameResult -or $sameBody) -and $target.Thread.status -ieq $expectedStatus) {
+            return @{ Delivered = $true; Error = '' }
+        }
+        $fresh = Test-ReviewerDeliveryStillValid -Session $Session -PrId $PrId -ExpectedSourceCommit $SourceCommit
+        if (-not $fresh.Ok) { return @{ Delivered = $false; Error = $fresh.Reason } }
+        $justInTime = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+            -OwnerAlias $OperatorAlias -PrId $PrId
+        if (($target -and (-not $justInTime -or $target.ThreadId -ne $justInTime.ThreadId -or
+                    $target.CommentId -ne $justInTime.CommentId -or $target.Content -cne $justInTime.Content)) -or
+            (-not $target -and $justInTime)) {
+            return @{ Delivered = $false; Error = 'The summary changed before publication; retry the sealed review instead of creating or replacing another comment.' }
+        }
+        $writeError = ''
+        try {
+            if ($target) {
+                if (-not ($sameResult -or $sameBody)) {
+                    Invoke-AgentMcpTool -Session $Session -Name repo_pull_request_thread_write -RawText -Arguments @{
+                        action = 'update'; project = $ExpectedProject; repositoryId = $RepositoryName
+                        pullRequestId = $PrId; threadId = $target.ThreadId; commentId = $target.CommentId; content = $Content
+                    } | Out-Null
+                }
+                if ($target.Thread.status -ine $expectedStatus) {
+                    Invoke-AgentMcpTool -Session $Session -Name repo_pull_request_thread_write -RawText -Arguments @{
+                        action = 'update_status'; project = $ExpectedProject; repositoryId = $RepositoryName
+                        pullRequestId = $PrId; threadId = $target.ThreadId; status = $expectedStatus
+                    } | Out-Null
+                }
+            }
+            else {
+                $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $Content -Status $expectedStatus
+                $writeError = [string]$post.Error
+            }
+        }
+        catch { $writeError = $_.Exception.Message }
+        # A failed/uncertain update never falls back to creating another thread.
+        $confirmed = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+            -OwnerAlias $OperatorAlias -PrId $PrId
+        $expectedBody = if ($sameResult -or $sameBody) { $target.Content } else { $Content }
+        $delivered = $confirmed -and (-not $target -or ($confirmed.ThreadId -eq $target.ThreadId -and
+                $confirmed.CommentId -eq $target.CommentId)) -and
+            (Get-ReviewerCommentFingerprint -Content $confirmed.Content) -ceq (Get-ReviewerCommentFingerprint -Content $expectedBody) -and
+            $confirmed.Thread.status -ieq $expectedStatus
+        return @{ Delivered = [bool]$delivered; Error = $(if ($delivered) { '' } elseif ($writeError) { $writeError } else { 'Summary publication did not confirm on the PR.' }) }
+    }
+    catch { return @{ Delivered = $false; Error = $_.Exception.Message } }
 }
 
 function Set-ReviewerVote {
@@ -5112,7 +5375,8 @@ function Invoke-ReviewerDelivery {
         # The sealed count of findings eligible to post, taken from the signed
         # artifact on a promotion. -1 means "this is the original review", where
         # the live postable set IS the sealed set.
-        [int]$SealedPublishableCount = -1
+        [int]$SealedPublishableCount = -1,
+        [hashtable]$DeliveryPayload
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; ThreadRepliesPosted = 0; ThreadReplyFailures = 0
@@ -5155,13 +5419,13 @@ function Invoke-ReviewerDelivery {
     # -- Findings --------------------------------------------------------------
     if ($EnableFindingComments -and @($Postable).Count -gt 0) {
         foreach ($f in @($Postable)) {
-            $fingerprint = Get-ReviewerFindingFingerprint -Finding $f
+            $fingerprint = Get-ReviewerFindingFingerprint -Finding $f -DeliveryPayload $DeliveryPayload
             if ($ExistingFingerprints.Contains($fingerprint)) {
                 Write-Host "  (already on the PR at this anchor, not re-posted) $([string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '(pr-level)'))" -ForegroundColor DarkGray
                 $outcome.PostedCount++
                 continue
             }
-            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content (Format-ReviewerFindingComment -Finding $f) `
+            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content (Get-ReviewerDeliveryBody -Payload $DeliveryPayload -Kind finding -Item $f) `
                 -FilePath ([string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '')) `
                 -Line ([int](Get-ReviewerHashValue -Container $f -Key 'line' -Default 0)) `
                 -Status (Get-ReviewerFindingThreadStatus -Finding $f)
@@ -5183,7 +5447,7 @@ function Invoke-ReviewerDelivery {
         $freshFingerprints = Get-ReviewerExistingFingerprints -Threads $freshThreads
         $confirmed = 0
         foreach ($f in @($Postable)) {
-            if ($freshFingerprints.Contains((Get-ReviewerFindingFingerprint -Finding $f))) { $confirmed++ }
+            if ($freshFingerprints.Contains((Get-ReviewerFindingFingerprint -Finding $f -DeliveryPayload $DeliveryPayload))) { $confirmed++ }
         }
         if ($confirmed -ne $outcome.PostedCount) {
             Write-Warning "Recorded $($outcome.PostedCount) posted finding(s) but only $confirmed are visible at the expected anchors on PR $PrId; treating the lower number as the truth."
@@ -5203,7 +5467,7 @@ function Invoke-ReviewerDelivery {
         if ($droppedThreadReplies -gt 0) {
             Write-Host "  skipped $droppedThreadReplies thread assessment(s) because the target comment is no longer the latest eligible human comment." -ForegroundColor DarkGray
         }
-        $existingThreadReplyFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $freshThreadsForReplies
+        $existingThreadReplyFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $freshThreadsForReplies -DeliveryPayload $DeliveryPayload
         foreach ($reply in $eligibleThreadReplies) {
             $threadId = [int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)
             $commentId = [int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0)
@@ -5240,7 +5504,7 @@ function Invoke-ReviewerDelivery {
                 continue
             }
             [void]$attemptedThreadReplies.Add($reply)
-            $body = Format-ReviewerThreadReply -Reply $reply
+            $body = Get-ReviewerDeliveryBody -Payload $DeliveryPayload -Kind reply -Item $reply
             $fingerprint = Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content $body
             if ($existingThreadReplyFingerprints.Contains($fingerprint)) {
                 Write-Host "  (assessment already exists in thread $threadId, not re-posted)" -ForegroundColor DarkGray
@@ -5260,11 +5524,11 @@ function Invoke-ReviewerDelivery {
         }
 
         $confirmedThreads = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
-        $confirmedFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $confirmedThreads
+        $confirmedFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $confirmedThreads -DeliveryPayload $DeliveryPayload
         $confirmedReplies = 0
         foreach ($reply in $attemptedThreadReplies) {
             $threadId = [int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)
-            if ($confirmedFingerprints.Contains((Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content (Format-ReviewerThreadReply -Reply $reply)))) {
+            if ($confirmedFingerprints.Contains((Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content (Get-ReviewerDeliveryBody -Payload $DeliveryPayload -Kind reply -Item $reply)))) {
                 $confirmedReplies++
             }
         }
@@ -5290,19 +5554,15 @@ function Invoke-ReviewerDelivery {
             }
         }
         if (@($SummaryFindings).Count -eq 0) { $SummaryFindings = @($Postable) }
-        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Presentation $Presentation `
+        $summaryBody = if ($DeliveryPayload) { [string]$DeliveryPayload.summary } else { Format-ReviewerSummaryComment -Summary $SummaryText -Presentation $Presentation `
             -Findings $SummaryFindings -RecommendedVote $RecommendedVote -Counts $Counts -Reported $ReportedFindingCount `
-            -Publishable (Get-ReviewerPublishableCount -SealedCount $SealedPublishableCount -PostableCount (@($Postable).Count))
-        $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
-        if ($ExistingFingerprints.Contains($summaryFingerprint)) {
-            Write-Host "  (the summary is already on the PR, not re-posted)" -ForegroundColor DarkGray
-            $outcome.SummaryPosted = $true
-        }
-        else {
-            $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content $summaryBody `
-                -Status (Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount)
-            if ($post.Error) { Write-Warning "  could not post the summary on PR ${PrId}: $($post.Error)" }
-            else { $outcome.SummaryPosted = $true; Write-Host "  posted the review summary." -ForegroundColor Green }
+            -Publishable (Get-ReviewerPublishableCount -SealedCount $SealedPublishableCount -PostableCount (@($Postable).Count)) }
+        $summaryResult = Set-ReviewerSummaryComment -Session $Session -PrId $PrId -SourceCommit $SourceCommit `
+            -Content $summaryBody -ReportedFindingCount $ReportedFindingCount
+        $outcome.SummaryPosted = [bool]$summaryResult.Delivered
+        if ($summaryResult.Error) {
+            $outcome.Reason = "summary publication incomplete: $($summaryResult.Error)"
+            Write-Warning "  could not publish the summary on PR ${PrId}: $($summaryResult.Error)"
         }
     }
 
@@ -5358,7 +5618,7 @@ function Invoke-ReviewerDelivery {
     $summaryOk = (-not $EnableSummaryComment) -or $outcome.SummaryDelivered
     $voteOk = (-not $EnableApprovalVote) -or $outcome.VoteResolved
     $outcome.Delivered = ($commentsOk -and $threadRepliesOk -and $summaryOk -and $voteOk)
-    if (-not $outcome.Delivered) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
+    if (-not $outcome.Delivered -and -not $outcome.Reason) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
     return $outcome
 }
 
@@ -6043,7 +6303,7 @@ function Invoke-ReviewerPullRequest {
     # itself.
     $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
     $preview = Write-ReviewerPreview -PrId $prId -SourceCommit $sourceCommit -PrTitle $prTitle `
-        -Summary $summaryText -Presentation $presentation `
+        -Summary $summaryText -Presentation $presentation -SummaryContext ([string]$Bound.DigestText) `
         -Postable $postable -Withheld $withheld -AllFindings $allFindings `
         -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
         -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested
@@ -6121,7 +6381,7 @@ function Invoke-ReviewerPullRequest {
         -Counts $counts -ReportedFindingCount $allFindings.Count `
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
         -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
-        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
+        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) -DeliveryPayload $preview.DeliveryPayload
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $threadRepliesPosted = [int]$delivery.ThreadRepliesPosted
@@ -6332,14 +6592,17 @@ function Invoke-ReviewerPromotion {
         if (-not (Test-ReviewerHasKey -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
     }
     $artifactVersion = [int]$signed.artifactVersion
-    if (@(4, 5, 6) -cnotcontains $artifactVersion) { throw "Unsupported preview artifact version $artifactVersion." }
+    if (@(4, 5, 6, 7) -cnotcontains $artifactVersion) { throw "Unsupported preview artifact version $artifactVersion." }
     if ($artifactVersion -eq 5) {
         foreach ($k in @('approvedReviewSections', 'securityReviewApplied')) {
             if (-not (Test-ReviewerHasKey -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
         }
-        if ($artifactVersion -eq 6 -and -not (Test-ReviewerHasKey -Container $signed -Key 'approvedPresentation')) {
-            throw "Preview artifact is missing required field 'approvedPresentation': $ArtifactPath"
-        }
+    }
+    if ($artifactVersion -ge 6 -and -not (Test-ReviewerHasKey -Container $signed -Key 'approvedPresentation')) {
+        throw "Preview artifact is missing required field 'approvedPresentation': $ArtifactPath"
+    }
+    if ($artifactVersion -eq 7 -and -not (Test-ReviewerHasKey -Container $signed -Key 'renderedDelivery')) {
+        throw "Preview artifact is missing required field 'renderedDelivery': $ArtifactPath"
     }
 
     # A review is only meaningful against the repository it was produced for.
@@ -6381,6 +6644,7 @@ function Invoke-ReviewerPromotion {
     # the operator explicitly accepts that the document cannot be verified.
     $previewPath = [string](Get-ReviewerHashValue -Container $signed -Key 'previewPath' -Default '')
     $previewSha = [string](Get-ReviewerHashValue -Container $signed -Key 'previewSha256' -Default '')
+    $verifiedPreviewText = ''
     if (-not $previewPath -or -not $previewSha) {
         throw ("This preview artifact does not record the document it was written alongside, so what was published " +
             "cannot be shown to be what was read. Re-run the reviewer to produce a current artifact: $ArtifactPath")
@@ -6394,7 +6658,8 @@ function Invoke-ReviewerPromotion {
         Write-Warning "The Markdown preview at $previewPath is missing; publishing the sealed manifest on the operator's explicit instruction."
     }
     else {
-        $onDisk = Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text (Get-Content -LiteralPath $previewPath -Raw))
+        $previewText = Get-Content -LiteralPath $previewPath -Raw
+        $onDisk = Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $previewText)
         if ($onDisk -cne $previewSha) {
             if (-not $AcceptUnverifiablePreviewDocument) {
                 throw ("The Markdown preview at $previewPath no longer matches the sealed artifact, so the review that " +
@@ -6404,6 +6669,7 @@ function Invoke-ReviewerPromotion {
             }
             Write-Warning "The Markdown preview at $previewPath does not match the sealed artifact; publishing the sealed manifest on the operator's explicit instruction."
         }
+        else { $verifiedPreviewText = $previewText }
     }
 
     # Defence in depth on the text: re-parse the stored marker under the same
@@ -6424,25 +6690,7 @@ function Invoke-ReviewerPromotion {
             default { $ResultMarkerPrefix }
         }
     }
-    # Every comment this run writes - the summary and each finding - is rendered
-    # by THIS script's formatter, heading and footer. If the agent was upgraded
-    # since the artifact was sealed and any of that text changed, a comment
-    # already on the PR no longer fingerprints equal to the one about to be
-    # written, dedupe silently fails, and the retry of an interrupted delivery
-    # posts a duplicate. The manifest is intact in that case, so the seal cannot
-    # catch it - the script identity has to.
     $sealedScriptSha = [string](Get-ReviewerHashValue -Container $signed -Key 'scriptSha256' -Default '')
-    if (-not (Test-ReviewerAgentVersionMatch -SealedSha $sealedScriptSha -RunningSha $ScriptSelfSha256)) {
-        if (-not $AcceptArtifactFromDifferentAgentVersion) {
-            throw ("This artifact was sealed by a different version of the reviewer (sealed " +
-                "$($sealedScriptSha.Substring(0, [Math]::Min(12, $sealedScriptSha.Length))), running " +
-                "$($ScriptSelfSha256.Substring(0, [Math]::Min(12, $ScriptSelfSha256.Length)))). The manifest is intact, " +
-                "but comment text is rendered by the running script, so a comment this artifact already posted may not " +
-                "be recognised as a duplicate and would be posted twice. Re-run the reviewer for a fresh artifact, or " +
-                "pass -AcceptArtifactFromDifferentAgentVersion if you know the comment format did not change.")
-        }
-        Write-Warning "This artifact was sealed by a different version of the reviewer; promoting it on the operator's explicit instruction. Watch for duplicated comments."
-    }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
     $marker = ConvertFrom-AgentResultMarker -StdOutText ("$storedMarkerPrefix " + [string]$signed.markerBody) `
@@ -6476,7 +6724,7 @@ function Invoke-ReviewerPromotion {
             throw "The sealed delivery manifest does not match the stored marker's detailed review sections."
         }
     }
-    if ($artifactVersion -eq 6) {
+    if ($artifactVersion -ge 6) {
         $manifestPresentationJson = Get-ReviewerCanonicalJson -Value $signed.approvedPresentation
         $markerPresentationJson = Get-ReviewerCanonicalJson -Value $storedPresentation
         if ($manifestPresentationJson -cne $markerPresentationJson) {
@@ -6487,6 +6735,23 @@ function Invoke-ReviewerPromotion {
     if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         throw ("-PromotePreview publishes an already-approved review, so it needs at least one of " +
             "-EnableFindingComments, -EnableThreadReplies, -EnableSummaryComment or -EnableApprovalVote.")
+    }
+
+    try {
+        $deliveryPayload = Get-ReviewerPromotionPayload -Manifest $signed -Marker $marker `
+            -VerifiedPreviewText $verifiedPreviewText `
+            -SameBuild ([bool]($sealedScriptSha -and $sealedScriptSha -ceq $ScriptSelfSha256)) `
+            -AcceptDifferentBuild ([bool]$AcceptArtifactFromDifferentAgentVersion)
+    }
+    catch {
+        if (-not $ExistingSession) { throw }
+        $reason = $_.Exception.Message
+        Write-Warning "PR $prId delivery remains blocked: $reason"
+        Send-ReviewerEvent delivery.blocked -Level warning -PrId $prId -SourceCommit $sourceCommit -Data @{
+            title = $prTitle; reason = $reason; retryable = $false
+            nextRetry = 'Use the original reviewer build or inspect the sealed preview for attended recovery; do not delete the pending plan.'
+        } -Message "PR $prId delivery requires verified legacy-format recovery."
+        return 2
     }
 
     $session = $ExistingSession
@@ -6500,17 +6765,17 @@ function Invoke-ReviewerPromotion {
 
         $allFindings = @($marker['findings'])
         $counts = Get-ReviewerSeverityCounts -Findings $allFindings
-        $approved = @($signed.approvedComments)
+        $approved = @($signed.approvedComments | Where-Object { $null -ne $_ })
         $approvedReviewSections = if ($artifactVersion -eq 5) { @($signed.approvedReviewSections) } else { @() }
         $securityReviewApplied = if ($artifactVersion -eq 5) { [bool]$signed.securityReviewApplied } else { $false }
-        $approvedPresentation = if ($artifactVersion -eq 6) {
+        $approvedPresentation = if ($artifactVersion -ge 6) {
             ConvertTo-ReviewerHashtable -Value $signed.approvedPresentation
         }
         else {
             Get-ReviewerPresentationFromMarker -Marker $marker
         }
-        $approvedThreadReplies = @($signed.approvedThreadReplies)
-        $reviewedThreadTargets = @($signed.reviewedThreadTargets)
+        $approvedThreadReplies = @($signed.approvedThreadReplies | Where-Object { $null -ne $_ })
+        $reviewedThreadTargets = @($signed.reviewedThreadTargets | Where-Object { $null -ne $_ })
         $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
         # Re-scope the APPROVED list; this can only remove entries.
         $stillPublishable = @((Split-ReviewerFindingsByChangeSet -Findings $approved -ChangedPaths $changedPaths).Postable)
@@ -6600,7 +6865,7 @@ function Invoke-ReviewerPromotion {
             -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
             -ChangeSetKnown (@($changedPaths).Count -gt 0) `
             -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
-            -SealedPublishableCount (@($approved).Count)
+            -SealedPublishableCount (@($approved).Count) -DeliveryPayload $deliveryPayload
 
         $reviewedState = Get-AgentDurableRecords -Context $script:ReviewerDurableContext
         $priorRecord = $null
@@ -7022,29 +7287,6 @@ function Invoke-ReviewerCycle {
                     [void]$blocked.Add("PR $prId blocked (delivery-pending)")
                     continue
                 }
-                # A plan sealed by an older build cannot be replayed safely (see
-                # Invoke-ReviewerPromotion). It is NOT abandoned, though: the
-                # plan is the only record of which findings still owe delivery,
-                # and re-reviewing at the same commit could both LOSE one (a
-                # fresh model run is not deterministic) and DUPLICATE another
-                # (the changed format no longer fingerprints equal to what is
-                # already on the PR). The PR is skipped instead, loudly, and the
-                # rest of the queue continues. A new commit supersedes the plan
-                # naturally; an operator can still replay it deliberately.
-                if (-not (Test-ReviewerAgentVersionMatch -SealedSha (Get-ReviewerArtifactScriptSha -Path $pendingPlan) -RunningSha $ScriptSelfSha256)) {
-                    Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer. " +
-                        "Replaying it could duplicate comments and re-reviewing could lose a finding that never posted, " +
-                        "so this PR is skipped. " + (Get-ReviewerVersionMismatchGuidance -ArtifactPath $pendingPlan))
-                    [void]$blocked.Add("PR $prId blocked (delivery plan sealed by another build)")
-                    $skipCounts.unfinishedDelivery++
-                    Send-ReviewerEvent delivery.blocked -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
-                        title = [string](Get-ReviewerHashValue -Container $prRecord -Key 'title' -Default "PR $prId")
-                        reason = 'unfinished delivery plan was sealed by another reviewer build'
-                        outstanding = @((Get-ReviewerHashValue -Container $reviewedState[[string]$prId] -Key 'pendingCapabilities' -Default @()))
-                        retryable = $true; nextRetry = 'after operator resolves the version mismatch'
-                    } -Message "PR $prId unfinished delivery is blocked by a reviewer version mismatch."
-                    continue
-                }
             }
             if ($pendingPlan) {
                 Send-ReviewerEvent delivery.retrying -Level warning -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit -Data @{
@@ -7053,6 +7295,11 @@ function Invoke-ReviewerCycle {
                 } -Message "PR $prId has an unfinished delivery; retrying the exact sealed review."
                 $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan -ExistingSession $session
                 if ([int]$retryCode -ne 0) { $result.ExitCode = 1 }
+                if ([int]$retryCode -eq 2) {
+                    [void]$blocked.Add("PR $prId blocked (legacy delivery text could not be verified)")
+                    $skipCounts.unfinishedDelivery++
+                    continue
+                }
                 [void]$retried.Add("PR $prId delivery retried")
                 $reviewedState = Get-AgentDurableRecordsSnapshot -Context $script:ReviewerDurableContext
                 continue

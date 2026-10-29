@@ -3235,6 +3235,26 @@ test("Simple presentation keeps unknown outcomes honest and all capability names
   assert.equal(selectionWindow(0, 0), 0);
 });
 
+test("Simple details show legacy recovery guidance only for the blocked PR", () => {
+  const reducer = new OperationsReducer();
+  reducer.apply(simpleLiveEvent("recovery", 202));
+  reducer.apply(simpleLiveEvent("recovery", 202, 2, {
+    eventType: "delivery.blocked",
+    data: { reason: "Legacy text is unverifiable", nextRetry: "Inspect the original sealed preview", retryable: false },
+  }));
+  const blocked = simpleInstanceRow(reducer.get("reviewer:recovery")!);
+  assert.ok(blocked.details.includes("Recovery: Inspect the original sealed preview"));
+  reducer.apply(simpleLiveEvent("recovery", 101, 3));
+  reducer.apply(simpleLiveEvent("recovery", 101, 4, {
+    eventType: "candidate.skipped",
+    data: { normalizedReason: "delivered", reason: "already reviewed and delivered" },
+  }));
+  const delivered = simpleInstanceRow(reducer.get("reviewer:recovery")!);
+  assert.equal(delivered.pullRequestId, 101);
+  assert.ok(delivered.details.includes("Outcome: delivered"));
+  assert.ok(delivered.details.every((detail) => !/Legacy text|Recovery:/.test(detail)));
+});
+
 test("Simple boxed sidebar has separate native bounds and visible focus at 100 and 140 columns, including eight rows", { timeout: 20_000 }, async (context) => {
   for (const width of [100, 140]) for (const height of [8, 16]) {
     const fixture = await automationFixture();
