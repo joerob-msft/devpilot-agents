@@ -551,7 +551,7 @@ test("running build version stays visible in Simple and Advanced without hiding 
           await setup.flush();
         }
         const header = setup.captureCharFrame().split("\n")[0]!;
-        assert.ok(header.includes(`v${packageInfo.version}`), header);
+        assert.ok(header.includes(`v${packageInfo.version} `), header);
         assert.ok(header.includes("OPERATIONAL"), header);
         assert.ok(header.length <= width, header);
         if (mode === "advanced") assert.ok(header.includes("NO MANUAL"), header);

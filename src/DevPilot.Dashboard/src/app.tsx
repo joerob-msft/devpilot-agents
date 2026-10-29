@@ -3247,14 +3247,14 @@ export function App(props: AppProps) {
       : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | ${headerContext()}`;
   const headerBrand = () => {
     const full = `DEVPILOT OPERATIONS v${packageInfo.version}`;
-    return full.length + headerStatus().length + 2 <= dimensions().width
+    return full.length + headerStatus().length + 3 <= dimensions().width
       ? full
       : `DEVPILOT v${packageInfo.version}`;
   };
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
-      <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
+      <box height={1} paddingX={1} gap={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
         <text height={1} flexShrink={0} fg={COLORS.brand}>{headerBrand()}</text>
         <text height={1} flexShrink={1} minWidth={0} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
           {headerStatus()}

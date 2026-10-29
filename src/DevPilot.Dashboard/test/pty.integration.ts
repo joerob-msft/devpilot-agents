@@ -2104,7 +2104,8 @@ test("real ConPTY Enter flow shows starting, late progress, completion and cance
       exitSubscription = terminal.onExit((exit) => { exited = exit; });
       await waitFor(SIMPLE_MAIN_HINT);
       await send("a", "INSTANCES");
-      await waitFor("DEVPILOT OPERATIONS");
+      await waitFor("DEVPILOT ");
+      await waitFor(`v${packageInfo.version}`);
       await send("m", "PR ID: (blank)");
       if (role === "review-handler") await send("\t", "Agent: Review Handler");
       await send("104\r\r", "NOT STARTED / READY TO START");
