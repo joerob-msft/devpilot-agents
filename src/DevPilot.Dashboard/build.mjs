@@ -1,5 +1,5 @@
 import { transformFileAsync } from "@babel/core";
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative } from "node:path";
 
 const roots = ["src", "test"];
@@ -30,3 +30,5 @@ async function visit(directory) {
 }
 
 for (const root of roots) await visit(root);
+// Bind version reporting to this build, not a later edit to the source package.
+await copyFile("package.json", join("dist", "package.json"));
