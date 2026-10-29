@@ -7,6 +7,7 @@ import { createDashboardLifecycle } from "./lifecycle.js";
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
 import { FileDismissalStorage } from "./dismissals.js";
+import packageInfo from "../package.json" with { type: "json" };
 
 interface Arguments {
   stateDirectories: string[];
@@ -73,6 +74,7 @@ export function parseArguments(argv: string[]): Arguments {
 async function main(): Promise<void> {
   const args = parseArguments(process.argv.slice(2));
   if (process.exitCode !== undefined) return;
+  process.stdout.write(`DevPilot Operations v${packageInfo.version}\n`);
   const dismissalStorage = new FileDismissalStorage(args.viewStateDirectory);
   let dismissalError = "";
   const reducer = await dismissalStorage.load()

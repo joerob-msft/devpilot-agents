@@ -6,6 +6,7 @@ import test, { type TestContext } from "node:test";
 import { testRender } from "@opentui/solid";
 import { BoxRenderable } from "@opentui/core";
 import type { TestRendererSetup } from "@opentui/core/testing";
+import packageInfo from "../package.json" with { type: "json" };
 import {
   App, BRAND_PLANE, HELP_LEGEND, appendPromptScalar, completionResultColor,
   printableKeySequence, safeHttpUrl, selectableCount, parseManualPullRequestId,
@@ -533,6 +534,40 @@ test("URL validation only permits credential-free HTTP(S) URLs", () => {
   assert.equal(safeHttpUrl("file:///C:/secret"), null);
   assert.equal(safeHttpUrl("https://user:password@example.com/pr"), null);
   assert.equal(safeHttpUrl("not a URL"), null);
+});
+
+test("running build version stays visible in Simple and Advanced without hiding authority", async (context) => {
+  for (const width of [60, 70, 100, 140]) {
+    const fixture = createFixture();
+    let setup: TestRendererSetup | undefined;
+    try {
+      setup = await testRender(() => <App {...fixture} launchMode="operational" />, {
+        width, height: 24, kittyKeyboard: true,
+      });
+      await setup.renderOnce();
+      for (const mode of ["simple", "advanced"]) {
+        if (mode === "advanced") {
+          setup.mockInput.pressKey("a");
+          await setup.flush();
+        }
+        const header = setup.captureCharFrame().split("\n")[0]!;
+        assert.ok(header.includes(`v${packageInfo.version}`), header);
+        assert.ok(header.includes("OPERATIONAL"), header);
+        assert.ok(header.length <= width, header);
+        if (mode === "advanced") assert.ok(header.includes("NO MANUAL"), header);
+        if (width === 140) assert.ok(header.includes("DEVPILOT OPERATIONS"), header);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("native FFI is not available")) {
+        context.skip("native rendering is covered by npm run test:renderer with the locked Bun runtime");
+        return;
+      }
+      throw error;
+    } finally {
+      setup?.renderer.destroy();
+      await fixture.tailer.stop();
+    }
+  }
 });
 
 test("partial and failure result phrases retain semantic colors", () => {

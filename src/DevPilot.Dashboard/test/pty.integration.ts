@@ -8,6 +8,7 @@ import { stripVTControlCharacters } from "node:util";
 import { execFileSync } from "node:child_process";
 import { spawn, type IDisposable, type IPty } from "node-pty";
 import { TerminalScreen } from "./terminal-screen.js";
+import packageInfo from "../package.json" with { type: "json" };
 
 const WAIT_TIMEOUT_MS = 8_000;
 const EXIT_TIMEOUT_MS = 5_000;
@@ -1154,7 +1155,7 @@ function resolvePowerShellPath(): string {
   throw new Error("PowerShell executable not found on PATH");
 }
 
-test("built dashboard accepts real ConPTY input and exits cleanly", {
+test("launcher and built dashboard show the running version, accept ConPTY input, and exit cleanly", {
   skip: process.platform === "win32" ? false : "ConPTY integration is Windows-only",
   timeout: 60_000,
 }, async () => {
@@ -1226,13 +1227,17 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     await mkdir(eventDirectory, { recursive: true });
     await writeFile(eventPath, fixtureLines(), "utf8");
 
-    terminal = spawn(bunPath, ["--conditions=browser", entryPath, "--state-dir", stateRoot,
-      "--view-state-dir", join(stateRoot, "display")], {
+    await writeFile(join(stateRoot, "package.json"), JSON.stringify({ version: "99.99.99" }));
+    await writeFile(join(stateRoot, "VERSION"), "99.99.99\n");
+    terminal = spawn(resolvePowerShellPath(), [
+      "-NoLogo", "-NoProfile", "-File", resolve(dashboardRoot, "..", "..", "tools", "Start-DevPilotDashboard.ps1"),
+      "-StateDir", stateRoot,
+    ], {
       name: "xterm-256color",
       cols: 130,
       rows: 36,
-      cwd: dashboardRoot,
-      env: environment(),
+      cwd: stateRoot,
+      env: { ...environment(), LOCALAPPDATA: join(stateRoot, "localappdata"), npm_package_version: "99.99.99" },
     });
     dataSubscription = terminal.onData((data) => {
       raw = (raw + data).slice(-MAX_CAPTURE_CHARS);
@@ -1245,6 +1250,9 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     });
 
     await waitForVisible(SIMPLE_MAIN_HINT);
+    await waitForVisible(`v${packageInfo.version}`);
+    assert.ok(stripVTControlCharacters(raw).includes(`DevPilot Operations v${packageInfo.version}`));
+    assert.doesNotMatch(visibleOutput(), /99\.99\.99/);
     await writeAndWait("a", "FOCUS RAIL");
     await waitForVisible("DEVPILOT OPERATIONS");
     await waitForVisible("OBSERVE ONLY");
@@ -1298,6 +1306,7 @@ test("built dashboard accepts real ConPTY input and exits cleanly", {
     screen.resize(terminalColumns, terminalRows);
     terminal.resize(terminalColumns, terminalRows);
     await waitForVisible("HISTORY | REVIEWER | FOCUS RAIL", resizeStart);
+    await waitForVisible(`v${packageInfo.version}`);
     resizeStart = revision + 1;
     terminalColumns = 130;
     terminalRows = 36;

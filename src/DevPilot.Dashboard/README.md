@@ -10,6 +10,10 @@ review-handler instances and, only under a trusted launcher, manually
 starting either agent by PR ID through the restricted broker contract,
 without requiring retained history.
 
+The startup banner and TUI header show the running toolkit version. The TUI
+version is captured when built, so installing a newer release does not relabel
+an already-running dashboard; relaunch through the consumer launcher to update.
+
 Every launch starts in **Simple**. At 100 columns and wider, a clearly boxed
 left sidebar lists agents, PRs, and statuses, with the selected item's latest
 activity beside it. The sidebar is bounded to 40-42 columns; it is not the

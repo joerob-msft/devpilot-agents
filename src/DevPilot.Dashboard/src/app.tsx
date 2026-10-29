@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { ScrollBoxRenderable } from "@opentui/core";
+import packageInfo from "../package.json" with { type: "json" };
 import { decideLayout, type LayoutDecision } from "./layout.js";
 import {
   age,
@@ -3239,21 +3240,24 @@ export function App(props: AppProps) {
   const simpleHeight = () => Math.max(3, dimensions().height - 1 - (footer().summary ? 2 : 1) -
     (showAutomationStatus() ? 1 : 0) - (showFeedback() ? 1 : 0) -
     (diagnostics().length || props.brokerFailure?.() || dismissalError() || automationError() ? 1 : 0));
+  const headerStatus = () => uiMode() === "simple"
+    ? props.launchMode === "operational" ? "OPERATIONAL" : props.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY"
+    : `${(props.launchMode ?? "observe") === "observe" && !props.broker
+      ? "OBSERVE ONLY"
+      : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | ${headerContext()}`;
+  const headerBrand = () => {
+    const full = `DEVPILOT OPERATIONS v${packageInfo.version}`;
+    return full.length + headerStatus().length + 2 <= dimensions().width
+      ? full
+      : `DEVPILOT v${packageInfo.version}`;
+  };
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={COLORS.bg}>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between" backgroundColor={COLORS.panelAlt}>
-        <text height={1} fg={COLORS.brand}>DEVPILOT OPERATIONS</text>
-        <text height={1} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
-          <Show when={uiMode() === "simple"} fallback={
-          <>
-          {(props.launchMode ?? "observe") === "observe" && !props.broker
-            ? "OBSERVE ONLY"
-            : `${(props.launchMode ?? "observe").toUpperCase()} | ${props.broker ? "TRUSTED MANUAL ENABLED" : "NO MANUAL"}`} | {headerContext()}
-          </>
-          }>
-            {props.launchMode === "operational" ? "OPERATIONAL" : props.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY"}
-          </Show>
+        <text height={1} flexShrink={0} fg={COLORS.brand}>{headerBrand()}</text>
+        <text height={1} flexShrink={1} minWidth={0} fg={props.launchMode === "operational" ? COLORS.error : props.broker ? COLORS.warning : COLORS.muted}>
+          {headerStatus()}
         </text>
       </box>
       <Show when={showAutomationStatus()}>
