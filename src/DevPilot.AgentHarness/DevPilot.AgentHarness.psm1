@@ -6057,14 +6057,22 @@ function Get-AgentSourceScopedAttemptRecord {
     if ($recordSource -ine $SourceCommit) { return $empty }
     $failureClass = [string](& $get $Record 'failureClass' '')
     $deterministicCount = [Math]::Max(0, [int](& $get $Record 'deterministicCount' 0))
+    $timestamps = @{}
+    foreach ($name in @('lastAt', 'nextRetryAt')) {
+        $value = & $get $Record $name ''
+        $timestamps[$name] = if ($value -is [DateTime] -or $value -is [DateTimeOffset]) {
+            $value.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        }
+        else { [string]$value }
+    }
     return @{
         MatchesSource = $true
         DeterministicCount = $deterministicCount
         FailureClass = $failureClass
         LastReason = [string](& $get $Record 'lastReason' '')
-        LastAt = [string](& $get $Record 'lastAt' '')
+        LastAt = $timestamps.lastAt
         Retryable = [bool](& $get $Record 'retryable' $true)
-        NextRetryAt = [string](& $get $Record 'nextRetryAt' '')
+        NextRetryAt = $timestamps.nextRetryAt
     }
 }
 
