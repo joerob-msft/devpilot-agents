@@ -10,7 +10,7 @@ BeforeAll {
         'Format-ReviewerFindingComment', 'Format-ReviewerThreadReply', 'Format-ReviewerSummaryComment',
         'Get-ReviewerSeverityCounts', 'Get-ReviewerCommentFingerprint', 'Get-ReviewerFindingFingerprint',
         'Get-ReviewerExistingFingerprints', 'Get-ReviewerThreadReplyFingerprint',
-        'Get-ReviewerExistingThreadReplyFingerprints', 'Get-ReviewerWritesRequested',
+        'Get-ReviewerExistingThreadReplyFingerprints', 'Get-ReviewerWritesRequested', 'ConvertTo-ReviewerThread',
         'Get-ReviewerPublishableCount', 'Test-ReviewerShouldPostSummary', 'Get-ReviewerFindingThreadStatus',
         'Get-ReviewerSummaryThreadStatus', 'Get-ReviewerDeliveryItemKey', 'New-ReviewerDeliveryPayload',
         'Get-ReviewerDeliveryBody', 'Test-ReviewerPayloadMatchesPreview', 'Get-ReviewerPromotionPayload',
@@ -25,12 +25,16 @@ BeforeAll {
         if (-not $definition) { throw "Missing helper $name" }
         . ([scriptblock]::Create($definition.Extent.Text))
     }
+    $script:reviewerThreadReaderDefinition = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ReviewerPullRequestThreads'
+    }, $true).Extent.Text
 
     function Get-ReviewerArtifactSigningKey { param([string]$KeyPath) return ,$script:testKey }
     function Test-ReviewerDeliveryStillValid { param($Session, $PrId, $ExpectedSourceCommit) }
     function Get-ReviewerAuthorUpn { param($Pr) return '' }
     function Get-ReviewerAuthorMentionIdentity { param($Pr) return @{ Id = ''; DisplayName = '' } }
-    function Get-ReviewerPullRequestThreads { param($Session, $PrId) return $script:threads }
+    function Get-ReviewerPullRequestThreads { param($Session, $PrId) return ,$script:threads }
     function Add-ReviewerThread { param($Session, $PrId, $Content, $FilePath, $Line, $Status) }
     function Invoke-AgentMcpTool { param($Session, $Name, [switch]$RawText, $Arguments) }
 
@@ -257,6 +261,51 @@ Describe 'sealed reviewer delivery across builds' {
         $script:threads[0].comments[0].content | Should -Be $review.Result.DeliveryPayload.summary
         Should -Invoke Add-ReviewerThread -Times 1 -Exactly
         Should -Invoke Invoke-AgentMcpTool -Times 0
+    }
+
+    It 'confirms and reuses summaries through the real reader with <ExistingCount> existing provider threads' -ForEach @(
+        @{ ExistingCount = 0 }, @{ ExistingCount = 1 }, @{ ExistingCount = 101 }
+    ) {
+        . ([scriptblock]::Create($script:reviewerThreadReaderDefinition))
+        Mock Invoke-AgentMcpTool {
+            param($Session, $Name, [switch]$RawText, $Arguments)
+            if ($Name -ne 'repo_pull_request_thread' -or $Arguments.action -ne 'list') {
+                throw 'Expected only a provider thread-list read.'
+            }
+            foreach ($thread in @($script:threads | Select-Object -Skip $Arguments.skip -First $Arguments.top)) {
+                @{
+                    id = $thread.threadId; status = $thread.status
+                    comments = @(
+                        foreach ($comment in $thread.comments) {
+                            @{
+                                id = $comment.commentId; content = $comment.content
+                                author = @{ uniqueName = $comment.authorUniqueName }
+                                publishedDate = $comment.publishedDate; isDeleted = $comment.isDeleted
+                            }
+                        }
+                    )
+                }
+            }
+        }
+        $review = New-TestReview
+        $body = $review.Result.DeliveryPayload.summary
+        for ($i = 0; $i -lt $ExistingCount; $i++) {
+            $owner = if ($i -lt $ExistingCount - 1) { 'other@example.test' } else { 'operator@example.test' }
+            $script:threads += New-TestSummaryThread $body -ThreadId (90 + $i) -Owner $owner
+        }
+        $first = Set-ReviewerSummaryComment -Session @{} -PrId 42 -SourceCommit ('a' * 40) `
+            -Content $body -ReportedFindingCount 2
+        $first.Error | Should -Be ''
+        $first.Delivered | Should -BeTrue
+        $retry = Set-ReviewerSummaryComment -Session @{} -PrId 42 -SourceCommit ('a' * 40) `
+            -Content ($body.Replace('Stored review.', 'Same result, different prose.')) -ReportedFindingCount 2
+        $retry.Delivered | Should -BeTrue
+        $script:threads.Count | Should -Be ([Math]::Max(1, $ExistingCount))
+        $expectedCreates = if ($ExistingCount -eq 0) { 1 } else { 0 }
+        Should -Invoke Add-ReviewerThread -Times $expectedCreates -Exactly
+        if ($ExistingCount -gt 100) {
+            Should -Invoke Invoke-AgentMcpTool -ParameterFilter { $Arguments.skip -eq 100 }
+        }
     }
 
     It 'updates the same summary when <Change> changes, including after a fresh wrapper pass' -ForEach @(

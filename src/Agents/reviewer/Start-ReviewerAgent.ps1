@@ -3423,7 +3423,7 @@ function Set-ReviewerSummaryComment {
     )
     $expectedStatus = Get-ReviewerSummaryThreadStatus -ReportedFindingCount $ReportedFindingCount
     try {
-        $threads = @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId)
+        $threads = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
         $target = Get-ReviewerSummaryTarget -Threads $threads -OwnerAlias $OperatorAlias -PrId $PrId
         $marker = Get-ReviewerSummaryMarker -Content $Content
         $sameResult = $target -and $marker -and (Get-ReviewerSummaryMarker -Content $target.Content) -ceq $marker
@@ -3434,7 +3434,7 @@ function Set-ReviewerSummaryComment {
         }
         $fresh = Test-ReviewerDeliveryStillValid -Session $Session -PrId $PrId -ExpectedSourceCommit $SourceCommit
         if (-not $fresh.Ok) { return @{ Delivered = $false; Error = $fresh.Reason } }
-        $justInTime = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+        $justInTime = Get-ReviewerSummaryTarget -Threads (Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
             -OwnerAlias $OperatorAlias -PrId $PrId
         if (($target -and (-not $justInTime -or $target.ThreadId -ne $justInTime.ThreadId -or
                     $target.CommentId -ne $justInTime.CommentId -or $target.Content -cne $justInTime.Content)) -or
@@ -3464,7 +3464,7 @@ function Set-ReviewerSummaryComment {
         }
         catch { $writeError = $_.Exception.Message }
         # A failed/uncertain update never falls back to creating another thread.
-        $confirmed = Get-ReviewerSummaryTarget -Threads @(Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
+        $confirmed = Get-ReviewerSummaryTarget -Threads (Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId) `
             -OwnerAlias $OperatorAlias -PrId $PrId
         $expectedBody = if ($sameResult -or $sameBody) { $target.Content } else { $Content }
         $delivered = $confirmed -and (-not $target -or ($confirmed.ThreadId -eq $target.ThreadId -and
