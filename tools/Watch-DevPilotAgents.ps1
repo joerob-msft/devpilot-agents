@@ -24,6 +24,14 @@
     delegable capability so no grant can ever widen it back for that launch.
     Once forces a single cycle even under Golden.
 
+    CanvasBridge (prototype) additionally lets the GitHub Copilot app canvas in
+    src\DevPilot.CopilotCanvas observe this dashboard and stage manual runs. The
+    dashboard serves an authenticated 127.0.0.1 bridge through its own trusted
+    broker client and publishes canvas-bridge.v1.json in the private watch-state
+    root. The broker, its launch provenance and the dashboard argv are unchanged.
+
+.EXAMPLE
+    .\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
 .EXAMPLE
     .\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
@@ -139,7 +147,10 @@ param(
     [string]$ReviewHandlerModel,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [switch]$IncludeOwnPullRequests
+    [switch]$IncludeOwnPullRequests,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$CanvasBridge
 )
 
 $ErrorActionPreference = 'Stop'
@@ -301,6 +312,9 @@ function Resolve-WatchLaunchPolicy {
     # an explicit -EnableManual* switch stays independent of -Agent, exactly as before.
     $manualReviewer = $EnableManualReviewer -or ($Golden -and $launchReviewer)
     $manualReviewHandler = $EnableManualReviewHandler -or ($Golden -and $launchReviewHandler)
+    if ((& $explicit 'CanvasBridge') -and -not ($manualReviewer -or $manualReviewHandler)) {
+        [void]$failures.Add('-CanvasBridge requires the trusted manual broker: add -Golden or enable a manual role.')
+    }
     $manualReviewerWrites = -not $PreviewOnly -and ($EnableManualReviewerWrites -or ($Golden -and $manualReviewer))
     $manualReviewHandlerCodeUpdates = -not $PreviewOnly -and
         ($EnableManualReviewHandlerCodeUpdates -or ($Golden -and $manualReviewHandler))
@@ -1001,13 +1015,25 @@ if ($startupFailure) {
 
 $dashboardCompletedNormally = $false
 $agentsStoppedByDashboard = $false
+$canvasBridgeEnvironment = @{}
+if ($CanvasBridge -and $brokerDescriptorPath) {
+    # Passed through the environment rather than argv so the dashboard command line that the broker
+    # pins for launch provenance stays byte-for-byte unchanged. The dashboard clears both on read.
+    $canvasBridgeEnvironment = @{
+        DEVPILOT_CANVAS_BRIDGE_FILE = (Join-Path $StateDir 'canvas-bridge.v1.json')
+        DEVPILOT_CONSUMER_REPOSITORY_ROOT = $consumerRepositoryRoot
+    }
+    Write-Host "Copilot canvas bridge: enabled (open the 'DevPilot Operations' canvas in a Copilot app session for $(if ($consumerRepositoryRoot) { $consumerRepositoryRoot } else { 'this launch' }))." -ForegroundColor Cyan
+}
 try {
+    foreach ($name in $canvasBridgeEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $canvasBridgeEnvironment[$name]) }
     $global:LASTEXITCODE = 0
     & $dashboardLauncher @dashboardParameters
     if ($LASTEXITCODE -ne 0) { throw "Dashboard exited with code $LASTEXITCODE." }
     $dashboardCompletedNormally = $true
 }
 finally {
+    foreach ($name in $canvasBridgeEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $null) }
     if (-not $dashboardCompletedNormally -or $launch.Continuous -or $launch.Operational) {
         foreach ($child in $children) {
             Close-OwnedAgentProcess -Process $child.Process -Role $child.Role

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="devpilot-nonce" content="__DEVPILOT_NONCE__">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DevPilot Operations</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="title">
+      <strong>DevPilot Operations</strong>
+      <span id="mode" class="badge" hidden></span>
+    </div>
+    <div class="actions">
+      <select id="view" aria-label="View">
+        <option value="current">Current</option>
+        <option value="live">Live</option>
+        <option value="history">History</option>
+      </select>
+      <button id="scan" type="button" disabled>Scan now</button>
+      <button id="review" type="button" class="primary" disabled>Review a PR</button>
+    </div>
+  </header>
+  <div id="subtitle" class="muted small"></div>
+  <div id="automation" class="muted small"></div>
+  <div id="notice" class="notice" role="status" hidden></div>
+
+  <section id="disconnected" class="panel" hidden>
+    <h2 id="disconnected-title">No Golden watch for this repository</h2>
+    <p class="muted">Start the DevPilot Golden watch from this repository in a terminal and keep it running. This canvas connects automatically.</p>
+    <pre id="command"></pre>
+    <div id="others"></div>
+  </section>
+
+  <section id="runs" hidden>
+    <h2>Started from this canvas</h2>
+    <div id="runs-list"></div>
+  </section>
+
+  <main id="main" hidden>
+    <aside id="list" aria-label="Agent instances"></aside>
+    <article id="detail"></article>
+  </main>
+
+  <dialog id="modal" aria-labelledby="modal-title">
+    <div id="modal-body"></div>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

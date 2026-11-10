@@ -451,6 +451,8 @@ The dashboard never bypasses authority or stops a process based on its PID.
   bounded process-local history visibility state.
 - `dismissals.ts` persists per-instance display dismissals atomically, independently
   of PR History, agent state, work leases, and launch authority.
+- `canvas-bridge.ts` is the opt-in loopback bridge for the Copilot app canvas. See
+  *Copilot app canvas (prototype)* below.
 - `layout.ts` is a pure responsive decision function used by the SolidJS UI.
 - `simple-view.tsx` supplies pure Simple presentation rows, identity-pinned list/details,
   and the scrollable manual panel without changing reducer or broker authority.
@@ -464,3 +466,66 @@ The UI displays only bounded summaries. Unknown envelope or `data` fields are
 accepted but are not rendered as unbounded raw content. Browser opening is
 fail-closed: only credential-free `http:` and `https:` URLs are passed as a
 process argument to a platform opener, never interpolated into a shell command.
+
+## Copilot app canvas (prototype)
+
+The **DevPilot Operations** canvas brings this dashboard into the GitHub Copilot
+app's side panel. It shows instances, automation, Scan now, and a *Review a PR*
+form with preview, Replace / Run next and cancel. Golden stays fully intact. The
+canvas never starts or trusts a broker of its own. It talks to this dashboard,
+which keeps owning the trusted broker client.
+
+1. Install the canvas once: `.\tools\Install-DevPilotCanvas.ps1`. It is copied to
+   `~\.copilot\extensions\devpilot-ops`, so it works in every repository's
+   sessions and nothing is committed to consumer repositories. Reload Copilot
+   extensions afterwards, or restart the app.
+2. From the consumer repository (where `.github\copilot\agents\*.config.json`
+   lives), start the watch with the bridge opted in:
+
+   ```powershell
+   .\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
+   ```
+
+   Keep this terminal open: the TUI is still the owner and authority.
+3. In the Copilot app, open a session for the same repository and open the
+   **DevPilot Operations** canvas, or ask Copilot to open it. A session in its
+   own worktree also matches, because the worktree's main checkout is compared.
+   If no watch matches, the canvas shows the command to run and lists other
+   running watches it can connect to explicitly.
+
+How it works:
+
+- `-CanvasBridge` passes `DEVPILOT_CANVAS_BRIDGE_FILE` and
+  `DEVPILOT_CONSUMER_REPOSITORY_ROOT` to the dashboard **through the
+  environment**. The dashboard argv pinned by broker launch provenance is
+  therefore unchanged. The dashboard clears both variables before it spawns the
+  broker.
+- `canvas-bridge.ts` serves an authenticated `127.0.0.1` API: bearer token,
+  exact `Host`, and JSON bodies of at most 16 KiB. It publishes
+  `canvas-bridge.v1.json` (URL, token, PID, consumer repository) in the private
+  watch-state root and removes it on exit.
+  - The API is `/v1/status`, `/v1/scan-now` and
+    `/v1/review/{describe,dispatch,prepare-run,confirm-run,cancel-queued,cancel}`.
+  - It never exposes widening, narrowing, the kill switch, or shutdown. These
+    stay TUI-only.
+- `src\DevPilot.CopilotCanvas` is the extension. It matches the session's
+  repository to a live bridge, keeps the token server-side, and serves its UI
+  behind a per-instance nonce.
+  - Agent-callable actions are read-only `get_status` and `prepare_review`.
+    `prepare_review` only pre-fills the form.
+  - Starting work always requires a human click on a Start or Confirm button
+    that is enabled only after the preview has rendered. This mirrors the TUI's
+    `previewRendered` guard.
+- Prototype risk: any process running as the same user can read the
+  owner-private discovery file and call the bridge. The bridge is off unless
+  `-CanvasBridge` is passed.
+
+**Long-term requirement:** the canvas must eventually **start and own the
+Golden watch itself**, with no terminal TUI and with Golden intact. Keep the
+bridge owner-agnostic and its `v1` contract stable toward that goal. The
+remaining design work is:
+
+- a trusted headless Golden owner profile in broker launch provenance;
+- an owner lifecycle that survives extension reloads;
+- a human-gated "Start Golden watch" in the canvas, never an agent action;
+- one owner per consumer repository.

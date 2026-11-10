@@ -50,6 +50,7 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
+  DevPilot.CopilotCanvas/    # prototype GitHub Copilot app canvas over the dashboard
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
@@ -360,7 +361,14 @@ be used:
 
 # Same live workflow with a terminal no-write capability ceiling:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -PreviewOnly
+
+# Prototype: also expose this watch to the "DevPilot Operations" canvas in the
+# GitHub Copilot app (install once with tools\Install-DevPilotCanvas.ps1):
+<toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
 ```
+
+See [Copilot app canvas (prototype)](src/DevPilot.Dashboard/README.md#copilot-app-canvas-prototype)
+for how the canvas finds this repository's watch and what it may do.
 
 `-Golden` is intentionally explicit because it grants write authority. It
 enables Reviewer finding comments, thread replies, and summaries, plus Review
