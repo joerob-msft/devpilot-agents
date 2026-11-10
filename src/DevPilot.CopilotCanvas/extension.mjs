@@ -1,7 +1,8 @@
-// DevPilot Operations canvas for the GitHub Copilot app (prototype).
-// Attaches to a Golden watch started with `Watch-DevPilotAgents.ps1 -Golden -CanvasBridge` for the
-// session's repository. Starting work always needs a human click in the canvas; no agent action
-// can start a run. Never use console.log here: stdout is the extension JSON-RPC channel.
+// DevPilot Operations canvas for the GitHub Copilot app.
+// Attaches to this repository's Golden watch (a terminal `Watch-DevPilotAgents.ps1 -Golden -CanvasBridge`
+// or a headless one the user started from this canvas). Starting or stopping a watch and starting a
+// run always need a human click in the canvas; no agent action can do any of them.
+// Never use console.log here: stdout is the extension JSON-RPC channel.
 import { createCanvas, joinSession } from "@github/copilot-sdk/extension";
 import { CanvasInstanceServer } from "./canvas-server.mjs";
 
@@ -35,12 +36,17 @@ function applyPrefill(server, input) {
 function summarize(state) {
   const { connection, data } = state;
   if (!data) {
+    const canStartWatch = connection.launcher?.available === true && connection.launch?.state !== "starting";
     return {
       connected: false,
       state: connection.state,
       error: connection.error ?? "",
       repositoryRoots: connection.repositoryRoots,
-      howToStart: connection.command,
+      canStartWatch,
+      watchLaunch: connection.launch ? { state: connection.launch.state, logPath: connection.launch.logPath } : null,
+      howToStart: canStartWatch
+        ? "Ask the user to open the DevPilot Operations canvas, preview the launch plan and click Start. Agents cannot start a watch."
+        : connection.launcher?.reason ? `${connection.launcher.reason} Or run in a terminal: ${connection.command}` : connection.command,
       otherWatches: connection.others,
     };
   }
@@ -48,6 +54,7 @@ function summarize(state) {
     connected: true,
     consumerRepositoryRoot: data.consumerRepositoryRoot,
     launchMode: data.launchMode,
+    watchHeadless: data.headless === true,
     automation: data.automation,
     instances: data.instances.map((item) => ({
       agent: item.agent,
@@ -71,7 +78,7 @@ session = await joinSession({
     createCanvas({
       id: "devpilot-ops",
       displayName: "DevPilot Operations",
-      description: "Watch DevPilot reviewer/review-handler agents for this repository's Golden watch and stage a PR review that the user confirms.",
+      description: "Start, watch and stop this repository's DevPilot Golden watch (reviewer/review-handler agents) and stage a PR review that the user confirms.",
       inputSchema: {
         type: "object",
         properties: {
@@ -119,7 +126,9 @@ session = await joinSession({
         const { connection } = await server.state("live").catch(() => ({ connection: { state: "error" } }));
         return {
           title: "DevPilot Operations",
-          status: connection.state === "connected" ? `${connection.bridge?.launchMode ?? ""} watch`.trim() : "No watch",
+          status: connection.state === "connected"
+            ? `${connection.bridge?.launchMode ?? ""} watch${connection.bridge?.headless ? " (canvas)" : ""}`.trim()
+            : "No watch",
           url: server.url,
         };
       },

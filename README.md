@@ -50,7 +50,7 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
-  DevPilot.CopilotCanvas/    # prototype GitHub Copilot app canvas over the dashboard
+  DevPilot.CopilotCanvas/    # GitHub Copilot app canvas: start/stop and operate the Golden watch
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
@@ -362,13 +362,15 @@ be used:
 # Same live workflow with a terminal no-write capability ceiling:
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -PreviewOnly
 
-# Prototype: also expose this watch to the "DevPilot Operations" canvas in the
-# GitHub Copilot app (install once with tools\Install-DevPilotCanvas.ps1):
+# Also expose this watch to the "DevPilot Operations" canvas in the GitHub
+# Copilot app (install once with tools\Install-DevPilotCanvas.ps1). The canvas
+# can also start the same Golden watch itself, without a terminal
+# (-Golden -Headless -CanvasBridge, after you preview its launch plan):
 <toolkit-root>\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
 ```
 
-See [Copilot app canvas (prototype)](src/DevPilot.Dashboard/README.md#copilot-app-canvas-prototype)
-for how the canvas finds this repository's watch and what it may do.
+See [Copilot app canvas](src/DevPilot.Dashboard/README.md#copilot-app-canvas)
+for how the canvas starts or finds this repository's watch and what it may do.
 
 `-Golden` is intentionally explicit because it grants write authority. It
 enables Reviewer finding comments, thread replies, and summaries, plus Review

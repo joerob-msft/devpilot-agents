@@ -116,6 +116,9 @@ jobs:
       - name: Test release orchestration
         shell: pwsh
         run: node --test ./tests/ReleaseAutomation.Tests.cjs ./tests/ReleasePolicy.Tests.cjs
+      - name: Test Copilot app canvas
+        shell: pwsh
+        run: node --test ./tests/CopilotCanvas.Tests.mjs
 
   dashboard:
     name: Operations dashboard

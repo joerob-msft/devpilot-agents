@@ -47,8 +47,13 @@ $brokerScriptSha256 = [Convert]::ToHexString(
 # script -- see Test-AgentDashboardLaunchProvenance for the full anchor). Computed exactly once,
 # here, before the request loop starts; never re-evaluated per-request. Baseline describe/
 # profile/manual (unwidened) dispatch are completely unaffected by this value.
-$interactiveWideningAvailable = Test-AgentDashboardLaunchProvenance -ToolkitRoot $toolkitRoot `
+$dashboardLaunchProfile = Get-AgentDashboardLaunchProfile -ToolkitRoot $toolkitRoot `
     -BrokerScriptPath $PSCommandPath -DescriptorPath $descriptorFullPath
+$interactiveWideningAvailable = $dashboardLaunchProfile -ceq 'interactive'
+# A canvas-started headless owner (Watch -Headless) is the same pinned Bun/broker chain without a
+# renderer. It may own Golden automatic workers and local observation (both still re-check the
+# grandparent ownerProcessId and start identity), but it never unlocks interactive widening.
+$trustedDashboardLauncher = $dashboardLaunchProfile -cin @('interactive', 'headless')
 $stateRoot = [IO.Path]::GetFullPath([string]$descriptor.stateRoot)
 $durableRoot = [IO.Path]::GetFullPath([string]$descriptor.durableStateRoot)
 $leaseRoot = [IO.Path]::GetFullPath([string]$descriptor.leaseRoot)
@@ -1404,7 +1409,7 @@ function Get-ManualWrapperNotificationArguments {
 function Initialize-BrokerLauncherControl {
     if (-not $descriptor.ContainsKey('launcherControl')) { return }
     $control = $descriptor.launcherControl
-    if (-not $interactiveWideningAvailable -or $control -isnot [Collections.IDictionary] -or
+    if (-not $trustedDashboardLauncher -or $control -isnot [Collections.IDictionary] -or
         $control.schemaVersion -ne 1 -or $control.sessionId -cnotmatch '^[0-9a-f-]{36}$' -or
         $control.ownerStartIdentity -cnotmatch '^(utc|linux):[0-9]+$') {
         throw '[scheduling-unavailable] Automatic-worker ownership requires the trusted current dashboard launcher.'
@@ -2773,7 +2778,7 @@ function Get-LocalWatchObservation {
 }
 
 $localObservation = Get-LocalWatchObservation -Descriptor $descriptor -StateRoot $stateRoot `
-    -DashboardProvenance:$interactiveWideningAvailable
+    -DashboardProvenance:$trustedDashboardLauncher
 if ($null -ne $localObservation) { Write-DispatchProtocolMessage $localObservation }
 
 $protocolReader = [IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false, 1024, $true)

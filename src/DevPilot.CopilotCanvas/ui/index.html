@@ -21,6 +21,7 @@
       </select>
       <button id="scan" type="button" disabled>Scan now</button>
       <button id="review" type="button" class="primary" disabled>Review a PR</button>
+      <button id="stop" type="button" class="danger" hidden>Stop watch</button>
     </div>
   </header>
   <div id="subtitle" class="muted small"></div>
@@ -29,8 +30,12 @@
 
   <section id="disconnected" class="panel" hidden>
     <h2 id="disconnected-title">No Golden watch for this repository</h2>
-    <p class="muted">Start the DevPilot Golden watch from this repository in a terminal and keep it running. This canvas connects automatically.</p>
-    <pre id="command"></pre>
+    <div id="launch"></div>
+    <details id="manual-start">
+      <summary class="muted">Or start it in a terminal</summary>
+      <p class="muted">Start the DevPilot Golden watch from this repository in a terminal and keep it running. This canvas connects automatically.</p>
+      <pre id="command"></pre>
+    </details>
     <div id="others"></div>
   </section>
 

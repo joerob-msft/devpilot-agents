@@ -24,9 +24,15 @@ const ERROR_TEXT = {
   "unknown-draft": "The preview expired. Preview the PR again.",
   "invalid-prompt": "Instructions must be at most 512 characters without control characters.",
   "invalid-pull-request-id": "Enter a PR number between 1 and 2147483647.",
+  "launch-repreview-required": "Preview the launch plan again before starting.",
+  "terminal-owned": "This watch is owned by a terminal. Quit its dashboard there.",
 };
 
-const state = { connection: null, data: null, view: "current", selected: "", modal: null, noticeTimer: 0 };
+const state = {
+  connection: null, data: null, view: "current", selected: "", modal: null, noticeTimer: 0,
+  launchUi: { previewOnly: false, plan: null, busy: false, error: "", armed: false, armScheduled: false, key: "" },
+  stopArmedUntil: 0,
+};
 
 class ApiError extends Error {
   constructor(status, code, detail) {
@@ -158,6 +164,7 @@ function render() {
   $("automation").textContent = connected ? automationText(data.automation) : "";
   $("scan").disabled = !connected || !data.automation?.available || !data.automation.agents.some((agent) => agent.canScanNow);
   $("review").disabled = !connected || data.launchMode === "observe";
+  $("stop").hidden = !(connected && data.headless === true);
   renderDisconnected();
   renderRuns();
   renderInstances();
@@ -172,6 +179,13 @@ function renderDisconnected() {
     ? "No Golden watch for this repository"
     : `Lost connection to the Golden watch (${connection.error || connection.state})`;
   $("command").textContent = connection.command;
+  // Default the terminal fallback open only when canvas Start is unavailable; never fight the user's toggle.
+  const startAvailable = Boolean(connection.launcher?.available);
+  if (state.launchUi.startAvailable !== startAvailable) {
+    state.launchUi.startAvailable = startAvailable;
+    $("manual-start").open = !startAvailable;
+  }
+  renderLaunch(connection);
   const others = $("others");
   others.replaceChildren();
   if (connection.others?.length) {
@@ -190,6 +204,129 @@ async function connectTo(watchId) {
     await refresh();
   } catch (error) {
     notice(errorText(error), true);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Start / Stop the Golden watch: -WhatIf launch plan -> (explicit, render-gated) Start.
+// Only a click here can start or stop a watch; no agent action exists for either.
+// ---------------------------------------------------------------------------------------------
+
+function renderLaunch(connection) {
+  const ui = state.launchUi;
+  const { launcher, launch } = connection;
+  const key = JSON.stringify({
+    launcher, launch: launch && { state: launch.state, pid: launch.pid, logTail: launch.logTail },
+    previewOnly: ui.previewOnly, plan: ui.plan && [ui.plan.launchToken, ui.plan.ok, ui.plan.output],
+    busy: ui.busy, error: ui.error, armed: ui.armed,
+  });
+  if (key === ui.key) return;
+  ui.key = key;
+  const root = $("launch");
+  root.replaceChildren();
+  if (!launcher) return;
+  if (!launcher.available) {
+    root.append(el("p", { class: "muted" }, `Starting from the canvas is unavailable: ${launcher.reason}`));
+    return;
+  }
+  if (launch?.state === "starting") {
+    root.append(el("p", {}, `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… This canvas connects when it is ready.`),
+      el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
+    if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
+    return;
+  }
+  if (launch?.state === "failed") {
+    root.append(el("p", { class: "error-text" }, "The Golden watch did not start."),
+      el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
+    if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
+  }
+  root.append(
+    el("p", { class: "muted" }, "Start this repository's Golden watch from here, without a terminal. It keeps running while the Copilot app is open, even if you close this canvas, until you stop it here. Quitting the app stops it and its agents."),
+    el("div", { class: "muted small" }, `Repository: ${launcher.repositoryRoot}`),
+    el("div", { class: "muted small" }, `Toolkit: ${launcher.toolkitRoot}${launcher.version ? ` (v${launcher.version})` : ""}`),
+    el("div", { class: "launch-row" },
+      el("label", {},
+        el("input", {
+          type: "checkbox", id: "launch-preview-only", checked: ui.previewOnly, disabled: ui.busy,
+          onchange: (event) => { Object.assign(ui, { previewOnly: event.target.checked, plan: null, error: "", armed: false }); renderLaunch(state.connection); },
+        }),
+        "Preview only (no writes, notifications or grants for the lifetime of this watch)"),
+      el("button", { type: "button", disabled: ui.busy, onclick: previewLaunch }, ui.busy && !ui.plan ? "Checking…" : "Preview launch plan")));
+  if (ui.error) root.append(el("p", { class: "error-text" }, ui.error));
+  if (!ui.plan) return;
+  root.append(el("h3", {}, ui.plan.ok ? "Launch plan" : "This watch cannot start yet"),
+    el("pre", { class: "plan" }, ui.plan.output || "(no output)"));
+  if (!ui.plan.ok) {
+    root.append(el("p", { class: "error-text" }, "Fix the problems above, then preview again."));
+    return;
+  }
+  root.append(el("div", { class: "launch-row" },
+    el("button", { type: "button", class: "primary", id: "launch-start", disabled: !ui.armed || ui.busy, onclick: startWatch },
+      ui.plan.previewOnly ? "Start preview-only Golden watch" : "Start Golden watch"),
+    el("span", { class: "muted small" }, ui.plan.command)));
+  // Like the review Start button: clickable only after the plan it confirms has painted.
+  if (!ui.armed && !ui.armScheduled) {
+    ui.armScheduled = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      ui.armScheduled = false;
+      ui.armed = true;
+      renderLaunch(state.connection);
+    }));
+  }
+}
+
+async function previewLaunch() {
+  const ui = state.launchUi;
+  if (ui.busy) return;
+  Object.assign(ui, { busy: true, plan: null, error: "", armed: false });
+  renderLaunch(state.connection);
+  try {
+    ui.plan = await api("/api/watch/preview", { previewOnly: ui.previewOnly });
+  } catch (error) {
+    ui.error = errorText(error);
+  } finally {
+    ui.busy = false;
+    renderLaunch(state.connection);
+  }
+}
+
+async function startWatch() {
+  const ui = state.launchUi;
+  if (ui.busy || !ui.armed || !ui.plan?.ok) return;
+  ui.busy = true;
+  renderLaunch(state.connection);
+  try {
+    await api("/api/watch/start", { launchToken: ui.plan.launchToken });
+    Object.assign(ui, { plan: null, error: "", armed: false });
+    notice("Starting the Golden watch…");
+  } catch (error) {
+    Object.assign(ui, { plan: null, armed: false, error: errorText(error) });
+  } finally {
+    ui.busy = false;
+    await refresh();
+  }
+}
+
+async function stopWatch() {
+  const button = $("stop");
+  if (Date.now() >= state.stopArmedUntil) {
+    state.stopArmedUntil = Date.now() + 5_000;
+    button.textContent = "Confirm stop";
+    gate(button);
+    setTimeout(() => { if (Date.now() >= state.stopArmedUntil) button.textContent = "Stop watch"; }, 5_100);
+    return;
+  }
+  state.stopArmedUntil = 0;
+  button.textContent = "Stop watch";
+  button.disabled = true;
+  try {
+    await api("/api/watch/stop", {});
+    notice("Stopping the Golden watch and its agents…");
+  } catch (error) {
+    notice(errorText(error), true);
+  } finally {
+    button.disabled = false;
+    await refresh();
   }
 }
 
@@ -520,6 +657,7 @@ $("modal").addEventListener("cancel", (event) => {
   else state.modal = null;
 });
 $("review").addEventListener("click", () => openModal());
+$("stop").addEventListener("click", stopWatch);
 $("scan").addEventListener("click", async () => {
   $("scan").disabled = true;
   try {

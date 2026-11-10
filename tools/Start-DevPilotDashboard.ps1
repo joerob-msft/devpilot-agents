@@ -15,7 +15,12 @@ param(
     [string]$LaunchMode = 'observe',
 
     [Parameter(DontShow)]
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+
+    # Canvas-started Golden owner (Watch-DevPilotAgents.ps1 -Headless): no terminal UI, only the
+    # trusted broker and the canvas bridge. Requires the broker descriptor.
+    [Parameter(DontShow)]
+    [switch]$Headless
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,8 +44,12 @@ function Stop-DashboardLaunch {
     exit 1
 }
 
-if (-not $ValidateOnly -and ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)) {
+if (-not $ValidateOnly -and -not $Headless -and ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected)) {
     Stop-DashboardLaunch 'DevPilot Operations requires an interactive terminal; input or output is redirected.'
+}
+
+if ($Headless -and -not $BrokerDescriptorPath) {
+    Stop-DashboardLaunch 'Headless DevPilot Operations requires the trusted broker descriptor.'
 }
 
 if ($StateDir.Count -eq 0 -and $EventLogPath.Count -eq 0) {
@@ -48,7 +57,7 @@ if ($StateDir.Count -eq 0 -and $EventLogPath.Count -eq 0) {
 }
 
 $width = try { [Console]::WindowWidth } catch { 0 }
-if (-not $ValidateOnly -and $width -lt 60) {
+if (-not $ValidateOnly -and -not $Headless -and $width -lt 60) {
     Stop-DashboardLaunch "DevPilot Operations requires a terminal width of at least 60 columns (current: $width)." @(
         'Resize the terminal and run the launcher again.'
     )
@@ -199,6 +208,8 @@ $arguments = New-Object System.Collections.Generic.List[string]
 [void]$arguments.Add($entryPath)
 [void]$arguments.Add('--launch-mode')
 [void]$arguments.Add($LaunchMode)
+# Pinned position checked by Assert-AgentDashboardCommandLineShape: directly after the mode pair.
+if ($Headless) { [void]$arguments.Add('--headless') }
 foreach ($path in $StateDir) {
     [void]$arguments.Add('--state-dir')
     [void]$arguments.Add([IO.Path]::GetFullPath($path))

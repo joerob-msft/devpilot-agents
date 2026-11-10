@@ -176,3 +176,8 @@ dialog::backdrop { background: var(--overlay-backdrop-color, rgba(0, 0, 0, 0.35)
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--background-color-neutral-muted, rgba(127, 127, 127, 0.15)); }
 .error-text { color: var(--text-color-danger, #cf222e); }
+.launch-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.launch-row label { display: inline-flex; gap: 6px; align-items: center; }
+pre.plan { max-height: 320px; overflow: auto; }
+#manual-start { margin-top: 12px; }
+#manual-start summary { cursor: pointer; }

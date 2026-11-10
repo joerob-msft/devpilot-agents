@@ -26,7 +26,8 @@ import type { EventTailer } from "./tailer.js";
 // dashboard and stage manual runs through the dashboard's own trusted broker client. The broker,
 // its launch provenance and the descriptor are untouched: the bridge is just another in-process
 // caller of DispatchClient. It deliberately exposes no widening, narrowing, kill-switch or shutdown.
-// It is owner-agnostic (no renderer dependency) so a future headless Golden owner can host it too.
+// It is owner-agnostic (no renderer dependency): the headless Golden owner (dashboard --headless,
+// started from the canvas) hosts it too, and only that owner exposes POST /v1/shutdown.
 export const CANVAS_BRIDGE_SCHEMA_VERSION = 1;
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_PROMPT_SCALARS = 512;
@@ -47,6 +48,8 @@ export interface CanvasBridgeOptions {
   tailer: Pick<EventTailer, "registerEventLogPath">;
   now?: () => number;
   token?: string;
+  // Headless owner only: the canvas's explicit Stop. A terminal-owned dashboard never sets this.
+  onShutdown?: (() => void) | undefined;
 }
 
 export interface CanvasBridgeDiscovery {
@@ -56,6 +59,7 @@ export interface CanvasBridgeDiscovery {
   dashboardPid: number;
   consumerRepositoryRoot: string;
   launchMode: string;
+  headless: boolean;
   startedAtUtc: string;
 }
 
@@ -125,6 +129,7 @@ export class CanvasBridge {
       dashboardPid: process.pid,
       consumerRepositoryRoot: this.options.consumerRepositoryRoot,
       launchMode: this.options.launchMode,
+      headless: Boolean(this.options.onShutdown),
       startedAtUtc: new Date(this.now()).toISOString(),
     };
     writeDiscoveryFile(this.options.discoveryFile, discovery);
@@ -183,6 +188,7 @@ export class CanvasBridge {
       case "POST /v1/review/confirm-run": return this.confirmRun(body);
       case "POST /v1/review/cancel-queued": return this.cancelQueued(body);
       case "POST /v1/review/cancel": return this.cancel(body);
+      case "POST /v1/shutdown": return this.shutdown();
       default: throw new HttpError(404, "not-found");
     }
   }
@@ -193,6 +199,7 @@ export class CanvasBridge {
     return {
       schemaVersion: CANVAS_BRIDGE_SCHEMA_VERSION,
       launchMode: this.options.launchMode,
+      headless: Boolean(this.options.onShutdown),
       consumerRepositoryRoot: this.options.consumerRepositoryRoot,
       dashboardPid: process.pid,
       view,
@@ -219,6 +226,14 @@ export class CanvasBridge {
     return value
       ? { available: value.available, scope: value.scope, agents: value.agents, error: "" }
       : { available: false, error };
+  }
+
+  private shutdown(): unknown {
+    const onShutdown = this.options.onShutdown;
+    if (!onShutdown) throw new HttpError(404, "not-found");
+    // Let this response flush before the owner tears the bridge and broker down.
+    setTimeout(onShutdown, 50);
+    return { stopping: true };
   }
 
   private async scanNow(): Promise<unknown> {
