@@ -1,6 +1,7 @@
 import { createCliRenderer } from "@opentui/core";
 import { render } from "@opentui/solid";
 import { App, type LaunchMode } from "./app.js";
+import { CanvasBridge } from "./canvas-bridge.js";
 import { DispatchClient, type BrokerLaunchDescriptor } from "./dispatch.js";
 import { PullRequestHistoryProjection } from "./history.js";
 import { createDashboardLifecycle } from "./lifecycle.js";
@@ -74,6 +75,12 @@ export function parseArguments(argv: string[]): Arguments {
 async function main(): Promise<void> {
   const args = parseArguments(process.argv.slice(2));
   if (process.exitCode !== undefined) return;
+  // Opt-in Copilot canvas bridge (Watch -CanvasBridge). Read and cleared before the broker is
+  // spawned so neither the broker nor its agent children inherit the bridge location.
+  const canvasBridgeFile = process.env.DEVPILOT_CANVAS_BRIDGE_FILE ?? "";
+  const consumerRepositoryRoot = process.env.DEVPILOT_CONSUMER_REPOSITORY_ROOT ?? "";
+  delete process.env.DEVPILOT_CANVAS_BRIDGE_FILE;
+  delete process.env.DEVPILOT_CONSUMER_REPOSITORY_ROOT;
   process.stdout.write(`DevPilot Operations v${packageInfo.version}\n`);
   const dismissalStorage = new FileDismissalStorage(args.viewStateDirectory);
   let dismissalError = "";
@@ -119,17 +126,28 @@ async function main(): Promise<void> {
       })
     : undefined;
   const lifecycle = createDashboardLifecycle(tailer, broker);
+  const canvasBridge = canvasBridgeFile && broker
+    ? new CanvasBridge({
+        discoveryFile: canvasBridgeFile, consumerRepositoryRoot, launchMode: args.launchMode, broker, reducer, tailer,
+      })
+    : undefined;
+  const stopCanvasBridge = (): void => canvasBridge?.stop();
+  process.once("exit", stopCanvasBridge);
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     clearOnShutdown: true,
     exitOnCtrlC: true,
     consoleMode: "disabled",
     backgroundColor: "#08090a",
-    onDestroy: lifecycle.onRendererDestroy,
+    onDestroy: () => {
+      stopCanvasBridge();
+      lifecycle.onRendererDestroy();
+    },
   });
 
   try {
     tailer.start();
+    await canvasBridge?.start();
     await render(() => <App
       reducer={reducer}
       history={history}
@@ -145,6 +163,7 @@ async function main(): Promise<void> {
     />, renderer);
     refresh = () => renderer.requestRender();
   } catch (error) {
+    stopCanvasBridge();
     await lifecycle.shutdownTailer();
     await lifecycle.shutdownBroker();
     if (!renderer.isDestroyed) renderer.destroy();

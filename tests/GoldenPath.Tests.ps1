@@ -56,6 +56,8 @@ $record = [ordered]@{
     descriptor = $(if ($BrokerDescriptorPath -and (Test-Path -LiteralPath $BrokerDescriptorPath -PathType Leaf)) {
         Get-Content -LiteralPath $BrokerDescriptorPath -Raw
     } else { '' })
+    canvasBridgeFile = [string]$env:DEVPILOT_CANVAS_BRIDGE_FILE
+    consumerRepositoryRoot = [string]$env:DEVPILOT_CONSUMER_REPOSITORY_ROOT
 }
 Add-Content -LiteralPath $env:DEVPILOT_TEST_DASHBOARD_LOG -Value ($record | ConvertTo-Json -Depth 10 -Compress)
 $callNumber = if (Test-Path -LiteralPath $env:DEVPILOT_TEST_DASHBOARD_LOG -PathType Leaf) {
@@ -388,6 +390,21 @@ Describe 'golden launch policy (issue #114)' {
         $result.StdOut | Should -Match 'Preview alternative'
     }
 
+    It 'hands the opt-in canvas bridge to the real Golden dashboard launch through the environment only' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-CanvasBridge') + (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $records = Get-DashboardRecord -Context $context
+        $records.Count | Should -Be 3
+        # Validation calls never see the bridge; the real launch keeps its argv and gains only the env.
+        $records[0].canvasBridgeFile | Should -BeExactly ''
+        $records[1].canvasBridgeFile | Should -BeExactly ''
+        $records[2].canvasBridgeFile | Should -BeExactly (Join-Path $records[2].stateDir[0] 'canvas-bridge.v1.json')
+        $records[2].brokerDescriptorPath | Should -Not -BeNullOrEmpty
+        ($records[2].descriptor | ConvertFrom-Json -AsHashtable).ContainsKey('launcherControl') | Should -BeTrue
+        $result.StdOut | Should -Match 'Copilot canvas bridge: enabled'
+    }
+
     It 'captures real Golden stdout through the real broker and tailer (buffered baseline=<BufferedBaseline>)' -Tag 'LiveCapture' -ForEach @(
         @{ BufferedBaseline = $true }, @{ BufferedBaseline = $false }
     ) {
@@ -619,6 +636,7 @@ exit 0
         @{ Case = @('-Golden', '-Agent', 'Reviewer'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Golden', '-Agent', 'ReviewHandler'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104'); Expected = 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both' }
+        @{ Case = @('-Agent', 'Reviewer', '-CanvasBridge'); Expected = '-CanvasBridge requires the trusted manual broker' }
     ) {
         $context = New-GoldenContext
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@($Case) + (Get-BaseLaunchArgument -Context $context))
