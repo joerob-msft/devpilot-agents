@@ -1,0 +1,242 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "proven-owner-cases",
+      "path": "src/WidgetTests.cs",
+      "lines": [
+        "using Microsoft.VisualStudio.TestTools.UnitTesting;",
+        "",
+        "[TestClass]",
+        "[Owner(\"class-advisory\")]",
+        "public class WidgetTests",
+        "{",
+        "    [TestMethod]",
+        "    [Owner(\"group-a\")]",
+        "    public void CompliantMethod() {}",
+        "",
+        "    [TestMethod, Owner(\"group-b\")]",
+        "    public void CombinedOwner() {}",
+        "",
+        "    [DataTestMethod]",
+        "    public void MissingOwner() {}",
+        "",
+        "    [TestMethod, Owner(\"group-c\")]",
+        "    public void MixedCompliant() {}",
+        "",
+        "    [TestMethod]",
+        "    public void MixedViolation() {}",
+        "",
+        "    public void HelperMethod() {}",
+        "",
+        "    [TestMethod]",
+        "    public void OutsideSpan() {}",
+        "",
+        "    [TestMethod]",
+        "    public void DuplicateName() {}",
+        "",
+        "    [DataTestMethod]",
+        "    public void DuplicateName(int value) {}",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 3, "endLine": 23 },
+        { "startLine": 28, "endLine": 32 }
+      ],
+      "expectedRunnerMethods": [
+        "MissingOwner",
+        "MixedViolation",
+        "DuplicateName",
+        "DuplicateName"
+      ],
+      "expectedViolationLines": [15, 21, 29, 32],
+      "expectedViolationCount": 4,
+      "expectedClassUnknownCount": 1
+    },
+    {
+      "id": "adjacent-response-failures",
+      "path": "src/BoundaryTests.cs",
+      "lines": [
+        "[TestClass]",
+        "public class BoundaryTests",
+        "{",
+        "    [TestMethod]",
+        "    public void ValidFirst() {}",
+        "    [TestMethod]",
+        "    public void Malformed() {}",
+        "    [TestMethod]",
+        "    public void ValidMiddle() {}",
+        "    [TestMethod]",
+        "    public void Omitted() {}",
+        "    [TestMethod]",
+        "    public void Duplicated() {}",
+        "    [TestMethod]",
+        "    public void ValidLast() {}",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 1, "endLine": 16 }
+      ],
+      "runnerModes": {
+        "Malformed": "malformed",
+        "Omitted": "omitted",
+        "Duplicated": "duplicated"
+      },
+      "expectedViolationMethods": [
+        "ValidFirst",
+        "ValidMiddle",
+        "ValidLast"
+      ],
+      "expectedRunnerUnknownCount": 3
+    },
+    {
+      "id": "recognizer-compatibility",
+      "path": "src/RecognizerTests.cs",
+      "lines": [
+        "[TestClass]",
+        "public class RecognizerTests",
+        "{",
+        "    [TestMethod]",
+        "    [DataRow(new int[] { 1, 2 })]",
+        "    public void NestedArrayAttribute(int value) {}",
+        "",
+        "    [TestMethod]",
+        "    // declaration comment",
+        "    public void CommentSeparated() {}",
+        "",
+        "    [TestMethod] // inline attribute comment",
+        "    public void InlineComment() {}",
+        "",
+        "    [TestMethod]",
+        "    /* legacy: [Owner(\"ghost\")] */",
+        "    public void CommentedOwner() {}",
+        "",
+        "    /* note */ [TestMethod]",
+        "    public void LeadingCommentAttribute() {}",
+        "",
+        "    [TestMethod]",
+        "    [Description(\"Owner, please fix\")]",
+        "    public void OwnerWordInString() {}",
+        "",
+        "    [TestMethod]",
+        "    [Description(\"a]b\")]",
+        "    public void BracketInString() {}",
+        "",
+        "    [TestMethod]",
+        "    [Description(@\"C:\\path\\\")]",
+        "    public void VerbatimPath() {}",
+        "",
+        "    [TestMethod]",
+        "    public ??? Broken()",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 1, "endLine": 35 }
+      ],
+      "expectedRunnerMethods": [
+        "NestedArrayAttribute",
+        "CommentSeparated",
+        "InlineComment",
+        "CommentedOwner",
+        "LeadingCommentAttribute",
+        "OwnerWordInString",
+        "BracketInString",
+        "VerbatimPath"
+      ],
+      "expectedViolationLines": [6, 10, 13, 17, 20, 24, 28, 32],
+      "expectedUnrecognizedMethodCount": 1
+    },
+    {
+      "id": "lexical-spoofing",
+      "path": "src/LexicalTests.cs",
+      "lines": [
+        "[TestClass]",
+        "public class LexicalTests",
+        "{",
+        "    [TestMethod]",
+        "    [DataRow(TestProperties.Owner, 3)]",
+        "    public void OwnerIdentifierArgument() {}",
+        "",
+        "    [Description(Kinds.TestMethod, 1)]",
+        "    public void PlainMethod() {}",
+        "",
+        "    [TestMethod]",
+        "    public void ClassWord() { Assert.AreEqual(\"class name\", \"class name\"); }",
+        "",
+        "    private const string Template = @\"",
+        "    [TestMethod]",
+        "    public void GhostMethod() {}",
+        "    \";",
+        "",
+        "    private const string Quote = @\"\"\"\";",
+        "",
+        "    [TestMethod]",
+        "    public void RealAfterVerbatim() {}",
+        "",
+        "    [TestMethod]",
+        "    [Description(@\"first",
+        "    Owner]",
+        "    last\")]",
+        "    public void MultiLineAttribute() {}",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 1, "endLine": 28 }
+      ],
+      "expectedRunnerMethods": [
+        "OwnerIdentifierArgument",
+        "ClassWord",
+        "RealAfterVerbatim",
+        "MultiLineAttribute"
+      ],
+      "expectedViolationLines": [6, 12, 22, 28],
+      "excludedMethods": ["PlainMethod", "GhostMethod"]
+    },
+    {
+      "id": "raw-and-trailing-attributes",
+      "path": "src/RawTests.cs",
+      "lines": [
+        "[TestClass]",
+        "public class RawTests",
+        "{",
+        "    private const string Template = \"\"\"",
+        "    [TestMethod]",
+        "    public void GhostMethod() {}",
+        "    \"\"\";",
+        "",
+        "    [TestMethod]",
+        "    public void RealAfterRaw() {}",
+        "",
+        "    public void Helper() {} [TestMethod]",
+        "    public void AfterBrace() {}",
+        "",
+        "    [TestMethod] public void One() {} [TestMethod] public void Two() {}",
+        "",
+        "    [TestClass] public class Inline { [TestMethod] public void Hidden() {} }",
+        "",
+        "    [Obsolete] private int value; [TestMethod] public void TrailingAfterField() {}",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 1, "endLine": 20 }
+      ],
+      "expectedRunnerMethods": ["RealAfterRaw", "One"],
+      "expectedViolationLines": [10, 15],
+      "expectedUnrecognizedMethodCount": 4,
+      "excludedMethods": ["GhostMethod", "AfterBrace", "Two", "Hidden", "TrailingAfterField"]
+    },
+    {
+      "id": "no-attributed-constructs",
+      "path": "src/Plain.cs",
+      "lines": [
+        "public class Plain",
+        "{",
+        "    public void Helper() {}",
+        "}"
+      ],
+      "spans": [
+        { "startLine": 1, "endLine": 4 }
+      ]
+    }
+  ]
+}
