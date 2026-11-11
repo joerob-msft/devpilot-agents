@@ -10,16 +10,18 @@
     repositories. Reload extensions afterwards (ask Copilot to reload extensions, or restart the
     app), then open the "DevPilot Operations" canvas in a session for a consumer repository.
 
-    The install also records toolkit.json: the DevPilot toolkit whose Watch-DevPilotAgents.ps1
-    the canvas runs when you click Start (-Golden -Headless -CanvasBridge). A watch started in a
-    terminal with -Golden -CanvasBridge is attached the same way.
+    When you click Start, the canvas prefers the repository's own Start-DevPilot.ps1 if it declares
+    -CanvasBridge and -Headless switches. The install also records toolkit.json, the fallback
+    DevPilot toolkit whose Watch-DevPilotAgents.ps1 the canvas runs otherwise
+    (-Golden -Headless -CanvasBridge). A watch started in a terminal with -Golden -CanvasBridge is
+    attached the same way.
 
 .PARAMETER Destination
     Override the install folder. Defaults to $env:COPILOT_HOME\extensions\devpilot-ops, or
     ~\.copilot\extensions\devpilot-ops when COPILOT_HOME is not set.
 
 .PARAMETER ToolkitRoot
-    The DevPilot toolkit the canvas Start button launches. Defaults to the toolkit containing this
+    The fallback DevPilot toolkit the canvas Start button launches. Defaults to the toolkit containing this
     script. Point it at a hardened toolkit install when this checkout fails the Watch trust preflight.
 
 .PARAMETER Uninstall

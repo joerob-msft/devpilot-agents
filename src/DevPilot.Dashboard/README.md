@@ -479,20 +479,34 @@ trusted broker client, either the terminal TUI or the headless owner it started.
 1. Install the canvas once: `.\tools\Install-DevPilotCanvas.ps1`. It is copied to
    `~\.copilot\extensions\devpilot-ops`, so it works in every repository's
    sessions and nothing is committed to consumer repositories. It also records
-   `toolkit.json`, the toolkit whose `Watch-DevPilotAgents.ps1` the Start button
-   runs. Pass `-ToolkitRoot` to point at a different hardened toolkit install.
+   `toolkit.json`, the fallback toolkit whose `Watch-DevPilotAgents.ps1` the
+   Start button runs when the repository has no canvas-aware entrypoint (see
+   step 3). Pass `-ToolkitRoot` to point at a different hardened toolkit install.
    Reload Copilot extensions afterwards, or restart the app.
 2. In the Copilot app, open a session for the consumer repository (where
    `.github\copilot\agents\*.config.json` lives) and open the **DevPilot
    Operations** canvas, or ask Copilot to open it. A session in its own worktree
    also matches, because the worktree's main checkout is compared.
-3. With no watch running, the canvas offers **Preview launch plan**. That runs
-   the recorded toolkit's `Watch-DevPilotAgents.ps1 -Golden -Headless
-   -CanvasBridge -WhatIf` (plus `-PreviewOnly` when ticked) in the repository
-   root and shows Watch's own launch plan or preflight failures with their
-   remediation. **Start Golden watch** becomes clickable only after that plan
-   has rendered, and starts the same command without `-WhatIf`. **Stop watch**
-   (with a confirm click) shuts a canvas-started watch down.
+3. With no watch running, the canvas offers **Preview launch plan**. The
+   command depends on the repository (its main checkout, not a session worktree):
+   - If the repository root has a `Start-DevPilot.ps1` that declares both
+     `-CanvasBridge` and `-Headless` switches, the canvas runs
+     `Start-DevPilot.ps1 -CanvasBridge -Headless -WhatIf`. That repository
+     entrypoint installs or updates the toolkit from its lock file, prepares
+     config and state, applies the repository's defaults and then runs Watch
+     `-Golden` in-process, exactly as a terminal start would. The canvas only
+     inspects the script's parameters to detect this and never runs it before
+     the preview.
+   - Otherwise it runs the recorded toolkit's `Watch-DevPilotAgents.ps1 -Golden
+     -Headless -CanvasBridge -WhatIf` and shows why the repository script was
+     not used.
+
+   `-PreviewOnly` is added when ticked. The preview shows the entrypoint's own
+   plan or preflight failures with their remediation. **Start Golden watch**
+   becomes clickable only after that plan has rendered, and starts the same
+   command without `-WhatIf`. If the entrypoint changes between preview and
+   Start, the canvas asks for a new preview. **Stop watch** (with a confirm
+   click) shuts a canvas-started watch down.
 
 A canvas-started watch keeps running across extension reloads, `/clear` and
 closing the canvas; reopening the canvas re-attaches. The Copilot app runs
