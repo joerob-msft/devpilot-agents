@@ -18,6 +18,8 @@ const STATUS_TIMEOUT_MS = 15_000;
 const REVIEW_TIMEOUT_MS = 180_000;
 const LAUNCH_PREVIEW_TTL_MS = 5 * 60_000;
 const LAUNCH_ATTACH_TIMEOUT_MS = 120_000;
+const REPOSITORY_ATTACH_TIMEOUT_MS = 20 * 60_000;
+const ENTRYPOINT_CACHE_MS = 15_000;
 const PROXIED_POSTS = new Set([
   "/api/scan-now",
   "/api/review/describe",
@@ -185,6 +187,7 @@ export class CanvasInstanceServer {
     this.launcher = launcher;
     this.launchPreview = null;
     this.launch = null;
+    this.entrypointCache = null;
   }
 
   async start() {
@@ -224,6 +227,8 @@ export class CanvasInstanceServer {
     // The main checkout (last root) owns .github\copilot\agents for Watch; session worktrees match too.
     const repositoryRoot = this.roots[this.roots.length - 1] ?? "";
     if (bridge && this.launch) this.launch = null;
+    const launcher = bridge ? null : await this.launcherState(repositoryRoot);
+    const location = repositoryRoot || "<consumer repository>";
     return {
       state: bridge ? "connected" : "no-bridge",
       workingDirectory: this.workingDirectory,
@@ -231,19 +236,35 @@ export class CanvasInstanceServer {
       watchRoot: this.watchRoot,
       bridge: publicBridge(bridge),
       others: bridges.filter((item) => item !== bridge).map(publicBridge),
-      command: `cd "${repositoryRoot || "<consumer repository>"}"; pwsh -File <devpilot-agents>\\tools\\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge`,
-      launcher: bridge ? null : this.launcherState(repositoryRoot),
+      command: launcher?.kind === "repository"
+        ? `cd "${location}"; .\\Start-DevPilot.ps1 -CanvasBridge`
+        : `cd "${location}"; pwsh -File <devpilot-agents>\\tools\\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge`,
+      launcher,
       launch: this.launchState(),
     };
   }
 
-  launcherState(repositoryRoot) {
+  // Polled every refresh, so the pwsh parameter probe is cached briefly; preview and start re-resolve.
+  async entrypoint(repositoryRoot, fresh = false) {
+    const cached = this.entrypointCache;
+    if (!fresh && cached && cached.repositoryRoot === repositoryRoot && Date.now() - cached.at < ENTRYPOINT_CACHE_MS) {
+      return cached.value;
+    }
+    const value = await this.launcher.resolveEntrypoint(repositoryRoot);
+    this.entrypointCache = { repositoryRoot, at: Date.now(), value };
+    return value;
+  }
+
+  async launcherState(repositoryRoot) {
     if (!repositoryRoot) return { available: false, reason: "This session folder is not inside a git repository." };
-    const toolkit = this.launcher.readToolkit();
-    if (!toolkit.available) return { available: false, reason: toolkit.reason, toolkitRoot: toolkit.toolkitRoot ?? "" };
+    const entrypoint = await this.entrypoint(repositoryRoot);
+    if (!entrypoint.available) {
+      return { available: false, reason: [entrypoint.repositoryNote, entrypoint.reason].filter(Boolean).join(" "), toolkitRoot: entrypoint.toolkitRoot ?? "" };
+    }
     return {
-      available: true, repositoryRoot, toolkitRoot: toolkit.toolkitRoot, version: toolkit.version,
-      command: this.launcher.displayCommand(toolkit.watchScript, {}),
+      available: true, repositoryRoot, kind: entrypoint.kind, script: entrypoint.script,
+      toolkitRoot: entrypoint.toolkitRoot, version: entrypoint.version, note: entrypoint.repositoryNote ?? "",
+      command: this.launcher.displayCommand(entrypoint, {}),
     };
   }
 
@@ -256,11 +277,13 @@ export class CanvasInstanceServer {
     } catch (error) {
       alive = error?.code === "EPERM";
     }
-    const failed = Boolean(this.launch.error) || !alive || elapsed > LAUNCH_ATTACH_TIMEOUT_MS;
+    // A repository entrypoint may install and qualify a new toolkit release before the watch starts.
+    const attachTimeout = this.launch.kind === "repository" ? REPOSITORY_ATTACH_TIMEOUT_MS : LAUNCH_ATTACH_TIMEOUT_MS;
+    const failed = Boolean(this.launch.error) || !alive || elapsed > attachTimeout;
     const tail = failed || elapsed > 10_000 ? this.launcher.logTail(this.launch.logPath) : "";
     return {
       state: failed ? "failed" : "starting", pid: this.launch.pid, logPath: this.launch.logPath,
-      previewOnly: this.launch.previewOnly, elapsedMs: elapsed,
+      previewOnly: this.launch.previewOnly, elapsedMs: elapsed, kind: this.launch.kind,
       logTail: [this.launch.error, tail].filter(Boolean).join("\n"),
     };
   }
@@ -273,17 +296,19 @@ export class CanvasInstanceServer {
     const connection = await this.connection();
     if (connection.bridge) throw Object.assign(new Error("A watch is already running for this repository."), { status: 409 });
     if (!connection.launcher?.available) throw Object.assign(new Error(connection.launcher?.reason ?? "Start is unavailable."), { status: 409 });
-    const toolkit = this.launcher.readToolkit();
     const repositoryRoot = connection.launcher.repositoryRoot;
-    const result = await this.launcher.previewLaunch({ toolkit, repositoryRoot, previewOnly: previewOnly === true });
+    const entrypoint = await this.entrypoint(repositoryRoot, true);
+    if (!entrypoint.available) throw Object.assign(new Error(entrypoint.reason ?? "Start is unavailable."), { status: 409 });
+    const result = await this.launcher.previewLaunch({ entrypoint, repositoryRoot, previewOnly: previewOnly === true });
     this.launchPreview = result.ok
       ? { token: randomBytes(18).toString("base64url"), previewOnly: previewOnly === true, repositoryRoot,
-          toolkitRoot: toolkit.toolkitRoot, expiresAt: Date.now() + LAUNCH_PREVIEW_TTL_MS }
+          kind: entrypoint.kind, script: entrypoint.script, expiresAt: Date.now() + LAUNCH_PREVIEW_TTL_MS }
       : null;
     return {
       ok: result.ok, exitCode: result.exitCode, output: result.output, previewOnly: previewOnly === true,
-      repositoryRoot, toolkitRoot: toolkit.toolkitRoot, version: toolkit.version,
-      command: this.launcher.displayCommand(toolkit.watchScript, { previewOnly: previewOnly === true }),
+      repositoryRoot, kind: entrypoint.kind, script: entrypoint.script, toolkitRoot: entrypoint.toolkitRoot,
+      version: entrypoint.version,
+      command: this.launcher.displayCommand(entrypoint, { previewOnly: previewOnly === true }),
       launchToken: this.launchPreview?.token ?? "",
     };
   }
@@ -298,12 +323,16 @@ export class CanvasInstanceServer {
     const connection = await this.connection();
     if (connection.bridge) throw Object.assign(new Error("A watch is already running for this repository."), { status: 409 });
     if (connection.launch?.state === "starting") throw Object.assign(new Error("A watch is already starting."), { status: 409 });
-    const toolkit = this.launcher.readToolkit();
-    if (!toolkit.available || toolkit.toolkitRoot !== preview.toolkitRoot || connection.launcher?.repositoryRoot !== preview.repositoryRoot) {
-      throw Object.assign(new Error("The toolkit or repository changed. Preview again."), { status: 409, code: "launch-repreview-required" });
+    const entrypoint = await this.entrypoint(preview.repositoryRoot, true);
+    if (!entrypoint.available || entrypoint.kind !== preview.kind || entrypoint.script !== preview.script ||
+        connection.launcher?.repositoryRoot !== preview.repositoryRoot) {
+      throw Object.assign(new Error("The launch command or repository changed. Preview again."), { status: 409, code: "launch-repreview-required" });
     }
-    this.launch = this.launcher.startLaunch({ toolkit, repositoryRoot: preview.repositoryRoot, previewOnly: preview.previewOnly });
-    this.log(`Started a ${preview.previewOnly ? "preview-only " : ""}DevPilot Golden watch for ${preview.repositoryRoot} from the canvas (PID ${this.launch.pid}).`);
+    this.launch = {
+      ...this.launcher.startLaunch({ entrypoint, repositoryRoot: preview.repositoryRoot, previewOnly: preview.previewOnly }),
+      kind: entrypoint.kind,
+    };
+    this.log(`Started a ${preview.previewOnly ? "preview-only " : ""}DevPilot Golden watch for ${preview.repositoryRoot} from the canvas via ${entrypoint.script} (PID ${this.launch.pid}).`);
     return { started: true, pid: this.launch.pid, logPath: this.launch.logPath };
   }
 

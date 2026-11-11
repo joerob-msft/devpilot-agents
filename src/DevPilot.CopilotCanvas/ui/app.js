@@ -230,7 +230,7 @@ function renderLaunch(connection) {
     return;
   }
   if (launch?.state === "starting") {
-    root.append(el("p", {}, `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… This canvas connects when it is ready.`),
+    root.append(el("p", {}, `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… ${launch.kind === "repository" ? "Installing or verifying the toolkit can take several minutes. " : ""}This canvas connects when it is ready.`),
       el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
     if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
     return;
@@ -243,7 +243,10 @@ function renderLaunch(connection) {
   root.append(
     el("p", { class: "muted" }, "Start this repository's Golden watch from here, without a terminal. It keeps running while the Copilot app is open, even if you close this canvas, until you stop it here. Quitting the app stops it and its agents."),
     el("div", { class: "muted small" }, `Repository: ${launcher.repositoryRoot}`),
-    el("div", { class: "muted small" }, `Toolkit: ${launcher.toolkitRoot}${launcher.version ? ` (v${launcher.version})` : ""}`),
+    launcher.kind === "repository"
+      ? el("div", { class: "muted small" }, `Runs: ${launcher.script} (installs or updates the DevPilot toolkit per this repository's lock, prepares config and state, applies its defaults)`)
+      : el("div", { class: "muted small" }, `Toolkit: ${launcher.toolkitRoot}${launcher.version ? ` (v${launcher.version})` : ""}`),
+    launcher.note ? el("div", { class: "muted small" }, launcher.note) : null,
     el("div", { class: "launch-row" },
       el("label", {},
         el("input", {

@@ -1,8 +1,10 @@
 // Starts a canvas-owned (headless) Golden watch. Pure Node so it can be tested without the SDK.
-// The canvas never chooses capabilities: it runs the recorded toolkit's own
-// Watch-DevPilotAgents.ps1 -Golden -Headless -CanvasBridge from the repository root, with the
-// optional -PreviewOnly ceiling, after the user has seen that script's -WhatIf launch plan.
-import { spawn } from "node:child_process";
+// The canvas never chooses capabilities. It prefers the repository's own Start-DevPilot.ps1 when that
+// script declares -CanvasBridge and -Headless, so a canvas start does exactly what the operator's
+// terminal start does (toolkit update per the repo lock, repo preparation, repo defaults). Otherwise
+// it runs the recorded toolkit's Watch-DevPilotAgents.ps1 -Golden. Either way the user first sees
+// the same command's -WhatIf plan, and -PreviewOnly is the only option the canvas adds.
+import { execFile, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -10,8 +12,10 @@ import { fileURLToPath } from "node:url";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const PREVIEW_TIMEOUT_MS = 120_000;
+const PROBE_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_CHARS = 20_000;
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+export const REPOSITORY_ENTRYPOINT = "Start-DevPilot.ps1";
 
 export function watchScriptPath(toolkitRoot) {
   return join(toolkitRoot, "tools", "Watch-DevPilotAgents.ps1");
@@ -37,17 +41,49 @@ export function readToolkit(extensionDir = EXTENSION_DIR) {
   }
 }
 
-export function watchArguments(watchScript, { previewOnly = false, whatIf = false } = {}) {
+// Asks pwsh whether the script declares both switches. Get-Command only parses the param block; the
+// path travels in the environment, never in the command text.
+export function probeRepositoryEntrypoint(script, { pwsh = "pwsh", execFileImpl = execFile } = {}) {
+  return new Promise((resolveProbe) => {
+    const command = "$c = Get-Command -Name $env:DEVPILOT_CANVAS_ENTRYPOINT -CommandType ExternalScript -ErrorAction Stop; " +
+      "if ($c.Parameters.ContainsKey('CanvasBridge') -and $c.Parameters.ContainsKey('Headless')) { 'supported' } else { 'unsupported' }";
+    execFileImpl(pwsh, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+      env: { ...process.env, DEVPILOT_CANVAS_ENTRYPOINT: script }, timeout: PROBE_TIMEOUT_MS, windowsHide: true,
+    }, (error, stdout) => resolveProbe(!error && String(stdout).trim() === "supported"));
+  });
+}
+
+// The launch target for one repository: its own Start-DevPilot.ps1 when supported, else the toolkit.
+export async function resolveEntrypoint(repositoryRoot, {
+  extensionDir = EXTENSION_DIR, probe = probeRepositoryEntrypoint, readToolkitImpl = readToolkit,
+} = {}) {
+  const script = join(repositoryRoot, REPOSITORY_ENTRYPOINT);
+  let repositoryNote = "";
+  if (existsSync(script)) {
+    if (await probe(script)) {
+      return { available: true, kind: "repository", script, repositoryRoot, toolkitRoot: "", version: "" };
+    }
+    repositoryNote = `${REPOSITORY_ENTRYPOINT} does not declare -CanvasBridge and -Headless, so the recorded toolkit is used instead.`;
+  }
+  const toolkit = readToolkitImpl(extensionDir);
+  if (!toolkit.available) return { ...toolkit, kind: "toolkit", repositoryNote };
+  return {
+    available: true, kind: "toolkit", script: toolkit.watchScript, repositoryRoot,
+    toolkitRoot: toolkit.toolkitRoot, version: toolkit.version, repositoryNote,
+  };
+}
+
+export function entrypointArguments(entrypoint, { previewOnly = false, whatIf = false } = {}) {
   return [
-    "-NoLogo", "-NoProfile", "-NonInteractive", "-File", watchScript,
-    "-Golden", "-Headless", "-CanvasBridge",
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-File", entrypoint.script,
+    ...(entrypoint.kind === "repository" ? ["-CanvasBridge", "-Headless"] : ["-Golden", "-Headless", "-CanvasBridge"]),
     ...(previewOnly ? ["-PreviewOnly"] : []),
     ...(whatIf ? ["-WhatIf"] : []),
   ];
 }
 
-export function displayCommand(watchScript, options) {
-  return ["pwsh", ...watchArguments(watchScript, options).slice(3)]
+export function displayCommand(entrypoint, options) {
+  return ["pwsh", ...entrypointArguments(entrypoint, options).slice(3)]
     .map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(" ");
 }
 
@@ -63,9 +99,9 @@ function cleanOutput(text) {
   return clean.length > MAX_OUTPUT_CHARS ? `…${clean.slice(-MAX_OUTPUT_CHARS)}` : clean;
 }
 
-// Runs the same command with -WhatIf: Watch prints its launch plan (or its aggregated preflight
-// failures) and stops before creating any state, descriptor or process.
-export function previewLaunch({ toolkit, repositoryRoot, previewOnly, pwsh = "pwsh", spawnImpl = spawn }) {
+// Runs the same command with -WhatIf: the entrypoint prints its plan (or its preflight failures)
+// and stops before installing, creating state, or starting any process.
+export function previewLaunch({ entrypoint, repositoryRoot, previewOnly, pwsh = "pwsh", spawnImpl = spawn }) {
   return new Promise((resolvePreview) => {
     let output = "";
     let settled = false;
@@ -75,7 +111,7 @@ export function previewLaunch({ toolkit, repositoryRoot, previewOnly, pwsh = "pw
       clearTimeout(timer);
       resolvePreview({ ok: exitCode === 0, exitCode, output: cleanOutput(output + extra) });
     };
-    const child = spawnImpl(pwsh, watchArguments(toolkit.watchScript, { previewOnly, whatIf: true }), {
+    const child = spawnImpl(pwsh, entrypointArguments(entrypoint, { previewOnly, whatIf: true }), {
       cwd: repositoryRoot, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {
@@ -96,7 +132,7 @@ export function previewLaunch({ toolkit, repositoryRoot, previewOnly, pwsh = "pw
 // Deliberately NOT `detached`: on Windows that is DETACHED_PROCESS, and pwsh without any console
 // silently drops all output and the Watch cannot run its dashboard and broker.
 export function startLaunch({
-  toolkit, repositoryRoot, previewOnly, pwsh = "pwsh", logDirectory = defaultLaunchLogDirectory(),
+  entrypoint, repositoryRoot, previewOnly, pwsh = "pwsh", logDirectory = defaultLaunchLogDirectory(),
   spawnImpl = spawn, now = Date.now,
 }) {
   mkdirSync(logDirectory, { recursive: true });
@@ -104,7 +140,7 @@ export function startLaunch({
   const logPath = join(logDirectory, `watch-launch-${stamp}.log`);
   const fd = openSync(logPath, "a");
   try {
-    const child = spawnImpl(pwsh, watchArguments(toolkit.watchScript, { previewOnly }), {
+    const child = spawnImpl(pwsh, entrypointArguments(entrypoint, { previewOnly }), {
       cwd: repositoryRoot, shell: false, windowsHide: true, stdio: ["ignore", fd, fd],
     });
     const launch = { pid: child.pid ?? 0, logPath, startedAt: now(), previewOnly, error: "" };

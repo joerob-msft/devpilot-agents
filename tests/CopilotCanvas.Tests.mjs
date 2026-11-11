@@ -17,8 +17,9 @@ function temp(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-test("the canvas launches only the recorded toolkit's Golden headless watch, with an optional preview ceiling", () => {
+test("the canvas prefers the repository's own Start-DevPilot.ps1 when it supports the canvas, else the recorded toolkit", async () => {
   const extensionDir = temp("canvas-ext-");
+  const repo = temp("canvas-repo-");
   try {
     assert.equal(launcher.readToolkit(extensionDir).available, false);
     writeFileSync(join(extensionDir, "toolkit.json"), JSON.stringify({ schemaVersion: 1, toolkitRoot: "relative\\path" }));
@@ -28,17 +29,35 @@ test("the canvas launches only the recorded toolkit's Golden headless watch, wit
     assert.equal(toolkit.available, true);
     assert.equal(toolkit.watchScript, join(repositoryRoot, "tools", "Watch-DevPilotAgents.ps1"));
 
-    const base = ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", toolkit.watchScript, "-Golden", "-Headless", "-CanvasBridge"];
-    assert.deepEqual(launcher.watchArguments(toolkit.watchScript), base);
-    assert.deepEqual(launcher.watchArguments(toolkit.watchScript, { previewOnly: true, whatIf: true }), [...base, "-PreviewOnly", "-WhatIf"]);
+    // No repository script: the recorded toolkit's Watch -Golden.
+    let entrypoint = await launcher.resolveEntrypoint(repo, { extensionDir });
+    assert.equal(entrypoint.kind, "toolkit");
+    const toolkitBase = ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", toolkit.watchScript, "-Golden", "-Headless", "-CanvasBridge"];
+    assert.deepEqual(launcher.entrypointArguments(entrypoint), toolkitBase);
+    assert.deepEqual(launcher.entrypointArguments(entrypoint, { previewOnly: true, whatIf: true }), [...toolkitBase, "-PreviewOnly", "-WhatIf"]);
+
+    // A repository script without both switches is not used (real pwsh parameter probe; never executed).
+    const script = join(repo, "Start-DevPilot.ps1");
+    writeFileSync(script, "[CmdletBinding()] param([switch]$CanvasBridge) throw 'must not run'\n");
+    entrypoint = await launcher.resolveEntrypoint(repo, { extensionDir });
+    assert.equal(entrypoint.kind, "toolkit");
+    assert.match(entrypoint.repositoryNote, /does not declare -CanvasBridge and -Headless/);
+
+    // A supporting repository script wins, with only the canvas switches added.
+    writeFileSync(script, "[CmdletBinding(SupportsShouldProcess)] param([switch]$CanvasBridge, [switch]$Headless, [switch]$PreviewOnly) throw 'must not run'\n");
+    entrypoint = await launcher.resolveEntrypoint(repo, { extensionDir });
+    assert.equal(entrypoint.kind, "repository");
+    assert.equal(entrypoint.script, script);
+    assert.deepEqual(launcher.entrypointArguments(entrypoint, { previewOnly: true, whatIf: true }),
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, "-CanvasBridge", "-Headless", "-PreviewOnly", "-WhatIf"]);
   } finally {
     rmSync(extensionDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
   }
 });
-
 test("Start spawns the watch with output in a launch log and no terminal, and preview uses -WhatIf", async () => {
   const logDirectory = temp("canvas-log-");
-  const toolkit = { watchScript: "C:\\toolkit\\tools\\Watch-DevPilotAgents.ps1" };
+  const entrypoint = { kind: "toolkit", script: "C:\\toolkit\\tools\\Watch-DevPilotAgents.ps1" };
   const calls = [];
   const spawnImpl = (file, args, options) => {
     calls.push({ file, args, options });
@@ -56,7 +75,7 @@ test("Start spawns the watch with output in a launch log and no terminal, and pr
     return child;
   };
   try {
-    const launch = launcher.startLaunch({ toolkit, repositoryRoot: "C:\\repo", previewOnly: false, logDirectory, spawnImpl, now: () => 0 });
+    const launch = launcher.startLaunch({ entrypoint, repositoryRoot: "C:\\repo", previewOnly: false, logDirectory, spawnImpl, now: () => 0 });
     assert.equal(launch.pid, 4321);
     assert.ok(existsSync(launch.logPath));
     assert.equal(calls[0].options.detached, undefined);
@@ -68,7 +87,7 @@ test("Start spawns the watch with output in a launch log and no terminal, and pr
     assert.equal(calls[0].args.includes("-WhatIf"), false);
     assert.equal(calls[0].args.includes("-PreviewOnly"), false);
 
-    const preview = await launcher.previewLaunch({ toolkit, repositoryRoot: "C:\\repo", previewOnly: true, spawnImpl });
+    const preview = await launcher.previewLaunch({ entrypoint, repositoryRoot: "C:\\repo", previewOnly: true, spawnImpl });
     assert.equal(preview.ok, true);
     assert.equal(preview.output, "DevPilot launch plan\n  Mode : PREVIEW ONLY\n");
     assert.deepEqual(calls[1].args.slice(-2), ["-PreviewOnly", "-WhatIf"]);
@@ -76,7 +95,7 @@ test("Start spawns the watch with output in a launch log and no terminal, and pr
 
     // A spawn failure is recorded on the launch instead of crashing the extension.
     const failing = launcher.startLaunch({
-      toolkit, repositoryRoot: "C:\\missing", previewOnly: false, logDirectory, now: () => 1,
+      entrypoint, repositoryRoot: "C:\\missing", previewOnly: false, logDirectory, now: () => 1,
       spawnImpl: () => {
         const child = new EventEmitter();
         setImmediate(() => child.emit("error", new Error("spawn pwsh ENOENT")));
@@ -111,7 +130,10 @@ test("the canvas server starts a watch only from a fresh human-previewed plan an
   const starts = [];
   const fakeLauncher = {
     ...launcher,
-    readToolkit: () => ({ available: true, toolkitRoot: "C:\\toolkit", version: "9.9.9", watchScript: "C:\\toolkit\\tools\\Watch-DevPilotAgents.ps1" }),
+    resolveEntrypoint: async (root) => ({
+      available: true, kind: "toolkit", script: "C:\\toolkit\\tools\\Watch-DevPilotAgents.ps1", repositoryRoot: root,
+      toolkitRoot: "C:\\toolkit", version: "9.9.9", repositoryNote: "",
+    }),
     previewLaunch: async (options) => { previews.push(options); return { ok: true, exitCode: 0, output: "DevPilot launch plan" }; },
     startLaunch: (options) => { starts.push(options); return { pid: process.pid, logPath: join(watchRoot, "launch.log"), startedAt: Date.now(), previewOnly: options.previewOnly }; },
     logTail: () => "",
@@ -145,6 +167,8 @@ test("the canvas server starts a watch only from a fresh human-previewed plan an
     assert.equal(starts.length, 1);
     assert.equal(starts[0].previewOnly, true);
     assert.equal(starts[0].repositoryRoot, preview.body.repositoryRoot);
+    assert.equal(starts[0].entrypoint.script, "C:\\toolkit\\tools\\Watch-DevPilotAgents.ps1");
+    assert.equal(previews[0].entrypoint.kind, "toolkit");
     assert.equal((await post("/api/watch/start", { launchToken: preview.body.launchToken })).status, 409);
 
     // A terminal-owned watch cannot be stopped from the canvas; a headless one can.
