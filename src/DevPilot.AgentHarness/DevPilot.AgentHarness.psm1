@@ -2940,7 +2940,14 @@ function Assert-AgentDashboardCommandLineShape {
         per-role absoluteDenies, never from anything on the Dashboard command line. Only its
         presence, position, cardinality, and membership in the fixed mode set are checked here --
         which is what keeps this a structural, fail-closed argv shape rather than a policy input.
+
+        Headless owner profile (Copilot app canvas): exactly one optional literal '--headless'
+        token may follow the --launch-mode pair. It is the only other pinned position, and it is
+        the only difference between the two profiles. On success this returns 'headless' or
+        'interactive'. Callers decide what each profile may do. Interactive widening must never
+        accept 'headless'.
     #>
+    [OutputType([string])]
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$ExecutablePath,
         [Parameter(Mandatory)][AllowNull()][string[]]$Arguments,
@@ -2971,6 +2978,11 @@ function Assert-AgentDashboardCommandLineShape {
     $i++
     if ($i -ge $argv.Count -or $argv[$i] -cnotin @('observe', 'preview', 'operational')) { throw $failure }
     $i++
+    $launchProfile = 'interactive'
+    if ($i -lt $argv.Count -and $argv[$i] -ceq '--headless') {
+        $launchProfile = 'headless'
+        $i++
+    }
     while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
         $i += 2
         if ($i -gt $argv.Count) { throw $failure }
@@ -2987,6 +2999,51 @@ function Assert-AgentDashboardCommandLineShape {
         $i++
     }
     if ($i -ne $argv.Count) { throw $failure }
+    return $launchProfile
+}
+
+function Get-AgentDashboardLaunchProfile {
+    <#
+        Returns 'interactive', 'headless' or 'none' for THIS broker process's immediate OS parent.
+        It applies the same OS-observed anchor as Test-AgentDashboardLaunchProvenance (below) and,
+        like it, never throws: any failure to establish provenance is 'none'.
+
+        'headless' is the canvas-started Golden owner: the same locked Bun runtime, entry script
+        and broker triple, launched by Watch-DevPilotAgents.ps1 -Headless. It may own Golden
+        automatic workers and local observation, because the broker still separately requires its
+        grandparent to be the descriptor's ownerProcessId with the captured start identity. It
+        must never unlock interactive widening or minted-grant dispatch.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$BrokerScriptPath,
+        [Parameter(Mandatory)][string]$DescriptorPath
+    )
+    try {
+        $dashboardRoot = Join-Path (Join-Path $ToolkitRoot 'src') 'DevPilot.Dashboard'
+        $bunExecutableName = if ($IsWindows) { 'bun.exe' } else { 'bun' }
+        $expectedBunExecutable = [IO.Path]::GetFullPath(
+            (Join-Path $dashboardRoot (Join-Path 'node_modules' (Join-Path 'bun' (Join-Path 'bin' $bunExecutableName)))))
+        $expectedEntryScript = [IO.Path]::GetFullPath((Join-Path $dashboardRoot (Join-Path 'dist' (Join-Path 'src' 'index.js'))))
+        $ownInvocation = Get-AgentProcessArgv -ProcessId $PID
+        $liveParentPid = Get-AgentImmediateParentProcessId -ProcessId $PID
+        $liveParentProcess = Get-Process -Id $liveParentPid -ErrorAction Stop
+        [void](Get-AgentProcessStartIdentity -Process $liveParentProcess)
+        $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
+        $launchProfile = Assert-AgentDashboardCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+            -Arguments $liveParentInvocation.Arguments -ExpectedBunExecutable $expectedBunExecutable `
+            -ExpectedEntryScript $expectedEntryScript `
+            -ExpectedBrokerExecutable ([IO.Path]::GetFullPath($ownInvocation.ExecutablePath)) `
+            -ExpectedBrokerScript ([IO.Path]::GetFullPath($BrokerScriptPath)) `
+            -ExpectedDescriptorPath ([IO.Path]::GetFullPath($DescriptorPath))
+        if ($launchProfile -cin @('interactive', 'headless')) { return $launchProfile }
+        return 'none'
+    }
+    catch {
+        return 'none'
+    }
 }
 
 function Test-AgentDashboardLaunchProvenance {
@@ -3052,11 +3109,12 @@ function Test-AgentDashboardLaunchProvenance {
         # obtainable at all is itself part of establishing a genuinely live, well-formed process.
         [void](Get-AgentProcessStartIdentity -Process $liveParentProcess)
         $liveParentInvocation = Get-AgentProcessArgv -ProcessId $liveParentPid
-        Assert-AgentDashboardCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
+        $launchProfile = Assert-AgentDashboardCommandLineShape -ExecutablePath $liveParentInvocation.ExecutablePath `
             -Arguments $liveParentInvocation.Arguments -ExpectedBunExecutable $expectedBunExecutable `
             -ExpectedEntryScript $expectedEntryScript -ExpectedBrokerExecutable $expectedBrokerExecutable `
             -ExpectedBrokerScript $expectedBrokerScript -ExpectedDescriptorPath $expectedDescriptorPath
-        return $true
+        # A canvas-started headless owner is never interactive provenance.
+        return ($launchProfile -ceq 'interactive')
     }
     catch {
         return $false
@@ -7419,6 +7477,7 @@ Export-ModuleMember -Function @(
     "Assert-AgentBrokerProcessAnchor",
     "Assert-AgentDashboardCommandLineShape",
     "Test-AgentDashboardLaunchProvenance",
+    "Get-AgentDashboardLaunchProfile",
      "Get-AgentDefaultCapabilityOverrideKillSwitchRoot",
      "Test-AgentCapabilityOverrideKillSwitch",
      "Enable-AgentCapabilityOverrideKillSwitch",

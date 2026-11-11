@@ -24,14 +24,21 @@
     delegable capability so no grant can ever widen it back for that launch.
     Once forces a single cycle even under Golden.
 
-    CanvasBridge (prototype) additionally lets the GitHub Copilot app canvas in
+    CanvasBridge additionally lets the GitHub Copilot app canvas in
     src\DevPilot.CopilotCanvas observe this dashboard and stage manual runs. The
     dashboard serves an authenticated 127.0.0.1 bridge through its own trusted
     broker client and publishes canvas-bridge.v1.json in the private watch-state
     root. The broker, its launch provenance and the dashboard argv are unchanged.
 
+    Headless (with CanvasBridge) runs the same trusted dashboard and broker without
+    a terminal UI, so the Copilot app canvas can start and stop the watch. The
+    broker accepts that pinned headless dashboard for Golden automatic workers but
+    never for interactive capability widening, which stays terminal-only.
+
 .EXAMPLE
     .\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
+.EXAMPLE
+    .\tools\Watch-DevPilotAgents.ps1 -Golden -Headless -CanvasBridge
 .EXAMPLE
     .\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
@@ -150,7 +157,10 @@ param(
     [switch]$IncludeOwnPullRequests,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [switch]$CanvasBridge
+    [switch]$CanvasBridge,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$Headless
 )
 
 $ErrorActionPreference = 'Stop'
@@ -314,6 +324,9 @@ function Resolve-WatchLaunchPolicy {
     $manualReviewHandler = $EnableManualReviewHandler -or ($Golden -and $launchReviewHandler)
     if ((& $explicit 'CanvasBridge') -and -not ($manualReviewer -or $manualReviewHandler)) {
         [void]$failures.Add('-CanvasBridge requires the trusted manual broker: add -Golden or enable a manual role.')
+    }
+    if ((& $explicit 'Headless') -and -not (& $explicit 'CanvasBridge')) {
+        [void]$failures.Add('-Headless requires -CanvasBridge: the Copilot app canvas is the only operator surface of a headless watch.')
     }
     $manualReviewerWrites = -not $PreviewOnly -and ($EnableManualReviewerWrites -or ($Golden -and $manualReviewer))
     $manualReviewHandlerCodeUpdates = -not $PreviewOnly -and
@@ -824,6 +837,7 @@ try {
     if ($brokerDescriptorPath) {
         $dashboardParameters.BrokerDescriptorPath = $brokerDescriptorPath
     }
+    if ($Headless) { $dashboardParameters.Headless = $true }
     & $dashboardLauncher @dashboardParameters -ValidateOnly
     if ($LASTEXITCODE -ne 0) {
         throw "Dashboard preflight failed with code $LASTEXITCODE; no agent was started."

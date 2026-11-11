@@ -46,10 +46,12 @@ param(
     [string[]]$EventLogPath = @(),
     [string]$BrokerDescriptorPath,
     [string]$LaunchMode = 'observe',
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$Headless
 )
 $record = [ordered]@{
     validateOnly = [bool]$ValidateOnly
+    headless = [bool]$Headless
     launchMode = $LaunchMode
     stateDir = @($StateDir)
     brokerDescriptorPath = [string]$BrokerDescriptorPath
@@ -403,6 +405,21 @@ Describe 'golden launch policy (issue #114)' {
         $records[2].brokerDescriptorPath | Should -Not -BeNullOrEmpty
         ($records[2].descriptor | ConvertFrom-Json -AsHashtable).ContainsKey('launcherControl') | Should -BeTrue
         $result.StdOut | Should -Match 'Copilot canvas bridge: enabled'
+        @($records | Where-Object { $_.headless }).Count | Should -Be 0
+    }
+
+    It 'runs a canvas-startable headless Golden watch through the same dashboard launcher and descriptor' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-Headless', '-CanvasBridge') + (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $records = Get-DashboardRecord -Context $context
+        $records.Count | Should -Be 3
+        # Only the descriptor-bearing validation and the real launch carry the broker; both are headless.
+        $records[2].validateOnly | Should -BeFalse
+        $records[2].headless | Should -BeTrue
+        $records[2].launchMode | Should -BeExactly 'operational'
+        $records[2].canvasBridgeFile | Should -BeExactly (Join-Path $records[2].stateDir[0] 'canvas-bridge.v1.json')
+        ($records[2].descriptor | ConvertFrom-Json -AsHashtable).ContainsKey('launcherControl') | Should -BeTrue
     }
 
     It 'captures real Golden stdout through the real broker and tailer (buffered baseline=<BufferedBaseline>)' -Tag 'LiveCapture' -ForEach @(
@@ -637,6 +654,7 @@ exit 0
         @{ Case = @('-Golden', '-Agent', 'ReviewHandler'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104'); Expected = 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both' }
         @{ Case = @('-Agent', 'Reviewer', '-CanvasBridge'); Expected = '-CanvasBridge requires the trusted manual broker' }
+        @{ Case = @('-Golden', '-Headless'); Expected = '-Headless requires -CanvasBridge' }
     ) {
         $context = New-GoldenContext
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@($Case) + (Get-BaseLaunchArgument -Context $context))

@@ -452,7 +452,7 @@ The dashboard never bypasses authority or stops a process based on its PID.
 - `dismissals.ts` persists per-instance display dismissals atomically, independently
   of PR History, agent state, work leases, and launch authority.
 - `canvas-bridge.ts` is the opt-in loopback bridge for the Copilot app canvas. See
-  *Copilot app canvas (prototype)* below.
+  *Copilot app canvas* below.
 - `layout.ts` is a pure responsive decision function used by the SolidJS UI.
 - `simple-view.tsx` supplies pure Simple presentation rows, identity-pinned list/details,
   and the scrollable manual panel without changing reducer or broker authority.
@@ -467,65 +467,79 @@ accepted but are not rendered as unbounded raw content. Browser opening is
 fail-closed: only credential-free `http:` and `https:` URLs are passed as a
 process argument to a platform opener, never interpolated into a shell command.
 
-## Copilot app canvas (prototype)
+## Copilot app canvas
 
 The **DevPilot Operations** canvas brings this dashboard into the GitHub Copilot
-app's side panel. It shows instances, automation, Scan now, and a *Review a PR*
-form with preview, Replace / Run next and cancel. Golden stays fully intact. The
-canvas never starts or trusts a broker of its own. It talks to this dashboard,
-which keeps owning the trusted broker client.
+app's side panel. It can **start and stop the repository's Golden watch** and
+shows instances, automation, Scan now, and a *Review a PR* form with preview,
+Replace / Run next and cancel. Golden stays fully intact. The canvas never
+starts or trusts a broker of its own: it talks to a dashboard that owns the
+trusted broker client, either the terminal TUI or the headless owner it started.
 
 1. Install the canvas once: `.\tools\Install-DevPilotCanvas.ps1`. It is copied to
    `~\.copilot\extensions\devpilot-ops`, so it works in every repository's
-   sessions and nothing is committed to consumer repositories. Reload Copilot
-   extensions afterwards, or restart the app.
-2. From the consumer repository (where `.github\copilot\agents\*.config.json`
-   lives), start the watch with the bridge opted in:
+   sessions and nothing is committed to consumer repositories. It also records
+   `toolkit.json`, the toolkit whose `Watch-DevPilotAgents.ps1` the Start button
+   runs. Pass `-ToolkitRoot` to point at a different hardened toolkit install.
+   Reload Copilot extensions afterwards, or restart the app.
+2. In the Copilot app, open a session for the consumer repository (where
+   `.github\copilot\agents\*.config.json` lives) and open the **DevPilot
+   Operations** canvas, or ask Copilot to open it. A session in its own worktree
+   also matches, because the worktree's main checkout is compared.
+3. With no watch running, the canvas offers **Preview launch plan**. That runs
+   the recorded toolkit's `Watch-DevPilotAgents.ps1 -Golden -Headless
+   -CanvasBridge -WhatIf` (plus `-PreviewOnly` when ticked) in the repository
+   root and shows Watch's own launch plan or preflight failures with their
+   remediation. **Start Golden watch** becomes clickable only after that plan
+   has rendered, and starts the same command without `-WhatIf`. **Stop watch**
+   (with a confirm click) shuts a canvas-started watch down.
 
-   ```powershell
-   .\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
-   ```
+A canvas-started watch keeps running across extension reloads, `/clear` and
+closing the canvas; reopening the canvas re-attaches. The Copilot app runs
+extensions inside a kill-on-close job object, so quitting the app stops the
+watch and its agents too. For a watch that must outlive the app, start it in a
+terminal instead and keep that terminal open; the canvas attaches to it the
+same way:
 
-   Keep this terminal open: the TUI is still the owner and authority.
-3. In the Copilot app, open a session for the same repository and open the
-   **DevPilot Operations** canvas, or ask Copilot to open it. A session in its
-   own worktree also matches, because the worktree's main checkout is compared.
-   If no watch matches, the canvas shows the command to run and lists other
-   running watches it can connect to explicitly.
+```powershell
+.\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
+```
 
 How it works:
 
 - `-CanvasBridge` passes `DEVPILOT_CANVAS_BRIDGE_FILE` and
   `DEVPILOT_CONSUMER_REPOSITORY_ROOT` to the dashboard **through the
-  environment**. The dashboard argv pinned by broker launch provenance is
-  therefore unchanged. The dashboard clears both variables before it spawns the
-  broker.
+  environment**, and the dashboard clears both before it spawns the broker.
+- `-Headless` (only with `-CanvasBridge`) adds one pinned `--headless` token
+  directly after the dashboard's `--launch-mode` pair. The dashboard then runs
+  its tailer, trusted broker client and bridge with no renderer.
+  - Broker launch provenance classifies its parent as `interactive`, `headless`
+    or `none` (`Get-AgentDashboardLaunchProfile`). Golden automatic workers and
+    local observation accept `interactive` or `headless`; both still require the
+    grandparent to be the descriptor's Watch `ownerProcessId` with the captured
+    start identity.
+  - **Interactive capability widening and minted grants require
+    `interactive`.** A headless owner can never widen.
 - `canvas-bridge.ts` serves an authenticated `127.0.0.1` API: bearer token,
   exact `Host`, and JSON bodies of at most 16 KiB. It publishes
-  `canvas-bridge.v1.json` (URL, token, PID, consumer repository) in the private
-  watch-state root and removes it on exit.
+  `canvas-bridge.v1.json` (URL, token, PID, consumer repository, `headless`) in
+  the private watch-state root and removes it on exit.
   - The API is `/v1/status`, `/v1/scan-now` and
     `/v1/review/{describe,dispatch,prepare-run,confirm-run,cancel-queued,cancel}`.
-  - It never exposes widening, narrowing, the kill switch, or shutdown. These
-    stay TUI-only.
+    Only a headless owner adds `POST /v1/shutdown`; a terminal-owned watch is
+    stopped from its terminal.
+  - It never exposes widening, narrowing or the kill switch. These stay
+    TUI-only.
 - `src\DevPilot.CopilotCanvas` is the extension. It matches the session's
   repository to a live bridge, keeps the token server-side, and serves its UI
   behind a per-instance nonce.
   - Agent-callable actions are read-only `get_status` and `prepare_review`.
-    `prepare_review` only pre-fills the form.
-  - Starting work always requires a human click on a Start or Confirm button
-    that is enabled only after the preview has rendered. This mirrors the TUI's
-    `previewRendered` guard.
-- Prototype risk: any process running as the same user can read the
-  owner-private discovery file and call the bridge. The bridge is off unless
-  `-CanvasBridge` is passed.
-
-**Long-term requirement:** the canvas must eventually **start and own the
-Golden watch itself**, with no terminal TUI and with Golden intact. Keep the
-bridge owner-agnostic and its `v1` contract stable toward that goal. The
-remaining design work is:
-
-- a trusted headless Golden owner profile in broker launch provenance;
-- an owner lifecycle that survives extension reloads;
-- a human-gated "Start Golden watch" in the canvas, never an agent action;
-- one owner per consumer repository.
+    `prepare_review` only pre-fills the form. No agent action can start or stop
+    a watch or start a run.
+  - Starting a watch or a run always requires a human click on a button that is
+    enabled only after the preview it confirms has rendered. This mirrors the
+    TUI's `previewRendered` guard. A launch preview token is single-use, expires
+    after five minutes, and is bound to the previewed toolkit and repository.
+- Risk: any process running as the same user can read the owner-private
+  discovery file and call the bridge. The bridge is off unless `-CanvasBridge`
+  is passed.

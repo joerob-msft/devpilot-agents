@@ -115,6 +115,8 @@ finally { Pop-Location }
 & node --test (Join-Path $root 'tests\ReleaseAutomation.Tests.cjs') `
     (Join-Path $root 'tests\ReleasePolicy.Tests.cjs')
 if ($LASTEXITCODE -ne 0) { throw 'Release orchestration tests failed.' }
+& node --test (Join-Path $root 'tests\CopilotCanvas.Tests.mjs')
+if ($LASTEXITCODE -ne 0) { throw 'Copilot app canvas tests failed.' }
 
 Invoke-DevPilotPesterIsolated -Path (Join-Path $root 'tests')
 

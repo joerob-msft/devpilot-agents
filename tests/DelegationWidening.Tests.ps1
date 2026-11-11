@@ -387,12 +387,12 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
     }
 
     It 'exports the new dashboard-anchor primitives at module scope and keeps them in the manifest' {
-        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance')) {
+        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance', 'Get-AgentDashboardLaunchProfile')) {
             Get-Command $name -Module DevPilot.AgentHarness | Should -Not -BeNullOrEmpty
         }
         $manifestPath = (Resolve-Path "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1").Path
         $manifestContent = Get-Content -LiteralPath $manifestPath -Raw
-        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance')) {
+        foreach ($name in @('Assert-AgentDashboardCommandLineShape', 'Test-AgentDashboardLaunchProvenance', 'Get-AgentDashboardLaunchProfile')) {
             $manifestContent | Should -Match ([regex]::Escape("'$name'"))
         }
     }
@@ -468,6 +468,37 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         }
     }
 
+    It 'Assert-AgentDashboardCommandLineShape accepts one --headless token only directly after the launch-mode pair and reports the profile' {
+        $brokerExe = 'C:\fake\pwsh.exe'
+        $descriptorPath = 'C:\fake\watch\broker.descriptor.v1.json'
+        $trustedTriple = @('--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+            '--broker-descriptor', $descriptorPath)
+        function Get-DashboardShapeProfile {
+            param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments $Arguments `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath -ExpectedDescriptorPath $descriptorPath
+        }
+        $prefix = @('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'operational')
+        Get-DashboardShapeProfile -Arguments (@($prefix) + @('--state-dir', 'C:\fake\s') + $trustedTriple) |
+            Should -BeExactly 'interactive'
+        Get-DashboardShapeProfile -Arguments (@($prefix) + @('--headless', '--state-dir', 'C:\fake\s') + $trustedTriple) |
+            Should -BeExactly 'headless'
+        foreach ($rejected in @(
+                , (@('--conditions=browser', $script:expectedDashboardEntryScript, '--headless', '--launch-mode', 'operational'))
+                , (@($prefix) + @('--headless', '--headless'))
+                , (@($prefix) + @('--state-dir', 'C:\fake\s', '--headless'))
+                , (@($prefix) + @('--Headless'))
+                , (@($prefix) + @('--headless=true'))
+            )) {
+            { Get-DashboardShapeProfile -Arguments (@($rejected) + $trustedTriple) } |
+                Should -Throw '*widening-interactive-required*' -Because (@($rejected) -join ' ')
+        }
+        { Get-DashboardShapeProfile -Arguments (@($prefix) + $trustedTriple + @('--headless')) } |
+            Should -Throw '*widening-interactive-required*'
+    }
+
     It 'keeps the harness argv shape and the launcher that produces it in the same fixed order' {
         # Read-only coupling check: Start-DevPilotDashboard.ps1 owns the argv, the harness validates
         # it, and the two must not drift. The launch mode is emitted immediately after the entry
@@ -484,6 +515,11 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         $stateDirIndex | Should -BeGreaterThan $launchModeValueIndex
         ([regex]::Matches($launcherSource, [regex]::Escape("[void]`$arguments.Add('--launch-mode')"))).Count | Should -Be 1
         $launcherSource | Should -Match "\[ValidateSet\('observe', 'preview', 'operational'\)\]"
+        # The optional headless token sits between the mode value and the first state-dir pair.
+        $headlessIndex = $launcherSource.IndexOf("if (`$Headless) { [void]`$arguments.Add('--headless') }")
+        $headlessIndex | Should -BeGreaterThan $launchModeValueIndex
+        $stateDirIndex | Should -BeGreaterThan $headlessIndex
+        ([regex]::Matches($launcherSource, [regex]::Escape("'--headless'"))).Count | Should -Be 1
     }
 
     It 'Assert-AgentDashboardCommandLineShape rejects a decoy Bun executable, a decoy entry script used as inert data, a wrong --conditions value, a forged broker triple, and trailing extra tokens' {
@@ -570,6 +606,23 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
             } -ParameterFilter { $ProcessId -eq 999999 }
             Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
                 Should -BeTrue
+            Get-AgentDashboardLaunchProfile -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeExactly 'interactive'
+
+            # Headless canvas owner: the same pinned chain is a trusted launcher for Golden, but
+            # never interactive provenance, so widening and minted grants stay unavailable.
+            Mock Get-AgentProcessArgv {
+                @{
+                    ExecutablePath = $ExpectedBunExecutable
+                    Arguments = @('--conditions=browser', $ExpectedEntryScript, '--launch-mode', 'operational', '--headless',
+                        '--broker-executable', $ownExecutable, '--broker-script', $BrokerPath,
+                        '--broker-descriptor', $descriptorPath)
+                }
+            } -ParameterFilter { $ProcessId -eq 999999 }
+            Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeFalse
+            Get-AgentDashboardLaunchProfile -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeExactly 'headless'
 
             # Reject: a parent that is otherwise the exact canonical shape but omits the
             # --launch-mode pair the trusted launcher always emits (issue #114).
@@ -608,12 +661,22 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
                 Should -Not -Throw
             Test-AgentDashboardLaunchProvenance -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
                 Should -BeFalse
+            Get-AgentDashboardLaunchProfile -ToolkitRoot $RepositoryRoot -BrokerScriptPath $BrokerPath -DescriptorPath $descriptorPath |
+                Should -BeExactly 'none'
         }
     }
 
     It 'gates every interactive-widening operation and dispatch of a minted grant behind $interactiveWideningAvailable, computed once at startup, without touching baseline describe/profile/manual dispatch' {
         $brokerSource = Get-Content -LiteralPath $script:brokerPath -Raw
-        $brokerSource | Should -Match '\$interactiveWideningAvailable = Test-AgentDashboardLaunchProvenance'
+        $brokerSource | Should -Match '\$dashboardLaunchProfile = Get-AgentDashboardLaunchProfile'
+        $brokerSource | Should -Match "\`$interactiveWideningAvailable = \`$dashboardLaunchProfile -ceq 'interactive'"
+        # A headless (canvas-started) owner may run Golden launcher control and local observation,
+        # but never the widening/minted-grant paths, which keep testing $interactiveWideningAvailable.
+        $brokerSource | Should -Match "\`$trustedDashboardLauncher = \`$dashboardLaunchProfile -cin @\('interactive', 'headless'\)"
+        $launcherControlBody = [regex]::Match($brokerSource, '(?s)function Initialize-BrokerLauncherControl \{.*?\n\}').Value
+        $launcherControlBody | Should -Match '-not \$trustedDashboardLauncher'
+        $launcherControlBody | Should -Match 'Get-AgentImmediateParentProcessId -ProcessId \$dashboardPid'
+        $brokerSource | Should -Match '-DashboardProvenance:\$trustedDashboardLauncher'
         foreach ($fn in @('Invoke-DescribeWidening', 'Invoke-ConfirmWideningPreview', 'Invoke-ConfirmWideningMint', 'Invoke-CancelWidening')) {
             $body = [regex]::Match($brokerSource, "(?s)function $fn \{.*?\n\}").Value
             $body | Should -Not -BeNullOrEmpty

@@ -57,7 +57,10 @@ interface Harness {
   cleanup: () => Promise<void>;
 }
 
-async function startHarness(overrides: Partial<Record<keyof DispatchBroker, unknown>> = {}): Promise<Harness> {
+async function startHarness(
+  overrides: Partial<Record<keyof DispatchBroker, unknown>> = {},
+  onShutdown?: () => void,
+): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "canvas-bridge-"));
   const calls: Harness["calls"] = [];
   let scheduledAccepted: (event: ScheduledDispatchAccepted) => void = () => {};
@@ -85,6 +88,7 @@ async function startHarness(overrides: Partial<Record<keyof DispatchBroker, unkn
   const bridge = new CanvasBridge({
     discoveryFile, consumerRepositoryRoot: "C:\\repo", launchMode: "operational", broker,
     reducer: new OperationsReducer(), tailer: { registerEventLogPath: (path: string) => { registered.push(path); return true; } },
+    onShutdown,
   });
   const discovery = await bridge.start();
   return {
@@ -126,6 +130,7 @@ test("canvas bridge only serves authenticated loopback callers and never exposes
     assert.equal(published.token, harness.discovery.token);
     assert.equal(published.consumerRepositoryRoot, "C:\\repo");
     assert.match(published.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+    assert.equal(published.headless, false);
 
     assert.equal((await call(harness, "GET", "/v1/status", undefined, { authorization: "Bearer wrong" })).status, 401);
     assert.equal((await call(harness, "GET", "/v1/status", undefined, { host: "localhost" })).status, 403);
@@ -139,6 +144,25 @@ test("canvas bridge only serves authenticated loopback callers and never exposes
     await harness.cleanup();
   }
   assert.equal(existsSync(harness.discoveryFile), false);
+});
+
+test("only a headless owner bridge advertises headless and accepts the canvas Stop", async () => {
+  let stopped = 0;
+  const harness = await startHarness({}, () => { stopped++; });
+  try {
+    const published = JSON.parse(readFileSync(harness.discoveryFile, "utf8")) as CanvasBridgeDiscovery;
+    assert.equal(published.headless, true);
+    assert.equal((await call(harness, "GET", "/v1/status")).body.headless, true);
+    assert.equal((await call(harness, "POST", "/v1/shutdown", {}, { authorization: "Bearer wrong" })).status, 401);
+    assert.equal(stopped, 0);
+    const response = await call(harness, "POST", "/v1/shutdown", {});
+    assert.equal(response.status, 200);
+    assert.equal(response.body.stopping, true);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 120));
+    assert.equal(stopped, 1);
+  } finally {
+    await harness.cleanup();
+  }
 });
 
 test("canvas bridge starts exactly the previewed broker draft once and bounds instructions", async () => {
