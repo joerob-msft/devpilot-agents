@@ -8,6 +8,8 @@ import { createDashboardLifecycle, type DashboardLifecycle } from "./lifecycle.j
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
 import { FileDismissalStorage } from "./dismissals.js";
+import { FileHistoryHideStorage } from "./history-hides.js";
+import { join } from "node:path";
 import packageInfo from "../package.json" with { type: "json" };
 
 interface Arguments {
@@ -101,6 +103,14 @@ async function main(): Promise<void> {
       return new OperationsReducer();
     });
   const history = new PullRequestHistoryProjection();
+  const historyHides = new FileHistoryHideStorage(
+    args.viewStateDirectory ? join(args.viewStateDirectory, "hidden-pr-history.v1.json") : undefined);
+  await historyHides.load()
+    .then((hides) => history.seedHidden(hides.hiddenKeys, hides.clearedThroughMs))
+    .catch((error: unknown) => {
+      dismissalError = [dismissalError, `Could not load hidden PR history: ${error instanceof Error ? error.message : String(error)}`]
+        .filter(Boolean).join(" ");
+    });
   let brokerFailure = "";
   let refresh = (): void => {};
   let stopHeadless: (code: number) => void = () => {};
@@ -144,6 +154,7 @@ async function main(): Promise<void> {
   const canvasBridge = canvasBridgeFile && broker
     ? new CanvasBridge({
         discoveryFile: canvasBridgeFile, consumerRepositoryRoot, launchMode: args.launchMode, broker, reducer, tailer,
+                history, historyHides,
         onShutdown: args.headless ? () => stopHeadless(0) : undefined,
       })
     : undefined;

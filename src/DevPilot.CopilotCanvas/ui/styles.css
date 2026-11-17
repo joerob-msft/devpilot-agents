@@ -181,3 +181,31 @@ dialog::backdrop { background: var(--overlay-backdrop-color, rgba(0, 0, 0, 0.35)
 pre.plan { max-height: 320px; overflow: auto; }
 #manual-start { margin-top: 12px; }
 #manual-start summary { cursor: pointer; }
+
+h1 { margin: 0; font-size: 16px; font-weight: 600; }
+button.link { border: none; background: none; padding: 0 4px; text-decoration: underline; }
+.notice.error { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.notice[hidden] { display: none; }
+.automation { margin-top: 4px; }
+.automation .chip.retrying, .automation .chip.failed { color: var(--text-color-attention, #9a6700); }
+.tabs { display: flex; gap: 4px; margin-top: 12px; border-bottom: 1px solid var(--border-color-default, #d0d7de); }
+.tabs[hidden] { display: none; }
+.tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 12px; }
+.tabs button[aria-selected="true"] { border-bottom-color: var(--border-color-emphasis, #0969da); font-weight: 600; }
+.badge.stale { color: var(--text-color-attention, #9a6700); border-color: currentColor; margin-left: 4px; }
+.row .actions-inline { display: flex; gap: 4px; }
+.row-wrap { display: flex; gap: 4px; align-items: stretch; }
+.row-wrap .row { flex: 1; min-width: 0; }
+.row-wrap .hide { font-size: 11px; padding: 2px 8px; }
+#exited { margin-top: 10px; }
+#exited summary { cursor: pointer; }
+.outcome { font-size: 15px; font-weight: 600; margin: 6px 0; }
+.pr-link { display: inline-block; margin: 4px 0 8px; font-weight: 600; }
+.spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+dialog .close { float: right; border: none; font-size: 18px; line-height: 1; padding: 0 6px; }
+.dialog-title { margin-top: 0; text-transform: none; letter-spacing: 0; font-size: 15px; color: inherit; }
+button.danger-fill { background: var(--background-color-danger-emphasis, #cf222e); }
+.suggestions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.suggestions button { font-size: 11px; padding: 1px 8px; border-radius: 999px; }

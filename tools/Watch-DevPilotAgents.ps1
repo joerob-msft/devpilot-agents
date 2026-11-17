@@ -24,21 +24,43 @@
     delegable capability so no grant can ever widen it back for that launch.
     Once forces a single cycle even under Golden.
 
-    CanvasBridge additionally lets the GitHub Copilot app canvas in
-    src\DevPilot.CopilotCanvas observe this dashboard and stage manual runs. The
-    dashboard serves an authenticated 127.0.0.1 bridge through its own trusted
-    broker client and publishes canvas-bridge.v1.json in the private watch-state
-    root. The broker, its launch provenance and the dashboard argv are unchanged.
+    The GitHub Copilot app canvas bridge is ON by default whenever the launch has a
+    trusted manual broker (-Golden or an -EnableManual* role): the 'DevPilot
+    Operations' canvas in src\DevPilot.CopilotCanvas can then observe this
+    dashboard and stage manual runs. The dashboard serves an authenticated
+    127.0.0.1 bridge through its own trusted broker client and publishes
+    canvas-bridge.v1.json in the private watch-state root. The broker, its launch
+    provenance and the dashboard argv are unchanged. A launch without a broker
+    turns the bridge off with a notice. TerminalOnly opts out: the terminal
+    dashboard runs alone and no bridge file is published. CanvasBridge is still
+    accepted for compatibility (it is the default); passed explicitly it still
+    requires the manual broker.
 
-    Headless (with CanvasBridge) runs the same trusted dashboard and broker without
-    a terminal UI, so the Copilot app canvas can start and stop the watch. The
-    broker accepts that pinned headless dashboard for Golden automatic workers but
-    never for interactive capability widening, which stays terminal-only.
+    Headless runs the same trusted dashboard and broker without a terminal UI, so
+    the Copilot app canvas can start and stop the watch; it implies the bridge and
+    cannot be combined with TerminalOnly. The broker accepts that pinned headless
+    dashboard for Golden automatic workers but never for interactive capability
+    widening, which stays terminal-only.
+
+    History: the dashboard also reloads up to 20 recent prior launches, but only
+    launches recorded for the SAME consumer repository (repository.v1.json in each
+    watch-state root). Older launches without that record are treated as unknown
+    and are not reloaded. Preview-only launches are capped separately so they can
+    never evict operational history.
+
+    PruneHistory is a human-run cleanup: it keeps the PruneKeep most recent
+    launch roots per repository (plus every unknown-repository root unless
+    -PruneUnknown), never touches a root whose watch is still running, honours
+    -WhatIf, and starts nothing.
 
 .EXAMPLE
-    .\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
+    .\tools\Watch-DevPilotAgents.ps1 -Golden
 .EXAMPLE
-    .\tools\Watch-DevPilotAgents.ps1 -Golden -Headless -CanvasBridge
+    .\tools\Watch-DevPilotAgents.ps1 -Golden -TerminalOnly
+.EXAMPLE
+    .\tools\Watch-DevPilotAgents.ps1 -Golden -Headless
+.EXAMPLE
+    .\tools\Watch-DevPilotAgents.ps1 -PruneHistory -PruneKeep 10 -WhatIf
 .EXAMPLE
     .\tools\Watch-DevPilotAgents.ps1 -Agent Both -Continuous
 
@@ -160,7 +182,20 @@ param(
     [switch]$CanvasBridge,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [switch]$Headless
+    [switch]$TerminalOnly,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$Headless,
+
+    [Parameter(Mandatory, ParameterSetName = 'Prune')]
+    [switch]$PruneHistory,
+
+    [Parameter(ParameterSetName = 'Prune')]
+    [ValidateRange(1, 1000)]
+    [int]$PruneKeep = 20,
+
+    [Parameter(ParameterSetName = 'Prune')]
+    [switch]$PruneUnknown
 )
 
 $ErrorActionPreference = 'Stop'
@@ -325,9 +360,20 @@ function Resolve-WatchLaunchPolicy {
     if ((& $explicit 'CanvasBridge') -and -not ($manualReviewer -or $manualReviewHandler)) {
         [void]$failures.Add('-CanvasBridge requires the trusted manual broker: add -Golden or enable a manual role.')
     }
-    if ((& $explicit 'Headless') -and -not (& $explicit 'CanvasBridge')) {
-        [void]$failures.Add('-Headless requires -CanvasBridge: the Copilot app canvas is the only operator surface of a headless watch.')
+    if ((& $explicit 'Headless') -and (& $explicit 'TerminalOnly')) {
+        [void]$failures.Add('-Headless cannot be combined with -TerminalOnly: the Copilot app canvas is the only operator surface of a headless watch.')
     }
+    elseif ((& $explicit 'Headless') -and -not ($manualReviewer -or $manualReviewHandler)) {
+        [void]$failures.Add('-Headless requires the trusted manual broker for the Copilot app canvas: add -Golden or enable a manual role.')
+    }
+    if ((& $explicit 'CanvasBridge') -and (& $explicit 'TerminalOnly')) {
+        [void]$failures.Add('-CanvasBridge cannot be combined with -TerminalOnly. Drop one of the two switches.')
+    }
+    # The canvas bridge is the default whenever a trusted manual broker exists; -TerminalOnly opts out.
+    $canvasBridge = -not (& $explicit 'TerminalOnly') -and ($manualReviewer -or $manualReviewHandler)
+    $canvasBridgeNotice = if (& $explicit 'TerminalOnly') { 'canvas: off (-TerminalOnly)' }
+        elseif (-not $canvasBridge) { 'canvas: off (no manual broker)' }
+        else { 'canvas: on' }
     $manualReviewerWrites = -not $PreviewOnly -and ($EnableManualReviewerWrites -or ($Golden -and $manualReviewer))
     $manualReviewHandlerCodeUpdates = -not $PreviewOnly -and
         ($EnableManualReviewHandlerCodeUpdates -or ($Golden -and $manualReviewHandler))
@@ -372,6 +418,8 @@ function Resolve-WatchLaunchPolicy {
         Operational = $operational
         Continuous = $continuous
         LaunchMode = $(if ($operational -or $hasManualAuthority) { 'operational' } else { 'preview' })
+        CanvasBridge = $canvasBridge
+        CanvasBridgeNotice = $canvasBridgeNotice
         ReviewHandlerCodeUpdates = $reviewHandlerCodeUpdates
         ReviewerTeamsNotifications = $operational -and $EnableReviewerTeamsNotifications
         ReviewHandlerTeamsNotifications = $operational -and $EnableReviewHandlerTeamsNotifications
@@ -434,11 +482,17 @@ function Get-PriorWatchStateDir {
         [Parameter(Mandatory)][string]$RepositoryRoot,
         [Parameter(Mandatory)][AllowEmptyString()][string]$CurrentStateDir,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ExcludedRoots,
-        [ValidateRange(1, 100)][int]$MaximumCount = 20
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RepositoryKey,
+        [ValidateRange(1, 100)][int]$MaximumCount = 20,
+        [ValidateRange(0, 100)][int]$MaximumPreviewCount = 5
     )
     $root = [IO.Path]::GetFullPath($WatchRoot)
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return , @() }
+    # History is repository-scoped: a launch with no repository identity has no history, and a prior
+    # launch with no (or an unreadable) repository record is unknown and is never reloaded.
+    if (-not $RepositoryKey) { return , @() }
     $selected = [Collections.Generic.List[string]]::new()
+    $previewCount = 0
     $candidates = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop |
         Where-Object { $_.Name -cmatch '^\d{8}T\d{6}Z-[0-9a-f]{8}$' } |
         Sort-Object -Property Name -Descending)
@@ -464,9 +518,138 @@ function Get-PriorWatchStateDir {
             Write-Warning "Excluding prior launch history '$path' from the dashboard: $($_.Exception.Message)"
             continue
         }
+        $record = Read-WatchRepositoryRecord -StateDir $trusted
+        if (-not $record -or -not (Test-WatchRepositoryKeyMatch -Left ([string]$record.repositoryKey) -Right $RepositoryKey)) {
+            continue
+        }
+        # Preview launches are capped separately so a burst of previews can never evict real history.
+        if ([string]$record.launchMode -ceq 'preview') {
+            if ($previewCount -ge $MaximumPreviewCount) { continue }
+            $previewCount++
+        }
         [void]$selected.Add($trusted)
     }
     return , @($selected.ToArray())
+}
+
+$script:WatchRepositoryRecordName = 'repository.v1.json'
+
+function Get-WatchRepositoryKey {
+    <#
+        Stable identity of the consumer repository a launch serves: its git top-level path, or (for a
+        config outside any git repository) the role config directory. Case-insensitive on Windows.
+    #>
+    param([AllowEmptyString()][string]$ConsumerRepositoryRoot, [AllowEmptyString()][string]$ConfigFile)
+    $basis = if ($ConsumerRepositoryRoot) { "repo:$ConsumerRepositoryRoot" }
+        elseif ($ConfigFile) { "config:$(Split-Path ([IO.Path]::GetFullPath($ConfigFile)) -Parent)" }
+        else { return '' }
+    $basis = ($basis -replace '[\\/]+', '/').TrimEnd('/')
+    if ($IsWindows) { $basis = $basis.ToLowerInvariant() }
+    return $basis
+}
+
+function Test-WatchRepositoryKeyMatch {
+    param([AllowEmptyString()][string]$Left, [AllowEmptyString()][string]$Right)
+    if (-not $Left -or -not $Right) { return $false }
+    return [string]::Equals($Left, $Right, $(if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }))
+}
+
+function Read-WatchRepositoryRecord {
+    <# The private repository record of one trusted watch-state root, or $null when absent/untrusted/invalid. #>
+    param([Parameter(Mandatory)][string]$StateDir)
+    $path = Join-Path $StateDir $script:WatchRepositoryRecordName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $trustedPath = Assert-AgentTrustedFile -Path $path -AllowedRoot $StateDir -Private
+        $record = Get-Content -LiteralPath $trustedPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        if ($record -isnot [Collections.IDictionary] -or [int]$record.schemaVersion -ne 1 -or -not $record.repositoryKey) { return $null }
+        return $record
+    }
+    catch {
+        Write-Warning "Ignoring unreadable launch repository record '$path': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Write-WatchRepositoryRecord {
+    param(
+        [Parameter(Mandatory)][string]$StateDir,
+        [Parameter(Mandatory)][string]$RepositoryKey,
+        [AllowEmptyString()][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$LaunchMode
+    )
+    $path = Join-Path $StateDir $script:WatchRepositoryRecordName
+    $record = [ordered]@{
+        schemaVersion = 1; repositoryKey = $RepositoryKey; repositoryRoot = $RepositoryRoot
+        launchMode = $LaunchMode; ownerProcessId = $PID; createdUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    [IO.File]::WriteAllText($path, (ConvertTo-AgentCanonicalJson $record), [Text.UTF8Encoding]::new($false))
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode($path, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+    }
+    return (Assert-AgentTrustedFile -Path $path -AllowedRoot $StateDir -Private)
+}
+
+function Test-WatchStateRootRunning {
+    <#
+        Conservative liveness of a prior launch. Any of these counts as running (and PID reuse errs on
+        the side of keeping the root): an owner PID in its repository record or broker descriptor, or
+        the dashboard PID in its canvas bridge file, that names a live process; an unreadable record;
+        or any file written within RecentWriteMinutes (covers older launches that recorded no PID).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StateDir,
+        [ValidateRange(1, 10080)][int]$RecentWriteMinutes = 60
+    )
+    foreach ($pair in @(@($script:WatchRepositoryRecordName, 'ownerProcessId'), @('broker.descriptor.v1.json', 'ownerProcessId'),
+            @('canvas-bridge.v1.json', 'dashboardPid'))) {
+        $path = Join-Path $StateDir $pair[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        try { $ownerPid = [int]((Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable)[$pair[1]]) }
+        catch { return $true }
+        if ($ownerPid -gt 0 -and (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)) { return $true }
+    }
+    $recentCutoffUtc = [DateTime]::UtcNow.AddMinutes(-$RecentWriteMinutes)
+    $recent = Get-ChildItem -LiteralPath $StateDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -gt $recentCutoffUtc } | Select-Object -First 1
+    return [bool]$recent
+}
+
+function Get-WatchHistoryPrunePlan {
+    <#
+        Which prior launch roots a human-run -PruneHistory would remove: everything beyond the Keep
+        newest roots of each repository, plus unknown-repository roots only when PruneUnknown is set.
+        Untrusted roots and roots whose watch is still running are never selected.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WatchRoot,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][int]$Keep,
+        [switch]$PruneUnknown
+    )
+    $root = [IO.Path]::GetFullPath($WatchRoot)
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return , @() }
+    $kept = @{}
+    $plan = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop |
+            Where-Object { $_.Name -cmatch '^\d{8}T\d{6}Z-[0-9a-f]{8}$' } | Sort-Object -Property Name -Descending)) {
+        try { $trusted = Resolve-AgentTrustedRoot -Path $candidate.FullName -Kind watch-state -RepositoryRoot $RepositoryRoot }
+        catch {
+            Write-Warning "Skipping untrusted launch root '$($candidate.FullName)': $($_.Exception.Message)"
+            continue
+        }
+        if (Test-WatchStateRootRunning -StateDir $trusted) { continue }
+        $record = Read-WatchRepositoryRecord -StateDir $trusted
+        if (-not $record) {
+            if ($PruneUnknown) { [void]$plan.Add([pscustomobject]@{ Path = $trusted; RepositoryKey = '' }) }
+            continue
+        }
+        $key = [string]$record.repositoryKey
+        if ($IsWindows) { $key = $key.ToLowerInvariant() }
+        $kept[$key] = 1 + [int]$kept[$key]
+        if ($kept[$key] -gt $Keep) { [void]$plan.Add([pscustomobject]@{ Path = $trusted; RepositoryKey = $key }) }
+    }
+    return , @($plan.ToArray())
 }
 
 function Assert-WatchManualRolePolicy {
@@ -504,6 +687,27 @@ if ($AttachOnly) {
     if ($LASTEXITCODE -ne 0) { throw "Dashboard preflight failed with code $LASTEXITCODE." }
     & $dashboardLauncher -StateDir $StateDir
     if ($LASTEXITCODE -ne 0) { throw "Dashboard exited with code $LASTEXITCODE." }
+    return
+}
+
+if ($PruneHistory) {
+    # Human-run, opt-in cleanup. Never launches anything and never touches a running watch's root.
+    $pruneWatchRoot = [IO.Path]::GetFullPath((Get-AgentDefaultWatchStateRoot))
+    $prunePlan = Get-WatchHistoryPrunePlan -WatchRoot $pruneWatchRoot -RepositoryRoot ([IO.Path]::GetFullPath($toolkitRoot)) `
+        -Keep $PruneKeep -PruneUnknown:$PruneUnknown
+    if ($prunePlan.Count -eq 0) {
+        Write-Host "No launch history to prune under $pruneWatchRoot (keeping $PruneKeep per repository)."
+        return
+    }
+    $removed = 0
+    foreach ($entry in $prunePlan) {
+        $label = if ($entry.RepositoryKey) { $entry.RepositoryKey } else { 'unknown repository' }
+        if ($PSCmdlet.ShouldProcess($entry.Path, "Remove DevPilot launch history ($label)")) {
+            Remove-Item -LiteralPath $entry.Path -Recurse -Force -ErrorAction Stop
+            $removed++
+        }
+    }
+    Write-Host "Pruned $removed of $($prunePlan.Count) launch root(s) under $pruneWatchRoot."
     return
 }
 
@@ -737,6 +941,7 @@ Write-Host "  Automatic roles     : $(if ($automaticRoleNames.Count -gt 0) { $au
 Write-Host "  Manual (broker) roles: $(if ($manualRoleNames.Count -gt 0) { $manualRoleNames -join ', ' } else { 'none' })"
 Write-Host "  Cycling             : $(if ($launch.Continuous) { "continuous, every $IntervalSeconds second(s)" } else { 'one cycle' })"
 Write-Host "  Watch state root    : $StateDir"
+Write-Host "  Copilot canvas      : $($launch.CanvasBridgeNotice -replace '^canvas: ', '')"
 Write-Host "  Enabled writes      : $(if ($enabledWrites.Count -gt 0) { $enabledWrites -join '; ' } else { 'none' })"
 Write-Host "  Default denials     : $(if ($defaultDenials.Count -gt 0) { $defaultDenials -join '; ' } else { 'none' })"
 if ($launch.LaunchMode -eq 'operational') {
@@ -755,10 +960,11 @@ if (-not $PSCmdlet.ShouldProcess($StateDir, "Create watch state and launch DevPi
 # failure can undo exactly what THIS invocation created and nothing else.
 # ---------------------------------------------------------------------------
 $watchStateRoot = [IO.Path]::GetFullPath((Get-AgentDefaultWatchStateRoot))
+$watchRepositoryKey = Get-WatchRepositoryKey -ConsumerRepositoryRoot $consumerRepositoryRoot -ConfigFile $configForRepository
 # Enumerated BEFORE the current state root exists, so the current launch can never appear in its
 # own history and the newest prior launch is never displaced by it.
 $priorStateDirs = Get-PriorWatchStateDir -WatchRoot $watchStateRoot -RepositoryRoot $repositoryRoot `
-    -CurrentStateDir $StateDir -ExcludedRoots @($DurableStateRoot, $LeaseRoot)
+    -CurrentStateDir $StateDir -ExcludedRoots @($DurableStateRoot, $LeaseRoot) -RepositoryKey $watchRepositoryKey
 $stateDirCreatedHere = $false
 $durableStateRootCreatedHere = $false
 $leaseRootCreatedHere = $false
@@ -783,6 +989,10 @@ function Remove-LaunchPreparationResidue {
     }
     if ($stateDirCreatedHere -and (Test-Path -LiteralPath $StateDir -PathType Container)) {
         [void](Resolve-AgentTrustedRoot -Path $StateDir -Kind watch-state -RepositoryRoot $repositoryRoot)
+        $repositoryRecordPath = Join-Path $StateDir $script:WatchRepositoryRecordName
+        if (Test-Path -LiteralPath $repositoryRecordPath -PathType Leaf) {
+            Remove-Item -LiteralPath $repositoryRecordPath -Force -ErrorAction Stop
+        }
         if (@(Get-ChildItem -LiteralPath $StateDir -Force).Count -eq 0) {
             Remove-Item -LiteralPath $StateDir -Force -ErrorAction Stop
         }
@@ -812,6 +1022,10 @@ catch {
 }
 
 try {
+    if ($watchRepositoryKey) {
+        [void](Write-WatchRepositoryRecord -StateDir $StateDir -RepositoryKey $watchRepositoryKey `
+                -RepositoryRoot $consumerRepositoryRoot -LaunchMode $launch.LaunchMode)
+    }
     if ($manualRoles.Count -gt 0) {
         $brokerDescriptorPath = Join-Path $StateDir 'broker.descriptor.v1.json'
         $brokerDescriptor = [ordered]@{
@@ -1030,14 +1244,17 @@ if ($startupFailure) {
 $dashboardCompletedNormally = $false
 $agentsStoppedByDashboard = $false
 $canvasBridgeEnvironment = @{}
-if ($CanvasBridge -and $brokerDescriptorPath) {
+if ($launch.CanvasBridge -and $brokerDescriptorPath) {
     # Passed through the environment rather than argv so the dashboard command line that the broker
     # pins for launch provenance stays byte-for-byte unchanged. The dashboard clears both on read.
     $canvasBridgeEnvironment = @{
         DEVPILOT_CANVAS_BRIDGE_FILE = (Join-Path $StateDir 'canvas-bridge.v1.json')
         DEVPILOT_CONSUMER_REPOSITORY_ROOT = $consumerRepositoryRoot
     }
-    Write-Host "Copilot canvas bridge: enabled (open the 'DevPilot Operations' canvas in a Copilot app session for $(if ($consumerRepositoryRoot) { $consumerRepositoryRoot } else { 'this launch' }))." -ForegroundColor Cyan
+    Write-Host "Copilot canvas bridge: enabled (open the 'DevPilot Operations' canvas in a Copilot app session for $(if ($consumerRepositoryRoot) { $consumerRepositoryRoot } else { 'this launch' }); pass -TerminalOnly to opt out)." -ForegroundColor Cyan
+}
+elseif (-not $Headless) {
+    Write-Host "Copilot canvas bridge: $($launch.CanvasBridgeNotice -replace '^canvas: ', '')." -ForegroundColor DarkGray
 }
 try {
     foreach ($name in $canvasBridgeEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $canvasBridgeEnvironment[$name]) }

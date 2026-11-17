@@ -16,10 +16,12 @@ import {
   type RunScheduleMode,
   type ScheduledDispatchAccepted,
 } from "./dispatch.js";
-import { AGENTS, type AgentRole, type InstanceState, type ViewFilter } from "./domain.js";
+import { AGENTS, type AgentRole, type InstanceState } from "./domain.js";
 import { eventNarrative } from "./format.js";
+import type { PullRequestHistoryEntry, PullRequestHistoryProjection } from "./history.js";
+import { isHistoryKey, type HistoryHideStorage } from "./history-hides.js";
 import { manualProgress } from "./manual-progress.js";
-import { liveElapsedMilliseconds, totalElapsedMilliseconds, type OperationsReducer } from "./reducer.js";
+import { isHistorical, liveElapsedMilliseconds, totalElapsedMilliseconds, type OperationsReducer } from "./reducer.js";
 import type { EventTailer } from "./tailer.js";
 
 // Opt-in loopback bridge that lets the Copilot app canvas (src/DevPilot.CopilotCanvas) observe this
@@ -36,8 +38,18 @@ const MAX_RUNS = 20;
 const TIMELINE_ITEMS = 15;
 const AUTOMATION_CACHE_MS = 2_000;
 const BUSY_CODES = new Set(["already-running", "state-contended"]);
+const HISTORY_ROWS = 200;
+const RECENT_PULL_REQUESTS = 8;
 
 type BridgeReducer = Pick<OperationsReducer, "list" | "getDispatch" | "registerLocalStream">;
+type BridgeHistory = Pick<PullRequestHistoryProjection,
+  "list" | "hide" | "restore" | "restoreAll" | "clearView" | "hiddenCount" | "hiddenKeyList" | "clearedThrough">;
+// Canvas views. "current" is accepted from older installed canvases and served as "live".
+export type CanvasView = "live" | "history";
+
+export function canvasView(value: string | null): CanvasView {
+  return value === "history" ? "history" : "live";
+}
 
 export interface CanvasBridgeOptions {
   discoveryFile: string;
@@ -46,6 +58,9 @@ export interface CanvasBridgeOptions {
   broker: DispatchBroker;
   reducer: BridgeReducer;
   tailer: Pick<EventTailer, "registerEventLogPath">;
+  // Per-PR history (the terminal History view's projection) and its persisted hide preferences.
+  history?: BridgeHistory | undefined;
+  historyHides?: HistoryHideStorage | undefined;
   now?: () => number;
   token?: string;
   // Headless owner only: the canvas's explicit Stop. A terminal-owned dashboard never sets this.
@@ -188,14 +203,23 @@ export class CanvasBridge {
       case "POST /v1/review/confirm-run": return this.confirmRun(body);
       case "POST /v1/review/cancel-queued": return this.cancelQueued(body);
       case "POST /v1/review/cancel": return this.cancel(body);
+      case "POST /v1/history/hide": return this.hideHistory(body);
+      case "POST /v1/history/restore": return this.restoreHistory(body);
+      case "POST /v1/history/clear": return this.clearHistory();
       case "POST /v1/shutdown": return this.shutdown();
       default: throw new HttpError(404, "not-found");
     }
   }
 
   private async status(viewParameter: string | null): Promise<unknown> {
-    const view: ViewFilter = viewParameter === "live" || viewParameter === "history" ? viewParameter : "current";
+    const view = canvasView(viewParameter);
     const now = this.now();
+    const all = this.options.reducer.list(now, undefined, undefined);
+    // Live is every non-terminal instance, including stale ones (status "stale"), so nothing falls
+    // between Live and History.
+    const instances = all.filter((state) => view === "history" ? isHistorical(state) : !isHistorical(state));
+    const history = this.options.history;
+    const pullRequests = history?.list() ?? [];
     return {
       schemaVersion: CANVAS_BRIDGE_SCHEMA_VERSION,
       launchMode: this.options.launchMode,
@@ -203,8 +227,17 @@ export class CanvasBridge {
       consumerRepositoryRoot: this.options.consumerRepositoryRoot,
       dashboardPid: process.pid,
       view,
+      views: ["live", "history"],
       automation: await this.automationStatus(now),
-      instances: this.options.reducer.list(now, undefined, view).map((state) => instanceView(state, now)),
+      instances: instances.map((state) => instanceView(state, now)),
+      historyAvailable: Boolean(history),
+      ...(view === "history" ? {
+        pullRequests: pullRequests.slice(0, HISTORY_ROWS).map(historyView),
+        hiddenPullRequestCount: history?.hiddenCount() ?? 0,
+      } : {}),
+      recentPullRequests: pullRequests.slice(0, RECENT_PULL_REQUESTS).map((entry) => ({
+        pullRequestId: entry.pullRequestId, title: entry.title, repository: entry.repositoryIdentity.slug,
+      })),
       runs: [...this.runs.values()].map((run) => this.runView(run, now)),
       queued: [...this.queued.values()].filter((item) => !item.dispatchId && !item.cancelled)
         .map((item) => ({ queueId: item.queueId, mode: item.mode, role: item.role, pullRequestId: item.pullRequestId,
@@ -226,6 +259,43 @@ export class CanvasBridge {
     return value
       ? { available: value.available, scope: value.scope, agents: value.agents, error: "" }
       : { available: false, error };
+  }
+
+  private historyOrThrow(): BridgeHistory {
+    if (!this.options.history) throw new HttpError(409, "history-unavailable");
+    return this.options.history;
+  }
+
+  private async persistHistory(history: BridgeHistory): Promise<void> {
+    await this.options.historyHides?.save({ hiddenKeys: history.hiddenKeyList(), clearedThroughMs: history.clearedThrough() });
+  }
+
+  private async hideHistory(body: Record<string, unknown>): Promise<unknown> {
+    const history = this.historyOrThrow();
+    if (!isHistoryKey(body.key)) throw new HttpError(400, "invalid-history-key");
+    if (!history.hide(body.key)) throw new HttpError(404, "unknown-history-key");
+    await this.persistHistory(history);
+    return { hidden: true, hiddenPullRequestCount: history.hiddenCount() };
+  }
+
+  private async restoreHistory(body: Record<string, unknown>): Promise<unknown> {
+    const history = this.historyOrThrow();
+    let restored: number;
+    if (body.key === undefined) {
+      restored = history.restoreAll();
+    } else {
+      if (!isHistoryKey(body.key)) throw new HttpError(400, "invalid-history-key");
+      restored = history.restore(body.key) ? 1 : 0;
+    }
+    await this.persistHistory(history);
+    return { restored, hiddenPullRequestCount: history.hiddenCount() };
+  }
+
+  private async clearHistory(): Promise<unknown> {
+    const history = this.historyOrThrow();
+    const hidden = history.clearView(this.now());
+    await this.persistHistory(history);
+    return { hidden, hiddenPullRequestCount: history.hiddenCount() };
   }
 
   private shutdown(): unknown {
@@ -422,6 +492,30 @@ function operatorPrompt(value: unknown): string {
     throw new HttpError(400, "invalid-prompt", "Instructions must be at most 512 characters without control characters.");
   }
   return normalized;
+}
+
+function historyView(entry: PullRequestHistoryEntry): unknown {
+  const role = (agent: AgentRole) => {
+    const outcome = entry.outcomes[agent];
+    const activity = entry.activities[agent];
+    return outcome || activity ? {
+      result: outcome?.result ?? "", resultAtMs: outcome?.timestampMs ?? null,
+      status: activity?.status ?? "", statusAtMs: activity?.timestampMs ?? null,
+    } : null;
+  };
+  return {
+    key: entry.key,
+    pullRequestId: entry.pullRequestId,
+    title: entry.title,
+    author: entry.author,
+    url: entry.url,
+    repository: entry.repositoryIdentity.slug,
+    sourceBranch: entry.sourceBranch,
+    targetBranch: entry.targetBranch,
+    lastSeenMs: entry.lastSeenTimestampMs,
+    reviewer: role("reviewer"),
+    reviewHandler: role("review-handler"),
+  };
 }
 
 function instanceView(state: InstanceState, now: number): unknown {

@@ -117,7 +117,7 @@ async function startBridgeStub() {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(req.url === "/v1/shutdown" ? { stopping: true } : {
       schemaVersion: 1, launchMode: "operational", headless: true, consumerRepositoryRoot: repositoryRoot,
-      dashboardPid: process.pid, view: "current", automation: { available: false }, instances: [], runs: [], queued: [],
+      dashboardPid: process.pid, view: "live", automation: { available: false }, instances: [], runs: [], queued: [],
     }));
   });
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));

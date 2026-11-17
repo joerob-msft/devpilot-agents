@@ -234,3 +234,99 @@ test("canvas bridge offers Replace or Run next when busy and tracks the confirme
     await harness.cleanup();
   }
 });
+
+test("canvas bridge serves Live by default (accepting legacy view=current) and per-PR History with persisted hides", async () => {
+  const { parseAgentEvent } = await import("../src/domain.js");
+  const { PullRequestHistoryProjection } = await import("../src/history.js");
+  const history = new PullRequestHistoryProjection();
+  history.apply(parseAgentEvent({
+    schemaVersion: 3, agent: "reviewer", instanceId: "i-1", processId: 1, timestamp: "2026-11-10T00:00:01Z", sequence: 1,
+    eventType: "review.completed", level: "info", cycleNumber: 1, pullRequestId: 42, sourceCommit: "a".repeat(40),
+    repositoryIdentity: identity, dispatch: null, data: { title: "Fix it", author: "Ada", result: "approved" }, message: "",
+  })!);
+  const saved: Array<{ hiddenKeys: string[]; clearedThroughMs: number }> = [];
+  const directory = await mkdtemp(join(tmpdir(), "canvas-bridge-history-"));
+  const bridge = new CanvasBridge({
+    discoveryFile: join(directory, "canvas-bridge.v1.json"), consumerRepositoryRoot: "C:\\repo", launchMode: "operational",
+    broker: { subscribeTerminal: () => () => {} } as unknown as DispatchBroker,
+    reducer: new OperationsReducer(), tailer: { registerEventLogPath: () => true },
+    history, historyHides: { load: async () => ({ hiddenKeys: [], clearedThroughMs: 0 }), save: async (value) => { saved.push(value); } },
+    now: () => Date.parse("2026-11-11T00:00:00Z"),
+  });
+  const discovery = await bridge.start();
+  const harness = { discovery } as unknown as Harness;
+  try {
+    for (const path of ["/v1/status", "/v1/status?view=current"]) {
+      const status = await call(harness, "GET", path);
+      assert.equal(status.body.view, "live", path);
+      assert.equal(status.body.pullRequests, undefined);
+      assert.deepEqual(status.body.recentPullRequests, [{ pullRequestId: 42, title: "Fix it", repository: identity.slug }]);
+    }
+    const historyStatus = await call(harness, "GET", "/v1/status?view=history");
+    const rows = historyStatus.body.pullRequests as Array<Record<string, unknown>>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.pullRequestId, 42);
+    assert.deepEqual((rows[0]!.reviewer as Record<string, unknown>).result, "approved");
+    const key = rows[0]!.key as string;
+
+    assert.equal((await call(harness, "POST", "/v1/history/hide", { key: "x\u0000:pr:1" })).status, 400);
+    assert.equal((await call(harness, "POST", "/v1/history/hide", { key: `${identity.key}:pr:7` })).status, 404);
+    assert.equal((await call(harness, "POST", "/v1/history/hide", { key })).status, 200);
+    assert.deepEqual(saved.at(-1), { hiddenKeys: [key], clearedThroughMs: 0 });
+    const hidden = await call(harness, "GET", "/v1/status?view=history");
+    assert.deepEqual(hidden.body.pullRequests, []);
+    assert.equal(hidden.body.hiddenPullRequestCount, 1);
+
+    assert.equal((await call(harness, "POST", "/v1/history/restore", {})).body.restored, 1);
+    assert.equal((await call(harness, "POST", "/v1/history/clear", {})).body.hidden, 1);
+    assert.equal(saved.at(-1)!.clearedThroughMs, Date.parse("2026-11-11T00:00:00Z"));
+    assert.deepEqual((await call(harness, "GET", "/v1/status?view=history")).body.pullRequests, []);
+  } finally {
+    bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("canvas Live keeps running-but-stale instances (with stale status) out of History", async () => {
+  const { parseAgentEvent } = await import("../src/domain.js");
+  const reducer = new OperationsReducer();
+  reducer.apply(parseAgentEvent({
+    schemaVersion: 3, agent: "reviewer", instanceId: "quiet", processId: 7, timestamp: "2026-11-10T00:00:00Z", sequence: 1,
+    eventType: "agent.started", level: "info", cycleNumber: 1, pullRequestId: null, sourceCommit: null,
+    repositoryIdentity: identity, dispatch: null, data: {}, message: "",
+  })!);
+  const directory = await mkdtemp(join(tmpdir(), "canvas-bridge-stale-"));
+  const bridge = new CanvasBridge({
+    discoveryFile: join(directory, "canvas-bridge.v1.json"), consumerRepositoryRoot: "C:\\repo", launchMode: "operational",
+    broker: { subscribeTerminal: () => () => {} } as unknown as DispatchBroker,
+    reducer, tailer: { registerEventLogPath: () => true },
+    now: () => Date.parse("2026-11-10T00:05:00Z"),
+  });
+  const harness = { discovery: await bridge.start() } as unknown as Harness;
+  try {
+    const live = (await call(harness, "GET", "/v1/status")).body.instances as Array<{ instanceId: string; status: string }>;
+    assert.deepEqual(live.map((item) => [item.instanceId, item.status]), [["quiet", "stale"]]);
+    assert.deepEqual((await call(harness, "GET", "/v1/status?view=history")).body.instances, []);
+  } finally {
+    bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("file-backed PR history hides survive a new storage instance and reject invalid records", async () => {
+  const { FileHistoryHideStorage } = await import("../src/history-hides.js");
+  const { writeFile } = await import("node:fs/promises");
+  const directory = await mkdtemp(join(tmpdir(), "history-hides-"));
+  const file = join(directory, "nested", "hidden-pr-history.v1.json");
+  try {
+    assert.deepEqual(await new FileHistoryHideStorage(file).load(), { hiddenKeys: [], clearedThroughMs: 0 });
+    const key = `${identity.key}:pr:42`;
+    await new FileHistoryHideStorage(file).save({ hiddenKeys: [key, key], clearedThroughMs: 5 });
+    assert.deepEqual(await new FileHistoryHideStorage(file).load(), { hiddenKeys: [key], clearedThroughMs: 5 });
+    await assert.rejects(new FileHistoryHideStorage(file).save({ hiddenKeys: ["bad\u0000:pr:1"], clearedThroughMs: 0 }));
+    await writeFile(file, JSON.stringify({ hiddenKeys: ["not-a-key"], clearedThroughMs: 0 }));
+    await assert.rejects(new FileHistoryHideStorage(file).load(), /Invalid/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

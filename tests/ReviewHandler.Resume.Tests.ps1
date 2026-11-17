@@ -151,3 +151,42 @@ Describe 'review-handler resume fallback' {
         $usable[0].SessionId | Should -Be 'usable-session'
     }
 }
+
+Describe 'coding-session resolution never resumes DevPilot cycle sessions' {
+    BeforeAll {
+        Import-Module "$PSScriptRoot\..\src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1" -Force
+        function New-TestSession {
+            param([string]$Root, [string]$Id, [string]$NameLine, [string]$UpdatedAt)
+            $dir = New-Item -ItemType Directory -Path (Join-Path $Root $Id) -Force
+            $lines = @("id: $Id", 'branch: feature/x', "updated_at: $UpdatedAt")
+            if ($NameLine) { $lines += $NameLine }
+            Set-Content -LiteralPath (Join-Path $dir.FullName 'workspace.yaml') -Value $lines -Encoding utf8NoBOM
+        }
+    }
+
+    It 'excludes named, prompt-titled, and explicitly excluded sessions and keeps the human coding session' {
+        $root = Join-Path $TestDrive 'session-state'
+        $dash = [char]0x2014
+        New-TestSession -Root $root -Id 'human' -NameLine 'name: Fix the flaky test' -UpdatedAt '2026-01-01T00:00:00Z'
+        New-TestSession -Root $root -Id 'named-cycle' -NameLine 'name: "[DevPilot] Review-handler cycle PR 7"' -UpdatedAt '2026-01-05T00:00:00Z'
+        New-TestSession -Root $root -Id 'legacy-handler' -NameLine "name: `"# Review-Handler Agent $dash Operational Cycle Prompt`"" -UpdatedAt '2026-01-04T00:00:00Z'
+        New-TestSession -Root $root -Id 'legacy-reviewer' -NameLine "name: |`n  # Reviewer Agent $dash Operational Cycle Prompt" -UpdatedAt '2026-01-03T00:00:00Z'
+        New-TestSession -Root $root -Id 'launched-here' -UpdatedAt '2026-01-02T00:00:00Z'
+
+        $found = @(Find-CopilotSessionForBranch -Branch 'refs/heads/feature/x' -SessionStateRoot $root -ExcludeSessionIds @('LAUNCHED-HERE'))
+        @($found.SessionId) | Should -BeExactly @('human')
+        @(Find-CopilotSessionForBranch -Branch 'feature/x' -SessionStateRoot $root).SessionId |
+            Should -BeExactly @('launched-here', 'human')
+    }
+
+    It 'names new cycle sessions and never names a resumed one' {
+        Get-AgentHarnessCycleSessionName -Role review-handler -PullRequestId 42 | Should -BeExactly '[DevPilot] Review-handler cycle PR 42'
+        Test-AgentHarnessCycleSessionName -Name (Get-AgentHarnessCycleSessionName -Role reviewer) | Should -BeTrue
+        Test-AgentHarnessCycleSessionName -Name 'DevPilot notes' | Should -BeFalse
+        $fresh = Get-AgentCopilotArgs -SessionName '[DevPilot] Reviewer cycle PR 1'
+        $fresh | Should -Contain '--name=[DevPilot] Reviewer cycle PR 1'
+        $resumed = Get-AgentCopilotArgs -SessionName '[DevPilot] Reviewer cycle PR 1' -ResumeSessionId ([Guid]::NewGuid().ToString())
+        @($resumed | Where-Object { $_ -like '--name*' }) | Should -BeNullOrEmpty
+        { Get-AgentCopilotArgs -SessionName 'bad"name' } | Should -Throw '*unsupported characters*'
+    }
+}

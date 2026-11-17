@@ -20,6 +20,7 @@ const LAUNCH_PREVIEW_TTL_MS = 5 * 60_000;
 const LAUNCH_ATTACH_TIMEOUT_MS = 120_000;
 const REPOSITORY_ATTACH_TIMEOUT_MS = 20 * 60_000;
 const ENTRYPOINT_CACHE_MS = 15_000;
+const ENTRYPOINT_CACHE_MAX_MS = 120_000;
 const PROXIED_POSTS = new Set([
   "/api/scan-now",
   "/api/review/describe",
@@ -28,6 +29,9 @@ const PROXIED_POSTS = new Set([
   "/api/review/confirm-run",
   "/api/review/cancel-queued",
   "/api/review/cancel",
+  "/api/history/hide",
+  "/api/history/restore",
+  "/api/history/clear",
 ]);
 const STATIC = {
   "/app.js": ["app.js", "text/javascript; charset=utf-8"],
@@ -237,21 +241,25 @@ export class CanvasInstanceServer {
       bridge: publicBridge(bridge),
       others: bridges.filter((item) => item !== bridge).map(publicBridge),
       command: launcher?.kind === "repository"
-        ? `cd "${location}"; .\\Start-DevPilot.ps1 -CanvasBridge`
-        : `cd "${location}"; pwsh -File <devpilot-agents>\\tools\\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge`,
+        ? `cd "${location}"; .\\Start-DevPilot.ps1`
+        : `cd "${location}"; pwsh -File <devpilot-agents>\\tools\\Watch-DevPilotAgents.ps1 -Golden`,
       launcher,
       launch: this.launchState(),
     };
   }
 
-  // Polled every refresh, so the pwsh parameter probe is cached briefly; preview and start re-resolve.
+  // Polled every refresh, so the pwsh parameter probe is cached; while nothing changes the cache
+  // backs off (15s doubling to 2m) so an idle no-watch canvas does not keep spawning PowerShell.
+  // Preview and start always re-resolve.
   async entrypoint(repositoryRoot, fresh = false) {
     const cached = this.entrypointCache;
-    if (!fresh && cached && cached.repositoryRoot === repositoryRoot && Date.now() - cached.at < ENTRYPOINT_CACHE_MS) {
+    if (!fresh && cached && cached.repositoryRoot === repositoryRoot && Date.now() - cached.at < cached.ttl) {
       return cached.value;
     }
     const value = await this.launcher.resolveEntrypoint(repositoryRoot);
-    this.entrypointCache = { repositoryRoot, at: Date.now(), value };
+    const unchanged = cached && cached.repositoryRoot === repositoryRoot && JSON.stringify(cached.value) === JSON.stringify(value);
+    const ttl = !fresh && unchanged ? Math.min(cached.ttl * 2, ENTRYPOINT_CACHE_MAX_MS) : ENTRYPOINT_CACHE_MS;
+    this.entrypointCache = { repositoryRoot, at: Date.now(), value, ttl };
     return value;
   }
 
@@ -363,7 +371,7 @@ export class CanvasInstanceServer {
     let data = null;
     if (this.bridge) {
       try {
-        const result = await this.callBridge("GET", `v1/status?view=${encodeURIComponent(view || "current")}`,
+        const result = await this.callBridge("GET", `v1/status?view=${encodeURIComponent(view === "history" ? "history" : "live")}`,
           undefined, STATUS_TIMEOUT_MS);
         if (result.status === 200) {
           data = result.body;
