@@ -69,7 +69,12 @@ function summarize(state) {
     canvasRuns: data.runs.map((run) => ({
       role: run.role, pullRequestId: run.pullRequestId, headline: run.headline, detail: run.detail, elapsed: run.elapsed,
     })),
-    queued: data.queued,
+    queued: (data.queued ?? []).filter((item) => item.state !== "resumed"),
+    notRun: [
+      ...(data.notRun ?? []),
+      ...(data.queued ?? []).filter((item) => item.state === "resumed" && !(data.notRun ?? []).some((other) => other.queueId === item.queueId))
+        .map(({ queueId, mode, role, pullRequestId }) => ({ queueId, mode, role, pullRequestId })),
+    ],
     ...(Array.isArray(data.pullRequests) ? {
       pullRequestHistory: data.pullRequests.slice(0, 25).map((entry) => ({
         pullRequestId: entry.pullRequestId, title: typeof entry.title === "string" ? entry.title.slice(0, 120) : null,

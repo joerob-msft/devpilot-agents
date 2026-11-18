@@ -157,7 +157,7 @@ function pollDelay() {
   const { connection, data } = state;
   if (connection?.launch?.state === "starting" || state.launchUi.busy) return 1_500;
   if (!data) return 5_000;
-  const active = data.runs?.some((run) => !run.terminal) || data.queued?.length ||
+  const active = data.runs?.some((run) => !run.terminal) || data.queued?.some((item) => item.state !== "resumed") ||
     (state.view === "live" && data.instances?.some((item) => item.status === "running" || item.status === "waiting"));
   return active ? 1_500 : 4_000;
 }
@@ -501,13 +501,30 @@ function patchList(container, items, keyOf, sigOf, build, update) {
 function renderRuns() {
   const data = state.data;
   const runs = data?.runs ?? [];
-  const queued = data?.queued ?? [];
-  $("runs").hidden = runs.length + queued.length === 0;
+  // Older bridges keep a retired queued turn ("resumed" with no dispatch) in `queued`: it never ran.
+  const queued = (data?.queued ?? []).filter((item) => item.state !== "resumed");
+  const notRun = [
+    ...(data?.notRun ?? []),
+    ...(data?.queued ?? []).filter((item) => item.state === "resumed" &&
+      !(data?.notRun ?? []).some((other) => other.queueId === item.queueId)),
+  ];
+  $("runs").hidden = runs.length + queued.length + notRun.length === 0;
   const items = [
     ...queued.map((item) => ({ kind: "queued", key: `q:${item.queueId}`, item })),
     ...[...runs].reverse().map((run) => ({ kind: "run", key: `r:${run.dispatchId}`, item: run })),
+    ...[...notRun].reverse().map((item) => ({ kind: "not-run", key: `n:${item.queueId}`, item })),
   ];
   patchList($("runs-list"), items, (entry) => entry.key, (entry) => JSON.stringify(entry.item), (entry) => {
+    if (entry.kind === "not-run") {
+      const item = entry.item;
+      const at = item.retiredAtUtc ? ` · ${when(Date.parse(item.retiredAtUtc))}` : "";
+      return el("div", { class: "run" },
+        el("div", {},
+          el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId} · Not run`),
+          el("div", { class: "small muted" },
+            `The queued ${item.mode === "next" ? "run-next" : "replace"} request expired or was withdrawn before it started${at}. Review the PR again to retry.`)),
+        el("button", { type: "button", onclick: () => openModal(String(item.pullRequestId), item.role) }, "Review again"));
+    }
     if (entry.kind === "queued") {
       const item = entry.item;
       return el("div", { class: "run" },

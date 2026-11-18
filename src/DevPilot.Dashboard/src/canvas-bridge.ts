@@ -94,6 +94,8 @@ interface BridgeQueued {
   progress: RunProgress | null;
   dispatchId: string | null;
   cancelled: boolean;
+  // Set when the broker retired the queued turn ("resumed") before any dispatch was accepted.
+  retiredMs: number | null;
 }
 
 class HttpError extends Error {
@@ -239,9 +241,12 @@ export class CanvasBridge {
         pullRequestId: entry.pullRequestId, title: entry.title, repository: entry.repositoryIdentity.slug,
       })),
       runs: [...this.runs.values()].map((run) => this.runView(run, now)),
-      queued: [...this.queued.values()].filter((item) => !item.dispatchId && !item.cancelled)
+      queued: [...this.queued.values()].filter((item) => !item.dispatchId && !item.cancelled && item.retiredMs === null)
         .map((item) => ({ queueId: item.queueId, mode: item.mode, role: item.role, pullRequestId: item.pullRequestId,
           state: item.progress?.state ?? "queued", code: item.progress?.code ?? "" })),
+      notRun: [...this.queued.values()].filter((item) => item.retiredMs !== null)
+        .map((item) => ({ queueId: item.queueId, mode: item.mode, role: item.role, pullRequestId: item.pullRequestId,
+          retiredAtUtc: new Date(item.retiredMs!).toISOString() })),
     };
   }
 
@@ -387,7 +392,7 @@ export class CanvasBridge {
     const queued = await this.options.broker.confirmRun(prepared);
     this.queued.set(queued.queueId, {
       queueId: queued.queueId, mode: queued.mode, role: prepared.role, pullRequestId: prepared.pullRequestId,
-      progress: null, dispatchId: null, cancelled: false,
+      progress: null, dispatchId: null, cancelled: false, retiredMs: null,
     });
     for (const [draftId, summary] of this.drafts) {
       if (summary.repositoryIdentity.key === prepared.repositoryKey && summary.role === prepared.role &&
@@ -449,7 +454,18 @@ export class CanvasBridge {
 
   private onSchedule(event: RunProgress): void {
     const item = this.queued.get(event.queueId);
-    if (item) item.progress = event;
+    if (!item) return;
+    item.progress = event;
+    // "resumed" retires the turn; a queued run that never got a dispatch did not run.
+    if (event.state === "resumed" && !item.dispatchId && item.retiredMs === null) {
+      item.retiredMs = this.now();
+      this.pruneQueued();
+    }
+  }
+
+  private pruneQueued(): void {
+    const finished = [...this.queued.values()].filter((item) => item.retiredMs !== null || item.cancelled || item.dispatchId);
+    for (const item of finished.slice(0, Math.max(0, finished.length - MAX_RUNS))) this.queued.delete(item.queueId);
   }
 
   private onScheduledAccepted(event: ScheduledDispatchAccepted): void {

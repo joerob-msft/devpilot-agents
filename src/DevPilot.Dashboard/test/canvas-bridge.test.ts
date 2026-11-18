@@ -12,6 +12,7 @@ import {
   type DispatchAccepted,
   type DispatchBroker,
   type RunPrepared,
+  type RunProgress,
   type ScheduledDispatchAccepted,
 } from "../src/dispatch.js";
 import type { RepositoryIdentityV1 } from "../src/domain.js";
@@ -328,5 +329,45 @@ test("file-backed PR history hides survive a new storage instance and reject inv
     await assert.rejects(new FileHistoryHideStorage(file).load(), /Invalid/);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a queued run retired before any dispatch leaves the queue and is reported as not run", async () => {
+  let schedule: (event: RunProgress) => void = () => {};
+  let nextQueue = 0;
+  const harness = await startHarness({
+    dispatch: async () => { throw new BrokerRejectionError("already-running", "lease held"); },
+    prepareRun: async (draft: CapabilitySummary, mode: "replace" | "next") => ({
+      schemaVersion: 1, requestId: "r", operation: "run-prepared", schedulingVersion: 1, scope: "current-launcher",
+      confirmationToken: `token-${++nextQueue}`, expiresAtUtc: new Date(Date.now() + 60_000).toISOString(),
+      repositoryKey: draft.repositoryIdentity.key, role: draft.role, pullRequestId: draft.prSnapshot.pullRequestId, mode,
+      conflict: { kind: "automatic", workId: "w", generation: "g", pullRequestId: 7 },
+    }),
+    confirmRun: async (value: RunPrepared) => ({
+      schemaVersion: 1, requestId: "r", operation: "run-queued", schedulingVersion: 1,
+      queueId: `q-${value.confirmationToken.slice(6)}`, mode: value.mode,
+    }),
+    subscribeSchedule: (listener: (event: RunProgress) => void) => { schedule = listener; return () => {}; },
+  });
+  const progress = (queueId: string, state: RunProgress["state"]): RunProgress =>
+    ({ schemaVersion: 1, requestId: "r", operation: "run-progress", schedulingVersion: 1, queueId, state, code: "" });
+  try {
+    for (const _ of [1, 2]) {
+      await call(harness, "POST", "/v1/review/describe", { pullRequestId: 42, role: "reviewer" });
+      const proposal = await call(harness, "POST", "/v1/review/prepare-run", { dispatchDraftId: "draft-42", mode: "replace" });
+      assert.equal((await call(harness, "POST", "/v1/review/confirm-run", { confirmationToken: proposal.body.confirmationToken })).status, 200);
+    }
+    schedule(progress("q-1", "waiting-authority"));
+    schedule(progress("q-1", "resumed"));
+    harness.emitScheduledAccepted(accepted("d-2", "q-2") as ScheduledDispatchAccepted);
+    schedule(progress("q-2", "resumed"));
+    const status = (await call(harness, "GET", "/v1/status")).body;
+    assert.deepEqual(status.queued, []);
+    const notRun = status.notRun as Array<{ queueId: string; pullRequestId: number; retiredAtUtc: string }>;
+    assert.deepEqual(notRun.map((item) => [item.queueId, item.pullRequestId]), [["q-1", 42]]);
+    assert.ok(Number.isFinite(Date.parse(notRun[0]!.retiredAtUtc)));
+    assert.deepEqual((status.runs as Array<{ dispatchId: string }>).map((run) => run.dispatchId), ["d-2"]);
+  } finally {
+    await harness.cleanup();
   }
 });
