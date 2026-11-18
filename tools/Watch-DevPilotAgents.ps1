@@ -169,11 +169,13 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$ReviewHandlerAgentName,
 
+    # Explicit default: headless Copilot CLI can fail to resolve the user's own default model
+    # ("No supported model available"), which fails every cycle before any work.
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$ReviewerModel,
+    [string]$ReviewerModel = 'gpt-6.1-sol',
 
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$ReviewHandlerModel,
+    [string]$ReviewHandlerModel = 'gpt-6.1-sol',
 
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$IncludeOwnPullRequests,
