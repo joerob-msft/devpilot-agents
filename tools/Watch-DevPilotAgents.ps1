@@ -969,6 +969,8 @@ if (-not $PSCmdlet.ShouldProcess($StateDir, "Create watch state and launch DevPi
 # Fail fast when a configured model cannot answer through the same `agency copilot --` path the
 # agents use; otherwise every cycle defers with the same headless CLI error and nothing surfaces.
 if (-not $SkipModelPreflight -and $preflightModels.Count -gt 0) {
+    # Validate before launching anything: a value such as '--yolo' must never reach the CLI as a flag.
+    foreach ($model in $preflightModels) { [void](Assert-AgentSupportedModel -ModelId $model -Where 'model preflight') }
     $preflightAgency = (Get-Command agency -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     Write-Host "Model preflight: verifying $($preflightModels -join ', ')..." -ForegroundColor DarkGray
     Assert-AgentModelPreflight -Models $preflightModels -AgencyPath $preflightAgency -TimeoutSeconds 120

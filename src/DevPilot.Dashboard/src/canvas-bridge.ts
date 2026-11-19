@@ -345,17 +345,26 @@ export class CanvasBridge {
     return roots;
   }
 
-  // Real path of `path` when it resolves (symlinks included) inside a watch state root.
+  // Real path of `path` when it resolves (symlinks included) inside a watch state root. The lexical
+  // check runs first so UNC/device paths or paths outside every root are never touched on disk.
   private containedPath(path: string): string | undefined {
+    if (!this.lexicallyContained(path)) return undefined;
     let real: string;
     try { real = realpathSync(path); } catch { return undefined; }
     return this.realRoots().some((root) => isInside(root, real)) ? real : undefined;
   }
 
   private stateRootOf(source: string): string | undefined {
+    if (!this.lexicallyContained(source)) return undefined;
     let real: string;
     try { real = realpathSync(source); } catch { return undefined; }
     return this.realRoots().find((root) => isInside(root, real));
+  }
+
+  private lexicallyContained(path: string): boolean {
+    if (typeof path !== "string" || !isAbsolute(path) || /^[\\/]{2}/.test(path)) return false;
+    const lexical = resolve(path);
+    return (this.options.stateRoots ?? []).some((root) => !/^[\\/]{2}/.test(root) && isInside(resolve(root), lexical));
   }
 
   private historyOrThrow(): BridgeHistory {
@@ -668,7 +677,9 @@ function isInside(root: string, candidate: string): boolean {
   return Boolean(rel) && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
-const SECRET_LINE = /Bearer |token=|Authorization/i;
+// Lines that may carry credentials: auth headers, token/password/secret assignments, GitHub tokens,
+// credentialed URLs, JWTs, and SAS signatures. Kept identical to AgentHealth.ps1's pattern.
+const SECRET_LINE = /Bearer |Authorization|token\s*[=:]|"token"|password\s*[=:]|passwd|secret\s*[=:]|api[_-]?key\s*[=:]|\bpat\s*[=:]|\bgh[pousr]_[A-Za-z0-9]{10,}|github_pat_|x-access-token|:\/\/[^\s\/@:]+:[^\s\/@]+@|\beyJ[A-Za-z0-9_-]{10,}\.|[?&]sig=/i;
 
 export function sanitizeLog(text: string): string {
   return text

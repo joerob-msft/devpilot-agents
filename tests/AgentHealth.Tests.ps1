@@ -14,6 +14,13 @@ Describe 'failure detail extraction' {
         Get-AgentFailureDetail -StdErr "🧠 banner`nsomething broke`n🔌 mcp" | Should -BeExactly 'something broke'
         Get-AgentFailureDetail -StdErr "🤖 only banner`nBearer secret" -FallbackReason "missing  `n marker" | Should -BeExactly 'missing marker'
     }
+    It 'never surfaces credential-looking lines (tokens, credentialed URLs, JWTs, SAS)' {
+        foreach ($line in @('Error: push to https://x-access-token:ghp_abcdefghijklmn@github.com failed',
+                'Error: password=hunter2', 'Error: "token": "abc"', 'Error: eyJhbGciOiJIUzI1NiJ9.e30.sig',
+                'Error: https://acct.blob.core.windows.net/c?sv=1&sig=abcd', 'Error: api_key: 123')) {
+            Get-AgentFailureDetail -StdErr "$line" -FallbackReason 'redacted fallback' | Should -BeExactly 'redacted fallback' -Because $line
+        }
+    }
     It 'truncates to 240 single-line characters' {
         $detail = Get-AgentFailureDetail -StdErr ('Error: ' + ('x' * 400))
         $detail.Length | Should -Be 240
@@ -99,8 +106,11 @@ Describe 'operator skip file' {
         $file = Join-Path $dir 'skipped-prs.json'
         @{ schemaVersion = 1; entries = @(
                 @{ repositoryKey = 'v1:ado:org:proj:repo'; pullRequestId = 77; sourceCommit = $sha1; skippedAtUtc = '2026-11-18T00:00:00Z' },
-                @{ repositoryKey = 'v1:ado:org:proj:repo'; pullRequestId = -1; sourceCommit = 'nothex' }) } |
+                @{ repositoryKey = 'v1:ado:org:proj:repo'; pullRequestId = -1; sourceCommit = 'nothex' },
+                @{ repositoryKey = ''; pullRequestId = 88; sourceCommit = $sha1 }) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $file
+        Get-AgentCandidateHold -StateDir $dir -HealthState $null -RepositoryKey 'v1:ado:org:proj:repo' -PullRequestId 88 -SourceCommit $sha1 |
+            Should -BeNullOrEmpty -Because 'a skip without a repository key must not apply to every repository'
         $hold = Get-AgentCandidateHold -StateDir $dir -HealthState $null -RepositoryKey 'v1:ado:org:proj:repo' -PullRequestId 77 -SourceCommit $sha1
         $hold.Kind | Should -Be 'operatorSkipped'
         $hold.Message | Should -BeExactly 'PR 77 skipped by operator until a new commit'
@@ -138,6 +148,9 @@ Describe 'model preflight' {
         $source = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\tools\Watch-DevPilotAgents.ps1') -Raw
         $source | Should -Match '\[switch\]\$SkipModelPreflight'
         $source.IndexOf('Assert-AgentModelPreflight') | Should -BeGreaterThan $source.IndexOf('$PSCmdlet.ShouldProcess(')
+        $validated = $source.IndexOf("Assert-AgentSupportedModel -ModelId `$model -Where 'model preflight'")
+        $validated | Should -BeGreaterThan -1
+        $validated | Should -BeLessThan $source.IndexOf('Assert-AgentModelPreflight -Models') -Because 'model names are validated before any process starts'
         $source | Should -Match 'Get-AgentModelPreflightPlanLine'
     }
 }

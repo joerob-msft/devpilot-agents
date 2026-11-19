@@ -16,7 +16,7 @@ $script:AgentNeutralResults = @('blocked', 'idle', 'retried', 'skipped', 'none',
 # the same commit is what makes a PR "stuck".
 $script:AgentNoProgressResults = @('no-safe-progress', 'no-progress', 'validation-failed')
 $script:AgentTransientFailurePattern = '(?i)timeout|timed out|\b429\b|rate limit|\b503\b|\b502\b|ECONNRESET|network|temporar'
-$script:AgentSecretLinePattern = '(?i)Bearer |token=|Authorization'
+$script:AgentSecretLinePattern = '(?i)Bearer |Authorization|token\s*[=:]|"token"|password\s*[=:]|passwd|secret\s*[=:]|api[_-]?key\s*[=:]|\bpat\s*[=:]|\bgh[pousr]_[A-Za-z0-9]{10,}|github_pat_|x-access-token|://[^\s/@:]+:[^\s/@]+@|\beyJ[A-Za-z0-9_-]{10,}\.|[?&]sig='
 $script:AgentAnsiPattern = '\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1B\[[0-?]*[ -/]*[@-~]|\x1B[@-Z\\-_]'
 # Agency prints a banner of emoji-prefixed status lines (robot, folder, package,
 # brain, check mark, plug, rocket, ...) before the child's own output.
@@ -319,6 +319,8 @@ function Read-AgentSkippedPrs {
             if ($null -eq $e -or -not [int]::TryParse([string]$e.pullRequestId, [ref]$id) -or $id -le 0) { continue }
             $commit = [string]$e.sourceCommit
             if ($commit -notmatch '^[0-9a-fA-F]{40}$') { continue }
+            # A skip must name its repository; an empty key would otherwise match every repository.
+            if ([string]$e.repositoryKey -notmatch '^v1:[a-z]+:[A-Za-z0-9._:-]{1,200}$') { continue }
             [pscustomobject]@{ repositoryKey = [string]$e.repositoryKey; pullRequestId = $id; sourceCommit = $commit.ToLowerInvariant() }
         }
         return @($entries)

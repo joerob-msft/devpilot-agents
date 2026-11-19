@@ -392,12 +392,14 @@ test("failure-log route serves only recorded logs inside a watch state root, cap
   const log = join(failed, "pr1-cycle1.txt");
   const big = join(failed, "pr1-cycle2.txt");
   const stray = join(outside, "secret.txt");
-  writeFileSync(log, "STDERR\n\u001b[31mError: No supported model available\u001b[0m\nAuthorization: Bearer abc\n");
+  writeFileSync(log, "STDERR\n\u001b[31mError: No supported model available\u001b[0m\nAuthorization: Bearer abc\n" +
+    "remote: https://x-access-token:ghp_abcdefghijklmnop@github.com/o/r\npassword=hunter2\n\"token\": \"eyJhbGciOiJIUzI1NiJ9.e30.x\"\n");
   writeFileSync(big, `${"x".repeat(70 * 1024)}\nError: tail`);
   writeFileSync(stray, "nope");
+  const unc = "\\\\devpilot-unreachable-host\\share\\pr1.txt";
   const health = new AgentHealthProjection();
   const source = join(root, "reviewer", "logs", "events", "reviewer", "events.jsonl");
-  for (const path of [log, big, stray]) {
+  for (const path of [log, big, stray, unc]) {
     health.apply(agentEvent("work.completed", { result: "failed", failureDetail: "Error: x", failureLogPath: path }), source);
   }
   const harness = await startHarness({}, undefined, { health, stateRoots: [root] });
@@ -406,12 +408,13 @@ test("failure-log route serves only recorded logs inside a watch state root, cap
     const ok = await call(harness, "POST", "/v1/agents/failure-log", { path: log });
     assert.equal(ok.status, 200);
     assert.match(String(ok.body.content), /^STDERR\nError: No supported model available\n\[line redacted/);
-    assert.doesNotMatch(String(ok.body.content), /Bearer abc/);
+    assert.doesNotMatch(String(ok.body.content), /Bearer abc|ghp_abcdefghijklmnop|hunter2|eyJhbGci/);
     const capped = await call(harness, "POST", "/v1/agents/failure-log", { path: big });
     assert.equal(capped.body.truncated, true);
     assert.equal(String(capped.body.content).length, 64 * 1024);
     assert.match(String(capped.body.content), /Error: tail$/);
     assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: stray })).status, 403);
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: unc })).status, 403);
     assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: join(failed, "other.txt") })).status, 404);
     assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: "relative.txt" })).status, 400);
     assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: 5 })).status, 400);
