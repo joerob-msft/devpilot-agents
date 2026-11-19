@@ -71,6 +71,10 @@ export interface Completion {
   nextScan: string;
   elapsedMilliseconds: number;
   timestampMs: number;
+  // Failed/deferred work.completed only (error-surfacing contract A); absent on older agents.
+  failureDetail?: string;
+  failureLogPath?: string;
+  failureKind?: string;
 }
 
 export interface BlockedWarning {
@@ -312,6 +316,27 @@ export function getNumber(data: Record<string, unknown>, key: string): number {
 
 export function getBoolean(data: Record<string, unknown>, key: string): boolean {
   return data[key] === true;
+}
+
+export interface FailureFields {
+  failureDetail?: string;
+  failureLogPath?: string;
+  failureKind?: string;
+}
+
+// Contract A fields of a failed/deferred work.completed. Paths keep their exact spelling (no
+// whitespace folding) so the bridge can match them against the recorded set.
+export function failureFields(data: Record<string, unknown>): FailureFields {
+  const failureDetail = getString(data, "failureDetail").slice(0, 240);
+  const rawPath = data.failureLogPath;
+  const failureLogPath = typeof rawPath === "string" && !/[\u0000-\u001f]/.test(rawPath) ? rawPath.slice(0, 512) : "";
+  const kind = getString(data, "failureKind");
+  const failureKind = kind === "transient" || kind === "persistent" || kind === "unknown" ? kind : "";
+  return {
+    ...(failureDetail ? { failureDetail } : {}),
+    ...(failureLogPath ? { failureLogPath } : {}),
+    ...(failureKind ? { failureKind } : {}),
+  };
 }
 
 export function getStringArray(data: Record<string, unknown>, key: string): string[] {

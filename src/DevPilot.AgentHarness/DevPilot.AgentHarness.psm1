@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot 'AgentOutput.ps1')
+. (Join-Path $PSScriptRoot 'AgentHealth.ps1')
 . (Join-Path $PSScriptRoot 'TeamsThreading.ps1')
 . (Join-Path $PSScriptRoot 'TeamsPrReference.ps1')
 

@@ -73,7 +73,10 @@ param(
     [string]$Model,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [switch]$IncludeOwnPullRequests
+    [switch]$IncludeOwnPullRequests,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$SkipModelPreflight
 )
 
 if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
@@ -100,6 +103,7 @@ if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewerAgentName = $AgentName }
 if ($Model) { $parameters.ReviewerModel = $Model }
 if ($IncludeOwnPullRequests) { $parameters.IncludeOwnPullRequests = $true }
+if ($SkipModelPreflight) { $parameters.SkipModelPreflight = $true }
 
 & (Join-Path $PSScriptRoot 'Watch-DevPilotAgents.ps1') @parameters
 exit $LASTEXITCODE

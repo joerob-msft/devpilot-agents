@@ -2568,8 +2568,44 @@ function Send-ReviewerEvent {
         [System.Collections.IDictionary]$Data = @{},
         [AllowEmptyString()][string]$Message = ''
     )
+    $isWorkCompleted = $EventType -eq 'work.completed' -and -not $DryRun
+    if ($isWorkCompleted) { Add-AgentWorkFailureFields -Data $Data -HealthState (Get-ReviewerHealthState) }
     Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType $EventType -Level $Level `
         -Cycle $Cycle -PrId $PrId -SourceCommit $SourceCommit -Data $Data -Message $Message | Out-Null
+    if ($isWorkCompleted) { Update-ReviewerHealthAfterWork -PrId $PrId -SourceCommit $SourceCommit -Data $Data }
+}
+
+$script:ReviewerHealthState = $null
+function Get-ReviewerHealthState {
+    if ($null -eq $script:ReviewerHealthState) {
+        if (-not $StateDir) { return $null }
+        $script:ReviewerHealthState = Read-AgentHealthState -Path (Join-Path $StateDir 'health.json')
+    }
+    return $script:ReviewerHealthState
+}
+
+function Update-ReviewerHealthAfterWork {
+    <# Health/alert bookkeeping is observational: any failure here is swallowed. #>
+    param([int]$PrId, [string]$SourceCommit, [System.Collections.IDictionary]$Data)
+    try {
+        $state = Get-ReviewerHealthState
+        $outcome = @([string]$Data['outcome'], [string]$Data['failureClass'], [string]$Data['result']) | Where-Object { $_ } | Select-Object -First 1
+        $update = Update-AgentHealthState -State $state -Result ([string]$Data['result']) -PullRequestId $PrId `
+            -SourceCommit $SourceCommit -Outcome ([string]$outcome) -FailureDetail ([string]$Data['failureDetail']) `
+            -BaseIntervalSeconds $IntervalSeconds
+        [void](Write-AgentHealthState -Path (Join-Path $StateDir 'health.json') -State $state)
+        Publish-AgentEvent -Context $script:ReviewerOutputContext -EventType agent.health `
+            -Level $(if ($update.State -ne 'healthy') { 'warning' } else { 'info' }) -PrId $update.PullRequestId `
+            -Data $update.Data -Message (Get-AgentHealthEventMessage -RoleLabel 'Reviewer' -Update $update) | Out-Null
+        if ($update.Alert) {
+            $text = Get-AgentHealthAlertText -RoleLabel 'Reviewer' -Update $update `
+                -RepositoryName ([string]$script:ReviewerOutputContext.RepositoryIdentity.repositoryName) `
+                -RecoveredPullRequestId $(if ($update.Alert -eq 'recovered') { $PrId } else { 0 })
+            Send-ReviewerTeamsNotification -NotificationEvent 'reviewFailed' -AgencyPath $AgencyPath -Title $text -Body $text `
+                -SourceCommit ("health-{0}-{1}" -f $update.Alert, [DateTime]::UtcNow.Ticks)
+        }
+    }
+    catch { Write-Warning "Reviewer health bookkeeping failed (ignored): $($_.Exception.Message)" }
 }
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
@@ -6228,6 +6264,8 @@ function Invoke-ReviewerPullRequest {
 
         # The transcript is the only way to diagnose a silent refusal, and it
         # never leaves this machine.
+        $transcript = ''
+        $failureDetail = Get-AgentFailureDetail -StdErr ([string]$run.StdErr) -StdOut ([string]$run.StdOut) -FallbackReason $reason
         try {
             $failDir = Join-Path $logDir "failed-cycles"
             New-Item -ItemType Directory -Force -Path $failDir | Out-Null
@@ -6251,7 +6289,10 @@ function Invoke-ReviewerPullRequest {
             ) | Set-Content -LiteralPath $transcript -Encoding UTF8
             Write-Host "Transcript written to $transcript" -ForegroundColor DarkYellow
         }
-        catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
+        catch {
+            Write-Warning "Could not write the failure transcript: $($_.Exception.Message)"
+            $transcript = ''
+        }
 
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
@@ -6278,6 +6319,7 @@ function Invoke-ReviewerPullRequest {
             boundSourceCommit = $sourceCommit; currentSourceCommit = $currentSourceCommit
             outputDrained = [bool]$run.OutputDrained
             nextRetry = 'after cycle backoff'
+            failureDetail = $failureDetail; failureLogPath = [string]$transcript
         }) -Message "PR $prId deferred for recovery: $reason"
         return @{ ExitCode = 1; Summary = "PR $prId deferred for recovery: $reason" }
     }
@@ -7225,6 +7267,16 @@ function Invoke-ReviewerCycle {
                     -MentionRecipientId ([string]$starvedMention.Id) `
                     -MentionRecipientDisplayName ([string]$starvedMention.DisplayName) `
                     -Links @(Get-ReviewerPullRequestLink -PrId $prId)
+                continue
+            }
+
+            $candidateHold = Get-AgentCandidateHold -StateDir $StateDir -HealthState (Get-ReviewerHealthState) `
+                -RepositoryKey ([string]$script:ReviewerOutputContext.RepositoryIdentity.key) -PullRequestId $prId -SourceCommit $sourceCommit
+            if ($candidateHold) {
+                Send-ReviewerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                    -Data (Get-ReviewerPullRequestHistoryData -PullRequest $prRecord -Additional @{
+                    reason = $candidateHold.Reason; normalizedReason = $candidateHold.Kind; nextAttemptUtc = $candidateHold.NextAttemptUtc
+                }) -Message $candidateHold.Message
                 continue
             }
 

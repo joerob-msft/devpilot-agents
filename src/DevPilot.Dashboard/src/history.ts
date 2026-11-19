@@ -1,5 +1,6 @@
 import {
   boundedText,
+  failureFields,
   getString,
   type AgentEvent,
   type AgentRole,
@@ -14,6 +15,9 @@ export interface PullRequestRoleOutcome {
   timestampMs: number;
   instanceId: string;
   sequence: number;
+  failureDetail?: string;
+  failureLogPath?: string;
+  failureKind?: string;
 }
 
 export interface PullRequestRoleActivity {
@@ -187,6 +191,7 @@ export class PullRequestHistoryProjection {
           timestampMs: event.timestampMs,
           instanceId: event.instanceId,
           sequence: event.sequence,
+          ...failureFields(event.data),
         },
       };
       outcomeChanged = true;

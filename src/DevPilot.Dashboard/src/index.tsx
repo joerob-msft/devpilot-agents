@@ -4,6 +4,7 @@ import { App, type LaunchMode } from "./app.js";
 import { CanvasBridge } from "./canvas-bridge.js";
 import { DispatchClient, type BrokerLaunchDescriptor } from "./dispatch.js";
 import { PullRequestHistoryProjection } from "./history.js";
+import { AgentHealthProjection } from "./health.js";
 import { createDashboardLifecycle, type DashboardLifecycle } from "./lifecycle.js";
 import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
@@ -103,6 +104,7 @@ async function main(): Promise<void> {
       return new OperationsReducer();
     });
   const history = new PullRequestHistoryProjection();
+  const health = new AgentHealthProjection();
   const historyHides = new FileHistoryHideStorage(
     args.viewStateDirectory ? join(args.viewStateDirectory, "hidden-pr-history.v1.json") : undefined);
   await historyHides.load()
@@ -120,7 +122,8 @@ async function main(): Promise<void> {
     onEvent(event, source) {
       const changed = reducer.apply(event, source);
       const historyChanged = history.apply(event);
-      if (changed || historyChanged) refresh();
+      const healthChanged = health.apply(event, source);
+      if (changed || historyChanged || healthChanged) refresh();
     },
     onDiagnostic(diagnostic) {
       reducer.addSourceDiagnostic(diagnostic);
@@ -154,7 +157,7 @@ async function main(): Promise<void> {
   const canvasBridge = canvasBridgeFile && broker
     ? new CanvasBridge({
         discoveryFile: canvasBridgeFile, consumerRepositoryRoot, launchMode: args.launchMode, broker, reducer, tailer,
-                history, historyHides,
+        history, historyHides, health, stateRoots: args.stateDirectories,
         onShutdown: args.headless ? () => stopHeadless(0) : undefined,
       })
     : undefined;

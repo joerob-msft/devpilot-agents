@@ -24,3 +24,11 @@ safety model are documented in the *Copilot app canvas* section of
 
 Install with `tools\Install-DevPilotCanvas.ps1`, which also records the
 fallback `toolkit.json`. Tests: `node --test tests\CopilotCanvas.Tests.mjs`.
+
+## Error surfacing
+
+- Failed or deferred runs show the real cause (`failureDetail`), when it happened, the next try, **View failure log** (read through the bridge only for a path an agent event recorded *and* that resolves inside a watch `--state-dir`, capped at 64 KiB, credential-looking lines redacted) and **Copy error**.
+- Agent health comes from `agent.health` events (falling back to 3+ consecutive failed/deferred `work.completed` for older agents): red banner when failing, amber chip when stuck, and the canvas/tab title reads `⚠ DevPilot Operations · Reviewer failing`. `get_status` includes bounded health.
+- History and Live rows carry a pill: Needs you, Will retry, Reviewed or Stuck. Stuck PRs offer **Skip this PR** (confirmed by the user; the bridge resolves repository and commit from recorded events and writes `<watch StateDir>/<role>/skipped-prs.json`), **Review again…** and **View last failure log**. Agents cannot skip.
+- Teams delivery problems show `Teams: N queued · <reason>` and a warning banner after 3 failures since the last delivery.
+- A failed canvas launch shows the `DevPilot model preflight failed` line (or the last Error/Exception line) above the log tail.

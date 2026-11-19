@@ -187,7 +187,7 @@ exit 0
 
     function Get-BaseLaunchArgument {
         param([Parameter(Mandatory)][hashtable]$Context)
-        return @('-OperatorAlias', 'golden-test',
+        return @('-OperatorAlias', 'golden-test', '-SkipModelPreflight',
             '-ReviewerConfigFile', $Context.ReviewerConfig,
             '-ReviewHandlerConfigFile', $Context.ReviewHandlerConfig)
     }
@@ -661,7 +661,7 @@ exit 0
         $context = New-GoldenContext
         $configParameter = if ($Role -eq 'reviewer') { $context.ReviewerConfig } else { $context.ReviewHandlerConfig }
         $result = Invoke-GoldenLaunch -Context $context -Script $Wrapper `
-            -Arguments @('-OperatorAlias', 'golden-test', '-ConfigFile', $configParameter)
+            -Arguments @('-OperatorAlias', 'golden-test', '-ConfigFile', $configParameter, '-SkipModelPreflight')
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
         $argv = Get-AgentArgv -Context $context -Role $Role
         $argv | Should -Contain '-Once'

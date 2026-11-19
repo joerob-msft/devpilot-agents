@@ -26,7 +26,7 @@ export function manualProgress(
   const latestEvent = state?.timeline.at(-1);
   const progress: ManualProgress = {
     headline: "STARTED / RUNNING",
-    detail: state ? `Phase: ${state.phase}` : "Waiting for first progress; no agent events received yet.",
+    detail: state ? (state.phase ? `Phase: ${state.phase}` : "Started; waiting for the first phase.") : "Waiting for first progress; no agent events received yet.",
     latest: latestEvent ? eventNarrative(latestEvent) : "",
     elapsed: duration(Math.max(0, (terminalMs ?? (stopped ? state?.lastEventMs : now) ?? now) - startedMs)),
     attention: false,

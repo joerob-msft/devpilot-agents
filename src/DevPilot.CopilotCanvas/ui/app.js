@@ -74,6 +74,28 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// Bridge fields are often null (no PR selected yet, no title, no completion). Never let a template
+// string turn them into the literal text "null" or "undefined".
+function present(value) {
+  return value !== null && value !== undefined && value !== "" && !(typeof value === "number" && !Number.isFinite(value));
+}
+
+function joinParts(parts, separator = " · ") {
+  return parts.filter(present).map(String).join(separator);
+}
+
+function prLabel(pullRequestId, title) {
+  return joinParts([pullRequestId ? `PR #${pullRequestId}` : "", title], " ");
+}
+
+function roleLabel(role) {
+  return ROLE_LABEL[role] ?? (present(role) ? String(role) : "Agent");
+}
+
+function branches(source, target) {
+  return present(source) ? joinParts([source, target], " → ") : "";
+}
+
 function duration(ms) {
   if (ms === null || ms === undefined || !Number.isFinite(ms)) return "—";
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -201,12 +223,154 @@ function automationChips(automation) {
     return [el("span", { class: "chip" }, automation.error ? `Automation unavailable (${automation.error})` : "Automation unavailable")];
   }
   return automation.agents.map((agent) => {
-    const parts = [`${ROLE_LABEL[agent.role] ?? agent.role}: ${agent.state}`];
+    const parts = [joinParts([roleLabel(agent.role), agent.state], ": ")];
     if (agent.continuous && agent.intervalSeconds) parts.push(`every ${Math.round(agent.intervalSeconds / 60)}m`);
     const retryAt = agent.state === "retrying" && agent.retryAtUtc ? Date.parse(agent.retryAtUtc) : NaN;
     if (Number.isFinite(retryAt)) parts.push(`retry in ${duration(Math.max(0, retryAt - Date.now()))}`);
     return el("span", { class: `chip ${agent.state}` }, parts.join(" · "));
   });
+}
+
+// --- Error surfacing: agent health, failure classification, notification health -------------
+
+function healthOf(role) {
+  return (state.data?.health ?? []).find((item) => item?.role === role) ?? null;
+}
+
+function healthChips(health) {
+  const chips = [];
+  for (const item of health ?? []) {
+    if (!item) continue;
+    if (item.state === "failing") {
+      chips.push(el("span", { class: "chip failed", title: item.cause || "" },
+        joinParts([`${roleLabel(item.role)}: failing`, present(item.consecutiveFailures) ? `${item.consecutiveFailures} in a row` : ""])));
+    } else if (item.state === "stuck" && item.stuck?.length) {
+      chips.push(el("span", { class: "chip retrying" }, `${roleLabel(item.role)}: stuck on PR #${item.stuck[0].pullRequestId}`));
+    }
+    const teams = item.notifications;
+    if (teams && teams.failuresSinceSuccess > 0) {
+      chips.push(el("span", { class: `chip${teams.warning ? " retrying" : ""}` },
+        joinParts([`Teams: ${teams.failuresSinceSuccess} queued`, teams.latestReason])));
+    }
+  }
+  return chips;
+}
+
+// History/Live classification pill: Needs you / Will retry / Reviewed / Stuck.
+function classify(outcome, role, pullRequestId) {
+  const health = healthOf(role);
+  if (pullRequestId && health?.stuck?.some((item) => item.pullRequestId === pullRequestId)) return ["Stuck", "amber"];
+  const result = String(outcome?.result ?? "").toLowerCase();
+  if (!["failed", "deferred", "error"].includes(result)) {
+    return result && !["blocked", "cancelled", "skipped"].includes(result) ? ["Reviewed", "green"] : null;
+  }
+  if (outcome.failureKind === "persistent" || health?.state === "failing") return ["Needs you", "red"];
+  if (outcome.failureKind === "transient") return ["Will retry", "amber"];
+  return null;
+}
+
+function pill(kind) {
+  return kind ? el("span", { class: `pill ${kind[1]}` }, kind[0]) : null;
+}
+
+function renderHealthBanner(data) {
+  let banner = $("health-banner");
+  if (!banner) {
+    banner = el("div", { id: "health-banner", role: "alert" });
+    $("automation").after(banner);
+  }
+  const health = data?.health ?? [];
+  const failing = health.filter((item) => item?.state === "failing");
+  const teams = health.filter((item) => item?.notifications?.warning);
+  const sig = JSON.stringify([failing, teams.map((item) => item.notifications)]);
+  if (banner.dataset.sig === sig) return;
+  banner.dataset.sig = sig;
+  banner.replaceChildren();
+  for (const item of failing) {
+    const since = item.failingSinceUtc ? Date.parse(item.failingSinceUtc) : NaN;
+    const success = item.lastSuccessUtc ? Date.parse(item.lastSuccessUtc) : NaN;
+    banner.append(el("div", { class: "banner" },
+      el("strong", {}, `${roleLabel(item.role)} has failed ${item.consecutiveFailures} times in a row`),
+      el("div", { class: "small" }, joinParts([
+        Number.isFinite(since) ? `Since ${when(since)}` : "",
+        Number.isFinite(success) ? `last success ${when(success)}` : "no recent success",
+        item.cause ? "every run:" : ""])),
+      item.cause ? el("pre", {}, item.cause) : null));
+  }
+  for (const item of teams) {
+    const teamsHealth = item.notifications;
+    banner.append(el("div", { class: "banner warn" },
+      el("strong", {}, `${roleLabel(item.role)} Teams notifications are not being delivered`),
+      el("div", { class: "small" }, joinParts([`${teamsHealth.failuresSinceSuccess} queued or failed since the last delivery`, teamsHealth.latestReason]))));
+  }
+  banner.hidden = !banner.childElementCount;
+}
+
+function healthTitle(data) {
+  const failing = (data?.health ?? []).filter((item) => item?.state === "failing").map((item) => `${roleLabel(item.role)} failing`);
+  const stuck = (data?.health ?? []).filter((item) => item?.state === "stuck").map((item) => `${roleLabel(item.role)} stuck`);
+  const problems = [...failing, ...stuck];
+  return problems.length ? `⚠ DevPilot Operations · ${problems.join(" · ")}` : "DevPilot Operations";
+}
+
+async function viewFailureLog(path) {
+  try {
+    const result = await api("/api/agents/failure-log", { path });
+    let dialog = $("log-dialog");
+    if (!dialog) {
+      dialog = el("dialog", { id: "log-dialog", "aria-labelledby": "log-title" });
+      document.body.append(dialog);
+    }
+    dialog.replaceChildren(
+      el("button", { type: "button", class: "close", "aria-label": "Close", onclick: () => dialog.close() }, "×"),
+      el("h2", { id: "log-title", class: "dialog-title" }, "Failure log"),
+      el("p", { class: "muted small" }, joinParts([result.path, result.truncated ? "showing the last 64 KiB" : ""])),
+      el("pre", { class: "plan" }, String(result.content ?? "")),
+      el("div", { class: "buttons" },
+        el("button", { type: "button", onclick: () => copyText(String(result.content ?? ""), "Failure log") }, "Copy log"),
+        el("button", { type: "button", onclick: () => dialog.close() }, "Close")));
+    if (!dialog.open) dialog.showModal();
+  } catch (error) {
+    showError(errorText(error));
+  }
+}
+
+async function skipPullRequest(role, pullRequestId) {
+  const ok = await confirmAction(`Skip PR #${pullRequestId}?`,
+    `${roleLabel(role)} will stop retrying PR #${pullRequestId} until a new commit is pushed. You can still review it manually.`, "Skip this PR");
+  if (!ok) return;
+  try {
+    await api("/api/agents/skip", { role, pullRequestId });
+    notice(`${roleLabel(role)} will skip PR #${pullRequestId} until a new commit.`);
+  } catch (error) {
+    showError(errorText(error));
+  }
+  await refresh();
+}
+
+function failureSection(outcome, role, pullRequestId) {
+  const detail = outcome?.failureDetail;
+  const stuck = pullRequestId ? healthOf(role)?.stuck?.find((item) => item.pullRequestId === pullRequestId) : null;
+  if (!detail && !outcome?.failureLogPath && !stuck) return null;
+  const nextTry = stuck?.nextAttemptUtc ? Date.parse(stuck.nextAttemptUtc) : NaN;
+  const observe = state.data?.launchMode === "observe";
+  return el("div", { class: "panel" },
+    stuck ? el("p", { class: "outcome" }, pill(["Stuck", "amber"]), ` Same outcome ${stuck.repeatCount} times on this commit`, stuck.outcome ? ` (${stuck.outcome})` : "") : null,
+    detail ? el("pre", {}, detail) : null,
+    el("dl", {},
+      field("Next try", Number.isFinite(nextTry) ? when(nextTry) : "")),
+    el("div", { class: "launch-row" },
+      outcome?.failureLogPath ? el("button", { type: "button", onclick: () => viewFailureLog(outcome.failureLogPath) },
+        stuck ? "View last failure log" : "View failure log") : null,
+      detail ? el("button", { type: "button", onclick: () => copyText(detail, "Error") }, "Copy error") : null,
+      stuck && !observe ? el("button", { type: "button", class: "danger", onclick: () => skipPullRequest(role, pullRequestId) }, "Skip this PR") : null,
+      stuck && !observe ? el("button", { type: "button", onclick: () => openModal(pullRequestId, role) }, "Review again…") : null));
+}
+
+function failureHeadline(completion) {
+  if (!completion?.failureDetail) return "";
+  const elapsed = completion.elapsedMilliseconds;
+  return elapsed > 0 && elapsed < 60_000 ? "Failed before review started" : `${completion.result === "deferred" ? "Deferred" : "Failed"}: ${completion.failureDetail}`;
 }
 
 function repositoryName(path) {
@@ -224,17 +388,20 @@ function render() {
   }
   const started = connection?.bridge?.startedAtUtc ? Date.parse(connection.bridge.startedAtUtc) : NaN;
   const subtitle = $("subtitle");
-  subtitle.title = connected ? `${data.consumerRepositoryRoot} · dashboard PID ${data.dashboardPid}` : "";
+  subtitle.title = connected ? joinParts([data.consumerRepositoryRoot, present(data.dashboardPid) ? `dashboard PID ${data.dashboardPid}` : ""]) : "";
   subtitle.textContent = connected
     ? [repositoryName(data.consumerRepositoryRoot), Number.isFinite(started) ? `started ${when(started)}` : "",
       data.headless ? "running from this canvas" : "running in a terminal"].filter(Boolean).join(" · ")
     : connection?.workingDirectory ? `Session folder: ${connection.workingDirectory}` : "";
   const automation = $("automation");
   const chipsKey = connected ? JSON.stringify(data.automation) : "";
-  if (automation.dataset.sig !== chipsKey || data?.automation?.agents?.some((agent) => agent.state === "retrying")) {
-    automation.dataset.sig = chipsKey;
-    automation.replaceChildren(...(connected ? automationChips(data.automation) : []));
+  const healthKey = connected ? JSON.stringify(data.health ?? null) : "";
+  if (automation.dataset.sig !== chipsKey + healthKey || data?.automation?.agents?.some((agent) => agent.state === "retrying")) {
+    automation.dataset.sig = chipsKey + healthKey;
+    automation.replaceChildren(...(connected ? [...automationChips(data.automation), ...healthChips(data.health)] : []));
   }
+  renderHealthBanner(connected ? data : null);
+  document.title = connected ? healthTitle(data) : "DevPilot Operations";
   // With no watch there is nothing to scan, review or view: the launch panel's Start is the only action.
   $("scan").hidden = !connected;
   $("scan").disabled = !connected || !data.automation?.available || !data.automation.agents.some((agent) => agent.canScanNow);
@@ -279,7 +446,7 @@ function renderDisconnected() {
     others.append(el("p", { class: "muted small", text: "Other running watches on this machine:" }));
     for (const other of connection.others) {
       others.append(el("div", { class: "run" },
-        el("span", {}, `${other.consumerRepositoryRoot || "(unknown repository)"} · ${other.launchMode} · started ${new Date(other.startedAtUtc).toLocaleString()}`),
+        el("span", {}, joinParts([other.consumerRepositoryRoot || "(unknown repository)", other.launchMode, other.startedAtUtc ? `started ${when(Date.parse(other.startedAtUtc))}` : ""])),
         el("button", { type: "button", onclick: () => connectTo(other.watchId) }, "Connect anyway")));
     }
   }
@@ -312,7 +479,7 @@ function renderLaunch(connection) {
   const ui = state.launchUi;
   const { launcher, launch } = connection;
   const key = JSON.stringify({
-    launcher, launch: launch && { state: launch.state, pid: launch.pid, logTail: launch.logTail },
+    launcher, launch: launch && { state: launch.state, pid: launch.pid, logTail: launch.logTail, failureCause: launch.failureCause },
     previewOnly: ui.previewOnly, plan: ui.plan && [ui.plan.launchToken, ui.plan.ok, ui.plan.output],
     busy: ui.busy, error: ui.error, armed: ui.armed,
   });
@@ -322,20 +489,21 @@ function renderLaunch(connection) {
   root.replaceChildren();
   if (!launcher) return;
   if (!launcher.available) {
-    root.append(el("p", { class: "muted" }, `Starting from the canvas is unavailable: ${launcher.reason}`));
+    root.append(el("p", { class: "muted" }, joinParts(["Starting from the canvas is unavailable", launcher.reason], ": ")));
     return;
   }
   if (launch?.state === "starting") {
     root.append(el("p", { role: "status" }, el("span", { class: "spinner", "aria-hidden": "true" }),
-      `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… `, since(Date.now() - launch.elapsedMs)),
+      `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch${present(launch.pid) ? ` (PID ${launch.pid})` : ""}… `, since(Date.now() - launch.elapsedMs)),
     el("p", { class: "muted small" }, `${launch.kind === "repository" ? "Installing or verifying the toolkit can take several minutes. " : ""}This canvas connects when it is ready.`),
-    el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
+    launch.logPath ? el("p", { class: "muted small" }, `Log: ${launch.logPath}`) : null);
     if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
     return;
   }
   if (launch?.state === "failed") {
     root.append(el("p", { class: "error-text", role: "alert" }, "The Golden watch did not start."),
-      el("p", { class: "muted small" }, `Log: ${launch.logPath}`),
+      launch.failureCause ? el("pre", { class: "banner" }, launch.failureCause) : null,
+      launch.logPath ? el("p", { class: "muted small" }, `Log: ${launch.logPath}`) : null,
       el("div", { class: "launch-row" },
         el("button", { type: "button", onclick: () => copyText(launch.logPath, "Log path") }, "Copy log path"),
         launch.logTail ? el("button", { type: "button", onclick: () => copyText(launch.logTail, "Log output") }, "Copy log output") : null));
@@ -343,10 +511,10 @@ function renderLaunch(connection) {
   }
   root.append(
     el("p", { class: "muted" }, "Start this repository's Golden watch from here, without a terminal. It keeps running while the Copilot app is open, even if you close this canvas, until you stop it here. Quitting the app stops it and its agents."),
-    el("div", { class: "muted small" }, `Repository: ${launcher.repositoryRoot}`),
+    launcher.repositoryRoot ? el("div", { class: "muted small" }, `Repository: ${launcher.repositoryRoot}`) : null,
     launcher.kind === "repository"
       ? el("div", { class: "muted small" }, `Runs: ${launcher.script} (installs or updates the DevPilot toolkit per this repository's lock, prepares config and state, applies its defaults)`)
-      : el("div", { class: "muted small" }, `Toolkit: ${launcher.toolkitRoot}${launcher.version ? ` (v${launcher.version})` : ""}`),
+      : el("div", { class: "muted small" }, joinParts(["Toolkit:", launcher.toolkitRoot || "(not recorded)", launcher.version ? `(v${launcher.version})` : ""], " ")),
     launcher.note ? el("div", { class: "muted small" }, launcher.note) : null,
     el("div", { class: "launch-row" },
       el("label", {},
@@ -520,7 +688,7 @@ function renderRuns() {
       const at = item.retiredAtUtc ? ` · ${when(Date.parse(item.retiredAtUtc))}` : "";
       return el("div", { class: "run" },
         el("div", {},
-          el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId} · Not run`),
+          el("strong", {}, joinParts([roleLabel(item.role), prLabel(item.pullRequestId), "Not run"])),
           el("div", { class: "small muted" },
             `The queued ${item.mode === "next" ? "run-next" : "replace"} request expired or was withdrawn before it started${at}. Review the PR again to retry.`)),
         el("button", { type: "button", onclick: () => openModal(String(item.pullRequestId), item.role) }, "Review again"));
@@ -529,16 +697,16 @@ function renderRuns() {
       const item = entry.item;
       return el("div", { class: "run" },
         el("div", {},
-          el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId}`),
-          el("div", { class: "small muted" }, `Queued (${item.mode === "next" ? "run next" : "replace"}) · ${item.state}${item.code ? ` · ${item.code}` : ""}`)),
+          el("strong", {}, joinParts([roleLabel(item.role), prLabel(item.pullRequestId)])),
+          el("div", { class: "small muted" }, joinParts([`Queued (${item.mode === "next" ? "run next" : "replace"})`, item.state, item.code]))),
         el("button", { type: "button", class: "danger", onclick: () => cancelQueued(item.queueId) }, "Cancel"));
     }
     const run = entry.item;
     const latest = run.latest && !run.latest.startsWith(run.detail) ? run.latest : "";
     return el("div", { class: "run" },
       el("div", {},
-        el("strong", {}, `${ROLE_LABEL[run.role]} · PR #${run.pullRequestId} · ${run.headline}`),
-        el("div", { class: "small muted" }, [run.detail, latest, `elapsed ${run.elapsed}`].filter(Boolean).join(" · "))),
+        el("strong", {}, joinParts([roleLabel(run.role), prLabel(run.pullRequestId), run.headline])),
+        el("div", { class: "small muted" }, joinParts([run.detail, latest, present(run.elapsed) ? `elapsed ${run.elapsed}` : ""]))),
       run.terminal ? null : el("button", { type: "button", class: "danger", onclick: () => cancelRun(run.dispatchId) }, "Cancel"));
   });
 }
@@ -584,9 +752,9 @@ function instanceRow(item) {
   const key = `i|${item.key}`;
   return el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
     el("div", { class: "line" },
-      el("strong", {}, ROLE_LABEL[item.agent] ?? item.agent),
-      el("span", { class: "status" })),
-    el("div", { class: "sub" }, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : item.repository || "No PR selected"),
+      el("strong", {}, roleLabel(item.agent)),
+      el("span", {}, pill(classify(item.completion, item.agent, item.pullRequestId)), el("span", { class: "status" }))),
+    el("div", { class: "sub" }, item.pullRequestId ? prLabel(item.pullRequestId, item.pullRequestTitle) : item.repository || "No PR selected"),
     el("div", { class: "sub elapsed" }));
 }
 
@@ -601,7 +769,7 @@ function updateInstanceRow(node, item) {
     ? `No heartbeat for ${duration(item.heartbeatAgeMilliseconds)}; the process may be hung or slow.` : "";
   const ended = ["completed", "exited", "failed"].includes(item.status);
   node.querySelector(".elapsed").textContent = ended
-    ? `${item.phase || item.status} · ended ${when(item.lastEventMs)}`
+    ? joinParts([item.phase || item.status, item.lastEventMs ? `ended ${when(item.lastEventMs)}` : ""])
     : `${item.phase || "—"} · ${duration(item.phaseElapsedMilliseconds)}`;
 }
 
@@ -619,8 +787,16 @@ function historyRow(entry) {
     el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
       el("div", { class: "line" }, el("strong", {}, `PR #${entry.pullRequestId}`), el("span", { class: "small muted" }, when(entry.lastSeenMs))),
       el("div", { class: "sub" }, entry.title || entry.repository),
-      el("div", { class: "sub" }, outcomes || "No outcome yet")),
+      el("div", { class: "sub" }, historyPill(entry), outcomes || "No outcome yet")),
     el("button", { type: "button", class: "hide", "aria-label": `Hide PR #${entry.pullRequestId} from history`, onclick: () => hideHistory(entry.key) }, "Hide"));
+}
+
+function historyPill(entry) {
+  const kinds = [classify(entry.reviewer, "reviewer", entry.pullRequestId), classify(entry.reviewHandler, "review-handler", entry.pullRequestId)]
+    .filter(Boolean);
+  const rank = { Stuck: 0, "Needs you": 1, "Will retry": 2, Reviewed: 3 };
+  kinds.sort((a, b) => rank[a[0]] - rank[b[0]]);
+  return kinds.length ? [pill(kinds[0]), " "] : [];
 }
 
 function updateHistoryRow(node, entry) {
@@ -733,7 +909,7 @@ function renderDetail(selection) {
     const heartbeat = $("d-heartbeat");
     if (heartbeat) heartbeat.textContent = item.heartbeatAgeMilliseconds === null ? "—" : `${duration(item.heartbeatAgeMilliseconds)} ago`;
     const status = $("d-status");
-    if (status) status.textContent = `${ROLE_LABEL[item.agent]} · ${item.status}`;
+    if (status) status.textContent = joinParts([roleLabel(item.agent), item.status]);
   }
 }
 
@@ -741,20 +917,23 @@ function roleOutcome(label, role) {
   if (!role) return [];
   const parts = [role.result ? `${role.result}${role.resultAtMs ? ` (${when(role.resultAtMs)})` : ""}` : ""];
   if (role.status && role.status !== role.result) parts.push(`latest: ${role.status}${role.statusAtMs ? ` (${when(role.statusAtMs)})` : ""}`);
+  if (role.failureDetail) parts.push(role.failureDetail);
   return field(label, parts.filter(Boolean).join(" · "));
 }
 
 function renderPrDetail(detail, entry) {
   detail.append(
-    el("h2", { class: "dialog-title" }, `PR #${entry.pullRequestId} ${entry.title}`),
+    el("h2", { class: "dialog-title" }, prLabel(entry.pullRequestId, entry.title)),
     prLink(entry.url),
     el("dl", {},
       roleOutcome("Reviewer", entry.reviewer),
       roleOutcome("Review Handler", entry.reviewHandler),
       field("Last activity", when(entry.lastSeenMs)),
       field("Author", entry.author),
-      field("Branches", entry.sourceBranch ? `${entry.sourceBranch} → ${entry.targetBranch}` : ""),
+      field("Branches", branches(entry.sourceBranch, entry.targetBranch)),
       field("Repository", entry.repository)),
+    failureSection(entry.reviewer, "reviewer", entry.pullRequestId),
+    failureSection(entry.reviewHandler, "review-handler", entry.pullRequestId),
     state.data?.launchMode !== "observe"
       ? el("div", { class: "launch-row" }, el("button", { type: "button", onclick: () => openModal(entry.pullRequestId) }, "Review this PR…"))
       : null,
@@ -763,31 +942,36 @@ function renderPrDetail(detail, entry) {
 
 function renderInstanceDetail(detail, item) {
   const completion = item.completion;
-  const headline = completion
-    ? `${completion.result}${completion.reason ? ` · ${completion.reason}` : ""}`
-    : item.blocked ? `Blocked · ${item.blocked.reason}` : item.status === "stale" ? "Stale · no recent heartbeat" : item.phase || item.status;
+  const findings = completion?.findings;
+  const headline = failureHeadline(completion) || (completion ? joinParts([completion.result, completion.reason]) : "") ||
+    (item.blocked ? joinParts(["Blocked", item.blocked.reason]) : item.status === "stale" ? "Stale · no recent heartbeat" : item.phase || item.status);
   detail.append(
-    el("h2", { class: "dialog-title" }, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : ROLE_LABEL[item.agent]),
-    el("div", { class: "small muted", id: "d-status" }, `${ROLE_LABEL[item.agent]} · ${item.status}`),
+    el("h2", { class: "dialog-title" }, item.pullRequestId ? prLabel(item.pullRequestId, item.pullRequestTitle) : roleLabel(item.agent)),
+    el("div", { class: "small muted", id: "d-status" }, joinParts([roleLabel(item.agent), item.status])),
     el("p", { class: "outcome" }, headline),
     completion?.summary ? el("p", {}, completion.summary) : null,
+    failureSection(completion, item.agent, item.pullRequestId),
     prLink(item.pullRequestUrl),
     el("dl", {},
-      completion ? field("Findings", `${completion.findings.critical} critical · ${completion.findings.important} important · ${completion.findings.suggestion} suggestion`) : [],
-      completion ? field("Delivered", completion.delivered.join(", ")) : [],
+      findings ? field("Findings", joinParts([
+        `${findings.critical ?? 0} critical`, `${findings.important ?? 0} important`, `${findings.suggestion ?? 0} suggestion`])) : [],
+      Array.isArray(completion?.delivered) ? field("Delivered", completion.delivered.filter(present).join(", ")) : [],
       completion ? field("Preview", completion.previewArtifact) : [],
       field("Phase", "—", "d-phase"),
       field("Heartbeat", "—", "d-heartbeat"),
+      field("When", completion?.failureDetail && completion.timestampMs ? joinParts([when(completion.timestampMs), completion.elapsedMilliseconds > 0 ? ` after launch` : ""]) : ""),
       field("Model", item.modelActivity),
       field("Author", item.pullRequestAuthor),
-      field("Branches", item.sourceBranch ? `${item.sourceBranch} → ${item.targetBranch}` : ""),
-      field("Threads", item.threadCount ? `${item.actionableThreadCount}/${item.threadCount} actionable · ${item.changedFileCount} files` : ""),
+      field("Branches", branches(item.sourceBranch, item.targetBranch)),
+      field("Threads", item.threadCount ? joinParts([
+        present(item.actionableThreadCount) ? `${item.actionableThreadCount}/${item.threadCount} actionable` : `${item.threadCount} threads`,
+        present(item.changedFileCount) ? `${item.changedFileCount} files` : ""]) : ""),
       field("Candidates", item.candidateStory),
-      field("Blocked", item.blocked ? `${item.blocked.reason}${item.blocked.nextRetry ? ` · retry ${item.blocked.nextRetry}` : ""}` : ""),
-      field("Waiting", item.waiting ? `${item.waiting.kind} · ${duration(item.waiting.delayMilliseconds)}` : ""),
+      field("Blocked", item.blocked ? joinParts([item.blocked.reason, item.blocked.nextRetry ? `retry ${item.blocked.nextRetry}` : ""]) : ""),
+      field("Waiting", item.waiting ? joinParts([item.waiting.kind, present(item.waiting.delayMilliseconds) ? duration(item.waiting.delayMilliseconds) : ""]) : ""),
       field("Repository", item.repository)),
     idsSection([
-      field("Instance", item.instanceId), field("Process", String(item.processId)),
+      field("Instance", item.instanceId), field("Process", item.processId),
       field("Session", item.sessionNamespace), field("Commit", item.sourceCommit), field("Key", item.key)]),
     el("h3", {}, "Timeline"),
     el("ul", { class: "timeline" },
@@ -875,17 +1059,17 @@ function renderPreview(body, m) {
     m.prompt = prompt.value;
     count.textContent = `${Array.from(m.prompt).length}/${MAX_PROMPT}`;
   });
-  const start = gate(el("button", { type: "button", class: "primary", onclick: start_ }, `Start ${ROLE_LABEL[d.role]}`));
+  const start = gate(el("button", { type: "button", class: "primary", onclick: start_ }, `Start ${roleLabel(d.role)}`));
   body.append(
     el("p", { class: "small" }, el("strong", {}, "NOT STARTED"), " · review the target, then click Start."),
     el("dl", {},
-      field("Repository", `${d.repository.slug} (${d.repository.provider})`),
-      field("Pull request", `#${pr.pullRequestId} ${pr.title}`),
+      field("Repository", joinParts([d.repository?.slug, d.repository?.provider ? `(${d.repository.provider})` : ""], " ")),
+      field("Pull request", joinParts([`#${pr.pullRequestId}`, pr.title], " ")),
       field("Author", pr.author),
-      field("Source", `${pr.sourceRef} @ ${pr.sourceCommit.slice(0, 12)}`),
+      field("Source", joinParts([pr.sourceRef, pr.sourceCommit ? String(pr.sourceCommit).slice(0, 12) : ""], " @ ")),
       field("Target", pr.targetRef),
       field("State", `${pr.active ? "active" : "not active"}${pr.draft ? " · draft" : ""}`),
-      field("Agent", ROLE_LABEL[d.role])),
+      field("Agent", roleLabel(d.role))),
     el("div", { class: "field" }, el("label", {}, "Allowed"),
       el("div", { class: "chips" }, d.capabilities.length ? d.capabilities.map((name) => el("span", { class: "chip" }, name)) : el("span", { class: "muted small" }, "Preview only (no writes)"))),
     el("div", { class: "field" }, el("label", {}, "Not allowed"),
@@ -951,7 +1135,7 @@ async function start_() {
   try {
     const result = await api("/api/review/dispatch", { dispatchDraftId: m.draft.dispatchDraftId, operatorPrompt: m.prompt });
     closeModal();
-    notice(`Started ${ROLE_LABEL[m.draft.role]} for PR #${m.draft.pullRequest.pullRequestId} (child PID ${result.childProcessId}).`);
+    notice(`Started ${roleLabel(m.draft.role)} for PR #${m.draft.pullRequest.pullRequestId}${present(result.childProcessId) ? ` (child PID ${result.childProcessId})` : ""}.`);
     refresh();
   } catch (error) {
     if (state.modal !== m) return;
@@ -1031,7 +1215,7 @@ $("scan").addEventListener("click", async () => {
   $("scan").disabled = true;
   try {
     const result = await api("/api/scan-now", {});
-    notice("Scan now: " + result.results.map((item) => `${ROLE_LABEL[item.role]} ${item.outcome}`).join(", "));
+    notice("Scan now: " + result.results.map((item) => joinParts([roleLabel(item.role), item.outcome], " ")).join(", "));
   } catch (error) {
     showError(errorText(error));
   }

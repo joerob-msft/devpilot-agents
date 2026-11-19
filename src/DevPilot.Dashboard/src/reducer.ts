@@ -4,6 +4,7 @@ import { observeProcess, type LocalProcessStream, type ProcessObserver } from ".
 import {
   boundedText,
   eventKey,
+  failureFields,
   getBoolean,
   getNumber,
   getString,
@@ -489,6 +490,7 @@ export class OperationsReducer {
           nextScan: getString(data, "nextScan") || getString(data, "nextRetry"),
           elapsedMilliseconds: Math.max(0, getNumber(data, "elapsedMilliseconds")),
           timestampMs: event.timestampMs,
+          ...failureFields(data),
         };
         state.modelActivity = `Completed: ${result}`;
         if (isResolvedCompletion(result)) {

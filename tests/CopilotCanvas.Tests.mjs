@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { CanvasInstanceServer } from "../src/DevPilot.CopilotCanvas/canvas-server.mjs";
+import { CanvasInstanceServer, healthTitle, launchFailureCause } from "../src/DevPilot.CopilotCanvas/canvas-server.mjs";
 import * as launcher from "../src/DevPilot.CopilotCanvas/watch-launcher.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -193,4 +193,24 @@ test("the canvas server starts a watch only from a fresh human-previewed plan an
     bridge.server.close();
     rmSync(watchRoot, { recursive: true, force: true });
   }
+});
+
+test("a failed launch surfaces the model preflight line, else the last Error/Exception line", () => {
+  const preflight = [
+    "🤖 Agency banner",
+    "DevPilot model preflight failed for model 'gpt-x': Error: No supported model available. Choose a supported model (copilot --help) or pass -SkipModelPreflight.",
+    "At line:1 char:1",
+    "Exception: rethrown",
+  ].join("\n");
+  assert.match(launchFailureCause(preflight), /^DevPilot model preflight failed for model 'gpt-x'/);
+  assert.equal(launchFailureCause("starting\nSystem.IO.IOException: disk full\ndone"), "System.IO.IOException: disk full");
+  assert.equal(launchFailureCause("all good"), "");
+  assert.equal(launchFailureCause(undefined), "");
+});
+
+test("the canvas title flags failing or stuck agents and tolerates missing health", () => {
+  assert.equal(healthTitle(null), "DevPilot Operations");
+  assert.equal(healthTitle([{ role: "reviewer", state: "healthy" }]), "DevPilot Operations");
+  assert.equal(healthTitle([{ role: "reviewer", state: "failing" }, { role: "review-handler", state: "stuck" }, null]),
+    "⚠ DevPilot Operations · Reviewer failing · Review Handler stuck");
 });

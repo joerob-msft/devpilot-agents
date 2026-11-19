@@ -73,7 +73,10 @@ param(
     [string]$AgentName,
 
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$Model
+    [string]$Model,
+
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$SkipModelPreflight
 )
 
 if ($PSBoundParameters.ContainsKey('PullRequestId') -and $PullRequestId -le 0) {
@@ -100,6 +103,7 @@ if ($PSBoundParameters.ContainsKey('IntervalSeconds')) { $parameters.IntervalSec
 if ($OperatorAlias) { $parameters.OperatorAlias = $OperatorAlias }
 if ($AgentName) { $parameters.ReviewHandlerAgentName = $AgentName }
 if ($Model) { $parameters.ReviewHandlerModel = $Model }
+if ($SkipModelPreflight) { $parameters.SkipModelPreflight = $true }
 
 & (Join-Path $PSScriptRoot 'Watch-DevPilotAgents.ps1') @parameters
 exit $LASTEXITCODE
