@@ -231,6 +231,148 @@ function automationChips(automation) {
   });
 }
 
+// --- Error surfacing: agent health, failure classification, notification health -------------
+
+function healthOf(role) {
+  return (state.data?.health ?? []).find((item) => item?.role === role) ?? null;
+}
+
+function healthChips(health) {
+  const chips = [];
+  for (const item of health ?? []) {
+    if (!item) continue;
+    if (item.state === "failing") {
+      chips.push(el("span", { class: "chip failed", title: item.cause || "" },
+        joinParts([`${roleLabel(item.role)}: failing`, present(item.consecutiveFailures) ? `${item.consecutiveFailures} in a row` : ""])));
+    } else if (item.state === "stuck" && item.stuck?.length) {
+      chips.push(el("span", { class: "chip retrying" }, `${roleLabel(item.role)}: stuck on PR #${item.stuck[0].pullRequestId}`));
+    }
+    const teams = item.notifications;
+    if (teams && teams.failuresSinceSuccess > 0) {
+      chips.push(el("span", { class: `chip${teams.warning ? " retrying" : ""}` },
+        joinParts([`Teams: ${teams.failuresSinceSuccess} queued`, teams.latestReason])));
+    }
+  }
+  return chips;
+}
+
+// History/Live classification pill: Needs you / Will retry / Reviewed / Stuck.
+function classify(outcome, role, pullRequestId) {
+  const health = healthOf(role);
+  if (pullRequestId && health?.stuck?.some((item) => item.pullRequestId === pullRequestId)) return ["Stuck", "amber"];
+  const result = String(outcome?.result ?? "").toLowerCase();
+  if (!["failed", "deferred", "error"].includes(result)) {
+    return result && !["blocked", "cancelled", "skipped"].includes(result) ? ["Reviewed", "green"] : null;
+  }
+  if (outcome.failureKind === "persistent" || health?.state === "failing") return ["Needs you", "red"];
+  if (outcome.failureKind === "transient") return ["Will retry", "amber"];
+  return null;
+}
+
+function pill(kind) {
+  return kind ? el("span", { class: `pill ${kind[1]}` }, kind[0]) : null;
+}
+
+function renderHealthBanner(data) {
+  let banner = $("health-banner");
+  if (!banner) {
+    banner = el("div", { id: "health-banner", role: "alert" });
+    $("automation").after(banner);
+  }
+  const health = data?.health ?? [];
+  const failing = health.filter((item) => item?.state === "failing");
+  const teams = health.filter((item) => item?.notifications?.warning);
+  const sig = JSON.stringify([failing, teams.map((item) => item.notifications)]);
+  if (banner.dataset.sig === sig) return;
+  banner.dataset.sig = sig;
+  banner.replaceChildren();
+  for (const item of failing) {
+    const since = item.failingSinceUtc ? Date.parse(item.failingSinceUtc) : NaN;
+    const success = item.lastSuccessUtc ? Date.parse(item.lastSuccessUtc) : NaN;
+    banner.append(el("div", { class: "banner" },
+      el("strong", {}, `${roleLabel(item.role)} has failed ${item.consecutiveFailures} times in a row`),
+      el("div", { class: "small" }, joinParts([
+        Number.isFinite(since) ? `Since ${when(since)}` : "",
+        Number.isFinite(success) ? `last success ${when(success)}` : "no recent success",
+        item.cause ? "every run:" : ""])),
+      item.cause ? el("pre", {}, item.cause) : null));
+  }
+  for (const item of teams) {
+    const teamsHealth = item.notifications;
+    banner.append(el("div", { class: "banner warn" },
+      el("strong", {}, `${roleLabel(item.role)} Teams notifications are not being delivered`),
+      el("div", { class: "small" }, joinParts([`${teamsHealth.failuresSinceSuccess} queued or failed since the last delivery`, teamsHealth.latestReason]))));
+  }
+  banner.hidden = !banner.childElementCount;
+}
+
+function healthTitle(data) {
+  const failing = (data?.health ?? []).filter((item) => item?.state === "failing").map((item) => `${roleLabel(item.role)} failing`);
+  const stuck = (data?.health ?? []).filter((item) => item?.state === "stuck").map((item) => `${roleLabel(item.role)} stuck`);
+  const problems = [...failing, ...stuck];
+  return problems.length ? `⚠ DevPilot Operations · ${problems.join(" · ")}` : "DevPilot Operations";
+}
+
+async function viewFailureLog(path) {
+  try {
+    const result = await api("/api/agents/failure-log", { path });
+    let dialog = $("log-dialog");
+    if (!dialog) {
+      dialog = el("dialog", { id: "log-dialog", "aria-labelledby": "log-title" });
+      document.body.append(dialog);
+    }
+    dialog.replaceChildren(
+      el("button", { type: "button", class: "close", "aria-label": "Close", onclick: () => dialog.close() }, "×"),
+      el("h2", { id: "log-title", class: "dialog-title" }, "Failure log"),
+      el("p", { class: "muted small" }, joinParts([result.path, result.truncated ? "showing the last 64 KiB" : ""])),
+      el("pre", { class: "plan" }, String(result.content ?? "")),
+      el("div", { class: "buttons" },
+        el("button", { type: "button", onclick: () => copyText(String(result.content ?? ""), "Failure log") }, "Copy log"),
+        el("button", { type: "button", onclick: () => dialog.close() }, "Close")));
+    if (!dialog.open) dialog.showModal();
+  } catch (error) {
+    showError(errorText(error));
+  }
+}
+
+async function skipPullRequest(role, pullRequestId) {
+  const ok = await confirmAction(`Skip PR #${pullRequestId}?`,
+    `${roleLabel(role)} will stop retrying PR #${pullRequestId} until a new commit is pushed. You can still review it manually.`, "Skip this PR");
+  if (!ok) return;
+  try {
+    await api("/api/agents/skip", { role, pullRequestId });
+    notice(`${roleLabel(role)} will skip PR #${pullRequestId} until a new commit.`);
+  } catch (error) {
+    showError(errorText(error));
+  }
+  await refresh();
+}
+
+function failureSection(outcome, role, pullRequestId) {
+  const detail = outcome?.failureDetail;
+  const stuck = pullRequestId ? healthOf(role)?.stuck?.find((item) => item.pullRequestId === pullRequestId) : null;
+  if (!detail && !outcome?.failureLogPath && !stuck) return null;
+  const nextTry = stuck?.nextAttemptUtc ? Date.parse(stuck.nextAttemptUtc) : NaN;
+  const observe = state.data?.launchMode === "observe";
+  return el("div", { class: "panel" },
+    stuck ? el("p", { class: "outcome" }, pill(["Stuck", "amber"]), ` Same outcome ${stuck.repeatCount} times on this commit`, stuck.outcome ? ` (${stuck.outcome})` : "") : null,
+    detail ? el("pre", {}, detail) : null,
+    el("dl", {},
+      field("Next try", Number.isFinite(nextTry) ? when(nextTry) : "")),
+    el("div", { class: "launch-row" },
+      outcome?.failureLogPath ? el("button", { type: "button", onclick: () => viewFailureLog(outcome.failureLogPath) },
+        stuck ? "View last failure log" : "View failure log") : null,
+      detail ? el("button", { type: "button", onclick: () => copyText(detail, "Error") }, "Copy error") : null,
+      stuck && !observe ? el("button", { type: "button", class: "danger", onclick: () => skipPullRequest(role, pullRequestId) }, "Skip this PR") : null,
+      stuck && !observe ? el("button", { type: "button", onclick: () => openModal(pullRequestId, role) }, "Review again…") : null));
+}
+
+function failureHeadline(completion) {
+  if (!completion?.failureDetail) return "";
+  const elapsed = completion.elapsedMilliseconds;
+  return elapsed > 0 && elapsed < 60_000 ? "Failed before review started" : `${completion.result === "deferred" ? "Deferred" : "Failed"}: ${completion.failureDetail}`;
+}
+
 function repositoryName(path) {
   return String(path || "").split(/[\\/]/).filter(Boolean).pop() || "(unknown repository)";
 }
@@ -253,10 +395,13 @@ function render() {
     : connection?.workingDirectory ? `Session folder: ${connection.workingDirectory}` : "";
   const automation = $("automation");
   const chipsKey = connected ? JSON.stringify(data.automation) : "";
-  if (automation.dataset.sig !== chipsKey || data?.automation?.agents?.some((agent) => agent.state === "retrying")) {
-    automation.dataset.sig = chipsKey;
-    automation.replaceChildren(...(connected ? automationChips(data.automation) : []));
+  const healthKey = connected ? JSON.stringify(data.health ?? null) : "";
+  if (automation.dataset.sig !== chipsKey + healthKey || data?.automation?.agents?.some((agent) => agent.state === "retrying")) {
+    automation.dataset.sig = chipsKey + healthKey;
+    automation.replaceChildren(...(connected ? [...automationChips(data.automation), ...healthChips(data.health)] : []));
   }
+  renderHealthBanner(connected ? data : null);
+  document.title = connected ? healthTitle(data) : "DevPilot Operations";
   // With no watch there is nothing to scan, review or view: the launch panel's Start is the only action.
   $("scan").hidden = !connected;
   $("scan").disabled = !connected || !data.automation?.available || !data.automation.agents.some((agent) => agent.canScanNow);
@@ -334,7 +479,7 @@ function renderLaunch(connection) {
   const ui = state.launchUi;
   const { launcher, launch } = connection;
   const key = JSON.stringify({
-    launcher, launch: launch && { state: launch.state, pid: launch.pid, logTail: launch.logTail },
+    launcher, launch: launch && { state: launch.state, pid: launch.pid, logTail: launch.logTail, failureCause: launch.failureCause },
     previewOnly: ui.previewOnly, plan: ui.plan && [ui.plan.launchToken, ui.plan.ok, ui.plan.output],
     busy: ui.busy, error: ui.error, armed: ui.armed,
   });
@@ -357,6 +502,7 @@ function renderLaunch(connection) {
   }
   if (launch?.state === "failed") {
     root.append(el("p", { class: "error-text", role: "alert" }, "The Golden watch did not start."),
+      launch.failureCause ? el("pre", { class: "banner" }, launch.failureCause) : null,
       launch.logPath ? el("p", { class: "muted small" }, `Log: ${launch.logPath}`) : null,
       el("div", { class: "launch-row" },
         el("button", { type: "button", onclick: () => copyText(launch.logPath, "Log path") }, "Copy log path"),
@@ -607,7 +753,7 @@ function instanceRow(item) {
   return el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
     el("div", { class: "line" },
       el("strong", {}, roleLabel(item.agent)),
-      el("span", { class: "status" })),
+      el("span", {}, pill(classify(item.completion, item.agent, item.pullRequestId)), el("span", { class: "status" }))),
     el("div", { class: "sub" }, item.pullRequestId ? prLabel(item.pullRequestId, item.pullRequestTitle) : item.repository || "No PR selected"),
     el("div", { class: "sub elapsed" }));
 }
@@ -641,8 +787,16 @@ function historyRow(entry) {
     el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
       el("div", { class: "line" }, el("strong", {}, `PR #${entry.pullRequestId}`), el("span", { class: "small muted" }, when(entry.lastSeenMs))),
       el("div", { class: "sub" }, entry.title || entry.repository),
-      el("div", { class: "sub" }, outcomes || "No outcome yet")),
+      el("div", { class: "sub" }, historyPill(entry), outcomes || "No outcome yet")),
     el("button", { type: "button", class: "hide", "aria-label": `Hide PR #${entry.pullRequestId} from history`, onclick: () => hideHistory(entry.key) }, "Hide"));
+}
+
+function historyPill(entry) {
+  const kinds = [classify(entry.reviewer, "reviewer", entry.pullRequestId), classify(entry.reviewHandler, "review-handler", entry.pullRequestId)]
+    .filter(Boolean);
+  const rank = { Stuck: 0, "Needs you": 1, "Will retry": 2, Reviewed: 3 };
+  kinds.sort((a, b) => rank[a[0]] - rank[b[0]]);
+  return kinds.length ? [pill(kinds[0]), " "] : [];
 }
 
 function updateHistoryRow(node, entry) {
@@ -763,6 +917,7 @@ function roleOutcome(label, role) {
   if (!role) return [];
   const parts = [role.result ? `${role.result}${role.resultAtMs ? ` (${when(role.resultAtMs)})` : ""}` : ""];
   if (role.status && role.status !== role.result) parts.push(`latest: ${role.status}${role.statusAtMs ? ` (${when(role.statusAtMs)})` : ""}`);
+  if (role.failureDetail) parts.push(role.failureDetail);
   return field(label, parts.filter(Boolean).join(" · "));
 }
 
@@ -777,6 +932,8 @@ function renderPrDetail(detail, entry) {
       field("Author", entry.author),
       field("Branches", branches(entry.sourceBranch, entry.targetBranch)),
       field("Repository", entry.repository)),
+    failureSection(entry.reviewer, "reviewer", entry.pullRequestId),
+    failureSection(entry.reviewHandler, "review-handler", entry.pullRequestId),
     state.data?.launchMode !== "observe"
       ? el("div", { class: "launch-row" }, el("button", { type: "button", onclick: () => openModal(entry.pullRequestId) }, "Review this PR…"))
       : null,
@@ -786,13 +943,14 @@ function renderPrDetail(detail, entry) {
 function renderInstanceDetail(detail, item) {
   const completion = item.completion;
   const findings = completion?.findings;
-  const headline = (completion ? joinParts([completion.result, completion.reason]) : "") ||
+  const headline = failureHeadline(completion) || (completion ? joinParts([completion.result, completion.reason]) : "") ||
     (item.blocked ? joinParts(["Blocked", item.blocked.reason]) : item.status === "stale" ? "Stale · no recent heartbeat" : item.phase || item.status);
   detail.append(
     el("h2", { class: "dialog-title" }, item.pullRequestId ? prLabel(item.pullRequestId, item.pullRequestTitle) : roleLabel(item.agent)),
     el("div", { class: "small muted", id: "d-status" }, joinParts([roleLabel(item.agent), item.status])),
     el("p", { class: "outcome" }, headline),
     completion?.summary ? el("p", {}, completion.summary) : null,
+    failureSection(completion, item.agent, item.pullRequestId),
     prLink(item.pullRequestUrl),
     el("dl", {},
       findings ? field("Findings", joinParts([
@@ -801,6 +959,7 @@ function renderInstanceDetail(detail, item) {
       completion ? field("Preview", completion.previewArtifact) : [],
       field("Phase", "—", "d-phase"),
       field("Heartbeat", "—", "d-heartbeat"),
+      field("When", completion?.failureDetail && completion.timestampMs ? joinParts([when(completion.timestampMs), completion.elapsedMilliseconds > 0 ? ` after launch` : ""]) : ""),
       field("Model", item.modelActivity),
       field("Author", item.pullRequestAuthor),
       field("Branches", branches(item.sourceBranch, item.targetBranch)),

@@ -187,7 +187,7 @@ exit 0
 
     function Get-BaseLaunchArgument {
         param([Parameter(Mandatory)][hashtable]$Context)
-        return @('-OperatorAlias', 'golden-test',
+        return @('-OperatorAlias', 'golden-test', '-SkipModelPreflight',
             '-ReviewerConfigFile', $Context.ReviewerConfig,
             '-ReviewHandlerConfigFile', $Context.ReviewHandlerConfig)
     }

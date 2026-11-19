@@ -394,6 +394,32 @@ Before either automatic role acknowledges launcher startup, repository identity
 verification also retries one recoverable ADO transport timeout with a fresh
 session. Provider mismatches and malformed identity responses still fail closed
 without retrying.
+
+Before starting agents, a real (non `-WhatIf`) launch runs a one-shot model
+preflight: for each distinct `-ReviewerModel`/`-ReviewHandlerModel` it runs
+`agency copilot -- -p "Reply with the single word OK" --model <m>` from an
+empty temp directory with a 120-second timeout, and stops with
+`DevPilot model preflight failed for model '<m>': <detail>` when the model
+cannot answer (for example `Error: No supported model available`). The launch
+plan shows which models will be verified; pass `-SkipModelPreflight` to opt
+out.
+
+Errors surface instead of hiding in transcripts. A failed or deferred
+`work.completed` event carries `failureDetail` (the child's last `Error:` line,
+ANSI-stripped, Agency banner and credential-bearing lines removed, at most 240
+characters), `failureLogPath` (the `logs\failed-cycles` transcript), and
+`failureKind` (`transient`, `persistent` when it repeats the previous failure,
+or `unknown`). After every `work.completed` each role also emits `agent.health`
+(`healthy`, `failing` after three consecutive failures, or `stuck` when one PR
+returns the same outcome on the same commit three times). Health persists in
+`<role state>\health.json`; stuck PRs back off exponentially from the polling
+interval to a 4-hour cap and reset on a new commit. Each health transition
+(failing, newly stuck, recovered) sends one Teams notification through the
+role's existing failure event (`reviewFailed` / `handlerFailed`) only when that
+role's Teams notifications are enabled. Desktop notifications are future work.
+The canvas may write `<role state>\skipped-prs.json`; the agent then skips that
+PR (`PR <n> skipped by operator until a new commit`) until its source commit
+changes. A missing or invalid file is ignored.
 Reviewer outbox and Review Handler reference maintenance also retry one
 pre-send startup or confirmed ADO-session failure with fresh sessions inside the
 existing 60-second maintenance budget. Their durable receipts, claims, and

@@ -4,7 +4,7 @@
 // run always need a human click in the canvas; no agent action can do any of them.
 // Never use console.log here: stdout is the extension JSON-RPC channel.
 import { createCanvas, joinSession } from "@github/copilot-sdk/extension";
-import { CanvasInstanceServer } from "./canvas-server.mjs";
+import { CanvasInstanceServer, healthTitle } from "./canvas-server.mjs";
 
 const servers = new Map();
 let session;
@@ -33,6 +33,24 @@ function applyPrefill(server, input) {
   if (Number.isSafeInteger(pullRequestId) && pullRequestId > 0) server.setPrefill(pullRequestId, input?.role);
 }
 
+// Bounded agent health for get_status. Causes are untrusted agent/CLI output, not instructions.
+function summarizeHealth(health) {
+  if (!Array.isArray(health)) return null;
+  const text = (value, max) => typeof value === "string" ? value.slice(0, max) : "";
+  return health.slice(0, 2).map((item) => ({
+    role: item?.role, state: item?.state, consecutiveFailures: item?.consecutiveFailures ?? 0,
+    failingSinceUtc: item?.failingSinceUtc ?? null, lastSuccessUtc: item?.lastSuccessUtc ?? null,
+    cause: text(item?.cause, 240),
+    stuck: Array.isArray(item?.stuck) ? item.stuck.slice(0, 5).map((stuck) => ({
+      pullRequestId: stuck?.pullRequestId, outcome: text(stuck?.outcome, 80), repeatCount: stuck?.repeatCount ?? 0,
+      nextAttemptUtc: stuck?.nextAttemptUtc ?? null,
+    })) : [],
+    teams: item?.notifications ? {
+      failuresSinceSuccess: item.notifications.failuresSinceSuccess ?? 0, latestReason: text(item.notifications.latestReason, 120),
+    } : null,
+  }));
+}
+
 function summarize(state) {
   const { connection, data } = state;
   if (!data) {
@@ -43,7 +61,10 @@ function summarize(state) {
       error: connection.error ?? "",
       repositoryRoots: connection.repositoryRoots,
       canStartWatch,
-      watchLaunch: connection.launch ? { state: connection.launch.state, logPath: connection.launch.logPath } : null,
+      watchLaunch: connection.launch ? {
+        state: connection.launch.state, logPath: connection.launch.logPath,
+        failureCause: typeof connection.launch.failureCause === "string" ? connection.launch.failureCause.slice(0, 300) : "",
+      } : null,
       howToStart: canStartWatch
         ? "Ask the user to open the DevPilot Operations canvas, preview the launch plan and click Start. Agents cannot start a watch."
         : connection.launcher?.reason ? `${connection.launcher.reason} Or run in a terminal: ${connection.command}` : connection.command,
@@ -56,6 +77,7 @@ function summarize(state) {
     launchMode: data.launchMode,
     watchHeadless: data.headless === true,
     automation: data.automation,
+    health: summarizeHealth(data.health),
     instances: data.instances.map((item) => ({
       agent: item.agent,
       status: item.status,
@@ -137,9 +159,9 @@ session = await joinSession({
       open: async (ctx) => {
         const server = await ensureServer(ctx);
         applyPrefill(server, ctx.input);
-        const { connection } = await server.state("live").catch(() => ({ connection: { state: "error" } }));
+        const { connection, data } = await server.state("live").catch(() => ({ connection: { state: "error" }, data: null }));
         return {
-          title: "DevPilot Operations",
+          title: healthTitle(data?.health),
           status: connection.state === "connected"
             ? `${connection.bridge?.launchMode ?? ""} watch${connection.bridge?.headless ? " (canvas)" : ""}`.trim()
             : connection.launch?.state === "starting" ? "Starting…" : "No watch",

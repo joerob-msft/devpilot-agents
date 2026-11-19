@@ -96,7 +96,7 @@ if ($LASTEXITCODE -ne 0) { throw "Scheduling fixture failed: $LASTEXITCODE" }
                 '-Golden', '-ReviewerConfigFile', $fixture.ReviewerConfig,
                 '-ReviewHandlerConfigFile', $fixture.HandlerConfig, '-OperatorAlias', 'fixture',
                 '-StateDir', $fixture.Watch, '-DurableStateRoot', $fixture.Durable, '-LeaseRoot', $fixture.Leases,
-                '-IntervalSeconds', '73', '-ReviewerModel', 'gpt-5.4', '-ReviewHandlerModel', 'gpt-5.4', '-IncludeOwnPullRequests')
+                '-IntervalSeconds', '73', '-ReviewerModel', 'gpt-5.4', '-ReviewHandlerModel', 'gpt-5.4', '-IncludeOwnPullRequests', '-SkipModelPreflight')
             if ($Preview) { $arguments += '-PreviewOnly' }
             $result = Invoke-TimedProcess -FilePath (Resolve-AgentPwshPath) -ArgumentList $arguments `
                 -WorkingDirectory $fixture.Toolkit -CaptureStdOut -CaptureStdErr -TimeoutSeconds 110

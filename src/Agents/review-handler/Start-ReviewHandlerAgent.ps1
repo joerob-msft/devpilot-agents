@@ -1164,8 +1164,44 @@ function Send-HandlerEvent {
         [System.Collections.IDictionary]$Data = @{},
         [AllowEmptyString()][string]$Message = ''
     )
+    $isWorkCompleted = $EventType -eq 'work.completed' -and -not $DryRun
+    if ($isWorkCompleted) { Add-AgentWorkFailureFields -Data $Data -HealthState (Get-HandlerHealthState) }
     Publish-AgentEvent -Context $script:HandlerOutputContext -EventType $EventType -Level $Level `
         -Cycle $Cycle -PrId $PrId -SourceCommit $SourceCommit -Data $Data -Message $Message | Out-Null
+    if ($isWorkCompleted) { Update-HandlerHealthAfterWork -PrId $PrId -SourceCommit $SourceCommit -Data $Data }
+}
+
+$script:HandlerHealthState = $null
+function Get-HandlerHealthState {
+    if ($null -eq $script:HandlerHealthState) {
+        if (-not $StateDir) { return $null }
+        $script:HandlerHealthState = Read-AgentHealthState -Path (Join-Path $StateDir 'health.json')
+    }
+    return $script:HandlerHealthState
+}
+
+function Update-HandlerHealthAfterWork {
+    <# Health/alert bookkeeping is observational: any failure here is swallowed. #>
+    param([int]$PrId, [string]$SourceCommit, [System.Collections.IDictionary]$Data)
+    try {
+        $state = Get-HandlerHealthState
+        $outcome = @([string]$Data['outcome'], [string]$Data['failureClass'], [string]$Data['result']) | Where-Object { $_ } | Select-Object -First 1
+        $update = Update-AgentHealthState -State $state -Result ([string]$Data['result']) -PullRequestId $PrId `
+            -SourceCommit $SourceCommit -Outcome ([string]$outcome) -FailureDetail ([string]$Data['failureDetail']) `
+            -BaseIntervalSeconds $IntervalSeconds
+        [void](Write-AgentHealthState -Path (Join-Path $StateDir 'health.json') -State $state)
+        Publish-AgentEvent -Context $script:HandlerOutputContext -EventType agent.health `
+            -Level $(if ($update.State -ne 'healthy') { 'warning' } else { 'info' }) -PrId $update.PullRequestId `
+            -Data $update.Data -Message (Get-AgentHealthEventMessage -RoleLabel 'Review handler' -Update $update) | Out-Null
+        if ($update.Alert) {
+            $text = Get-AgentHealthAlertText -RoleLabel 'Review handler' -Update $update `
+                -RepositoryName ([string]$script:HandlerOutputContext.RepositoryIdentity.repositoryName) `
+                -RecoveredPullRequestId $(if ($update.Alert -eq 'recovered') { $PrId } else { 0 })
+            Send-HandlerTeamsNotification -AgencyPath $AgencyPath -Event 'handlerFailed' -Title $text -Body $text `
+                -SourceCommit ("health-{0}-{1}" -f $update.Alert, [DateTime]::UtcNow.Ticks)
+        }
+    }
+    catch { Write-Warning "Review-handler health bookkeeping failed (ignored): $($_.Exception.Message)" }
 }
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
@@ -2790,6 +2826,16 @@ function Invoke-HandlerCycle {
                 continue
             }
 
+            $candidateHold = Get-AgentCandidateHold -StateDir $StateDir -HealthState (Get-HandlerHealthState) `
+                -RepositoryKey ([string]$script:HandlerOutputContext.RepositoryIdentity.key) -PullRequestId $prId -SourceCommit $sourceCommit
+            if ($candidateHold) {
+                Send-HandlerEvent candidate.skipped -Cycle $CycleNumber -PrId $prId -SourceCommit $sourceCommit `
+                    -Data (Get-HandlerPullRequestHistoryData -PullRequest $prDetail -Additional @{
+                    reason = $candidateHold.Reason; normalizedReason = $candidateHold.Kind; nextAttemptUtc = $candidateHold.NextAttemptUtc
+                }) -Message $candidateHold.Message
+                continue
+            }
+
             $maxThreadDate = Get-HandlerMaxThreadDate -Threads $threads
             if (-not $ForceAnalysis -and
                 (Test-HandlerAlreadyHandled -HandledState $handledState -PrId $prId -SourceCommit $sourceCommit -MaxThreadDate $maxThreadDate)) {
@@ -3193,6 +3239,8 @@ function Invoke-HandlerCycle {
             # Persist the failed transcript so an operator can diagnose WHY the
             # model produced no usable marker. Transcripts are wrapper-owned,
             # stay on this box, and are the only way to debug a silent refusal.
+            $transcript = ''
+            $failureDetail = Get-AgentFailureDetail -StdErr ([string]$run.StdErr) -StdOut ([string]$run.StdOut) -FallbackReason $reason
             try {
                 $failDir = Join-Path $logDir "failed-cycles"
                 New-Item -ItemType Directory -Force -Path $failDir | Out-Null
@@ -3218,7 +3266,10 @@ function Invoke-HandlerCycle {
                     foreach ($t in $tail) { Write-Host "  | $t" -ForegroundColor DarkGray }
                 }
             }
-            catch { Write-Warning "Could not write failure transcript: $($_.Exception.Message)" }
+            catch {
+                Write-Warning "Could not write failure transcript: $($_.Exception.Message)"
+                $transcript = ''
+            }
 
             Write-HandlerCycleMetadata -Fields @{
                 cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId; reason = $reason
@@ -3249,6 +3300,7 @@ function Invoke-HandlerCycle {
                 worktreeStatusChanged = ($postRunWorktreeStatus -cne $preRunWorktreeStatus)
                 outputDrained = [bool]$run.OutputDrained
                 nextRetry = 'after cycle backoff and authoritative reconciliation'
+                failureDetail = $failureDetail; failureLogPath = [string]$transcript
             } -Message $result.Summary
             return $result
         }

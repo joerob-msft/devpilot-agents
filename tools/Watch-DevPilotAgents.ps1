@@ -177,6 +177,10 @@ param(
     [Parameter(ParameterSetName = 'Launch')]
     [string]$ReviewHandlerModel = 'gpt-6.1-sol',
 
+    # Skips the one-shot "can this model answer?" probe run before agents start.
+    [Parameter(ParameterSetName = 'Launch')]
+    [switch]$SkipModelPreflight,
+
     [Parameter(ParameterSetName = 'Launch')]
     [switch]$IncludeOwnPullRequests,
 
@@ -943,6 +947,11 @@ Write-Host "  Automatic roles     : $(if ($automaticRoleNames.Count -gt 0) { $au
 Write-Host "  Manual (broker) roles: $(if ($manualRoleNames.Count -gt 0) { $manualRoleNames -join ', ' } else { 'none' })"
 Write-Host "  Cycling             : $(if ($launch.Continuous) { "continuous, every $IntervalSeconds second(s)" } else { 'one cycle' })"
 Write-Host "  Watch state root    : $StateDir"
+$preflightModels = @(@(
+        $(if ($launchReviewer) { $ReviewerModel })
+        $(if ($launchReviewHandler) { $ReviewHandlerModel })
+    ) | Where-Object { $_ } | Select-Object -Unique)
+Write-Host (Get-AgentModelPreflightPlanLine -Models $preflightModels -Skip:$SkipModelPreflight)
 Write-Host "  Copilot canvas      : $($launch.CanvasBridgeNotice -replace '^canvas: ', '')"
 Write-Host "  Enabled writes      : $(if ($enabledWrites.Count -gt 0) { $enabledWrites -join '; ' } else { 'none' })"
 Write-Host "  Default denials     : $(if ($defaultDenials.Count -gt 0) { $defaultDenials -join '; ' } else { 'none' })"
@@ -955,6 +964,14 @@ else {
 
 if (-not $PSCmdlet.ShouldProcess($StateDir, "Create watch state and launch DevPilot agents ($($launch.LaunchMode))")) {
     return
+}
+
+# Fail fast when a configured model cannot answer through the same `agency copilot --` path the
+# agents use; otherwise every cycle defers with the same headless CLI error and nothing surfaces.
+if (-not $SkipModelPreflight -and $preflightModels.Count -gt 0) {
+    $preflightAgency = (Get-Command agency -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    Write-Host "Model preflight: verifying $($preflightModels -join ', ')..." -ForegroundColor DarkGray
+    Assert-AgentModelPreflight -Models $preflightModels -AgencyPath $preflightAgency -TimeoutSeconds 120
 }
 
 # ---------------------------------------------------------------------------

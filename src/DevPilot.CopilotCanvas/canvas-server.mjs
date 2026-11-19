@@ -22,6 +22,8 @@ const REPOSITORY_ATTACH_TIMEOUT_MS = 20 * 60_000;
 const ENTRYPOINT_CACHE_MS = 15_000;
 const ENTRYPOINT_CACHE_MAX_MS = 120_000;
 const PROXIED_POSTS = new Set([
+  "/api/agents/failure-log",
+  "/api/agents/skip",
   "/api/scan-now",
   "/api/review/describe",
   "/api/review/dispatch",
@@ -38,6 +40,25 @@ const STATIC = {
   "/styles.css": ["styles.css", "text/css; charset=utf-8"],
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'";
+
+const ROLE_TITLE = { reviewer: "Reviewer", "review-handler": "Review Handler" };
+
+// The line that explains a failed canvas-started launch: the model preflight failure, else the last
+// Error/Exception line of the log tail.
+export function launchFailureCause(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const preflight = lines.findLast((line) => line.startsWith("DevPilot model preflight failed"));
+  const cause = preflight ?? lines.findLast((line) => /(Error|Exception)\b/.test(line));
+  return cause ? cause.slice(0, 600) : "";
+}
+
+// Canvas/tab title: "⚠ DevPilot Operations · Reviewer failing" while any agent is failing or stuck.
+export function healthTitle(health) {
+  const problems = (Array.isArray(health) ? health : [])
+    .filter((item) => item && (item.state === "failing" || item.state === "stuck"))
+    .map((item) => `${ROLE_TITLE[item.role] ?? "Agent"} ${item.state}`);
+  return problems.length ? `⚠ DevPilot Operations · ${problems.join(" · ")}` : "DevPilot Operations";
+}
 
 export function defaultWatchRoot(env = process.env) {
   if (process.platform === "win32") {
@@ -289,10 +310,12 @@ export class CanvasInstanceServer {
     const attachTimeout = this.launch.kind === "repository" ? REPOSITORY_ATTACH_TIMEOUT_MS : LAUNCH_ATTACH_TIMEOUT_MS;
     const failed = Boolean(this.launch.error) || !alive || elapsed > attachTimeout;
     const tail = failed || elapsed > 10_000 ? this.launcher.logTail(this.launch.logPath) : "";
+    const logTail = [this.launch.error, tail].filter(Boolean).join("\n");
     return {
       state: failed ? "failed" : "starting", pid: this.launch.pid, logPath: this.launch.logPath,
       previewOnly: this.launch.previewOnly, elapsedMs: elapsed, kind: this.launch.kind,
-      logTail: [this.launch.error, tail].filter(Boolean).join("\n"),
+      logTail,
+      failureCause: failed ? launchFailureCause(logTail) : "",
     };
   }
 

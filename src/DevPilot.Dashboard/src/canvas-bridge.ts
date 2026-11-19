@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   BrokerRejectionError,
   assertManualTarget,
@@ -18,6 +18,7 @@ import {
 } from "./dispatch.js";
 import { AGENTS, type AgentRole, type InstanceState } from "./domain.js";
 import { eventNarrative } from "./format.js";
+import type { AgentHealthProjection } from "./health.js";
 import type { PullRequestHistoryEntry, PullRequestHistoryProjection } from "./history.js";
 import { isHistoryKey, type HistoryHideStorage } from "./history-hides.js";
 import { manualProgress } from "./manual-progress.js";
@@ -40,8 +41,14 @@ const AUTOMATION_CACHE_MS = 2_000;
 const BUSY_CODES = new Set(["already-running", "state-contended"]);
 const HISTORY_ROWS = 200;
 const RECENT_PULL_REQUESTS = 8;
+export const FAILURE_LOG_MAX_BYTES = 64 * 1024;
+export const SKIPPED_PRS_FILE = "skipped-prs.json";
+export const SKIPPED_PRS_LIMIT = 200;
+const REPOSITORY_KEY = /^v1:[a-z]+:[A-Za-z0-9._:-]{1,200}$/;
+const SOURCE_COMMIT = /^[0-9a-f]{40}$/;
 
 type BridgeReducer = Pick<OperationsReducer, "list" | "getDispatch" | "registerLocalStream">;
+type BridgeHealth = Pick<AgentHealthProjection, "all" | "notification" | "failureLogSource" | "skipTarget">;
 type BridgeHistory = Pick<PullRequestHistoryProjection,
   "list" | "hide" | "restore" | "restoreAll" | "clearView" | "hiddenCount" | "hiddenKeyList" | "clearedThrough">;
 // Canvas views. "current" is accepted from older installed canvases and served as "live".
@@ -61,6 +68,10 @@ export interface CanvasBridgeOptions {
   // Per-PR history (the terminal History view's projection) and its persisted hide preferences.
   history?: BridgeHistory | undefined;
   historyHides?: HistoryHideStorage | undefined;
+  // Error surfacing (agent.health, notification health, failure logs, operator skip).
+  health?: BridgeHealth | undefined;
+  // Watch state roots the dashboard tails (--state-dir). Failure logs and skip files must live inside one.
+  stateRoots?: string[] | undefined;
   now?: () => number;
   token?: string;
   // Headless owner only: the canvas's explicit Stop. A terminal-owned dashboard never sets this.
@@ -208,6 +219,8 @@ export class CanvasBridge {
       case "POST /v1/history/hide": return this.hideHistory(body);
       case "POST /v1/history/restore": return this.restoreHistory(body);
       case "POST /v1/history/clear": return this.clearHistory();
+      case "POST /v1/agents/failure-log": return this.failureLog(body);
+      case "POST /v1/agents/skip": return this.skip(body);
       case "POST /v1/shutdown": return this.shutdown();
       default: throw new HttpError(404, "not-found");
     }
@@ -231,6 +244,7 @@ export class CanvasBridge {
       view,
       views: ["live", "history"],
       automation: await this.automationStatus(now),
+      health: this.healthView(),
       instances: instances.map((state) => instanceView(state, now)),
       historyAvailable: Boolean(history),
       ...(view === "history" ? {
@@ -264,6 +278,84 @@ export class CanvasBridge {
     return value
       ? { available: value.available, scope: value.scope, agents: value.agents, error: "" }
       : { available: false, error };
+  }
+
+  private healthView(): unknown {
+    const health = this.options.health;
+    if (!health) return null;
+    return health.all().map((item) => ({ ...item, notifications: health.notification(item.role) }));
+  }
+
+  private failureLog(body: Record<string, unknown>): unknown {
+    const health = this.options.health;
+    const path = body.path;
+    if (typeof path !== "string" || !path || path.length > 1024 || !isAbsolute(path)) throw new HttpError(400, "invalid-path");
+    if (!health || health.failureLogSource(path) === undefined) throw new HttpError(404, "unknown-failure-log");
+    const real = this.containedPath(path);
+    if (!real) throw new HttpError(403, "outside-state-root");
+    const fd = openSync(real, "r");
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) throw new HttpError(404, "unknown-failure-log");
+      const length = Math.min(stat.size, FAILURE_LOG_MAX_BYTES);
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, stat.size - length);
+      return { path, size: stat.size, truncated: stat.size > length, content: sanitizeLog(buffer.toString("utf8")) };
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  private skip(body: Record<string, unknown>): unknown {
+    const role = body.role;
+    const pullRequestId = body.pullRequestId;
+    if (Object.keys(body).some((key) => key !== "role" && key !== "pullRequestId")) throw new HttpError(400, "unexpected-field");
+    if (typeof role !== "string" || !(AGENTS as readonly string[]).includes(role)) throw new HttpError(400, "invalid-role");
+    if (!isPullRequestId(pullRequestId)) throw new HttpError(400, "invalid-pull-request-id");
+    const agentRole = role as AgentRole;
+    // Repository and commit come only from recorded agent events, never from the client.
+    const target = this.options.health?.skipTarget(agentRole, pullRequestId);
+    if (!target) throw new HttpError(404, "unknown-pull-request", "No recorded attempt for this pull request.");
+    const sourceCommit = target.sourceCommit.toLowerCase();
+    if (!REPOSITORY_KEY.test(target.repositoryKey) || !SOURCE_COMMIT.test(sourceCommit)) {
+      throw new HttpError(409, "skip-target-incomplete", "The recorded repository or commit is not verified.");
+    }
+    const root = target.source ? this.stateRootOf(target.source) : undefined;
+    if (!root) throw new HttpError(409, "state-root-unknown", "The agent's watch state directory is not known.");
+    const roleDirectory = join(root, agentRole);
+    try {
+      if (!statSync(roleDirectory).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new HttpError(409, "state-root-unknown", "The agent's state directory does not exist.");
+    }
+    const file = join(roleDirectory, SKIPPED_PRS_FILE);
+    const entry = { repositoryKey: target.repositoryKey, pullRequestId, sourceCommit, skippedAtUtc: new Date(this.now()).toISOString() };
+    const entries = readSkipEntries(file)
+      .filter((item) => !(item.repositoryKey === entry.repositoryKey && item.pullRequestId === pullRequestId));
+    entries.push(entry);
+    writePrivateJson(file, { schemaVersion: 1, entries: entries.slice(-SKIPPED_PRS_LIMIT) });
+    return { skipped: true, role: agentRole, pullRequestId, sourceCommit, skippedAtUtc: entry.skippedAtUtc };
+  }
+
+  private realRoots(): string[] {
+    const roots: string[] = [];
+    for (const root of this.options.stateRoots ?? []) {
+      try { roots.push(realpathSync(resolve(root))); } catch { /* missing roots contain nothing */ }
+    }
+    return roots;
+  }
+
+  // Real path of `path` when it resolves (symlinks included) inside a watch state root.
+  private containedPath(path: string): string | undefined {
+    let real: string;
+    try { real = realpathSync(path); } catch { return undefined; }
+    return this.realRoots().some((root) => isInside(root, real)) ? real : undefined;
+  }
+
+  private stateRootOf(source: string): string | undefined {
+    let real: string;
+    try { real = realpathSync(source); } catch { return undefined; }
+    return this.realRoots().find((root) => isInside(root, real));
   }
 
   private historyOrThrow(): BridgeHistory {
@@ -516,6 +608,7 @@ function historyView(entry: PullRequestHistoryEntry): unknown {
     const activity = entry.activities[agent];
     return outcome || activity ? {
       result: outcome?.result ?? "", resultAtMs: outcome?.timestampMs ?? null,
+      failureDetail: outcome?.failureDetail ?? "", failureLogPath: outcome?.failureLogPath ?? "", failureKind: outcome?.failureKind ?? "",
       status: activity?.status ?? "", statusAtMs: activity?.timestampMs ?? null,
     } : null;
   };
@@ -567,6 +660,49 @@ function instanceView(state: InstanceState, now: number): unknown {
       timestampMs: event.timestampMs, eventType: event.eventType, level: event.level, text: eventNarrative(event),
     })),
   };
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const fold = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+  const rel = relative(fold(root), fold(candidate));
+  return Boolean(rel) && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+const SECRET_LINE = /Bearer |token=|Authorization/i;
+
+export function sanitizeLog(text: string): string {
+  return text
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .split(/\r?\n/)
+    .map((line) => SECRET_LINE.test(line) ? "[line redacted: may contain a credential]" : line)
+    .join("\n");
+}
+
+interface SkipEntry { repositoryKey: string; pullRequestId: number; sourceCommit: string; skippedAtUtc: string }
+
+function readSkipEntries(file: string): SkipEntry[] {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { schemaVersion?: unknown; entries?: unknown };
+    if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.entries)) return [];
+    return parsed.entries.filter((item): item is SkipEntry => Boolean(item) && typeof item === "object" &&
+      typeof item.repositoryKey === "string" && REPOSITORY_KEY.test(item.repositoryKey) &&
+      isPullRequestId(item.pullRequestId) && typeof item.sourceCommit === "string" && SOURCE_COMMIT.test(item.sourceCommit) &&
+      typeof item.skippedAtUtc === "string" && Number.isFinite(Date.parse(item.skippedAtUtc)));
+  } catch {
+    return [];
+  }
+}
+
+function writePrivateJson(path: string, value: unknown): void {
+  const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (process.platform !== "win32") chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 function writeDiscoveryFile(path: string, discovery: CanvasBridgeDiscovery): void {

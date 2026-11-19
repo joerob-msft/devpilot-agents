@@ -391,7 +391,8 @@ $script:AgentOutputEventTypes = @(
     'work.completed',
     'cycle.completed',
     'cycle.failed',
-    'agent.waiting'
+    'agent.waiting',
+    'agent.health'
 )
 
 function Test-AgentInteractiveOutput {
@@ -679,6 +680,11 @@ function Write-ReviewerHumanEvent {
             Write-ReviewerOutputLine $Context "DevPilot $name - RUNNING"
             Write-ReviewerOutputLine $Context ("{0} / {1} / {2} -> {3}" -f $data.organization, $data.project, $data.repository, $data.target)
             Write-ReviewerOutputLine $Context ("Operator: {0}  Writes: {1}  Vote: {2}" -f $data.operator, $data.writes, $data.vote)
+        }
+        'agent.health' {
+            if ([string]$data.state -ne 'healthy' -or $Event.level -eq 'warning') {
+                if ($message) { Write-ReviewerOutputLine $Context $message }
+            }
         }
         'cycle.started' { Write-ReviewerOutputLine $Context "`nCycle $cycle" }
         'candidates.enumerated' {

@@ -209,3 +209,25 @@ dialog .close { float: right; border: none; font-size: 18px; line-height: 1; pad
 button.danger-fill { background: var(--background-color-danger-emphasis, #cf222e); }
 .suggestions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .suggestions button { font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+
+/* Error surfacing: health banners and classification pills. */
+#health-banner[hidden] { display: none; }
+.banner {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--text-color-danger, #cf222e);
+  color: var(--text-color-danger, #cf222e);
+  background: var(--background-color-danger-muted, rgba(207, 34, 46, 0.08));
+}
+.banner.warn {
+  border-color: var(--text-color-attention, #9a6700);
+  color: var(--text-color-attention, #9a6700);
+  background: var(--background-color-attention-muted, rgba(154, 103, 0, 0.08));
+}
+.banner pre { margin: 6px 0 0; color: var(--text-color-default, CanvasText); }
+pre.banner { white-space: pre-wrap; font-family: var(--font-mono, ui-monospace, Consolas, monospace); }
+.pill { font-size: 11px; font-weight: 600; padding: 0 8px; margin-right: 6px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.red { color: var(--text-color-danger, #cf222e); }
+.pill.amber { color: var(--text-color-attention, #9a6700); }
+.pill.green { color: var(--text-color-success, #1a7f37); }

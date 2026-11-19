@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CanvasBridge, type CanvasBridgeDiscovery } from "../src/canvas-bridge.js";
+import { CanvasBridge, type CanvasBridgeDiscovery, type CanvasBridgeOptions } from "../src/canvas-bridge.js";
+import { AgentHealthProjection } from "../src/health.js";
+import { parseAgentEvent } from "../src/domain.js";
 import {
   BrokerRejectionError,
   type CapabilitySummary,
@@ -61,6 +63,7 @@ interface Harness {
 async function startHarness(
   overrides: Partial<Record<keyof DispatchBroker, unknown>> = {},
   onShutdown?: () => void,
+  extra: Partial<CanvasBridgeOptions> = {},
 ): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "canvas-bridge-"));
   const calls: Harness["calls"] = [];
@@ -90,6 +93,7 @@ async function startHarness(
     discoveryFile, consumerRepositoryRoot: "C:\\repo", launchMode: "operational", broker,
     reducer: new OperationsReducer(), tailer: { registerEventLogPath: (path: string) => { registered.push(path); return true; } },
     onShutdown,
+    ...extra,
   });
   const discovery = await bridge.start();
   return {
@@ -369,5 +373,95 @@ test("a queued run retired before any dispatch leaves the queue and is reported 
     assert.deepEqual((status.runs as Array<{ dispatchId: string }>).map((run) => run.dispatchId), ["d-2"]);
   } finally {
     await harness.cleanup();
+  }
+});
+
+function agentEvent(eventType: string, data: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+  return parseAgentEvent({
+    schemaVersion: 3, agent: "reviewer", instanceId: "watch-1", processId: 7, sequence: 1,
+    timestamp: "2026-11-18T10:00:00.000Z", eventType, level: "warning", cycleNumber: 1,
+    pullRequestId: 15461706, sourceCommit: "a1d09dfe".padEnd(40, "0"), repositoryIdentity: identity, data, message: "", ...extra,
+  });
+}
+
+test("failure-log route serves only recorded logs inside a watch state root, capped and redacted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "canvas-watch-"));
+  const outside = await mkdtemp(join(tmpdir(), "canvas-outside-"));
+  const failed = join(root, "reviewer", "logs", "failed-cycles");
+  mkdirSync(failed, { recursive: true });
+  const log = join(failed, "pr1-cycle1.txt");
+  const big = join(failed, "pr1-cycle2.txt");
+  const stray = join(outside, "secret.txt");
+  writeFileSync(log, "STDERR\n\u001b[31mError: No supported model available\u001b[0m\nAuthorization: Bearer abc\n");
+  writeFileSync(big, `${"x".repeat(70 * 1024)}\nError: tail`);
+  writeFileSync(stray, "nope");
+  const health = new AgentHealthProjection();
+  const source = join(root, "reviewer", "logs", "events", "reviewer", "events.jsonl");
+  for (const path of [log, big, stray]) {
+    health.apply(agentEvent("work.completed", { result: "failed", failureDetail: "Error: x", failureLogPath: path }), source);
+  }
+  const harness = await startHarness({}, undefined, { health, stateRoots: [root] });
+  try {
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: log }, { authorization: "Bearer wrong" })).status, 401);
+    const ok = await call(harness, "POST", "/v1/agents/failure-log", { path: log });
+    assert.equal(ok.status, 200);
+    assert.match(String(ok.body.content), /^STDERR\nError: No supported model available\n\[line redacted/);
+    assert.doesNotMatch(String(ok.body.content), /Bearer abc/);
+    const capped = await call(harness, "POST", "/v1/agents/failure-log", { path: big });
+    assert.equal(capped.body.truncated, true);
+    assert.equal(String(capped.body.content).length, 64 * 1024);
+    assert.match(String(capped.body.content), /Error: tail$/);
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: stray })).status, 403);
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: join(failed, "other.txt") })).status, 404);
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: "relative.txt" })).status, 400);
+    assert.equal((await call(harness, "POST", "/v1/agents/failure-log", { path: 5 })).status, 400);
+  } finally {
+    await harness.cleanup();
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("skip route validates, resolves the target server-side and writes the skip file atomically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "canvas-watch-"));
+  mkdirSync(join(root, "reviewer", "logs"), { recursive: true });
+  const source = join(root, "reviewer", "logs", "events.jsonl");
+  writeFileSync(source, "");
+  const health = new AgentHealthProjection();
+  health.apply(agentEvent("agent.health", {
+    state: "stuck", consecutiveFailures: 0, stuck: [{ pullRequestId: 15461706, sourceCommit: "b".repeat(40), outcome: "no-safe-progress", repeatCount: 12 }],
+  }), source);
+  const file = join(root, "reviewer", "skipped-prs.json");
+  writeFileSync(file, JSON.stringify({ schemaVersion: 1, entries: [
+    ...Array.from({ length: 200 }, (_, index) => ({ repositoryKey: identity.key, pullRequestId: index + 1, sourceCommit: "c".repeat(40), skippedAtUtc: "2026-11-01T00:00:00Z" })),
+    { repositoryKey: "bad", pullRequestId: 1, sourceCommit: "c".repeat(40), skippedAtUtc: "2026-11-01T00:00:00Z" },
+  ] }));
+  const harness = await startHarness({}, undefined, { health, stateRoots: [root], now: () => Date.parse("2026-11-18T12:00:00Z") });
+  try {
+    const body = { role: "reviewer", pullRequestId: 15461706 };
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", body, { authorization: "Bearer wrong" })).status, 401);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", body, { host: "localhost" })).status, 403);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", { ...body, sourceCommit: "d".repeat(40) })).status, 400);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", { ...body, role: "fixer" })).status, 400);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", { ...body, pullRequestId: -1 })).status, 400);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", { ...body, pullRequestId: 99 })).status, 404);
+    assert.equal((await call(harness, "POST", "/v1/agents/skip", { role: "review-handler", pullRequestId: 15461706 })).status, 404);
+    const ok = await call(harness, "POST", "/v1/agents/skip", body);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.sourceCommit, "b".repeat(40));
+    const written = JSON.parse(readFileSync(file, "utf8"));
+    assert.equal(written.schemaVersion, 1);
+    assert.equal(written.entries.length, 200);
+    assert.deepEqual(written.entries.at(-1), {
+      repositoryKey: identity.key, pullRequestId: 15461706, sourceCommit: "b".repeat(40), skippedAtUtc: "2026-11-18T12:00:00.000Z",
+    });
+    assert.equal(written.entries[0].pullRequestId, 2);
+    assert.equal(written.entries.some((entry: { repositoryKey: string }) => entry.repositoryKey === "bad"), false);
+    const status = await call(harness, "GET", "/v1/status");
+    const reviewer = (status.body.health as Array<Record<string, unknown>>).find((item) => item.role === "reviewer")!;
+    assert.equal(reviewer.state, "stuck");
+  } finally {
+    await harness.cleanup();
+    await rm(root, { recursive: true, force: true });
   }
 });
