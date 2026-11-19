@@ -156,7 +156,7 @@ function calculateStatus(state: InstanceState, now: number): InstanceStatus {
   return "running";
 }
 
-function isHistorical(state: InstanceState): boolean {
+export function isHistorical(state: InstanceState): boolean {
   return state.exitObservedMs !== null || state.lifecycle === "stopped" || state.status === "completed";
 }
 

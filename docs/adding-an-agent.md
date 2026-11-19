@@ -197,13 +197,23 @@ Do not reimplement these:
 | Open / call / close an MCP session | `Open-AgentMcpSession`, `Invoke-AgentMcpTool` |
 | Parse the result marker | `Get-AgentResultMarker` |
 | Read and write agent state | `Get-JsonState`, `Save-JsonState` |
-| Locate a prior coding session | `Find-CopilotSessionForBranch` |
+| Locate a prior coding session (skips DevPilot's own cycle sessions) | `Find-CopilotSessionForBranch` |
+| Record / list cycle sessions this agent launched | `Add-AgentHarnessLaunchedSessionId`, `Get-AgentHarnessLaunchedSessionIds` |
 | Create / reuse an isolated worktree | `New-AgentWorktree` |
 | Notify a channel or a person | `Send-AgentNotification` |
 | Find toolkit assets after install | `Get-DevPilotAgentPath` |
 | Resolve the *consumer's* repo root | `Resolve-AgentRepositoryRoot` |
 
 `Get-Command -Module DevPilot.AgentHarness` lists the rest.
+
+Each new cycle session is launched with a pre-assigned `--session-id` and a
+`[DevPilot] <Role> cycle PR <n>` name. The IDs are kept (last 500) in the
+agent's `launched-sessions.json`, and `Find-CopilotSessionForBranch` excludes
+them and any cycle-named session, so an agent never resumes its own earlier
+cycle as the developer's coding session. Cycle sessions still use the user's
+Copilot data folder and therefore appear in the Copilot app's session list; a
+dedicated per-watch `COPILOT_HOME` would hide them but needs its own config,
+MCP setup and sign-in, so it is not done yet.
 
 ## Before you open a pull request
 

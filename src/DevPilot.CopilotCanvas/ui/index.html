@@ -10,23 +10,22 @@
 <body>
   <header class="bar">
     <div class="title">
-      <strong>DevPilot Operations</strong>
+      <h1>DevPilot Operations</h1>
       <span id="mode" class="badge" hidden></span>
     </div>
     <div class="actions">
-      <select id="view" aria-label="View">
-        <option value="current">Current</option>
-        <option value="live">Live</option>
-        <option value="history">History</option>
-      </select>
-      <button id="scan" type="button" disabled>Scan now</button>
-      <button id="review" type="button" class="primary" disabled>Review a PR</button>
+      <button id="scan" type="button" hidden>Scan now</button>
+      <button id="review" type="button" class="primary" hidden>Review a PR</button>
       <button id="stop" type="button" class="danger" hidden>Stop watch</button>
     </div>
   </header>
   <div id="subtitle" class="muted small"></div>
-  <div id="automation" class="muted small"></div>
+  <div id="automation" class="chips automation" aria-label="Automation"></div>
   <div id="notice" class="notice" role="status" hidden></div>
+  <div id="error" class="notice error" role="alert" hidden>
+    <span id="error-text"></span>
+    <button id="error-dismiss" type="button" class="link" aria-label="Dismiss error">Dismiss</button>
+  </div>
 
   <section id="disconnected" class="panel" hidden>
     <h2 id="disconnected-title">No Golden watch for this repository</h2>
@@ -40,17 +39,39 @@
   </section>
 
   <section id="runs" hidden>
-    <h2>Started from this canvas</h2>
+    <h2>Manual runs on this watch</h2>
     <div id="runs-list"></div>
   </section>
 
-  <main id="main" hidden>
-    <aside id="list" aria-label="Agent instances"></aside>
-    <article id="detail"></article>
+  <nav id="tabs" class="tabs" role="tablist" aria-label="View" hidden>
+    <button id="tab-live" type="button" role="tab" aria-selected="true" aria-controls="main" data-view="live">Live</button>
+    <button id="tab-history" type="button" role="tab" aria-selected="false" aria-controls="main" data-view="history">History</button>
+  </nav>
+
+  <main id="main" role="tabpanel" aria-labelledby="tab-live" hidden>
+    <aside id="list-pane">
+      <div id="history-tools" class="launch-row small" hidden></div>
+      <div id="list" role="listbox" aria-label="Agent instances"></div>
+      <details id="exited" hidden>
+        <summary id="exited-summary" class="muted small">Exited processes</summary>
+        <div id="exited-list" role="listbox" aria-label="Exited processes"></div>
+      </details>
+    </aside>
+    <article id="detail" aria-live="off"></article>
   </main>
 
   <dialog id="modal" aria-labelledby="modal-title">
+    <button id="modal-close" type="button" class="close" aria-label="Close">×</button>
     <div id="modal-body"></div>
+  </dialog>
+
+  <dialog id="confirm" aria-labelledby="confirm-title">
+    <h2 id="confirm-title" class="dialog-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="buttons">
+      <button id="confirm-cancel" type="button">Keep running</button>
+      <button id="confirm-ok" type="button" class="primary danger-fill"></button>
+    </div>
   </dialog>
 
   <script type="module" src="/app.js"></script>

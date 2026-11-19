@@ -105,6 +105,8 @@ export class PullRequestHistoryProjection {
   private readonly entries = new Map<string, PullRequestHistoryEntry>();
   private readonly hiddenKeys = new Set<string>();
   private evictionDiagnostic = "";
+  // "Clear history view" hides everything seen up to this instant; later activity reappears.
+  private clearedThroughMs = 0;
 
   constructor(private readonly limit = PR_HISTORY_LIMIT) {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("history limit must be positive");
@@ -197,7 +199,7 @@ export class PullRequestHistoryProjection {
   list(filter = "", repositoryKey = ""): PullRequestHistoryEntry[] {
     const needle = filter.trim().toLowerCase();
     return [...this.entries.values()]
-      .filter((entry) => !this.hiddenKeys.has(entry.key))
+      .filter((entry) => !this.isHidden(entry))
       .filter((entry) => !repositoryKey || entry.repositoryIdentity.key === repositoryKey)
       .filter((entry) => this.matchesFilter(entry, needle))
       .sort((left, right) =>
@@ -227,6 +229,7 @@ export class PullRequestHistoryProjection {
   hide(key: string): boolean {
     if (!this.entries.has(key)) return false;
     this.hiddenKeys.add(key);
+    this.trimHidden();
     return true;
   }
 
@@ -235,9 +238,58 @@ export class PullRequestHistoryProjection {
   }
 
   restoreAll(): number {
-    const restored = this.hiddenKeys.size;
+    const restored = this.hiddenCount();
     this.hiddenKeys.clear();
+    this.clearedThroughMs = 0;
     return restored;
+  }
+
+  // Seeds persisted display preferences before (or after) the entries they name are replayed.
+  seedHidden(keys: Iterable<string>, clearedThroughMs = 0): void {
+    for (const key of keys) this.hiddenKeys.add(key);
+    this.trimHidden();
+    if (Number.isSafeInteger(clearedThroughMs) && clearedThroughMs > this.clearedThroughMs) {
+      this.clearedThroughMs = clearedThroughMs;
+    }
+  }
+
+  // Persisted hides may name PRs this launch never replays, so eviction alone cannot bound them.
+  // Keep at most `limit` keys: drop keys without a retained entry first, oldest first.
+  private trimHidden(): void {
+    let excess = this.hiddenKeys.size - this.limit;
+    if (excess <= 0) return;
+    for (const key of [...this.hiddenKeys]) {
+      if (excess <= 0) return;
+      if (!this.entries.has(key)) { this.hiddenKeys.delete(key); excess--; }
+    }
+    for (const key of [...this.hiddenKeys]) {
+      if (excess <= 0) return;
+      this.hiddenKeys.delete(key);
+      excess--;
+    }
+  }
+
+  hiddenKeyList(): string[] {
+    return [...this.hiddenKeys];
+  }
+
+  clearedThrough(): number {
+    return this.clearedThroughMs;
+  }
+
+  clearView(throughMs: number): number {
+    const hidden = [...this.entries.values()].filter((entry) => !this.isHidden(entry) &&
+      entry.lastSeenTimestampMs <= throughMs).length;
+    if (throughMs > this.clearedThroughMs) this.clearedThroughMs = throughMs;
+    return hidden;
+  }
+
+  hiddenCount(): number {
+    return [...this.entries.values()].filter((entry) => this.isHidden(entry)).length;
+  }
+
+  private isHidden(entry: PullRequestHistoryEntry): boolean {
+    return this.hiddenKeys.has(entry.key) || entry.lastSeenTimestampMs <= this.clearedThroughMs;
   }
 
   hideAll(): number {
@@ -248,6 +300,7 @@ export class PullRequestHistoryProjection {
         hidden++;
       }
     }
+    this.trimHidden();
     return hidden;
   }
 

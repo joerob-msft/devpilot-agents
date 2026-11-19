@@ -107,9 +107,22 @@ blast radius and `y` mints the grant. Enter never advances these challenges;
 minting never starts work. The ordinary post-preview Enter confirmation is still
 required afterward. No launcher or broker authority gate is changed.
 
-Golden History includes the current launch and up to 20 recent watch runs that
-still satisfy the owner-private trusted-path contract. Unsafe prior roots are
-reported and excluded; durable and lease roots are never scanned.
+Golden History includes the current launch and up to 20 recent watch runs **for
+the same repository** that still satisfy the owner-private trusted-path
+contract. Each launch records its repository in a private `repository.v1.json`
+in its watch root; roots without that record (launches before this change) are
+treated as unknown and are not reloaded. Preview-only launches fill at most 5 of
+the 20 slots so they cannot evict real history. Unsafe prior roots are reported
+and excluded; durable and lease roots are never scanned.
+
+Watch roots are never removed automatically. To reclaim disk, run the
+human-gated prune, which keeps the newest `-PruneKeep` roots per repository,
+never touches a running watch, and leaves unknown roots alone unless
+`-PruneUnknown` is passed:
+
+```powershell
+.\tools\Watch-DevPilotAgents.ps1 -PruneHistory -PruneKeep 10 -WhatIf
+```
 
 ### Automatic polling and Scan now
 
@@ -487,8 +500,10 @@ trusted broker client, either the terminal TUI or the headless owner it started.
    `.github\copilot\agents\*.config.json` lives) and open the **DevPilot
    Operations** canvas, or ask Copilot to open it. A session in its own worktree
    also matches, because the worktree's main checkout is compared.
-3. With no watch running, the canvas offers **Preview launch plan**. The
-   command depends on the repository (its main checkout, not a session worktree):
+3. With no watch running, the canvas shows one **Start watch…** button. It
+   renders the launch plan first; **Confirm start** becomes clickable only after
+   that plan has rendered. The command depends on the repository (its main
+   checkout, not a session worktree):
    - If the repository root has a `Start-DevPilot.ps1` that declares both
      `-CanvasBridge` and `-Headless` switches, the canvas runs
      `Start-DevPilot.ps1 -CanvasBridge -Headless -WhatIf`. That repository
@@ -501,30 +516,44 @@ trusted broker client, either the terminal TUI or the headless owner it started.
      -Headless -CanvasBridge -WhatIf` and shows why the repository script was
      not used.
 
-   `-PreviewOnly` is added when ticked. The preview shows the entrypoint's own
-   plan or preflight failures with their remediation. **Start Golden watch**
-   becomes clickable only after that plan has rendered, and starts the same
-   command without `-WhatIf`. If the entrypoint changes between preview and
-   Start, the canvas asks for a new preview. **Stop watch** (with a confirm
-   click) shuts a canvas-started watch down.
+   `-PreviewOnly` is added when ticked. The plan shows the entrypoint's own
+   output or preflight failures with their remediation, with a spinner and
+   elapsed time while it runs. **Confirm start** runs the same command without
+   `-WhatIf`. If the entrypoint changes between plan and Start, the canvas asks
+   for a new plan. **Stop watch** (with an in-page confirmation) shuts a
+   canvas-started watch down; a terminal-owned watch is quit from its terminal.
+
+The canvas has two views. **Live** (the default) lists every agent instance
+that has not finished, including stalled ones with a *stale* badge. **History**
+mirrors the terminal's PR History: one row per PR with Reviewer and Review
+Handler outcomes and dated timestamps, plus a collapsed *Exited processes*
+section. Rows can be hidden individually, or all at once with **Clear history
+view**; hides are saved in `hidden-pr-history.v1.json` beside the dismissal
+state, so they survive watch restarts. **Manual runs on this watch** lists the
+runs started through the bridge while this watch has been running.
 
 A canvas-started watch keeps running across extension reloads, `/clear` and
 closing the canvas; reopening the canvas re-attaches. The Copilot app runs
 extensions inside a kill-on-close job object, so quitting the app stops the
 watch and its agents too. For a watch that must outlive the app, start it in a
-terminal instead and keep that terminal open; the canvas attaches to it the
-same way:
+terminal instead and keep that terminal open. The canvas bridge is on by
+default whenever a manual broker exists, so the canvas attaches to it the same
+way:
 
 ```powershell
-.\tools\Watch-DevPilotAgents.ps1 -Golden -CanvasBridge
+.\tools\Watch-DevPilotAgents.ps1 -Golden
 ```
+
+Pass `-TerminalOnly` to run without the canvas bridge. `-CanvasBridge` is still
+accepted for older callers but is now the default; `-Headless -TerminalOnly` and
+`-CanvasBridge -TerminalOnly` are rejected.
 
 How it works:
 
-- `-CanvasBridge` passes `DEVPILOT_CANVAS_BRIDGE_FILE` and
+- The bridge passes `DEVPILOT_CANVAS_BRIDGE_FILE` and
   `DEVPILOT_CONSUMER_REPOSITORY_ROOT` to the dashboard **through the
   environment**, and the dashboard clears both before it spawns the broker.
-- `-Headless` (only with `-CanvasBridge`) adds one pinned `--headless` token
+- `-Headless` (implies the bridge) adds one pinned `--headless` token
   directly after the dashboard's `--launch-mode` pair. The dashboard then runs
   its tailer, trusted broker client and bridge with no renderer.
   - Broker launch provenance classifies its parent as `interactive`, `headless`
@@ -538,7 +567,8 @@ How it works:
   exact `Host`, and JSON bodies of at most 16 KiB. It publishes
   `canvas-bridge.v1.json` (URL, token, PID, consumer repository, `headless`) in
   the private watch-state root and removes it on exit.
-  - The API is `/v1/status`, `/v1/scan-now` and
+  - The API is `/v1/status` (`view=live|history`; older canvases' `current`
+    maps to `live`), `/v1/scan-now`, `/v1/history/{hide,restore,clear}` and
     `/v1/review/{describe,dispatch,prepare-run,confirm-run,cancel-queued,cancel}`.
     Only a headless owner adds `POST /v1/shutdown`; a terminal-owned watch is
     stopped from its terminal.
@@ -555,5 +585,5 @@ How it works:
     TUI's `previewRendered` guard. A launch preview token is single-use, expires
     after five minutes, and is bound to the previewed toolkit and repository.
 - Risk: any process running as the same user can read the owner-private
-  discovery file and call the bridge. The bridge is off unless `-CanvasBridge`
-  is passed.
+  discovery file and call the bridge. The bridge is on by default; pass
+  `-TerminalOnly` to turn it off.

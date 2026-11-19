@@ -149,3 +149,12 @@ test("v2 and unverified events remain instance-observable but never enter PR his
   assert.equal(history.apply(v2), false);
   assert.equal(history.list().length, 0);
 });
+
+test("persisted hides for PRs never replayed stay bounded by the history limit", () => {
+  const history = new PullRequestHistoryProjection(2);
+  history.apply(event("9007199254740993", 1, 1, { data: { title: "Alpha" } }));
+  const retained = history.list()[0]!.key;
+  history.seedHidden([retained, "v1:github:1:pr:2", "v1:github:1:pr:3", "v1:github:1:pr:4"]);
+  assert.deepEqual(history.hiddenKeyList(), [retained, "v1:github:1:pr:4"]);
+  assert.equal(history.hiddenCount(), 1);
+});

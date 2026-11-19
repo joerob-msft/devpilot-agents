@@ -25,13 +25,16 @@ const ERROR_TEXT = {
   "invalid-prompt": "Instructions must be at most 512 characters without control characters.",
   "invalid-pull-request-id": "Enter a PR number between 1 and 2147483647.",
   "launch-repreview-required": "Preview the launch plan again before starting.",
-  "terminal-owned": "This watch is owned by a terminal. Quit its dashboard there.",
+  "terminal-owned": "This watch runs in a terminal. Quit its dashboard from that terminal to stop it.",
+  "invalid-history-key": "That history entry is no longer valid. Refresh the view.",
+  "unknown-history-key": "That history entry is no longer available.",
+  "history-unavailable": "PR history is not available from this watch version.",
 };
 
 const state = {
-  connection: null, data: null, view: "current", selected: "", modal: null, noticeTimer: 0,
-  launchUi: { previewOnly: false, plan: null, busy: false, error: "", armed: false, armScheduled: false, key: "" },
-  stopArmedUntil: 0,
+  connection: null, data: null, view: "live", selected: "", modal: null, noticeTimer: 0, refreshError: false,
+  idsOpen: false, detailSig: "",
+  launchUi: { previewOnly: false, plan: null, busy: false, error: "", armed: false, armScheduled: false, key: "", since: 0 },
 };
 
 class ApiError extends Error {
@@ -86,6 +89,14 @@ function clock(ms) {
   return ms ? new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
 }
 
+// Time only for today; date and time otherwise, so History entries from earlier days are unambiguous.
+function when(ms) {
+  if (!ms) return "";
+  const date = new Date(ms);
+  if (date.toDateString() === new Date().toDateString()) return clock(ms);
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
 function safeUrl(value) {
   try {
     const url = new URL(value);
@@ -104,48 +115,102 @@ function errorText(error) {
   return error.detail && !label.includes(error.detail) ? `${label} ${error.detail}` : label;
 }
 
-function notice(text, isError = false) {
+function notice(text) {
   const node = $("notice");
   node.textContent = text;
-  node.classList.toggle("error", isError);
   node.hidden = false;
   clearTimeout(state.noticeTimer);
-  state.noticeTimer = setTimeout(() => { node.hidden = true; }, isError ? 10_000 : 5_000);
+  state.noticeTimer = setTimeout(() => { node.hidden = true; }, 5_000);
+}
+
+// Errors stay until dismissed (or, for polling errors, until polling recovers).
+function showError(text, fromRefresh = false) {
+  state.refreshError = fromRefresh;
+  $("error-text").textContent = text;
+  $("error").hidden = false;
+}
+
+function clearError() {
+  state.refreshError = false;
+  $("error").hidden = true;
+}
+
+// Elements carrying data-since show a live elapsed counter without re-rendering their section.
+function tick() {
+  for (const node of document.querySelectorAll("[data-since]")) {
+    node.textContent = duration(Date.now() - Number(node.dataset.since));
+  }
+}
+
+function since(startMs) {
+  return el("span", { "data-since": String(startMs) }, duration(Date.now() - startMs));
 }
 
 // ---------------------------------------------------------------------------------------------
-// Polling and page rendering
+// Polling: fast while something is running, slower when idle, paused while the canvas is hidden.
 // ---------------------------------------------------------------------------------------------
+
+let pollTimer = 0;
+let polling = false;
+
+function pollDelay() {
+  const { connection, data } = state;
+  if (connection?.launch?.state === "starting" || state.launchUi.busy) return 1_500;
+  if (!data) return 5_000;
+  const active = data.runs?.some((run) => !run.terminal) || data.queued?.some((item) => item.state !== "resumed") ||
+    (state.view === "live" && data.instances?.some((item) => item.status === "running" || item.status === "waiting"));
+  return active ? 1_500 : 4_000;
+}
 
 async function refresh() {
   try {
     const result = await api(`/api/state?view=${encodeURIComponent(state.view)}`);
     state.connection = result.connection;
     state.data = result.data;
+    if (state.refreshError) clearError();
     render();
     if (result.prefill && !$("modal").open && state.data) {
       openModal(result.prefill.pullRequestId, result.prefill.role);
       api("/api/prefill/clear", {}).catch(() => {});
     }
   } catch (error) {
-    notice(`Canvas error: ${errorText(error)}`, true);
+    showError(`Canvas error: ${errorText(error)}`, true);
   }
 }
 
 async function loop() {
-  await refresh();
-  setTimeout(loop, POLL_MS);
+  clearTimeout(pollTimer);
+  if (polling) return;
+  polling = true;
+  try {
+    await refresh();
+  } finally {
+    polling = false;
+  }
+  if (!document.hidden) pollTimer = setTimeout(loop, pollDelay());
 }
 
-function automationText(automation) {
-  if (!automation) return "";
-  if (!automation.available) return automation.error ? `Automation: unavailable (${automation.error})` : "Automation: unavailable";
-  return "Automation: " + automation.agents.map((agent) => {
-    let text = `${ROLE_LABEL[agent.role] ?? agent.role} ${agent.state}`;
-    if (agent.continuous && agent.intervalSeconds) text += ` · every ${Math.round(agent.intervalSeconds / 60)}m`;
-    if (agent.state === "retrying" && agent.retryAtUtc) text += ` · retry ${clock(Date.parse(agent.retryAtUtc))}`;
-    return text;
-  }).join("  |  ");
+// ---------------------------------------------------------------------------------------------
+// Page rendering. Sections are patched in place so polling keeps focus, scroll, selection and
+// open <details>.
+// ---------------------------------------------------------------------------------------------
+
+function automationChips(automation) {
+  if (!automation) return [];
+  if (!automation.available) {
+    return [el("span", { class: "chip" }, automation.error ? `Automation unavailable (${automation.error})` : "Automation unavailable")];
+  }
+  return automation.agents.map((agent) => {
+    const parts = [`${ROLE_LABEL[agent.role] ?? agent.role}: ${agent.state}`];
+    if (agent.continuous && agent.intervalSeconds) parts.push(`every ${Math.round(agent.intervalSeconds / 60)}m`);
+    const retryAt = agent.state === "retrying" && agent.retryAtUtc ? Date.parse(agent.retryAtUtc) : NaN;
+    if (Number.isFinite(retryAt)) parts.push(`retry in ${duration(Math.max(0, retryAt - Date.now()))}`);
+    return el("span", { class: `chip ${agent.state}` }, parts.join(" · "));
+  });
+}
+
+function repositoryName(path) {
+  return String(path || "").split(/[\\/]/).filter(Boolean).pop() || "(unknown repository)";
 }
 
 function render() {
@@ -154,20 +219,39 @@ function render() {
   const mode = $("mode");
   mode.hidden = !connected;
   if (connected) {
-    const label = data.launchMode === "operational" ? "OPERATIONAL" : data.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY";
-    mode.textContent = label;
+    mode.textContent = data.launchMode === "operational" ? "OPERATIONAL" : data.launchMode === "preview" ? "PREVIEW ONLY" : "OBSERVE ONLY";
     mode.className = `badge ${data.launchMode}`;
   }
-  $("subtitle").textContent = connected
-    ? `Repository: ${data.consumerRepositoryRoot || "(unknown)"} · dashboard PID ${data.dashboardPid}`
+  const started = connection?.bridge?.startedAtUtc ? Date.parse(connection.bridge.startedAtUtc) : NaN;
+  const subtitle = $("subtitle");
+  subtitle.title = connected ? `${data.consumerRepositoryRoot} · dashboard PID ${data.dashboardPid}` : "";
+  subtitle.textContent = connected
+    ? [repositoryName(data.consumerRepositoryRoot), Number.isFinite(started) ? `started ${when(started)}` : "",
+      data.headless ? "running from this canvas" : "running in a terminal"].filter(Boolean).join(" · ")
     : connection?.workingDirectory ? `Session folder: ${connection.workingDirectory}` : "";
-  $("automation").textContent = connected ? automationText(data.automation) : "";
+  const automation = $("automation");
+  const chipsKey = connected ? JSON.stringify(data.automation) : "";
+  if (automation.dataset.sig !== chipsKey || data?.automation?.agents?.some((agent) => agent.state === "retrying")) {
+    automation.dataset.sig = chipsKey;
+    automation.replaceChildren(...(connected ? automationChips(data.automation) : []));
+  }
+  // With no watch there is nothing to scan, review or view: the launch panel's Start is the only action.
+  $("scan").hidden = !connected;
   $("scan").disabled = !connected || !data.automation?.available || !data.automation.agents.some((agent) => agent.canScanNow);
+  $("review").hidden = !connected;
   $("review").disabled = !connected || data.launchMode === "observe";
-  $("stop").hidden = !(connected && data.headless === true);
+  $("stop").hidden = !connected;
+  $("stop").title = connected && data.headless !== true ? "This watch runs in a terminal; quit it there." : "";
+  $("tabs").hidden = !connected;
+  for (const tab of document.querySelectorAll("#tabs [role=tab]")) {
+    const selected = tab.dataset.view === state.view;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected) $("main").setAttribute("aria-labelledby", tab.id);
+  }
   renderDisconnected();
   renderRuns();
-  renderInstances();
+  renderMain();
 }
 
 function renderDisconnected() {
@@ -187,6 +271,9 @@ function renderDisconnected() {
   }
   renderLaunch(connection);
   const others = $("others");
+  const othersKey = JSON.stringify(connection.others ?? []);
+  if (others.dataset.sig === othersKey) return;
+  others.dataset.sig = othersKey;
   others.replaceChildren();
   if (connection.others?.length) {
     others.append(el("p", { class: "muted small", text: "Other running watches on this machine:" }));
@@ -203,14 +290,23 @@ async function connectTo(watchId) {
     await api("/api/connect", { watchId });
     await refresh();
   } catch (error) {
-    notice(errorText(error), true);
+    showError(errorText(error));
   }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Start / Stop the Golden watch: -WhatIf launch plan -> (explicit, render-gated) Start.
+// Start / Stop the Golden watch: Start watch… -> -WhatIf launch plan -> (render-gated) Confirm start.
 // Only a click here can start or stop a watch; no agent action exists for either.
 // ---------------------------------------------------------------------------------------------
+
+async function copyText(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    notice(`${label} copied.`);
+  } catch {
+    showError(`Could not copy the ${label.toLowerCase()}. Select it in the panel instead.`);
+  }
+}
 
 function renderLaunch(connection) {
   const ui = state.launchUi;
@@ -230,14 +326,19 @@ function renderLaunch(connection) {
     return;
   }
   if (launch?.state === "starting") {
-    root.append(el("p", {}, `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… ${launch.kind === "repository" ? "Installing or verifying the toolkit can take several minutes. " : ""}This canvas connects when it is ready.`),
-      el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
+    root.append(el("p", { role: "status" }, el("span", { class: "spinner", "aria-hidden": "true" }),
+      `Starting the ${launch.previewOnly ? "preview-only " : ""}Golden watch (PID ${launch.pid})… `, since(Date.now() - launch.elapsedMs)),
+    el("p", { class: "muted small" }, `${launch.kind === "repository" ? "Installing or verifying the toolkit can take several minutes. " : ""}This canvas connects when it is ready.`),
+    el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
     if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
     return;
   }
   if (launch?.state === "failed") {
-    root.append(el("p", { class: "error-text" }, "The Golden watch did not start."),
-      el("p", { class: "muted small" }, `Log: ${launch.logPath}`));
+    root.append(el("p", { class: "error-text", role: "alert" }, "The Golden watch did not start."),
+      el("p", { class: "muted small" }, `Log: ${launch.logPath}`),
+      el("div", { class: "launch-row" },
+        el("button", { type: "button", onclick: () => copyText(launch.logPath, "Log path") }, "Copy log path"),
+        launch.logTail ? el("button", { type: "button", onclick: () => copyText(launch.logTail, "Log output") }, "Copy log output") : null));
     if (launch.logTail) root.append(el("pre", { class: "plan" }, launch.logTail));
   }
   root.append(
@@ -253,19 +354,30 @@ function renderLaunch(connection) {
           type: "checkbox", id: "launch-preview-only", checked: ui.previewOnly, disabled: ui.busy,
           onchange: (event) => { Object.assign(ui, { previewOnly: event.target.checked, plan: null, error: "", armed: false }); renderLaunch(state.connection); },
         }),
-        "Preview only (no writes, notifications or grants for the lifetime of this watch)"),
-      el("button", { type: "button", disabled: ui.busy, onclick: previewLaunch }, ui.busy && !ui.plan ? "Checking…" : "Preview launch plan")));
-  if (ui.error) root.append(el("p", { class: "error-text" }, ui.error));
-  if (!ui.plan) return;
+        "Preview only (no writes, notifications or grants for the lifetime of this watch)")));
+  if (ui.error) root.append(el("p", { class: "error-text", role: "alert" }, ui.error));
+  if (ui.busy && !ui.plan) {
+    root.append(el("p", { role: "status" }, el("span", { class: "spinner", "aria-hidden": "true" }),
+      "Checking the launch plan… ", since(ui.since)));
+    return;
+  }
+  if (!ui.plan) {
+    root.append(el("div", { class: "launch-row" },
+      el("button", { type: "button", class: "primary", id: "launch-begin", onclick: previewLaunch }, "Start watch…"),
+      el("span", { class: "muted small" }, "Shows the launch plan first; nothing starts until you confirm.")));
+    return;
+  }
   root.append(el("h3", {}, ui.plan.ok ? "Launch plan" : "This watch cannot start yet"),
     el("pre", { class: "plan" }, ui.plan.output || "(no output)"));
   if (!ui.plan.ok) {
-    root.append(el("p", { class: "error-text" }, "Fix the problems above, then preview again."));
+    root.append(el("p", { class: "error-text" }, "Fix the problems above, then try again."),
+      el("div", { class: "launch-row" }, el("button", { type: "button", onclick: previewLaunch }, "Check again")));
     return;
   }
   root.append(el("div", { class: "launch-row" },
+    el("button", { type: "button", onclick: () => { Object.assign(ui, { plan: null, armed: false }); renderLaunch(state.connection); } }, "Back"),
     el("button", { type: "button", class: "primary", id: "launch-start", disabled: !ui.armed || ui.busy, onclick: startWatch },
-      ui.plan.previewOnly ? "Start preview-only Golden watch" : "Start Golden watch"),
+      ui.busy ? "Starting…" : ui.plan.previewOnly ? "Confirm start (preview only)" : "Confirm start"),
     el("span", { class: "muted small" }, ui.plan.command)));
   // Like the review Start button: clickable only after the plan it confirms has painted.
   if (!ui.armed && !ui.armScheduled) {
@@ -281,7 +393,7 @@ function renderLaunch(connection) {
 async function previewLaunch() {
   const ui = state.launchUi;
   if (ui.busy) return;
-  Object.assign(ui, { busy: true, plan: null, error: "", armed: false });
+  Object.assign(ui, { busy: true, plan: null, error: "", armed: false, since: Date.now() });
   renderLaunch(state.connection);
   try {
     ui.plan = await api("/api/watch/preview", { previewOnly: ui.previewOnly });
@@ -306,138 +418,380 @@ async function startWatch() {
     Object.assign(ui, { plan: null, armed: false, error: errorText(error) });
   } finally {
     ui.busy = false;
-    await refresh();
+    await loop();
   }
 }
 
+// One confirmation pattern for every destructive action; the confirm button is render-gated.
+function confirmAction(title, text, okLabel) {
+  const dialog = $("confirm");
+  $("confirm-title").textContent = title;
+  $("confirm-text").textContent = text;
+  const ok = $("confirm-ok");
+  ok.textContent = okLabel;
+  return new Promise((resolveConfirm) => {
+    const finish = (value) => {
+      ok.onclick = null;
+      $("confirm-cancel").onclick = null;
+      dialog.onclose = null;
+      if (dialog.open) dialog.close();
+      resolveConfirm(value);
+    };
+    ok.onclick = () => finish(true);
+    $("confirm-cancel").onclick = () => finish(false);
+    dialog.onclose = () => finish(false);
+    dialog.showModal();
+    gate(ok);
+    $("confirm-cancel").focus();
+  });
+}
+
 async function stopWatch() {
-  const button = $("stop");
-  if (Date.now() >= state.stopArmedUntil) {
-    state.stopArmedUntil = Date.now() + 5_000;
-    button.textContent = "Confirm stop";
-    gate(button);
-    setTimeout(() => { if (Date.now() >= state.stopArmedUntil) button.textContent = "Stop watch"; }, 5_100);
+  const data = state.data;
+  if (!data) return;
+  if (data.headless !== true) {
+    showError(ERROR_TEXT["terminal-owned"]);
     return;
   }
-  state.stopArmedUntil = 0;
-  button.textContent = "Stop watch";
+  if (!await confirmAction("Stop the Golden watch?", "The watch and any agents it is running will be stopped. You can start it again from this canvas.", "Stop watch")) return;
+  const button = $("stop");
   button.disabled = true;
   try {
     await api("/api/watch/stop", {});
     notice("Stopping the Golden watch and its agents…");
   } catch (error) {
-    notice(errorText(error), true);
+    showError(errorText(error));
   } finally {
     button.disabled = false;
     await refresh();
   }
 }
 
-function renderRuns() {
-  const data = state.data;
-  const section = $("runs");
-  const list = $("runs-list");
-  const runs = data?.runs ?? [];
-  const queued = data?.queued ?? [];
-  section.hidden = runs.length + queued.length === 0;
-  list.replaceChildren();
-  for (const item of queued) {
-    list.append(el("div", { class: "run" },
-      el("div", {},
-        el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId}`),
-        el("div", { class: "small muted" }, `Queued (${item.mode === "next" ? "run next" : "replace"}) · ${item.state}${item.code ? ` · ${item.code}` : ""}`)),
-      el("button", { type: "button", class: "danger", onclick: () => cancelQueued(item.queueId) }, "Cancel")));
+// Reuses unchanged row nodes (by data-key/data-sig) and only reorders when needed, so polling keeps
+// focus and scroll; update() refreshes the cheap per-poll parts (elapsed, selection) in place.
+function patchList(container, items, keyOf, sigOf, build, update) {
+  const existing = new Map();
+  for (const node of container.children) if (node.dataset.key) existing.set(node.dataset.key, node);
+  const active = document.activeElement;
+  const focusKey = active && container.contains(active) ? active.closest("[data-key]")?.dataset.key ?? "" : "";
+  const focusIndex = focusKey ? [...(existing.get(focusKey)?.querySelectorAll("button") ?? [])].indexOf(active) : -1;
+  const next = items.map((item) => {
+    const key = keyOf(item);
+    const sig = sigOf(item);
+    const old = existing.get(key);
+    const node = old && old.dataset.sig === sig ? old : build(item);
+    node.dataset.key = key;
+    node.dataset.sig = sig;
+    update?.(node, item);
+    return node;
+  });
+  const current = [...container.children];
+  if (current.length !== next.length || current.some((node, index) => node !== next[index])) {
+    const scroll = container.scrollTop;
+    container.replaceChildren(...next);
+    container.scrollTop = scroll;
   }
-  for (const run of [...runs].reverse()) {
-    const open = !run.terminal;
-    const latest = run.latest && !run.latest.startsWith(run.detail) ? run.latest : "";
-    list.append(el("div", { class: "run" },
-      el("div", {},
-        el("strong", {}, `${ROLE_LABEL[run.role]} · PR #${run.pullRequestId} · ${run.headline}`),
-        el("div", { class: "small muted" }, [run.detail, latest, `elapsed ${run.elapsed}`].filter(Boolean).join(" · "))),
-      open ? el("button", { type: "button", class: "danger", onclick: () => cancelRun(run.dispatchId) }, "Cancel") : null));
+  if (focusKey && !container.contains(document.activeElement)) {
+    const node = next.find((item) => item.dataset.key === focusKey);
+    const target = node?.matches("button") ? node : node?.querySelectorAll("button")[Math.max(0, focusIndex)];
+    target?.focus({ preventScroll: true });
   }
 }
 
+function renderRuns() {
+  const data = state.data;
+  const runs = data?.runs ?? [];
+  // Older bridges keep a retired queued turn ("resumed" with no dispatch) in `queued`: it never ran.
+  const queued = (data?.queued ?? []).filter((item) => item.state !== "resumed");
+  const notRun = [
+    ...(data?.notRun ?? []),
+    ...(data?.queued ?? []).filter((item) => item.state === "resumed" &&
+      !(data?.notRun ?? []).some((other) => other.queueId === item.queueId)),
+  ];
+  $("runs").hidden = runs.length + queued.length + notRun.length === 0;
+  const items = [
+    ...queued.map((item) => ({ kind: "queued", key: `q:${item.queueId}`, item })),
+    ...[...runs].reverse().map((run) => ({ kind: "run", key: `r:${run.dispatchId}`, item: run })),
+    ...[...notRun].reverse().map((item) => ({ kind: "not-run", key: `n:${item.queueId}`, item })),
+  ];
+  patchList($("runs-list"), items, (entry) => entry.key, (entry) => JSON.stringify(entry.item), (entry) => {
+    if (entry.kind === "not-run") {
+      const item = entry.item;
+      const at = item.retiredAtUtc ? ` · ${when(Date.parse(item.retiredAtUtc))}` : "";
+      return el("div", { class: "run" },
+        el("div", {},
+          el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId} · Not run`),
+          el("div", { class: "small muted" },
+            `The queued ${item.mode === "next" ? "run-next" : "replace"} request expired or was withdrawn before it started${at}. Review the PR again to retry.`)),
+        el("button", { type: "button", onclick: () => openModal(String(item.pullRequestId), item.role) }, "Review again"));
+    }
+    if (entry.kind === "queued") {
+      const item = entry.item;
+      return el("div", { class: "run" },
+        el("div", {},
+          el("strong", {}, `${ROLE_LABEL[item.role]} · PR #${item.pullRequestId}`),
+          el("div", { class: "small muted" }, `Queued (${item.mode === "next" ? "run next" : "replace"}) · ${item.state}${item.code ? ` · ${item.code}` : ""}`)),
+        el("button", { type: "button", class: "danger", onclick: () => cancelQueued(item.queueId) }, "Cancel"));
+    }
+    const run = entry.item;
+    const latest = run.latest && !run.latest.startsWith(run.detail) ? run.latest : "";
+    return el("div", { class: "run" },
+      el("div", {},
+        el("strong", {}, `${ROLE_LABEL[run.role]} · PR #${run.pullRequestId} · ${run.headline}`),
+        el("div", { class: "small muted" }, [run.detail, latest, `elapsed ${run.elapsed}`].filter(Boolean).join(" · "))),
+      run.terminal ? null : el("button", { type: "button", class: "danger", onclick: () => cancelRun(run.dispatchId) }, "Cancel"));
+  });
+}
+
 async function cancelRun(dispatchId) {
-  if (!confirm("Cancel this run? The agent process will be stopped.")) return;
+  if (!await confirmAction("Cancel this run?", "The agent process will be stopped.", "Cancel run")) return;
   try {
     await api("/api/review/cancel", { dispatchId });
     notice("Cancellation requested.");
   } catch (error) {
-    notice(errorText(error), true);
+    showError(errorText(error));
   }
   refresh();
 }
 
 async function cancelQueued(queueId) {
+  if (!await confirmAction("Cancel this queued run?", "It will not start.", "Cancel queued run")) return;
   try {
     await api("/api/review/cancel-queued", { queueId });
     notice("Queued run cancelled.");
   } catch (error) {
-    notice(errorText(error), true);
+    showError(errorText(error));
   }
   refresh();
 }
 
-function renderInstances() {
+// ---------------------------------------------------------------------------------------------
+// Live and History
+// ---------------------------------------------------------------------------------------------
+
+const ELAPSED_FIELDS = new Set(["phaseElapsedMilliseconds", "totalElapsedMilliseconds", "heartbeatAgeMilliseconds", "status"]);
+
+function stableSig(item) {
+  return JSON.stringify(item, (key, value) => ELAPSED_FIELDS.has(key) ? undefined : value);
+}
+
+function select(key) {
+  state.selected = key;
+  renderMain();
+}
+
+function instanceRow(item) {
+  const key = `i|${item.key}`;
+  return el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
+    el("div", { class: "line" },
+      el("strong", {}, ROLE_LABEL[item.agent] ?? item.agent),
+      el("span", { class: "status" })),
+    el("div", { class: "sub" }, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : item.repository || "No PR selected"),
+    el("div", { class: "sub elapsed" }));
+}
+
+function updateInstanceRow(node, item) {
+  const key = `i|${item.key}`;
+  node.classList.toggle("selected", key === state.selected);
+  node.setAttribute("aria-selected", String(key === state.selected));
+  const status = node.querySelector(".status");
+  status.className = `status ${item.status}${item.status === "stale" ? " badge stale" : ""}`;
+  status.textContent = item.status;
+  status.title = item.status === "stale" && item.heartbeatAgeMilliseconds !== null
+    ? `No heartbeat for ${duration(item.heartbeatAgeMilliseconds)}; the process may be hung or slow.` : "";
+  const ended = ["completed", "exited", "failed"].includes(item.status);
+  node.querySelector(".elapsed").textContent = ended
+    ? `${item.phase || item.status} · ended ${when(item.lastEventMs)}`
+    : `${item.phase || "—"} · ${duration(item.phaseElapsedMilliseconds)}`;
+}
+
+function outcomeText(role) {
+  return role ? role.result || role.status || "" : "";
+}
+
+function historyRow(entry) {
+  const key = `p|${entry.key}`;
+  const outcomes = [
+    entry.reviewer ? `Reviewer: ${outcomeText(entry.reviewer)}` : "",
+    entry.reviewHandler ? `Review Handler: ${outcomeText(entry.reviewHandler)}` : "",
+  ].filter(Boolean).join(" · ");
+  return el("div", { class: "row-wrap" },
+    el("button", { type: "button", class: "row", role: "option", onclick: () => select(key) },
+      el("div", { class: "line" }, el("strong", {}, `PR #${entry.pullRequestId}`), el("span", { class: "small muted" }, when(entry.lastSeenMs))),
+      el("div", { class: "sub" }, entry.title || entry.repository),
+      el("div", { class: "sub" }, outcomes || "No outcome yet")),
+    el("button", { type: "button", class: "hide", "aria-label": `Hide PR #${entry.pullRequestId} from history`, onclick: () => hideHistory(entry.key) }, "Hide"));
+}
+
+function updateHistoryRow(node, entry) {
+  const selected = `p|${entry.key}` === state.selected;
+  const row = node.querySelector(".row");
+  row.classList.toggle("selected", selected);
+  row.setAttribute("aria-selected", String(selected));
+}
+
+async function historyAction(path, body, message) {
+  try {
+    notice(message(await api(path, body)));
+  } catch (error) {
+    showError(errorText(error));
+  }
+  await refresh();
+}
+
+function hideHistory(key) {
+  return historyAction("/api/history/hide", { key }, () => "Hidden from History. Use Restore hidden to bring it back.");
+}
+
+function renderHistoryTools(data) {
+  const tools = $("history-tools");
+  const hidden = data.hiddenPullRequestCount ?? 0;
+  const sig = `${state.view}|${data.historyAvailable}|${hidden}|${data.pullRequests?.length ?? 0}`;
+  tools.hidden = state.view !== "history" || !data.historyAvailable;
+  if (tools.dataset.sig === sig) return;
+  tools.dataset.sig = sig;
+  tools.replaceChildren(
+    el("button", { type: "button", disabled: !data.pullRequests?.length,
+      onclick: () => historyAction("/api/history/clear", {}, (result) => `Cleared ${result.hidden} PR${result.hidden === 1 ? "" : "s"} from the History view. New activity appears again.`) },
+    "Clear history view"),
+    hidden ? el("button", { type: "button", onclick: () => historyAction("/api/history/restore", {}, (result) => `Restored ${result.restored} hidden PR${result.restored === 1 ? "" : "s"}.`) },
+      `Restore hidden (${hidden})`) : null);
+}
+
+function renderMain() {
   const data = state.data;
   const main = $("main");
   main.hidden = !data;
   if (!data) return;
+  const history = state.view === "history";
+  const prHistory = history && data.historyAvailable === true;
+  const instances = data.instances ?? [];
+  const pullRequests = prHistory ? data.pullRequests ?? [] : [];
+  renderHistoryTools(data);
+  const keys = [...pullRequests.map((entry) => `p|${entry.key}`), ...instances.map((item) => `i|${item.key}`)];
+  if (!keys.includes(state.selected)) state.selected = keys[0] ?? "";
   const list = $("list");
-  const instances = data.instances;
-  if (!instances.some((item) => item.key === state.selected)) state.selected = instances[0]?.key ?? "";
-  list.replaceChildren();
-  if (!instances.length) list.append(el("p", { class: "muted", text: `No ${state.view} agent instances yet.` }));
-  for (const item of instances) {
-    list.append(el("button", {
-      type: "button",
-      class: `row${item.key === state.selected ? " selected" : ""}`,
-      onclick: () => { state.selected = item.key; renderInstances(); },
-    },
-    el("div", { class: "line" },
-      el("strong", {}, ROLE_LABEL[item.agent] ?? item.agent),
-      el("span", { class: `status ${item.status}` }, item.status)),
-    el("div", { class: "sub" }, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : item.repository || "No PR selected"),
-    el("div", { class: "sub" }, `${item.phase || "—"} · ${duration(item.phaseElapsedMilliseconds)}`)));
+  list.setAttribute("aria-label", prHistory ? "Pull request history" : history ? "Exited agent processes" : "Live agent instances");
+  if (prHistory) {
+    patchList(list, pullRequests, (entry) => `p|${entry.key}`, (entry) => JSON.stringify(entry), historyRow, updateHistoryRow);
+  } else {
+    patchList(list, instances, (item) => `i|${item.key}`, stableSig, instanceRow, updateInstanceRow);
   }
-  renderDetail(instances.find((item) => item.key === state.selected));
+  const empty = prHistory ? !pullRequests.length : !instances.length;
+  let emptyNode = $("list-empty");
+  if (empty && !emptyNode) {
+    emptyNode = el("p", { id: "list-empty", class: "muted" });
+    list.after(emptyNode);
+  }
+  if (emptyNode) {
+    emptyNode.hidden = !empty;
+    emptyNode.textContent = prHistory
+      ? (data.hiddenPullRequestCount ? "All PR history is hidden. Use Restore hidden to show it." : "No pull request activity yet.")
+      : history ? "No exited agent processes yet." : "No agents are running. Automation scans and manual runs appear here.";
+  }
+  $("exited").hidden = !prHistory || !instances.length;
+  if (prHistory) {
+    $("exited-summary").textContent = `Exited processes (${instances.length})`;
+    patchList($("exited-list"), instances, (item) => `i|${item.key}`, stableSig, instanceRow, updateInstanceRow);
+  }
+  const selected = state.selected.startsWith("p|")
+    ? { kind: "pr", item: pullRequests.find((entry) => `p|${entry.key}` === state.selected) }
+    : { kind: "instance", item: instances.find((item) => `i|${item.key}` === state.selected) };
+  renderDetail(selected);
 }
 
-function field(label, value) {
-  return value === "" || value === null || value === undefined ? [] : [el("dt", {}, label), el("dd", {}, value)];
+function field(label, value, id) {
+  return value === "" || value === null || value === undefined ? [] : [el("dt", {}, label), el("dd", id ? { id } : {}, value)];
 }
 
-function renderDetail(item) {
+function prLink(url) {
+  const link = safeUrl(url);
+  return link ? el("a", { class: "pr-link", href: link, target: "_blank", rel: "noopener noreferrer" }, "Open pull request ↗") : null;
+}
+
+function idsSection(rows) {
+  const details = el("details", { ontoggle: (event) => { state.idsOpen = event.target.open; } },
+    el("summary", { class: "muted small" }, "Identifiers"),
+    el("dl", { class: "small" }, rows));
+  details.open = state.idsOpen;
+  return details;
+}
+
+function renderDetail(selection) {
   const detail = $("detail");
-  detail.replaceChildren();
-  if (!item) return;
-  const link = safeUrl(item.pullRequestUrl);
-  const completion = item.completion;
+  const item = selection.item;
+  const sig = item ? `${selection.kind}|${selection.kind === "pr" ? JSON.stringify(item) : stableSig(item)}` : "";
+  if (sig !== state.detailSig) {
+    state.detailSig = sig;
+    detail.replaceChildren();
+    if (item && selection.kind === "pr") renderPrDetail(detail, item);
+    else if (item) renderInstanceDetail(detail, item);
+  }
+  if (item && selection.kind === "instance") {
+    const phase = $("d-phase");
+    if (phase) phase.textContent = `${item.phase || "—"} · ${duration(item.phaseElapsedMilliseconds)} (total ${duration(item.totalElapsedMilliseconds)})`;
+    const heartbeat = $("d-heartbeat");
+    if (heartbeat) heartbeat.textContent = item.heartbeatAgeMilliseconds === null ? "—" : `${duration(item.heartbeatAgeMilliseconds)} ago`;
+    const status = $("d-status");
+    if (status) status.textContent = `${ROLE_LABEL[item.agent]} · ${item.status}`;
+  }
+}
+
+function roleOutcome(label, role) {
+  if (!role) return [];
+  const parts = [role.result ? `${role.result}${role.resultAtMs ? ` (${when(role.resultAtMs)})` : ""}` : ""];
+  if (role.status && role.status !== role.result) parts.push(`latest: ${role.status}${role.statusAtMs ? ` (${when(role.statusAtMs)})` : ""}`);
+  return field(label, parts.filter(Boolean).join(" · "));
+}
+
+function renderPrDetail(detail, entry) {
   detail.append(
-    el("h3", {}, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : ROLE_LABEL[item.agent]),
-    el("div", { class: "small muted" }, `${ROLE_LABEL[item.agent]} · ${item.status} · instance ${item.instanceId.slice(0, 8)} · PID ${item.processId}`),
+    el("h2", { class: "dialog-title" }, `PR #${entry.pullRequestId} ${entry.title}`),
+    prLink(entry.url),
     el("dl", {},
-      field("Phase", `${item.phase || "—"} · ${duration(item.phaseElapsedMilliseconds)} (total ${duration(item.totalElapsedMilliseconds)})`),
-      field("Heartbeat", item.heartbeatAgeMilliseconds === null ? "" : `${duration(item.heartbeatAgeMilliseconds)} ago`),
+      roleOutcome("Reviewer", entry.reviewer),
+      roleOutcome("Review Handler", entry.reviewHandler),
+      field("Last activity", when(entry.lastSeenMs)),
+      field("Author", entry.author),
+      field("Branches", entry.sourceBranch ? `${entry.sourceBranch} → ${entry.targetBranch}` : ""),
+      field("Repository", entry.repository)),
+    state.data?.launchMode !== "observe"
+      ? el("div", { class: "launch-row" }, el("button", { type: "button", onclick: () => openModal(entry.pullRequestId) }, "Review this PR…"))
+      : null,
+    idsSection(field("History key", entry.key)));
+}
+
+function renderInstanceDetail(detail, item) {
+  const completion = item.completion;
+  const headline = completion
+    ? `${completion.result}${completion.reason ? ` · ${completion.reason}` : ""}`
+    : item.blocked ? `Blocked · ${item.blocked.reason}` : item.status === "stale" ? "Stale · no recent heartbeat" : item.phase || item.status;
+  detail.append(
+    el("h2", { class: "dialog-title" }, item.pullRequestId ? `PR #${item.pullRequestId} ${item.pullRequestTitle}` : ROLE_LABEL[item.agent]),
+    el("div", { class: "small muted", id: "d-status" }, `${ROLE_LABEL[item.agent]} · ${item.status}`),
+    el("p", { class: "outcome" }, headline),
+    completion?.summary ? el("p", {}, completion.summary) : null,
+    prLink(item.pullRequestUrl),
+    el("dl", {},
+      completion ? field("Findings", `${completion.findings.critical} critical · ${completion.findings.important} important · ${completion.findings.suggestion} suggestion`) : [],
+      completion ? field("Delivered", completion.delivered.join(", ")) : [],
+      completion ? field("Preview", completion.previewArtifact) : [],
+      field("Phase", "—", "d-phase"),
+      field("Heartbeat", "—", "d-heartbeat"),
       field("Model", item.modelActivity),
-      field("Repository", item.repository),
       field("Author", item.pullRequestAuthor),
       field("Branches", item.sourceBranch ? `${item.sourceBranch} → ${item.targetBranch}` : ""),
       field("Threads", item.threadCount ? `${item.actionableThreadCount}/${item.threadCount} actionable · ${item.changedFileCount} files` : ""),
       field("Candidates", item.candidateStory),
       field("Blocked", item.blocked ? `${item.blocked.reason}${item.blocked.nextRetry ? ` · retry ${item.blocked.nextRetry}` : ""}` : ""),
       field("Waiting", item.waiting ? `${item.waiting.kind} · ${duration(item.waiting.delayMilliseconds)}` : ""),
-      completion ? field("Result", `${completion.result}${completion.reason ? ` · ${completion.reason}` : ""}`) : [],
-      completion ? field("Findings", `${completion.findings.critical} critical · ${completion.findings.important} important · ${completion.findings.suggestion} suggestion`) : [],
-      completion ? field("Delivered", completion.delivered.join(", ")) : [],
-      completion ? field("Summary", completion.summary) : [],
-      completion ? field("Preview", completion.previewArtifact) : []),
-    link ? el("p", {}, el("a", { href: link, target: "_blank", rel: "noopener noreferrer" }, "Open pull request ↗")) : null,
-    el("h2", {}, "Timeline"),
+      field("Repository", item.repository)),
+    idsSection([
+      field("Instance", item.instanceId), field("Process", String(item.processId)),
+      field("Session", item.sessionNamespace), field("Commit", item.sourceCommit), field("Key", item.key)]),
+    el("h3", {}, "Timeline"),
     el("ul", { class: "timeline" },
-      [...item.timeline].reverse().map((event) => el("li", {}, el("time", {}, clock(event.timestampMs)), event.text))));
+      [...item.timeline].reverse().map((event) => el("li", {}, el("time", {}, when(event.timestampMs)), event.text))));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -490,9 +844,18 @@ function renderTarget(body, m) {
     el("option", { value: "reviewer", selected: m.role === "reviewer" }, "Reviewer"),
     el("option", { value: "review-handler", selected: m.role === "review-handler" }, "Review Handler"));
   role.addEventListener("change", () => { m.role = role.value; });
+  const recent = (state.data?.recentPullRequests ?? []).filter((item) => Number.isSafeInteger(item.pullRequestId));
+  const suggestions = recent.length
+    ? el("div", { class: "suggestions", "aria-label": "Recent pull requests" },
+      el("span", { class: "small muted" }, "Recent:"),
+      recent.map((item) => el("button", {
+        type: "button", title: item.title,
+        onclick: () => { m.pullRequestId = String(item.pullRequestId); input.value = m.pullRequestId; input.focus(); },
+      }, `#${item.pullRequestId}`)))
+    : null;
   body.append(
     el("p", { class: "muted small" }, "The repository comes from this watch's agent config. Previewing never starts anything."),
-    el("div", { class: "field" }, el("label", { for: "pr" }, "Pull request ID"), input),
+    el("div", { class: "field" }, el("label", { for: "pr" }, "Pull request ID"), input, suggestions),
     el("div", { class: "field" }, el("label", { for: "role" }, "Agent"), role),
     el("div", { class: "buttons" },
       el("button", { type: "button", onclick: closeModal }, "Cancel"),
@@ -645,6 +1008,7 @@ async function confirmProposal() {
   }
 }
 
+
 // ---------------------------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------------------------
@@ -659,6 +1023,8 @@ $("modal").addEventListener("cancel", (event) => {
   if (state.modal?.inFlight) event.preventDefault();
   else state.modal = null;
 });
+$("modal-close").addEventListener("click", () => { if (!state.modal?.inFlight) closeModal(); });
+$("error-dismiss").addEventListener("click", clearError);
 $("review").addEventListener("click", () => openModal());
 $("stop").addEventListener("click", stopWatch);
 $("scan").addEventListener("click", async () => {
@@ -667,13 +1033,29 @@ $("scan").addEventListener("click", async () => {
     const result = await api("/api/scan-now", {});
     notice("Scan now: " + result.results.map((item) => `${ROLE_LABEL[item.role]} ${item.outcome}`).join(", "));
   } catch (error) {
-    notice(errorText(error), true);
+    showError(errorText(error));
   }
   refresh();
 });
-$("view").addEventListener("change", () => {
-  state.view = $("view").value;
-  refresh();
+for (const tab of document.querySelectorAll("#tabs [role=tab]")) {
+  tab.addEventListener("click", () => {
+    if (state.view === tab.dataset.view) return;
+    state.view = tab.dataset.view;
+    state.selected = "";
+    render();
+    loop();
+  });
+  tab.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    const other = tab.dataset.view === "live" ? $("tab-history") : $("tab-live");
+    other.focus();
+    other.click();
+  });
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearTimeout(pollTimer);
+  else loop();
 });
+setInterval(tick, 1_000);
 
 loop();

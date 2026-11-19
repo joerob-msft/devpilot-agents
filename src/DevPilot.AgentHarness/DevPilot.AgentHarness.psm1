@@ -553,7 +553,13 @@ function Get-AgentCopilotArgs {
         [switch]$UseYolo,
         [string]$ResumeSessionId,
         [string[]]$SupportedModels,
-        [switch]$JsonOutput
+        [switch]$JsonOutput,
+        # Display name for a NEW session (`--name`), so harness cycle sessions are recognisable in
+        # the Copilot app and excluded from coding-session resolution. Ignored when resuming.
+        [string]$SessionName,
+        # Pre-assigned GUID for a NEW session (`--session-id`), recorded by the caller so the
+        # cycle session is excluded from coding-session resolution. Ignored when resuming.
+        [string]$NewSessionId
     )
     $allow = @($AllowTools)
     $deny = @($DenyTools)
@@ -592,6 +598,20 @@ function Get-AgentCopilotArgs {
             throw "Get-AgentCopilotArgs: -ResumeSessionId '$ResumeSessionId' is not a valid session GUID."
         }
         $engineArgs += @("--resume", $ResumeSessionId)
+    }
+    else {
+        if (-not [string]::IsNullOrWhiteSpace($SessionName)) {
+            if ($SessionName -notmatch '^[A-Za-z0-9 \[\]#._:-]{1,100}$') {
+                throw "Get-AgentCopilotArgs: -SessionName '$SessionName' contains unsupported characters."
+            }
+            $engineArgs += "--name=$SessionName"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($NewSessionId)) {
+            if ($NewSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                throw "Get-AgentCopilotArgs: -NewSessionId '$NewSessionId' is not a valid session GUID."
+            }
+            $engineArgs += "--session-id=$NewSessionId"
+        }
     }
     $cliArgs = @("copilot")
     if (-not [string]::IsNullOrWhiteSpace($AgentName)) {
@@ -4665,6 +4685,106 @@ function ConvertFrom-AgentResultMarker {
 # Local Copilot session store (branch -> coding session resolution)
 # ---------------------------------------------------------------------------
 
+function Get-AgentHarnessCycleSessionName {
+    <# The `--name` given to a NEW reviewer/review-handler cycle session. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewer', 'review-handler')][string]$Role,
+        [int]$PullRequestId
+    )
+    $label = if ($Role -ceq 'reviewer') { 'Reviewer' } else { 'Review-handler' }
+    if ($PullRequestId -gt 0) { return "[DevPilot] $label cycle PR $PullRequestId" }
+    return "[DevPilot] $label cycle"
+}
+
+function Test-AgentHarnessCycleSessionName {
+    <#
+        True when a Copilot session name identifies a DevPilot cycle session: either the explicit
+        `[DevPilot] ` name prefix, or (for sessions started before naming existed) a name derived
+        from the first line of a reviewer/review-handler operational cycle prompt.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $trimmed = $Name.Trim()
+    foreach ($prefix in @('[DevPilot] ',
+            "# Reviewer Agent $([char]0x2014) Operational Cycle Prompt",
+            "# Review-Handler Agent $([char]0x2014) Operational Cycle Prompt")) {
+        if ($trimmed.StartsWith($prefix, [StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+$script:AgentLaunchedSessionsFileName = 'launched-sessions.json'
+
+function Get-AgentHarnessLaunchedSessionIds {
+    <#
+        Session IDs this harness pre-assigned (`--session-id`) to its own cycle sessions. Reads
+        `launched-sessions.json` from each -StateDir and, with -IncludeSiblings, from every sibling
+        folder of each -StateDir (a watch keeps `reviewer` and `review-handler` side by side).
+    #>
+    param([AllowEmptyCollection()][string[]]$StateDir = @(), [switch]$IncludeSiblings)
+    $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $dirs = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($dir in @($StateDir)) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        [void]$dirs.Add($dir)
+        if ($IncludeSiblings) {
+            $parent = Split-Path -Path $dir -Parent
+            if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) {
+                foreach ($sibling in @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue)) {
+                    [void]$dirs.Add($sibling.FullName)
+                }
+            }
+        }
+    }
+    foreach ($dir in $dirs) {
+        $path = Join-Path $dir $script:AgentLaunchedSessionsFileName
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $state = Get-JsonState -Path $path
+        foreach ($id in @($state['sessionIds'])) {
+            if ($id -is [string] -and $id -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                [void]$ids.Add($id)
+            }
+        }
+    }
+    return , @($ids)
+}
+
+function Add-AgentHarnessLaunchedSessionId {
+    <# Records a pre-assigned cycle session ID in -StateDir, keeping only the newest -MaxEntries. #>
+    param(
+        [Parameter(Mandatory)][string]$StateDir,
+        [Parameter(Mandatory)][string]$SessionId,
+        [ValidateRange(1, 10000)][int]$MaxEntries = 500
+    )
+    if ($SessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        throw "Add-AgentHarnessLaunchedSessionId: '$SessionId' is not a valid session GUID."
+    }
+    $path = Join-Path $StateDir $script:AgentLaunchedSessionsFileName
+    $state = Get-JsonState -Path $path
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($state['sessionIds'])) {
+        if ($id -is [string] -and $id -ine $SessionId) { $list.Add($id) }
+    }
+    $list.Add($SessionId)
+    if ($list.Count -gt $MaxEntries) { $list.RemoveRange(0, $list.Count - $MaxEntries) }
+    Set-JsonState -Path $path -State @{ version = 1; sessionIds = @($list) }
+}
+
+function Get-AgentWorkspaceSessionName {
+    <# The top-level `name:` scalar of a workspace.yaml (quotes and a block-scalar first line handled). #>
+    param([AllowEmptyCollection()][string[]]$Lines = @())
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -notmatch '^name:\s*(.*)$') { continue }
+        $value = $matches[1].Trim()
+        if ($value -match '^[|>][+-]?$' -and ($i + 1) -lt $Lines.Count) { return $Lines[$i + 1].Trim() }
+        if ($value.Length -ge 2 -and (($value[0] -eq '"' -and $value[-1] -eq '"') -or ($value[0] -eq "'" -and $value[-1] -eq "'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        return $value
+    }
+    return ''
+}
+
 function Find-CopilotSessionForBranch {
     <#
         Scans `~/.copilot/session-state/*/workspace.yaml` (a flat, line-based
@@ -4672,14 +4792,22 @@ function Find-CopilotSessionForBranch {
         returns sessions whose `branch` matches $Branch (and, when supplied,
         `repository` / `git_root`), newest `updated_at` first. Sessions holding
         an `inuse.*.lock` are skipped as busy. Only line-anchored scalar keys
-        are read; free-text keys such as `name:` are ignored (never trusted).
+        are read; the free-text `name:` key is never trusted for selection and
+        is used ONLY to exclude sessions (see Test-AgentHarnessCycleSessionName).
+
+        DevPilot's own reviewer/review-handler cycle sessions are never a coding
+        session: resuming one would make every handler cycle grow the previous
+        cycle's transcript. They are excluded by name and by -ExcludeSessionIds.
     #>
     param(
         [Parameter(Mandatory)][string]$Branch,
         [string]$Repository,
         [string]$GitRoot,
-        [string]$SessionStateRoot
+        [string]$SessionStateRoot,
+        [string[]]$ExcludeSessionIds = @()
     )
+    $excluded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in @($ExcludeSessionIds)) { if ($id) { [void]$excluded.Add([string]$id) } }
     if (-not $SessionStateRoot) {
         $SessionStateRoot = Join-Path (Join-Path $HOME ".copilot") "session-state"
     }
@@ -4696,7 +4824,9 @@ function Find-CopilotSessionForBranch {
         if ($lockFiles.Count -gt 0) { continue }
 
         $fields = @{}
-        foreach ($line in @(Get-Content -LiteralPath $wsPath -ErrorAction SilentlyContinue)) {
+        $wsLines = @(Get-Content -LiteralPath $wsPath -ErrorAction SilentlyContinue)
+        if (Test-AgentHarnessCycleSessionName -Name (Get-AgentWorkspaceSessionName -Lines $wsLines)) { continue }
+        foreach ($line in $wsLines) {
             if ($line -match '^\s*(id|cwd|git_root|repository|host_type|branch|updated_at|created_at):\s*(.*)$') {
                 $key = $matches[1]
                 $val = $matches[2].Trim()
@@ -4716,6 +4846,9 @@ function Find-CopilotSessionForBranch {
         if ($sessBranch -ne $normBranch) { continue }
         if ($Repository -and $fields.ContainsKey('repository') -and $fields['repository'] -ne $Repository) { continue }
         if ($GitRoot -and $fields.ContainsKey('git_root') -and $fields['git_root'] -ne $GitRoot) { continue }
+
+        $candidateId = if ($fields.ContainsKey('id')) { [string]$fields['id'] } else { $dir.Name }
+        if ($excluded.Contains($candidateId) -or $excluded.Contains($dir.Name)) { continue }
 
         $updatedRaw = if ($fields.ContainsKey('updated_at')) { [string]$fields['updated_at'] } else { "" }
         $updatedUtc = [DateTime]::MinValue
@@ -7499,6 +7632,11 @@ Export-ModuleMember -Function @(
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
     "Find-CopilotSessionForBranch",
+    "Get-AgentHarnessCycleSessionName",
+    "Get-AgentHarnessLaunchedSessionIds",
+    "Add-AgentHarnessLaunchedSessionId",
+    "Test-AgentHarnessCycleSessionName",
+    "Get-AgentWorkspaceSessionName",
     "Set-TimedProcessArguments",
     "Resolve-AgentPwshPath",
     "ConvertTo-AgentCanonicalJson",

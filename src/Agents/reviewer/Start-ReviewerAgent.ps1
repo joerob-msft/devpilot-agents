@@ -6076,10 +6076,16 @@ function Invoke-ReviewerPullRequest {
     $argsFactory = {
         param([string]$RequestedModel)
         $modelArg = if ($RequestedModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $RequestedModel }
+        # Every launch is a NEW session: pre-assign and record its ID so it is never resolved
+        # as a coding session for the PR branch.
+        $cycleSessionId = [guid]::NewGuid().ToString()
+        Add-AgentHarnessLaunchedSessionId -StateDir $StateDir -SessionId $cycleSessionId
         Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
             -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg `
             -DisableMcpServers $DisabledMcpServers -DisableBuiltinMcps `
-            -DisableDynamicSkillRetrieval -DisableDelegation -JsonOutput
+            -DisableDynamicSkillRetrieval -DisableDelegation -JsonOutput `
+            -SessionName (Get-AgentHarnessCycleSessionName -Role reviewer -PullRequestId $prId) `
+            -NewSessionId $cycleSessionId
     }
     $agencyArgs = & $argsFactory $EffectiveModel
     $commonLaunch = @{

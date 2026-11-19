@@ -2810,7 +2810,8 @@ function Invoke-HandlerCycle {
             $candidateSessions = $null
             if ($RequireCodingSession) {
                 $candidateSessions = Get-HandlerUsableSessionMatches `
-                    -Sessions (Find-CopilotSessionForBranch -Branch $candidateBranch) `
+                    -Sessions (Find-CopilotSessionForBranch -Branch $candidateBranch `
+                        -ExcludeSessionIds (Get-AgentHarnessLaunchedSessionIds -StateDir $StateDir -IncludeSiblings)) `
                     -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
                 if (-not $candidateSessions -or $candidateSessions.Count -eq 0) {
                     $skipCounts.other++
@@ -2920,7 +2921,8 @@ function Invoke-HandlerCycle {
         }
         else {
             Get-HandlerUsableSessionMatches `
-                -Sessions (Find-CopilotSessionForBranch -Branch $bound.SourceBranch) `
+                -Sessions (Find-CopilotSessionForBranch -Branch $bound.SourceBranch `
+                    -ExcludeSessionIds (Get-AgentHarnessLaunchedSessionIds -StateDir $StateDir -IncludeSiblings)) `
                 -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
         }
         if ($sessionMatches -and $sessionMatches.Count -gt 0) {
@@ -2978,11 +2980,18 @@ function Invoke-HandlerCycle {
 
         # -- Step 6: launch the model -----------------------------------------
         $modelArg = if ($EffectiveModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $EffectiveModel }
+        $cycleSessionName = Get-AgentHarnessCycleSessionName -Role review-handler -PullRequestId $prId
+        # Pre-assign the NEW session's ID and record it before launch so later cycles never
+        # resolve this cycle session as the PR's coding session.
+        $cycleSessionId = [guid]::NewGuid().ToString()
+        Add-AgentHarnessLaunchedSessionId -StateDir $StateDir -SessionId $cycleSessionId
         $agencyArgs = Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
-            -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -ResumeSessionId $resumeId -JsonOutput
+            -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -ResumeSessionId $resumeId -JsonOutput `
+            -SessionName $cycleSessionName -NewSessionId $cycleSessionId
         $freshAgencyArgs = if ($resumeId) {
             Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
-                -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -JsonOutput
+                -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -JsonOutput `
+                -SessionName $cycleSessionName -NewSessionId $cycleSessionId
         }
         else {
             $agencyArgs

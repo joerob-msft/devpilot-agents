@@ -392,9 +392,9 @@ Describe 'golden launch policy (issue #114)' {
         $result.StdOut | Should -Match 'Preview alternative'
     }
 
-    It 'hands the opt-in canvas bridge to the real Golden dashboard launch through the environment only' {
+    It 'hands the default canvas bridge to the real Golden dashboard launch through the environment only' {
         $context = New-GoldenContext
-        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-CanvasBridge') + (Get-BaseLaunchArgument -Context $context))
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
         $records = Get-DashboardRecord -Context $context
         $records.Count | Should -Be 3
@@ -405,12 +405,41 @@ Describe 'golden launch policy (issue #114)' {
         $records[2].brokerDescriptorPath | Should -Not -BeNullOrEmpty
         ($records[2].descriptor | ConvertFrom-Json -AsHashtable).ContainsKey('launcherControl') | Should -BeTrue
         $result.StdOut | Should -Match 'Copilot canvas bridge: enabled'
+        $result.StdOut | Should -Match 'Copilot canvas\s+: on'
         @($records | Where-Object { $_.headless }).Count | Should -Be 0
+    }
+
+    It 'keeps the deprecated -CanvasBridge switch as an accepted no-op' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-CanvasBridge') + (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $records = Get-DashboardRecord -Context $context
+        $records[2].canvasBridgeFile | Should -BeExactly (Join-Path $records[2].stateDir[0] 'canvas-bridge.v1.json')
+    }
+
+    It 'runs the terminal dashboard alone under -TerminalOnly' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-TerminalOnly') + (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        $records = Get-DashboardRecord -Context $context
+        $records.Count | Should -Be 3
+        foreach ($record in $records) { $record.canvasBridgeFile | Should -BeExactly '' }
+        $records[2].brokerDescriptorPath | Should -Not -BeNullOrEmpty
+        $result.StdOut | Should -Match 'Copilot canvas bridge: off \(-TerminalOnly\)'
+        $result.StdOut | Should -Not -Match 'Copilot canvas bridge: enabled'
+    }
+
+    It 'turns the default bridge off with a notice when the launch has no manual broker' {
+        $context = New-GoldenContext
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Agent', 'Reviewer') + (Get-BaseLaunchArgument -Context $context))
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        foreach ($record in (Get-DashboardRecord -Context $context)) { $record.canvasBridgeFile | Should -BeExactly '' }
+        $result.StdOut | Should -Match 'Copilot canvas\s+: off \(no manual broker\)'
     }
 
     It 'runs a canvas-startable headless Golden watch through the same dashboard launcher and descriptor' {
         $context = New-GoldenContext
-        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-Headless', '-CanvasBridge') + (Get-BaseLaunchArgument -Context $context))
+        $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden', '-Headless') + (Get-BaseLaunchArgument -Context $context))
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
         $records = Get-DashboardRecord -Context $context
         $records.Count | Should -Be 3
@@ -654,7 +683,9 @@ exit 0
         @{ Case = @('-Golden', '-Agent', 'ReviewHandler'); Expected = '-Golden always launches both agents' }
         @{ Case = @('-Agent', 'ReviewHandler', '-ReviewerPullRequestId', '104'); Expected = 'ReviewerPullRequestId requires -Agent Reviewer or -Agent Both' }
         @{ Case = @('-Agent', 'Reviewer', '-CanvasBridge'); Expected = '-CanvasBridge requires the trusted manual broker' }
-        @{ Case = @('-Golden', '-Headless'); Expected = '-Headless requires -CanvasBridge' }
+        @{ Case = @('-Golden', '-Headless', '-TerminalOnly'); Expected = '-Headless cannot be combined with -TerminalOnly' }
+        @{ Case = @('-Golden', '-CanvasBridge', '-TerminalOnly'); Expected = '-CanvasBridge cannot be combined with -TerminalOnly' }
+        @{ Case = @('-Agent', 'Reviewer', '-Headless'); Expected = '-Headless requires the trusted manual broker' }
     ) {
         $context = New-GoldenContext
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@($Case) + (Get-BaseLaunchArgument -Context $context))
@@ -748,14 +779,35 @@ Describe 'cross-launch state history (issue #114)' {
         $context = New-GoldenContext
         $watchRoot = New-HardenedDirectory $context.WatchRoot
         $expected = [Collections.Generic.List[string]]::new()
-        # 25 prior launches: only the 20 most recent may be offered.
-        foreach ($index in 1..25) {
-            $name = '{0:00000000}T000000Z-{1:x8}' -f (20200101 + $index), $index
-            $path = Resolve-AgentTrustedRoot -Path (Join-Path $watchRoot $name) -Kind watch-state `
+        $repositoryKey = ('config:' + (Split-Path $context.ReviewerConfig -Parent)) -replace '[\\/]+', '/'
+        if ($IsWindows) { $repositoryKey = $repositoryKey.ToLowerInvariant() }
+        function New-PriorLaunch {
+            param([string]$Name, [string]$Key, [string]$Mode = 'operational')
+            $path = Resolve-AgentTrustedRoot -Path (Join-Path $watchRoot $Name) -Kind watch-state `
                 -RepositoryRoot $context.Root -Create
-            [void]$expected.Add($path)
+            if ($Key) {
+                @{ schemaVersion = 1; repositoryKey = $Key; repositoryRoot = ''; launchMode = $Mode; ownerProcessId = 0 } |
+                    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $path 'repository.v1.json') -Encoding utf8NoBOM
+            }
+            return $path
         }
+        # 25 prior launches of THIS repository: only the newest may be offered.
+        foreach ($index in 1..25) {
+            [void]$expected.Add((New-PriorLaunch -Name ('{0:00000000}T000000Z-{1:x8}' -f (20200101 + $index), $index) -Key $repositoryKey))
+        }
+        # Newer launches that must never be offered (another repository, or no repository record), and
+        # a burst of newer previews of which only five may be offered.
+        $foreign = @(foreach ($index in 1..3) {
+                New-PriorLaunch -Name ('{0:00000000}T000000Z-{1:x8}' -f (20300101 + $index), (0x100 + $index)) -Key 'repo:c:/other/repository'
+            })
+        $unknown = @(foreach ($index in 1..2) {
+                New-PriorLaunch -Name ('{0:00000000}T000000Z-{1:x8}' -f (20300111 + $index), (0x200 + $index)) -Key ''
+            })
+        $previews = @(foreach ($index in 1..8) {
+                New-PriorLaunch -Name ('{0:00000000}T000000Z-{1:x8}' -f (20300201 + $index), (0x300 + $index)) -Key $repositoryKey -Mode preview
+            })
         $newestFirst = @($expected | Sort-Object -Descending)
+        $newestPreviewsFirst = @($previews | Sort-Object -Descending)
         $linkTarget = New-HardenedDirectory (Join-Path $TestDrive ([Guid]::NewGuid().ToString('N')))
         $linkPath = Join-Path $watchRoot '20991231T235959Z-deadbeef'
         $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
@@ -786,10 +838,17 @@ Describe 'cross-launch state history (issue #114)' {
         $record = (Get-DashboardRecord -Context $context)[-1]
         $stateDirs = @($record.stateDir)
         $stateDirs.Count | Should -Be 21
-        # Current launch first, then the 20 newest trusted prior launches, newest to oldest.
+        # Current launch first, then the 20 newest trusted prior launches of THIS repository, newest
+        # to oldest, with previews capped at five so they cannot evict operational history.
         $stateDirs[0] | Should -Not -BeIn $newestFirst
         (Split-Path $stateDirs[0] -Parent) | Should -BeExactly $watchRoot
-        @($stateDirs[1..20]) | Should -BeExactly @($newestFirst[0..19])
+        @($stateDirs[1..5]) | Should -BeExactly @($newestPreviewsFirst[0..4])
+        @($stateDirs[6..20]) | Should -BeExactly @($newestFirst[0..14])
+        foreach ($excluded in @($foreign) + @($unknown)) { $stateDirs | Should -Not -Contain $excluded }
+        # The current launch records its own repository identity for future launches.
+        $currentRecord = Get-Content -LiteralPath (Join-Path $stateDirs[0] 'repository.v1.json') -Raw | ConvertFrom-Json
+        $currentRecord.repositoryKey | Should -BeExactly $repositoryKey
+        $currentRecord.launchMode | Should -BeExactly 'operational'
         $stateDirs | Should -Not -Contain $linkPath
         # A poisoned prior launch is a warning and an exclusion, never a fatal launch failure.
         # PowerShell renders the warning stream on stdout when the host output is redirected.
@@ -804,6 +863,58 @@ Describe 'cross-launch state history (issue #114)' {
             @($stateDirs | Where-Object { $_ -like "*$([IO.Path]::DirectorySeparatorChar)$reserved$([IO.Path]::DirectorySeparatorChar)*" }) |
                 Should -BeNullOrEmpty
         }
+    }
+}
+
+Describe 'human-run launch history prune' {
+    It 'keeps the newest launches per repository, honours -WhatIf, and never touches unknown or running roots' {
+        $context = New-GoldenContext
+        $watchRoot = New-HardenedDirectory $context.WatchRoot
+        function New-PrunableLaunch {
+            param([int]$Index, [string]$Key, [int]$OwnerProcessId = 0, [switch]$Recent)
+            $path = Resolve-AgentTrustedRoot -Path (Join-Path $watchRoot ('{0:00000000}T000000Z-{1:x8}' -f (20200101 + $Index), $Index)) `
+                -Kind watch-state -RepositoryRoot $context.Root -Create
+            if ($Key) {
+                @{ schemaVersion = 1; repositoryKey = $Key; launchMode = 'operational'; ownerProcessId = $OwnerProcessId } |
+                    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $path 'repository.v1.json') -Encoding utf8NoBOM
+            }
+            $log = Join-Path $path 'reviewer.events.jsonl'
+            Set-Content -LiteralPath $log -Value '{}' -Encoding utf8NoBOM
+            if (-not $Recent) {
+                foreach ($file in Get-ChildItem -LiteralPath $path -Recurse -File -Force) {
+                    $file.LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
+                }
+            }
+            return $path
+        }
+        $running = New-PrunableLaunch -Index 1 -Key 'repo:c:/a' -OwnerProcessId $PID
+        $recentlyWritten = New-PrunableLaunch -Index 0 -Key 'repo:c:/a' -Recent
+        $sameRepo = @(foreach ($index in 2..5) { New-PrunableLaunch -Index $index -Key 'repo:c:/a' })
+        $otherRepo = New-PrunableLaunch -Index 6 -Key 'repo:c:/b'
+        $unknown = New-PrunableLaunch -Index 7 -Key ''
+        $all = @($running, $recentlyWritten) + $sameRepo + @($otherRepo, $unknown)
+
+        $preview = Invoke-GoldenLaunch -Context $context -Arguments @('-PruneHistory', '-PruneKeep', '2', '-WhatIf')
+        $preview.ExitCode | Should -Be 0 -Because $preview.StdErr
+        foreach ($path in $all) { Test-Path -LiteralPath $path | Should -BeTrue }
+        Get-DashboardRecord -Context $context | Should -BeNullOrEmpty
+
+        $result = Invoke-GoldenLaunch -Context $context -Arguments         @('-PruneHistory', '-PruneKeep', '2')
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        # Newest two of repository a survive; the two older ones go.
+        Test-Path -LiteralPath $sameRepo[3] | Should -BeTrue
+        Test-Path -LiteralPath $sameRepo[2] | Should -BeTrue
+        Test-Path -LiteralPath $sameRepo[1] | Should -BeFalse
+        Test-Path -LiteralPath $sameRepo[0] | Should -BeFalse
+        foreach ($path in @($running, $recentlyWritten, $otherRepo, $unknown)) { Test-Path -LiteralPath $path | Should -BeTrue }
+        Get-DashboardRecord -Context $context | Should -BeNullOrEmpty
+
+        # An unrecorded launch (older toolkit) still writing logs is treated as running, even with -PruneUnknown.
+        $activeUnknown = New-PrunableLaunch -Index 8 -Key '' -Recent
+        $result = Invoke-GoldenLaunch -Context $context -Arguments @('-PruneHistory', '-PruneKeep', '2', '-PruneUnknown')
+        $result.ExitCode | Should -Be 0 -Because $result.StdErr
+        Test-Path -LiteralPath $activeUnknown | Should -BeTrue
+        Test-Path -LiteralPath $unknown | Should -BeFalse
     }
 }
 

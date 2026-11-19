@@ -16,7 +16,11 @@ safety model are documented in the *Copilot app canvas* section of
   parameters without running the script. Otherwise it falls back to the recorded
   toolkit's `Watch-DevPilotAgents.ps1 -Golden -Headless -CanvasBridge`. Previews
   add `-WhatIf`.
-- `ui/` holds the static page. It uses Primer theme tokens with fallbacks.
+- `ui/` holds the static page. It uses Primer theme tokens with fallbacks. It
+  has Live (default) and History tabs, a single **Start watch…** → plan →
+  **Confirm start** flow when no watch runs, and updates rows in place so
+  polling never steals focus or scroll. Polling pauses while the canvas is
+  hidden and backs off when idle.
 
 Install with `tools\Install-DevPilotCanvas.ps1`, which also records the
 fallback `toolkit.json`. Tests: `node --test tests\CopilotCanvas.Tests.mjs`.
