@@ -92,7 +92,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Test-AgentInteractiveOutput', 'New-AgentOutputContext', 'Set-AgentOutputRepositoryIdentity', 'Set-AgentOutputLegacySuppression',
                'Get-AgentNormalizedSkipReason', 'Format-AgentCount',
                'Format-AgentSkipSummary', 'Publish-AgentEvent', 'Close-AgentOutputContext',
-               'Get-AgentFailureDetail', 'Get-AgentFailureKind', 'New-AgentHealthState', 'Read-AgentHealthState',
+               'Get-AgentFailureDetail', 'Get-AgentDeniedToolCall', 'Get-AgentFailureKind', 'New-AgentHealthState', 'Read-AgentHealthState',
                'Write-AgentHealthState', 'Get-AgentStuckBackoffSeconds', 'Update-AgentHealthState',
                'Get-AgentHealthStuckRetryUtc', 'Get-AgentHealthAlertText', 'Read-AgentSkippedPrs',
                'Test-AgentPrOperatorSkipped', 'Invoke-AgentModelPreflight', 'Get-AgentModelPreflightPlanLine', 'Assert-AgentModelPreflight',

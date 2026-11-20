@@ -21,6 +21,19 @@ Describe 'failure detail extraction' {
             Get-AgentFailureDetail -StdErr "$line" -FallbackReason 'redacted fallback' | Should -BeExactly 'redacted fallback' -Because $line
         }
     }
+    It 'ignores Agency MCP proxy lines and names a headless permission refusal' {
+        $stderr = "🚀 Launching Copilot CLI`nLaunched 6 MCP proxies:`n  - workiq: http://127.0.0.1:63914 (log span: mcp{workiq})"
+        $stdout = @(
+            '{"type":"tool.execution_start","data":{"toolCallId":"c1","toolName":"powershell","arguments":{"command":"git --no-pager log -5 --format=''%H %s''"}}}'
+            '{"type":"tool.execution_complete","data":{"toolCallId":"c1","success":false,"error":{"message":"Permission denied because no interactive user response was available.","code":"denied"}}}'
+        ) -join "`n"
+        Get-AgentDeniedToolCall -StdOut $stdout | Should -BeExactly "powershell: git --no-pager log -5 --format='%H %s'"
+        Get-AgentFailureDetail -StdErr $stderr -StdOut $stdout -FallbackReason "model reported outcome 'no-safe-progress'" -ModelReported |
+            Should -BeExactly "model reported outcome 'no-safe-progress'; Copilot refused without interactive approval: powershell: git --no-pager log -5 --format='%H %s'"
+        Get-AgentFailureDetail -StdErr $stderr -FallbackReason "model reported outcome 'no-safe-progress'" -ModelReported |
+            Should -BeExactly "model reported outcome 'no-safe-progress'"
+        Get-AgentFailureDetail -StdErr $stderr -FallbackReason 'copilot exited 1' | Should -BeExactly 'copilot exited 1'
+    }
     It 'truncates to 240 single-line characters' {
         $detail = Get-AgentFailureDetail -StdErr ('Error: ' + ('x' * 400))
         $detail.Length | Should -Be 240
@@ -152,5 +165,15 @@ Describe 'model preflight' {
         $validated | Should -BeGreaterThan -1
         $validated | Should -BeLessThan $source.IndexOf('Assert-AgentModelPreflight -Models') -Because 'model names are validated before any process starts'
         $source | Should -Match 'Get-AgentModelPreflightPlanLine'
+    }
+}
+
+Describe 'review-handler unattended shell guidance' {
+    It 'gives the model the wrapper-captured git state and warns about refused % commands' {
+        $source = Get-Content -Raw (Join-Path $PSScriptRoot '..\src\Agents\review-handler\Start-ReviewHandlerAgent.ps1')
+        $source | Should -Match '-LocalGitState \$localGitState'
+        $source | Should -Match 'log -5 --oneline'
+        $source | Should -Match 'containing a ``%`` character'
+        $source | Should -Match '-ModelReported:\(\$run\.ExitCode -eq 0'
     }
 }
