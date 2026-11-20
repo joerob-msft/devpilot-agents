@@ -21,6 +21,34 @@ $script:AgentAnsiPattern = '\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1B\[[0-?]*[ -/]*
 # Agency prints a banner of emoji-prefixed status lines (robot, folder, package,
 # brain, check mark, plug, rocket, ...) before the child's own output.
 $script:AgentBannerLinePattern = '^\s*(?:[\uD800-\uDBFF][\uDC00-\uDFFF]|[\u2190-\u2BFF])'
+# Agency start-up noise that is never a failure cause (MCP proxy list and plugin bookkeeping).
+$script:AgentNoiseLinePattern = '^(?:-\s+\S+:\s+https?://(?:127\.0\.0\.1|localhost)\S*|Launched \d+ MCP prox|Launch plugin metadata|Loaded \d+ MCP server)'
+
+function Get-AgentDeniedToolCall {
+    <#
+        The first tool call Copilot refused because it needed interactive approval in a
+        headless run, read from `--output-format json` stdout. Returns "<tool>: <command or path>"
+        (secret-redacted, single line) or '' when none.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$StdOut = '')
+    try {
+        if ([string]::IsNullOrEmpty($StdOut) -or $StdOut -notmatch 'no interactive user response') { return '' }
+        $starts = @{}
+        foreach ($raw in ($StdOut -split "`r?`n")) {
+            if (-not $raw.StartsWith('{"type":"tool.execution_')) { continue }
+            $evt = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($evt.type -eq 'tool.execution_start') { $starts[[string]$evt.data.toolCallId] = $evt.data; continue }
+            if ($evt.type -ne 'tool.execution_complete' -or [string]$evt.data.error.code -ne 'denied') { continue }
+            $start = $starts[[string]$evt.data.toolCallId]
+            $tool = if ($start) { [string]$start.toolName } else { 'tool' }
+            $target = if ($start.arguments.command) { [string]$start.arguments.command } elseif ($start.arguments.path) { [string]$start.arguments.path } else { '' }
+            $target = @(ConvertTo-AgentFailureLines -Text $target) -join ' '
+            return ("{0}: {1}" -f $tool, $target).Trim(' ', ':')
+        }
+        return ''
+    }
+    catch { return '' }
+}
 
 function ConvertTo-AgentFailureLines {
     param([AllowNull()][AllowEmptyString()][string]$Text)
@@ -44,15 +72,25 @@ function Get-AgentFailureDetail {
     param(
         [AllowNull()][AllowEmptyString()][string]$StdErr = '',
         [AllowNull()][AllowEmptyString()][string]$StdOut = '',
-        [AllowNull()][AllowEmptyString()][string]$FallbackReason = ''
+        [AllowNull()][AllowEmptyString()][string]$FallbackReason = '',
+        # The child exited 0 and the model itself reported the outcome: its reason is the cause,
+        # not whatever Agency last printed to stderr.
+        [switch]$ModelReported
     )
     try {
-        $err = @(ConvertTo-AgentFailureLines -Text $StdErr)
+        $err = @(ConvertTo-AgentFailureLines -Text $StdErr | Where-Object { $_ -notmatch $script:AgentNoiseLinePattern })
         $out = @(ConvertTo-AgentFailureLines -Text $StdOut)
-        $pick = @($err | Where-Object { $_ -cmatch '^Error:' }) | Select-Object -Last 1
+        $denied = Get-AgentDeniedToolCall -StdOut $StdOut
+        $reasonText = @(ConvertTo-AgentFailureLines -Text $FallbackReason) -join ' '
+        $pick = $null
+        if ($ModelReported) {
+            $pick = if ($denied) { "$reasonText; Copilot refused without interactive approval: $denied" } else { $reasonText }
+        }
+        if (-not $pick) { $pick = @($err | Where-Object { $_ -cmatch '^Error:' }) | Select-Object -Last 1 }
         if (-not $pick) { $pick = @($out | Where-Object { $_ -cmatch '^Error:' }) | Select-Object -Last 1 }
+        if (-not $pick -and $denied) { $pick = "Copilot refused without interactive approval: $denied" }
         if (-not $pick) { $pick = @($err | Where-Object { $_ -notmatch $script:AgentBannerLinePattern }) | Select-Object -Last 1 }
-        if (-not $pick) { $pick = @(ConvertTo-AgentFailureLines -Text $FallbackReason) -join ' ' }
+        if (-not $pick) { $pick = $reasonText }
         $detail = ([string]$pick).Trim()
         if ($detail.Length -gt 240) { $detail = $detail.Substring(0, 237) + '...' }
         return $detail
@@ -502,7 +540,7 @@ function Assert-AgentModelPreflight {
 }
 
 Export-ModuleMember -Function @(
-    'Get-AgentFailureDetail', 'Get-AgentFailureKind', 'New-AgentHealthState', 'Read-AgentHealthState',
+    'Get-AgentFailureDetail', 'Get-AgentDeniedToolCall', 'Get-AgentFailureKind', 'New-AgentHealthState', 'Read-AgentHealthState',
     'Write-AgentHealthState', 'Get-AgentStuckBackoffSeconds', 'Update-AgentHealthState',
     'Get-AgentHealthStuckRetryUtc', 'Get-AgentHealthAlertText', 'Read-AgentSkippedPrs',
     'Test-AgentPrOperatorSkipped', 'Invoke-AgentModelPreflight', 'Get-AgentModelPreflightPlanLine',
