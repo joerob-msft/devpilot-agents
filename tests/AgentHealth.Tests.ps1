@@ -141,7 +141,7 @@ Describe 'model preflight' {
         (Invoke-AgentModelPreflight -Model 'gpt-x' -AgencyPath 'fake-agency' -Launcher $launcher).Succeeded | Should -BeTrue
         $seen.Path | Should -Be 'fake-agency'
         $seen.Args[0..1] | Should -BeExactly @('copilot', '--')
-        ($seen.Args -join ' ') | Should -Match '--model gpt-x --name \[DevPilot\] model preflight'
+        ($seen.Args -join ' ') | Should -Match '--model gpt-x --name=\[DevPilot\] model preflight --session-id=[0-9a-f-]{36}'
         $seen.Exists | Should -BeTrue
         $seen.Dir | Should -BeLike "$([IO.Path]::GetTempPath())*"
         Test-Path $seen.Dir | Should -BeFalse
@@ -175,5 +175,22 @@ Describe 'review-handler unattended shell guidance' {
         $source | Should -Match 'log -5 --oneline'
         $source | Should -Match 'containing a ``%`` character'
         $source | Should -Match '-ModelReported:\(\$run\.ExitCode -eq 0'
+    }
+}
+
+Describe 'model preflight session arguments' {
+    It 'names only a brand-new session and reports the Copilot CLI error, not the Agency wrapper' {
+        $box = @{}
+        $launcher = {
+            param($Path, $Arguments, $WorkDir, $Timeout)
+            $box.Arguments = $Arguments
+            @{ ExitCode = 1; StdOut = ''; StdErr = "error: option '-n, --name <name>' cannot be used with option '--session-id <id>'`nError: Agent execution failed: launch_engine - copilot.exe exited with non-zero status (exit code: 1)" }
+        }
+        $launcher = $launcher.GetNewClosure()
+        $probe = Invoke-AgentModelPreflight -Model 'gpt-x' -AgencyPath 'fake-agency' -Launcher $launcher
+        $captured = $box.Arguments
+        $probe.FailureDetail | Should -BeExactly "error: option '-n, --name <name>' cannot be used with option '--session-id <id>'"
+        @($captured | Where-Object { $_ -match '^--session-id=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' }).Count | Should -Be 1
+        $captured | Should -Contain '--name=[DevPilot] model preflight'
     }
 }

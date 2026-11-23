@@ -86,7 +86,13 @@ function Get-AgentFailureDetail {
         if ($ModelReported) {
             $pick = if ($denied) { "$reasonText; Copilot refused without interactive approval: $denied" } else { $reasonText }
         }
-        if (-not $pick) { $pick = @($err | Where-Object { $_ -cmatch '^Error:' }) | Select-Object -Last 1 }
+        if (-not $pick) {
+            # Copilot's own CLI error ("error: option ...") is more specific than Agency's
+            # trailing "Error: Agent execution failed: launch_engine ..." wrapper line.
+            $cliErrors = @($err | Where-Object { $_ -match '^(?i)error:' })
+            $pick = @($cliErrors | Where-Object { $_ -notmatch 'Agent execution failed' }) | Select-Object -Last 1
+            if (-not $pick) { $pick = $cliErrors | Select-Object -Last 1 }
+        }
         if (-not $pick) { $pick = @($out | Where-Object { $_ -cmatch '^Error:' }) | Select-Object -Last 1 }
         if (-not $pick -and $denied) { $pick = "Copilot refused without interactive approval: $denied" }
         if (-not $pick) { $pick = @($err | Where-Object { $_ -notmatch $script:AgentBannerLinePattern }) | Select-Object -Last 1 }
@@ -396,8 +402,10 @@ function Invoke-AgentModelPreflight {
         [int]$TimeoutSeconds = 120,
         [scriptblock]$Launcher
     )
+    # `--name` is accepted only for a brand-new session created by `--session-id=<new-uuid>`;
+    # without it Agency resolves an existing session and Copilot exits 1 before answering.
     $arguments = @('copilot', '--', '-p', 'Reply with the single word OK', '--model', $Model,
-        '--name', '[DevPilot] model preflight')
+        '--name=[DevPilot] model preflight', "--session-id=$([Guid]::NewGuid().ToString())")
     $workDir = Join-Path ([IO.Path]::GetTempPath()) ("devpilot-preflight-" + [Guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory($workDir) | Out-Null
