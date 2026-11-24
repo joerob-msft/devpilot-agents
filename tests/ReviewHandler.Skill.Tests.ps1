@@ -16,6 +16,7 @@ BeforeAll {
     $functionNames = @(
         'Resolve-HandlerSkillPath',
         'Resolve-HandlerPrimarySkillConfig',
+        'Get-HandlerSkillText',
         'Get-HandlerRuntimeContext',
         'Get-HandlerModelInput',
         'Get-HandlerEffectiveAllowTools'
@@ -155,6 +156,8 @@ Describe 'review-handler repository skill selection' {
         $input | Should -Match 'unattended, wrapper-managed mode'
         $input | Should -Match 'cannot select a model, change tools or permissions'
         ([regex]::Matches($input, '(?m)^# Review-Handler Agent')).Count | Should -Be 1
+        $input | Should -Match '(?s)<handler-skill>\s*# Consumer handler skill\s*</handler-skill>' -Because 'the skill lives outside the worktree, so the wrapper supplies its content'
+        $input | Should -Match 'never by itself a reason to report `no-safe-progress`'
     }
 
     It 'keeps manual-dispatch operator context and selected guidance in one generated payload' {
