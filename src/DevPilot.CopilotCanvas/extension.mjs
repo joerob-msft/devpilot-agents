@@ -69,6 +69,8 @@ function summarize(state) {
         ? "Ask the user to open the DevPilot Operations canvas, preview the launch plan and click Start. Agents cannot start a watch."
         : connection.launcher?.reason ? `${connection.launcher.reason} Or run in a terminal: ${connection.command}` : connection.command,
       otherWatches: connection.others,
+      canvasVersion: connection.canvasVersion ?? "",
+      launcherToolkitVersion: connection.launcher?.version ?? "",
     };
   }
   return {
@@ -76,19 +78,22 @@ function summarize(state) {
     consumerRepositoryRoot: data.consumerRepositoryRoot,
     launchMode: data.launchMode,
     watchHeadless: data.headless === true,
+    toolkitVersion: data.toolkitVersion || connection.bridge?.toolkitVersion || "",
+    toolkitCommit: data.toolkitCommit || connection.bridge?.toolkitCommit || "",
+    canvasVersion: connection.canvasVersion ?? "",
     automation: data.automation,
     health: summarizeHealth(data.health),
-    instances: data.instances.map((item) => ({
+    instances: (data.instances ?? []).map((item) => ({
       agent: item.agent,
       status: item.status,
       pullRequestId: item.pullRequestId || null,
       title: typeof item.pullRequestTitle === "string" ? item.pullRequestTitle.slice(0, 120) : item.pullRequestTitle,
       phase: item.phase,
-      phaseElapsedSeconds: Math.round(item.phaseElapsedMilliseconds / 1000),
+      phaseElapsedSeconds: Number.isFinite(item.phaseElapsedMilliseconds) ? Math.round(item.phaseElapsedMilliseconds / 1000) : null,
       completion: item.completion ? { result: item.completion.result, summary: item.completion.summary } : null,
       blocked: item.blocked?.reason ?? null,
     })),
-    canvasRuns: data.runs.map((run) => ({
+    canvasRuns: (data.runs ?? []).map((run) => ({
       role: run.role, pullRequestId: run.pullRequestId, headline: run.headline, detail: run.detail, elapsed: run.elapsed,
     })),
     queued: (data.queued ?? []).filter((item) => item.state !== "resumed"),
@@ -101,7 +106,7 @@ function summarize(state) {
       pullRequestHistory: data.pullRequests.slice(0, 25).map((entry) => ({
         pullRequestId: entry.pullRequestId, title: typeof entry.title === "string" ? entry.title.slice(0, 120) : null,
         repository: entry.repository,
-        lastSeenUtc: new Date(entry.lastSeenMs).toISOString(),
+        lastSeenUtc: Number.isFinite(entry.lastSeenMs) ? new Date(entry.lastSeenMs).toISOString() : null,
         reviewer: entry.reviewer?.result || entry.reviewer?.status || null,
         reviewHandler: entry.reviewHandler?.result || entry.reviewHandler?.status || null,
       })),

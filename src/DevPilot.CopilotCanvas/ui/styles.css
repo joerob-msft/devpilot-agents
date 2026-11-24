@@ -81,6 +81,8 @@ input, textarea {
 
 .badge.operational { color: var(--text-color-success, #1a7f37); border-color: currentColor; }
 .badge.preview { color: var(--text-color-attention, #9a6700); border-color: currentColor; }
+.badge.version { font-variant-numeric: tabular-nums; cursor: help; }
+.version-hint { color: var(--text-color-attention, #9a6700); }
 
 .notice {
   margin: 8px 0;

@@ -224,10 +224,15 @@ Describe 'trusted durable and lease roots' {
         } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
         $held = Enter-AgentWorkLease -LeaseRoot $leaseRoot -RepositoryIdentity $identity `
             -PullRequestId 104 -Role reviewer -TimeoutMilliseconds 0
+        # Windows needs a real in-buffer: the client writes its rejection line synchronously
+        # before this test reads. On Unix the socket buffers regardless, and explicit sizes make
+        # .NET setsockopt SO_RCVBUF/SO_SNDBUF on the accepted socket, which macOS fails with
+        # EINVAL once the client has already written and disconnected.
+        $pipeBufferSize = if ($IsWindows) { 4096 } else { 0 }
         $pipe = [IO.Pipes.NamedPipeServerStream]::new($pipeName, [IO.Pipes.PipeDirection]::In, 1,
             [IO.Pipes.PipeTransmissionMode]::Byte,
             [IO.Pipes.PipeOptions]::Asynchronous -bor [IO.Pipes.PipeOptions]::CurrentUserOnly,
-            4096, 4096)
+            $pipeBufferSize, $pipeBufferSize)
         try {
             $connection = $pipe.WaitForConnectionAsync()
             {

@@ -76,6 +76,36 @@ export interface CanvasBridgeOptions {
   token?: string;
   // Headless owner only: the canvas's explicit Stop. A terminal-owned dashboard never sets this.
   onShutdown?: (() => void) | undefined;
+  // The toolkit release this dashboard runs from, shown in the canvas header.
+  toolkit?: ToolkitIdentity | undefined;
+}
+
+export interface ToolkitIdentity {
+  version: string;
+  // Only when the install path is a pinned ~/.devpilot/toolkits/<40-hex> checkout; else "".
+  commit: string;
+  root: string;
+}
+
+const TOOLKIT_COMMIT_DIRECTORY = /^[0-9a-f]{40}$/i;
+
+// Walks up from the running dashboard to the toolkit root (the directory holding VERSION).
+export function toolkitIdentity(fromDirectory: string, version: string): ToolkitIdentity {
+  let directory = resolve(fromDirectory);
+  for (let depth = 0; depth < 8; depth += 1) {
+    try {
+      if (statSync(join(directory, "VERSION")).isFile()) {
+        const name = directory.split(/[\\/]/).filter(Boolean).pop() ?? "";
+        return { version, commit: TOOLKIT_COMMIT_DIRECTORY.test(name) ? name.toLowerCase() : "", root: directory };
+      }
+    } catch {
+      // Not the toolkit root; keep walking.
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return { version, commit: "", root: "" };
 }
 
 export interface CanvasBridgeDiscovery {
@@ -87,6 +117,8 @@ export interface CanvasBridgeDiscovery {
   launchMode: string;
   headless: boolean;
   startedAtUtc: string;
+  toolkitVersion: string;
+  toolkitCommit: string;
 }
 
 interface BridgeRun {
@@ -159,6 +191,8 @@ export class CanvasBridge {
       launchMode: this.options.launchMode,
       headless: Boolean(this.options.onShutdown),
       startedAtUtc: new Date(this.now()).toISOString(),
+      toolkitVersion: this.options.toolkit?.version ?? "",
+      toolkitCommit: this.options.toolkit?.commit ?? "",
     };
     writeDiscoveryFile(this.options.discoveryFile, discovery);
     this.written = true;
@@ -241,6 +275,9 @@ export class CanvasBridge {
       headless: Boolean(this.options.onShutdown),
       consumerRepositoryRoot: this.options.consumerRepositoryRoot,
       dashboardPid: process.pid,
+      toolkitVersion: this.options.toolkit?.version ?? "",
+      toolkitCommit: this.options.toolkit?.commit ?? "",
+      toolkitRoot: this.options.toolkit?.root ?? "",
       view,
       views: ["live", "history"],
       automation: await this.automationStatus(now),
