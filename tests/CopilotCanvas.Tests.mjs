@@ -214,3 +214,366 @@ test("the canvas title flags failing or stuck agents and tolerates missing healt
   assert.equal(healthTitle([{ role: "reviewer", state: "failing" }, { role: "review-handler", state: "stuck" }, null]),
     "⚠ DevPilot Operations · Reviewer failing · Review Handler stuck");
 });
+// ---------------------------------------------------------------------------------------------
+// Render guard: ui/app.js runs in a vm against a minimal DOM built from ui/index.html, fed bridge
+// payloads whose optional fields are all null or missing. No rendered text or title/aria-label may
+// contain "null", "undefined", "NaN" or "Invalid Date".
+// ---------------------------------------------------------------------------------------------
+
+const UI_DIR = join(repositoryRoot, "src", "DevPilot.CopilotCanvas", "ui");
+const BAD_TEXT = /\b(null|undefined|NaN)\b|Invalid Date/;
+
+class FakeNode {
+  constructor() { this.parentNode = null; }
+  get isConnected() {
+    let node = this;
+    while (node.parentNode) node = node.parentNode;
+    return node.isDocumentRoot === true;
+  }
+  remove() {
+    if (!this.parentNode) return;
+    const siblings = this.parentNode.childNodes;
+    siblings.splice(siblings.indexOf(this), 1);
+    this.parentNode = null;
+  }
+}
+
+class FakeText extends FakeNode {
+  constructor(data) { super(); this.data = data; }
+  get textContent() { return this.data; }
+}
+
+const camelToData = (name) => `data-${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+
+function parseSelector(selector) {
+  return selector.trim().split(/\s+/).map((part) => {
+    const compound = { tag: "", id: "", classes: [], attrs: [] };
+    for (const [token] of part.matchAll(/#[\w-]+|\.[\w-]+|\[[^\]]+\]|^[\w-]+/g)) {
+      if (token.startsWith("#")) compound.id = token.slice(1);
+      else if (token.startsWith(".")) compound.classes.push(token.slice(1));
+      else if (token.startsWith("[")) {
+        const [, name, value] = /^\[([\w-]+)(?:=["']?([^"'\]]*)["']?)?\]$/.exec(token);
+        compound.attrs.push([name, value]);
+      } else compound.tag = token.toLowerCase();
+    }
+    return compound;
+  });
+}
+
+function matchesCompound(node, compound) {
+  if (!(node instanceof FakeElement)) return false;
+  if (compound.tag && node.tagName.toLowerCase() !== compound.tag) return false;
+  if (compound.id && node.getAttribute("id") !== compound.id) return false;
+  const classes = (node.getAttribute("class") ?? "").split(/\s+/);
+  if (compound.classes.some((name) => !classes.includes(name))) return false;
+  return compound.attrs.every(([name, value]) => node.hasAttribute(name) && (value === undefined || node.getAttribute(name) === value));
+}
+
+function matchesSelector(node, selector) {
+  const compounds = parseSelector(selector);
+  if (!matchesCompound(node, compounds.at(-1))) return false;
+  let index = compounds.length - 2;
+  for (let parent = node.parentNode; parent && index >= 0; parent = parent.parentNode) {
+    if (matchesCompound(parent, compounds[index])) index -= 1;
+  }
+  return index < 0;
+}
+
+class FakeElement extends FakeNode {
+  constructor(document, tagName) {
+    super();
+    this.ownerDocument = document;
+    this.tagName = tagName.toUpperCase();
+    this.attributes = new Map();
+    this.childNodes = [];
+    this.listeners = {};
+    this.scrollTop = 0;
+    this.open = false;
+    const attributes = this.attributes;
+    this.dataset = new Proxy({}, {
+      get: (_, name) => typeof name === "string" ? attributes.get(camelToData(name)) : undefined,
+      set: (_, name, value) => { attributes.set(camelToData(name), String(value)); return true; },
+    });
+    this.classList = {
+      contains: (name) => (this.className || "").split(/\s+/).includes(name),
+      toggle: (name, force) => {
+        const set = new Set((this.className || "").split(/\s+/).filter(Boolean));
+        const on = force ?? !set.has(name);
+        if (on) set.add(name); else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
+  }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
+  hasAttribute(name) { return this.attributes.has(name); }
+  removeAttribute(name) { this.attributes.delete(name); }
+  get id() { return this.getAttribute("id") ?? ""; }
+  get className() { return this.getAttribute("class") ?? ""; }
+  set className(value) { this.setAttribute("class", value); }
+  get title() { return this.getAttribute("title") ?? ""; }
+  set title(value) { this.setAttribute("title", value); }
+  get hidden() { return this.hasAttribute("hidden"); }
+  set hidden(value) { if (value) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
+  get children() { return this.childNodes.filter((node) => node instanceof FakeElement); }
+  get childElementCount() { return this.children.length; }
+  get textContent() { return this.childNodes.map((node) => node.textContent).join(""); }
+  set textContent(value) {
+    this.replaceChildren();
+    // Like the DOM: null clears, anything else (including undefined) is stringified.
+    if (value !== null) this.append(String(value));
+  }
+  append(...nodes) {
+    for (const item of nodes) {
+      const node = item instanceof FakeNode ? item : new FakeText(String(item));
+      node.remove();
+      node.parentNode = this;
+      this.childNodes.push(node);
+    }
+  }
+  replaceChildren(...nodes) {
+    for (const node of this.childNodes) node.parentNode = null;
+    this.childNodes = [];
+    this.append(...nodes);
+  }
+  after(node) {
+    const parent = this.parentNode;
+    node.remove();
+    parent.childNodes.splice(parent.childNodes.indexOf(this) + 1, 0, node);
+    node.parentNode = parent;
+  }
+  contains(node) {
+    for (let current = node; current; current = current.parentNode) if (current === this) return true;
+    return false;
+  }
+  *descendants() {
+    for (const node of this.childNodes) {
+      if (node instanceof FakeElement) {
+        yield node;
+        yield* node.descendants();
+      }
+    }
+  }
+  querySelectorAll(selector) { return [...this.descendants()].filter((node) => matchesSelector(node, selector)); }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+  matches(selector) { return matchesSelector(this, selector); }
+  closest(selector) {
+    for (let node = this; node instanceof FakeElement; node = node.parentNode) if (node.matches(selector)) return node;
+    return null;
+  }
+  addEventListener(type, listener) { (this.listeners[type] ??= []).push(listener); }
+  dispatch(type, extra = {}) {
+    const event = { type, target: this, repeat: false, preventDefault() {}, stopPropagation() {}, ...extra };
+    for (const listener of this.listeners[type] ?? []) listener(event);
+    this[`on${type}`]?.(event);
+  }
+  click() { this.dispatch("click"); }
+  focus() { this.ownerDocument.activeElement = this; }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.onclose?.(); }
+}
+
+const VOID_TAGS = new Set(["meta", "link", "input", "br", "img"]);
+
+function fakeDocument(html) {
+  const document = {
+    title: "", hidden: false, activeElement: null,
+    createElement: (tag) => new FakeElement(document, tag),
+    createTextNode: (text) => new FakeText(String(text)),
+    addEventListener() {},
+  };
+  const root = new FakeElement(document, "html");
+  root.isDocumentRoot = true;
+  const stack = [root];
+  for (const [, close, tag, attributes, text] of html.matchAll(/<(\/?)([a-zA-Z][\w-]*)([^>]*)>|([^<]+)/g)) {
+    if (text !== undefined) {
+      if (text.trim()) stack.at(-1).append(text);
+      continue;
+    }
+    const name = tag.toLowerCase();
+    if (close) {
+      while (stack.length > 1 && stack.pop().tagName.toLowerCase() !== name) { /* unwind */ }
+      continue;
+    }
+    const node = new FakeElement(document, name);
+    for (const [, key, value] of attributes.matchAll(/([\w:-]+)(?:="([^"]*)")?/g)) node.setAttribute(key, value ?? "");
+    stack.at(-1).append(node);
+    if (!VOID_TAGS.has(name) && !attributes.trim().endsWith("/")) stack.push(node);
+  }
+  document.documentElement = root;
+  document.body = root.querySelector("body");
+  document.getElementById = (id) => root.querySelector(`#${id}`);
+  document.querySelector = (selector) => root.querySelector(selector);
+  document.querySelectorAll = (selector) => root.querySelectorAll(selector);
+  return document;
+}
+
+const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolveTick) => setImmediate(resolveTick)); };
+
+async function loadCanvas(respond) {
+  const { runInNewContext } = await import("node:vm");
+  const document = fakeDocument(readFileSync(join(UI_DIR, "index.html"), "utf8"));
+  const fetch = async (path, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    const value = await respond(String(path), body);
+    return { ok: true, status: 200, json: async () => value };
+  };
+  runInNewContext(readFileSync(join(UI_DIR, "app.js"), "utf8"), {
+    document, fetch, URL, Node: FakeNode, Element: FakeElement, console, JSON, Promise,
+    setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0,
+    requestAnimationFrame: (callback) => { queueMicrotask(() => callback(0)); return 0; },
+    navigator: { clipboard: { writeText: async () => {} } },
+  }, { filename: "app.js" });
+  await settle();
+  return document;
+}
+
+function assertNoBadText(document, label) {
+  const problems = [];
+  const visit = (node, path) => {
+    for (const child of node.childNodes) {
+      if (child instanceof FakeText) {
+        if (BAD_TEXT.test(child.data)) problems.push(`${path}: text "${child.data}"`);
+        continue;
+      }
+      const where = `${path}>${child.tagName.toLowerCase()}${child.id ? `#${child.id}` : ""}`;
+      for (const name of ["title", "aria-label", "value", "placeholder"]) {
+        const value = child.getAttribute(name);
+        if (value !== null && BAD_TEXT.test(value)) problems.push(`${where}: ${name}="${value}"`);
+      }
+      visit(child, where);
+    }
+  };
+  visit(document.documentElement, "");
+  if (BAD_TEXT.test(document.title)) problems.push(`document.title "${document.title}"`);
+  assert.deepEqual(problems, [], `${label} rendered null-like text`);
+}
+
+async function clickEveryRow(document, label) {
+  for (const row of document.querySelectorAll("[role=option]")) {
+    row.click();
+    await settle();
+    assertNoBadText(document, `${label} (selected ${row.textContent.slice(0, 40)})`);
+  }
+}
+
+const NULL_COMPLETION = {
+  result: null, reason: null, summary: null, failureDetail: null, failureKind: null, failureLogPath: null,
+  findings: { critical: null, important: null, suggestion: null }, delivered: [null], previewArtifact: null,
+  timestampMs: null, elapsedMilliseconds: null,
+};
+
+function nullData(view) {
+  return {
+    schemaVersion: 1, launchMode: null, headless: null, consumerRepositoryRoot: null, dashboardPid: null,
+    toolkitVersion: null, toolkitCommit: null, toolkitRoot: null, view,
+    automation: { available: true, agents: [null, { role: null, state: null, continuous: true, intervalSeconds: null, retryAtUtc: null }] },
+    health: [null,
+      { role: null, state: "failing", consecutiveFailures: null, cause: null, failingSinceUtc: null, lastSuccessUtc: "not a date",
+        notifications: { failuresSinceSuccess: null, warning: true, latestReason: null } },
+      { role: "reviewer", state: "stuck", stuck: [{ pullRequestId: null, repeatCount: null, nextAttemptUtc: null, outcome: null }] }],
+    instances: [
+      { key: "empty-fields", agent: null, status: null, phase: null, pullRequestId: null, pullRequestTitle: null, pullRequestUrl: null,
+        pullRequestAuthor: null, repository: null, completion: NULL_COMPLETION, blocked: { reason: null, nextRetry: null },
+        waiting: { kind: null, delayMilliseconds: null }, heartbeatAgeMilliseconds: null, phaseElapsedMilliseconds: null,
+        totalElapsedMilliseconds: null, lastEventMs: null, timeline: null, threadCount: null, actionableThreadCount: null,
+        changedFileCount: null, modelActivity: null, candidateStory: null, sourceBranch: null, targetBranch: null,
+        instanceId: null, processId: NaN, sessionNamespace: null, sourceCommit: null },
+      { key: "missing", status: "stale" },
+      { key: "failed", agent: "reviewer", status: "failed", pullRequestId: 7,
+        completion: { ...NULL_COMPLETION, result: "failed", failureDetail: "boom", timestampMs: NaN, failureLogPath: "C:\\log.txt" },
+        timeline: [null, { timestampMs: null, text: null }, { timestampMs: 8.64e16, text: "far future" }] },
+    ],
+    historyAvailable: true,
+    ...(view === "history" ? {
+      pullRequests: [
+        { key: "h-empty", pullRequestId: null, title: null, repository: null, lastSeenMs: null, url: null, author: null,
+          sourceBranch: null, targetBranch: null, reviewer: { result: null, status: null, resultAtMs: null, statusAtMs: null, failureDetail: null },
+          reviewHandler: null },
+        { key: "h-missing" },
+      ],
+      hiddenPullRequestCount: null,
+    } : {}),
+    recentPullRequests: null,
+    runs: [{ dispatchId: "d1", role: null, pullRequestId: null, headline: null, detail: null, latest: null, elapsed: null, terminal: null }],
+    queued: [{ queueId: "q1", mode: null, role: null, pullRequestId: null, state: null, code: null }],
+    notRun: [{ queueId: "n1", mode: null, role: null, pullRequestId: null, retiredAtUtc: null }],
+  };
+}
+
+function nullConnection(extra = {}) {
+  return {
+    state: "connected", error: null, workingDirectory: null, command: null, canvasVersion: null,
+    bridge: { startedAtUtc: null, launchMode: null, toolkitVersion: null, toolkitCommit: null },
+    others: [], launcher: null, launch: null, ...extra,
+  };
+}
+
+test("the canvas renders null or missing bridge fields without null-like text, in Live, History and every detail", async () => {
+  for (const automation of [undefined, { available: false, error: null }, { available: true, agents: null }]) {
+    const document = await loadCanvas((path) => {
+      const view = path.includes("view=history") ? "history" : "live";
+      const data = nullData(view);
+      if (automation) data.automation = automation;
+      return { connection: nullConnection(), data, prefill: null };
+    });
+    assertNoBadText(document, "live");
+    await clickEveryRow(document, "live");
+    document.getElementById("tab-history").click();
+    await settle();
+    assert.ok(document.querySelectorAll("[role=option]").length >= 2, "history rows rendered");
+    assertNoBadText(document, "history");
+    await clickEveryRow(document, "history");
+  }
+});
+
+test("the no-watch canvas renders null launcher, launch and other-watch fields without null-like text", async () => {
+  const launcher = { available: true, repositoryRoot: null, kind: "repository", script: null, toolkitRoot: null, version: null, note: null };
+  const launch = { pid: null, previewOnly: null, elapsedMs: null, kind: null, logPath: null, logTail: null, failureCause: null };
+  const others = [{ watchId: null, consumerRepositoryRoot: null, launchMode: null, startedAtUtc: null }];
+  const connections = [
+    { state: "no-bridge", launcher, others },
+    { state: "disconnected", launcher: { available: false, reason: null }, others: null },
+    { state: "no-bridge", launcher: { ...launcher, kind: "toolkit" }, launch: { ...launch, state: "starting" } },
+    { state: "no-bridge", launcher, launch: { ...launch, state: "failed" } },
+    { state: "no-bridge", launcher, launch: { ...launch, state: "starting", logTail: "Verified toolkit release: v0.5.15 @ 0123456789abcdef0123456789abcdef01234567" } },
+  ];
+  for (const connection of connections) {
+    const document = await loadCanvas(() => ({ connection: nullConnection({ bridge: null, ...connection }), data: null, prefill: null }));
+    assertNoBadText(document, `no-watch ${connection.state}/${connection.launch?.state ?? "idle"}`);
+  }
+
+  // The launch plan shows its toolkit version, with a refresh hint inside the channel cooldown.
+  const document = await loadCanvas((path) => path === "/api/watch/preview"
+    ? { ok: true, output: "DevPilot launch plan\nVerified toolkit within the six-hour channel cooldown: v0.5.15\n", command: null, previewOnly: null, launchToken: null }
+    : { connection: nullConnection({ state: "no-bridge", bridge: null, launcher }), data: null, prefill: null });
+  document.getElementById("launch-begin").click();
+  await settle();
+  const text = document.getElementById("launch").textContent;
+  assert.match(text, /Toolkit for this launch: v0\.5\.15/);
+  assert.match(text, /newer release may exist.*Install-DevPilotAgents\.ps1 -SetupDashboard -Refresh/);
+  assertNoBadText(document, "launch plan");
+});
+
+test("the canvas header shows the watch toolkit and canvas versions and flags an older canvas", async () => {
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  const document = await loadCanvas(() => ({
+    connection: nullConnection({ canvasVersion: "0.5.12" }),
+    data: { ...nullData("live"), launchMode: "operational", toolkitVersion: "0.5.15", toolkitCommit: commit, toolkitRoot: "C:\\toolkits\\x" },
+    prefill: null,
+  }));
+  const badge = document.getElementById("toolkit-version");
+  assert.equal(badge.hidden, false);
+  assert.equal(badge.textContent, "v0.5.15");
+  assert.match(badge.title, new RegExp(`commit ${commit}`));
+  assert.equal(document.getElementById("canvas-version").textContent, "canvas v0.5.12");
+  const hint = document.getElementById("version-hint");
+  assert.equal(hint.hidden, false);
+  assert.match(hint.textContent, /Canvas v0\.5\.12 is older than the watch toolkit v0\.5\.15.*Install-DevPilotCanvas\.ps1/);
+
+  const same = await loadCanvas(() => ({
+    connection: nullConnection({ canvasVersion: "v0.5.15" }), data: { ...nullData("live"), toolkitVersion: "0.5.15" }, prefill: null,
+  }));
+  assert.equal(same.getElementById("version-hint").hidden, true);
+  assertNoBadText(same, "matching versions");
+});

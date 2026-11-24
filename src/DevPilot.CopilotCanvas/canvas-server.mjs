@@ -164,6 +164,8 @@ function publicBridge(bridge) {
     headless: bridge.headless === true,
     startedAtUtc: bridge.startedAtUtc,
     dashboardPid: bridge.dashboardPid,
+    toolkitVersion: typeof bridge.toolkitVersion === "string" ? bridge.toolkitVersion : "",
+    toolkitCommit: typeof bridge.toolkitCommit === "string" ? bridge.toolkitCommit : "",
   };
 }
 
@@ -266,7 +268,22 @@ export class CanvasInstanceServer {
         : `cd "${location}"; pwsh -File <devpilot-agents>\\tools\\Watch-DevPilotAgents.ps1 -Golden`,
       launcher,
       launch: this.launchState(),
+      canvasVersion: this.canvasVersion(),
     };
+  }
+
+  // The installed canvas extension's own version (toolkit.json from Install-DevPilotCanvas.ps1).
+  canvasVersion() {
+    if (this.ownVersion === undefined) {
+      let version = "";
+      try {
+        version = this.launcher.readToolkit?.()?.version ?? "";
+      } catch {
+        version = "";
+      }
+      this.ownVersion = typeof version === "string" ? version : "";
+    }
+    return this.ownVersion;
   }
 
   // Polled every refresh, so the pwsh parameter probe is cached; while nothing changes the cache

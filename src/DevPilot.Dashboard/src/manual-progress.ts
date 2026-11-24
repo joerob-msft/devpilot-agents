@@ -59,7 +59,7 @@ export function manualProgress(
   } else if (stopped) {
     progress.headline = result === "cancelled" ? "CANCELLED" : completion || terminal ? "FINISHED" : "EXITED / OUTCOME UNKNOWN";
     progress.detail = completion
-      ? `Work result: ${completion.result}${completion.reason ? ` — ${completion.reason}` : ""}`
+      ? `Work result: ${completion.result || "unknown"}${completion.reason ? ` — ${completion.reason}` : ""}`
       : "Child exited; review outcome was not reported.";
     progress.attention = !completion;
   } else if ((!state && now - startedMs >= 30_000) ||
@@ -68,7 +68,7 @@ export function manualProgress(
     progress.detail = state ? "Heartbeat overdue; last known progress shown below." : "No progress after 30s; monitoring is still retrying.";
     progress.attention = true;
   } else if (completion) {
-    progress.detail = `Work result: ${completion.result}; waiting for child exit.`;
+    progress.detail = `Work result: ${completion.result || "unknown"}; waiting for child exit.`;
   }
   if (completion?.summary && !monitorError) progress.latest = completion.summary;
   return { ...progress, detail: boundedText(progress.detail, 240), latest: boundedText(progress.latest, 240) };

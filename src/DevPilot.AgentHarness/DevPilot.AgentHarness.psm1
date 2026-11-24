@@ -39,6 +39,7 @@ $ErrorActionPreference = "Stop"
 # Update ONLY this array when Copilot CLI adds/retires a model.
 # ---------------------------------------------------------------------------
 $script:AgentHarnessSupportedModels = @(
+    "claude-opus-5.5",
     "claude-sonnet-5",
     "claude-sonnet-4.6",
     "claude-haiku-4.5",
@@ -49,6 +50,7 @@ $script:AgentHarnessSupportedModels = @(
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6.2-sol",
     "gpt-6.1-sol",
     "gpt-5.5",
     "gpt-5.4",
@@ -2643,8 +2645,11 @@ function Get-AgentProcessArgv {
     # positional validator below -- any embedded-whitespace corruption changes the token count or
     # position and that validator already fails closed on anything but the one exact expected
     # shape, so this never silently accepts a misparsed line.
-    $comm = ([string](& ps -o comm= -p $ProcessId 2>$null)).Trim()
-    $full = ([string](& ps -o command= -p $ProcessId 2>$null)).Trim()
+    # ps prints nothing for a PID that has exited (or is not yet visible); join the captured
+    # lines instead of casting the possibly-empty pipeline result so that case reaches the
+    # descriptive throw below rather than a null-valued .Trim() call.
+    $comm = (@(& ps -o comm= -p $ProcessId 2>$null) -join ' ').Trim()
+    $full = (@(& ps -o command= -p $ProcessId 2>$null) -join ' ').Trim()
     if (-not $comm -or -not $full) {
         throw "Could not determine the command line for process $ProcessId via ps."
     }

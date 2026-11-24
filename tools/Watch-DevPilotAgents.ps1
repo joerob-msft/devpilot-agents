@@ -172,10 +172,10 @@ param(
     # Explicit default: headless Copilot CLI can fail to resolve the user's own default model
     # ("No supported model available"), which fails every cycle before any work.
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$ReviewerModel = 'gpt-6.1-sol',
+    [string]$ReviewerModel = 'claude-opus-5.5',
 
     [Parameter(ParameterSetName = 'Launch')]
-    [string]$ReviewHandlerModel = 'gpt-6.1-sol',
+    [string]$ReviewHandlerModel = 'claude-opus-5.5',
 
     # Skips the one-shot "can this model answer?" probe run before agents start.
     [Parameter(ParameterSetName = 'Launch')]

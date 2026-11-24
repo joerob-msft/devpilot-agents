@@ -1,7 +1,7 @@
 import { createCliRenderer } from "@opentui/core";
 import { render } from "@opentui/solid";
 import { App, type LaunchMode } from "./app.js";
-import { CanvasBridge } from "./canvas-bridge.js";
+import { CanvasBridge, toolkitIdentity } from "./canvas-bridge.js";
 import { DispatchClient, type BrokerLaunchDescriptor } from "./dispatch.js";
 import { PullRequestHistoryProjection } from "./history.js";
 import { AgentHealthProjection } from "./health.js";
@@ -10,7 +10,8 @@ import { OperationsReducer } from "./reducer.js";
 import { EventTailer } from "./tailer.js";
 import { FileDismissalStorage } from "./dismissals.js";
 import { FileHistoryHideStorage } from "./history-hides.js";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import packageInfo from "../package.json" with { type: "json" };
 
 interface Arguments {
@@ -159,6 +160,7 @@ async function main(): Promise<void> {
         discoveryFile: canvasBridgeFile, consumerRepositoryRoot, launchMode: args.launchMode, broker, reducer, tailer,
         history, historyHides, health, stateRoots: args.stateDirectories,
         onShutdown: args.headless ? () => stopHeadless(0) : undefined,
+        toolkit: toolkitIdentity(dirname(fileURLToPath(import.meta.url)), packageInfo.version),
       })
     : undefined;
   const stopCanvasBridge = (): void => canvasBridge?.stop();

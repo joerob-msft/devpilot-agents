@@ -1509,18 +1509,42 @@ $child.Process.WaitForExit(15000) | Out-Null
          $suiteRoot = Join-Path $TestDrive 'argv-integration'
          New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
          $descriptorStandIn = Join-Path $suiteRoot 'descriptor.json'
+         # A long-lived stand-in with the broker's exact -File/-DescriptorPath shape: the real
+                  # broker can exit promptly on the missing descriptor, and on fast hosts (macOS CI) that
+         # exit could precede the probe, leaving no process for ps to describe.
+         $standInBroker = Join-Path $suiteRoot 'broker-stand-in.ps1'
+         Set-Content -LiteralPath $standInBroker -Encoding utf8NoBOM -Value @'
+param([string]$DescriptorPath)
+Start-Sleep -Seconds 60
+'@
          $pwshPath = Resolve-AgentPwshPath
          $stdOut = Join-Path $suiteRoot 'child.stdout.log'
          $stdErr = Join-Path $suiteRoot 'child.stderr.log'
          $child = New-AgentRedirectedProcess -FilePath $pwshPath -ArgumentList @(
-             '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $brokerPath, '-DescriptorPath', $descriptorStandIn
+             '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $standInBroker, '-DescriptorPath', $descriptorStandIn
          ) -StandardOutputPath $stdOut -StandardErrorPath $stdErr
          try {
-             Start-Sleep -Milliseconds 500
-             $invocation = Get-AgentProcessArgv -ProcessId $child.Process.Id
+             # Until exec completes, the OS may still report the forked parent's image and argv;
+             # poll with a bounded deadline rather than a fixed sleep.
+             $deadline = [DateTime]::UtcNow.AddSeconds(15)
+             $invocation = $null
+             $resolvedDescriptor = $null
+             $lastError = $null
+             while ([DateTime]::UtcNow -lt $deadline -and -not $child.Process.HasExited) {
+                 try {
+                     $invocation = Get-AgentProcessArgv -ProcessId $child.Process.Id
+                     $resolvedDescriptor = Assert-AgentBrokerCommandLineShape -ExecutablePath $invocation.ExecutablePath `
+                         -Arguments $invocation.Arguments -ExpectedBrokerScript ([IO.Path]::GetFullPath($standInBroker))
+                     break
+                 }
+                 catch {
+                     $lastError = $_
+                     Start-Sleep -Milliseconds 100
+                 }
+             }
+             $child.Process.HasExited | Should -BeFalse -Because 'the stand-in broker must still be running while probed'
+             if (-not $resolvedDescriptor) { throw $lastError }
              $invocation.ExecutablePath | Should -Match ([regex]::Escape('pwsh'))
-             $resolvedDescriptor = Assert-AgentBrokerCommandLineShape -ExecutablePath $invocation.ExecutablePath `
-                 -Arguments $invocation.Arguments -ExpectedBrokerScript $brokerPath
              $resolvedDescriptor | Should -Be ([IO.Path]::GetFullPath($descriptorStandIn))
          }
          finally {
