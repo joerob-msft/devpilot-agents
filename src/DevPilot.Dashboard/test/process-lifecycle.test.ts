@@ -279,3 +279,53 @@ test("tailer archives after ingestion and re-derives exits on reload without cha
     }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("earlier watch launches' stale and blocked agents move to History as interrupted; live ones and the current launch are unchanged", async () => {
+  const priorRoot = join(process.cwd(), ".prior-watch", "20260905T110000Z-aaaaaaaa");
+  const priorSource = join(priorRoot, "logs", "events", "reviewer", "reviewer.stdout.jsonl");
+  const currentSource = join(process.cwd(), ".current-watch", "logs", "events", "reviewer", "reviewer.stdout.jsonl");
+  const reducer = new OperationsReducer();
+  reducer.registerHistoryRoots([priorRoot]);
+  // Prior launch, killed without agent.stopped: heartbeat and then nothing.
+  reducer.apply(event("prior-stale", 1, "agent.started"), priorSource);
+  reducer.apply(event("prior-stale", 2, "agent.heartbeat"), priorSource);
+  // Prior launch that ended blocked and was then killed.
+  reducer.apply(event("prior-blocked", 1, "agent.started"), `${priorSource}.1`);
+  reducer.apply(event("prior-blocked", 2, "delivery.blocked"), `${priorSource}.1`);
+  // A concurrent (earlier-started) watch that is still heartbeating.
+  reducer.apply(event("prior-live", 1, "agent.started"), priorSource);
+  reducer.apply(event("prior-live", 2, "agent.heartbeat", NOW - 1_000), priorSource);
+  // Current launch, not broker-owned: today's stale behavior is unchanged.
+  reducer.apply(event("current-stale", 1, "agent.started"), currentSource);
+
+  const current = (now: number) => reducer.list(now, undefined, "current").map((state) => `${state.instanceId}:${state.status}`).sort();
+  assert.deepEqual(current(NOW), ["current-stale:stale", "prior-live:running"]);
+  assert.deepEqual(reducer.list(NOW, undefined, "history").map((state) => `${state.instanceId}:${state.status}`).sort(),
+    ["prior-blocked:exited", "prior-stale:exited"]);
+  assert.equal(reducer.priorLaunchInterruptedCount(NOW), 2);
+  assert.equal(reducer.get("reviewer:prior-stale", NOW)?.completion, null);
+
+  // A late heartbeat restores an archived prior-launch instance to Live.
+  reducer.apply(event("prior-stale", 3, "agent.heartbeat", NOW), priorSource);
+  assert.deepEqual(current(NOW), ["current-stale:stale", "prior-live:running", "prior-stale:running"]);
+  assert.equal(reducer.priorLaunchInterruptedCount(NOW), 1);
+
+  // When the concurrent watch stops heartbeating it is archived on the next poll.
+  const later = NOW + STALE_AFTER_MS + 1_000;
+  assert.equal(await reducer.observeProcesses(async () => "absent", later), true);
+  assert.deepEqual(current(later), ["current-stale:stale"]);
+  assert.equal(reducer.priorLaunchInterruptedCount(later), 3);
+});
+
+test("an instance also seen through the current launch is never archived as an earlier watch", () => {
+  const priorRoot = join(process.cwd(), ".prior-watch", "20260905T110000Z-bbbbbbbb");
+  const reducer = new OperationsReducer();
+  reducer.registerHistoryRoots([priorRoot]);
+  reducer.apply(event("shared", 1, "agent.started"), join(priorRoot, "reviewer.stdout.jsonl"));
+  reducer.apply(event("shared", 2, "delivery.blocked"), join(process.cwd(), ".current-watch", "reviewer.stdout.jsonl"));
+  // A sibling folder that merely shares the prefix is not inside the history root.
+  reducer.apply(event("sibling", 1, "agent.started"), `${priorRoot}-other${join("/", "reviewer.stdout.jsonl")}`);
+  assert.deepEqual(reducer.list(NOW, undefined, "current").map((state) => `${state.instanceId}:${state.status}`).sort(),
+    ["shared:blocked", "sibling:stale"]);
+  assert.equal(reducer.priorLaunchInterruptedCount(NOW), 0);
+});

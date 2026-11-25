@@ -1,4 +1,4 @@
-import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, normalize, relative, resolve } from "node:path";
 import type { InstanceDismissal } from "./dismissals.js";
 import { observeProcess, type LocalProcessStream, type ProcessObserver } from "./process-observer.js";
 import {
@@ -192,6 +192,8 @@ export class OperationsReducer {
   private readonly localStreams = new Map<string, LocalProcessStream>();
   private readonly originEvidence = new Map<string, { event: AgentEvent; source: string }>();
   private readonly dismissedInstances: Map<string, InstanceDismissal>;
+  private historyRoots: string[] = [];
+  private readonly priorLaunchRetired = new Set<string>();
 
   constructor(dismissals: readonly InstanceDismissal[] = []) {
     this.dismissedInstances = new Map(dismissals.map((record) => [record.key, { ...record }]));
@@ -217,6 +219,51 @@ export class OperationsReducer {
     return process.platform === "win32" ? path.toLowerCase() : path;
   }
 
+  // Prior watch launches (--history-state-dir). Only the launcher's argv supplies these roots.
+  registerHistoryRoots(roots: readonly string[]): void {
+    this.historyRoots = roots.filter(Boolean)
+      .map((root) => process.platform === "win32" ? resolve(root).toLowerCase() : resolve(root));
+  }
+
+  private isHistorySource(source: string): boolean {
+    const path = process.platform === "win32" ? resolve(source).toLowerCase() : resolve(source);
+    return this.historyRoots.some((root) => {
+      const inner = relative(root, path);
+      return inner !== "" && !inner.startsWith("..") && !isAbsolute(inner);
+    });
+  }
+
+  // A prior launch's instance that is no longer heartbeating was interrupted with that launch
+  // (app quit, reload): archive it like an observed exit. Current-launch instances, and any
+  // instance also seen through a current source, are never retired here. A later event clears
+  // exitObservedMs in apply(), so a concurrent watch that is still running reappears live.
+  private retirePriorLaunch(now: number): boolean {
+    if (!this.historyRoots.length) return false;
+    let changed = false;
+    for (const state of this.states.values()) {
+      if (state.exitObservedMs !== null || state.lifecycle === "stopped") continue;
+      state.status = calculateStatus(state, now);
+      if (isHistorical(state) || now - Math.max(state.lastEventMs, state.lastHeartbeatMs) <= STALE_AFTER_MS) continue;
+      if (!state.sources.length || !state.sources.every((source) => this.isHistorySource(source))) continue;
+      state.exitObservedMs = now;
+      state.status = calculateStatus(state, now);
+      this.priorLaunchRetired.add(state.key);
+      changed = true;
+    }
+    return changed;
+  }
+
+  // Interrupted instances from earlier watch launches that were moved from Live to History.
+  priorLaunchInterruptedCount(now = Date.now()): number {
+    this.retirePriorLaunch(now);
+    let count = 0;
+    for (const key of this.priorLaunchRetired) {
+      const state = this.states.get(key);
+      if (state && state.exitObservedMs !== null && !this.forgottenHistory.has(key)) count++;
+    }
+    return count;
+  }
+
   private hasLocalOrigin(event: AgentEvent, source: string): boolean {
     if (!source) return false;
     const stream = this.localStreams.get(this.streamPath(source));
@@ -230,10 +277,11 @@ export class OperationsReducer {
   }
 
   async observeProcesses(observe: ProcessObserver = observeProcess, now = Date.now()): Promise<boolean> {
-    if (this.observingProcesses || now - this.lastProcessCheckMs < 5_000) return false;
+    const retired = this.retirePriorLaunch(now);
+    if (this.observingProcesses || now - this.lastProcessCheckMs < 5_000) return retired;
     this.lastProcessCheckMs = now;
     this.observingProcesses = true;
-    let changed = false;
+    let changed = retired;
     try {
       const candidates = [...this.states.values()]
         .filter((state) => state.processOrigin === "local" && state.exitObservedMs === null && state.lifecycle !== "stopped" &&
@@ -282,6 +330,7 @@ export class OperationsReducer {
     state.lastSequence = event.sequence;
     this.eventRevision++;
     state.exitObservedMs = null;
+    this.priorLaunchRetired.delete(key);
     if (event.schemaVersion === 3 && event.dispatch && event.repositoryIdentity?.verified) {
       this.dispatchBindings.set(key, event);
     }
@@ -590,6 +639,7 @@ export class OperationsReducer {
   }
 
   list(now = Date.now(), role?: AgentRole, view?: ViewFilter): InstanceState[] {
+    this.retirePriorLaunch(now);
     const visible = [...this.states.values()].filter((state) => {
       state.status = calculateStatus(state, now);
       if (role && state.agent !== role) return false;

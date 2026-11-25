@@ -7,6 +7,11 @@ param(
     [ValidateNotNullOrEmpty()]
     [string[]]$EventLogPath = @(),
 
+    # Earlier watch launches' state roots (Watch-DevPilotAgents.ps1). Tailed for history only: an
+    # agent seen only there that is no longer heartbeating is shown as interrupted History.
+    [Parameter()]
+    [string[]]$HistoryStateDir = @(),
+
     [Parameter(DontShow)]
     [string]$BrokerDescriptorPath,
 
@@ -216,6 +221,11 @@ foreach ($path in $StateDir) {
 }
 foreach ($path in $EventLogPath) {
     [void]$arguments.Add('--event-log')
+    [void]$arguments.Add([IO.Path]::GetFullPath($path))
+}
+# Pinned position checked by Assert-AgentDashboardCommandLineShape: after every state-dir/event-log pair.
+foreach ($path in $HistoryStateDir) {
+    [void]$arguments.Add('--history-state-dir')
     [void]$arguments.Add([IO.Path]::GetFullPath($path))
 }
 if ($descriptor) {

@@ -425,6 +425,35 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
                 -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath `
                 -ExpectedDescriptorPath $descriptorPath
         } | Should -Not -Throw
+
+        # Prior watch launches follow every state-dir/event-log pair as --history-state-dir pairs.
+        {
+            Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                -Arguments @(
+                    '--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'operational', '--headless',
+                    '--state-dir', 'C:\fake\state1', '--history-state-dir', 'C:\fake\prior1', '--history-state-dir', 'C:\fake\prior2',
+                    '--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+                    '--broker-descriptor', $descriptorPath) `
+                -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath `
+                -ExpectedDescriptorPath $descriptorPath
+        } | Should -Not -Throw
+        foreach ($rejected in @(
+                , @('--history-state-dir', 'C:\fake\prior1', '--state-dir', 'C:\fake\state1')
+                , @('--state-dir', 'C:\fake\state1', '--history-state-dir')
+                , @('--state-dir', 'C:\fake\state1', '--History-State-Dir', 'C:\fake\prior1')
+                , @('--state-dir', 'C:\fake\state1', '--history-state-dir', 'C:\fake\prior1', '--event-log', 'C:\fake\e.jsonl')
+            )) {
+            {
+                Assert-AgentDashboardCommandLineShape -ExecutablePath $script:expectedDashboardBunExecutable `
+                    -Arguments (@('--conditions=browser', $script:expectedDashboardEntryScript, '--launch-mode', 'operational') +
+                        @($rejected) + @('--broker-executable', $brokerExe, '--broker-script', $script:brokerPath,
+                        '--broker-descriptor', $descriptorPath)) `
+                    -ExpectedBunExecutable $script:expectedDashboardBunExecutable -ExpectedEntryScript $script:expectedDashboardEntryScript `
+                    -ExpectedBrokerExecutable $brokerExe -ExpectedBrokerScript $script:brokerPath `
+                    -ExpectedDescriptorPath $descriptorPath
+            } | Should -Throw '*widening-interactive-required*' -Because (@($rejected) -join ' ')
+        }
     }
 
     It 'Assert-AgentDashboardCommandLineShape accepts every launch mode the launcher can emit, in exactly one fixed-position pair (issue #114)' {
@@ -520,6 +549,13 @@ Describe 'headless-broker bypass fix: broker parent must be the trusted Dashboar
         $headlessIndex | Should -BeGreaterThan $launchModeValueIndex
         $stateDirIndex | Should -BeGreaterThan $headlessIndex
         ([regex]::Matches($launcherSource, [regex]::Escape("'--headless'"))).Count | Should -Be 1
+        # History roots are emitted after the event-log pairs and before the broker triple.
+        $eventLogIndex = $launcherSource.IndexOf("[void]`$arguments.Add('--event-log')")
+        $historyIndex = $launcherSource.IndexOf("[void]`$arguments.Add('--history-state-dir')")
+        $brokerIndex = $launcherSource.IndexOf("[void]`$arguments.Add('--broker-executable')")
+        $historyIndex | Should -BeGreaterThan $eventLogIndex
+        $eventLogIndex | Should -BeGreaterThan $stateDirIndex
+        $brokerIndex | Should -BeGreaterThan $historyIndex
     }
 
     It 'Assert-AgentDashboardCommandLineShape rejects a decoy Bun executable, a decoy entry script used as inert data, a wrong --conditions value, a forged broker triple, and trailing extra tokens' {

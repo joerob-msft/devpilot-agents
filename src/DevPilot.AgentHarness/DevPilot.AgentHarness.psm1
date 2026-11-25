@@ -2953,6 +2953,7 @@ function Assert-AgentDashboardCommandLineShape {
         literal token '--conditions=browser'; the one canonical dist/src/index.js entry point;
         exactly one '--launch-mode' pair whose value is one of the three launch modes the
         launcher can emit (issue #114); zero or more well-formed --state-dir/--event-log pairs
+        followed by zero or more --history-state-dir pairs (prior watch launches)
         (their VALUES carry no trust weight -- only their shape is checked); then exactly the --broker-executable/
         --broker-script/--broker-descriptor triple, in that fixed order, whose three values must
         equal THIS broker process's own live executable path, its own running script path, and
@@ -3010,6 +3011,12 @@ function Assert-AgentDashboardCommandLineShape {
         $i++
     }
     while ($i -lt $argv.Count -and $argv[$i] -cin @('--state-dir', '--event-log')) {
+        $i += 2
+        if ($i -gt $argv.Count) { throw $failure }
+    }
+    # Prior watch launches' roots: only after every state-dir/event-log pair. Like those, the
+    # values carry no trust weight; a later --state-dir/--event-log falls through to the triple.
+    while ($i -lt $argv.Count -and $argv[$i] -ceq '--history-state-dir') {
         $i += 2
         if ($i -gt $argv.Count) { throw $failure }
     }

@@ -16,6 +16,7 @@ import packageInfo from "../package.json" with { type: "json" };
 
 interface Arguments {
   stateDirectories: string[];
+  historyStateDirectories: string[];
   eventLogPaths: string[];
   broker: BrokerLaunchDescriptor | null;
   launchMode: LaunchMode;
@@ -26,6 +27,7 @@ interface Arguments {
 export function parseArguments(argv: string[]): Arguments {
   const result: Arguments = {
     stateDirectories: [],
+    historyStateDirectories: [],
     eventLogPaths: [],
     broker: null,
     launchMode: "observe",
@@ -39,6 +41,10 @@ export function parseArguments(argv: string[]): Arguments {
       if (!value) throw new Error(`${argument} requires a path`);
       if (argument === "--state-dir") result.stateDirectories.push(value);
       else result.eventLogPaths.push(value);
+    } else if (argument === "--history-state-dir") {
+      const value = argv[++index];
+      if (!value) throw new Error("--history-state-dir requires a path");
+      result.historyStateDirectories.push(value);
     } else if (argument === "--view-state-dir") {
       const value = argv[++index];
       if (!value) throw new Error("--view-state-dir requires a path");
@@ -61,6 +67,7 @@ export function parseArguments(argv: string[]): Arguments {
     } else if (argument === "--help" || argument === "-h") {
       process.stdout.write(
         "Usage: npm start -- [--state-dir <path>]... [--event-log <path>]... [--launch-mode <observe|preview|operational>]\n" +
+          "  [--history-state-dir <path>]... tails an earlier watch launch; its stopped agents show as interrupted History.\n" +
           "  [--headless] runs the trusted broker and canvas bridge without a terminal UI (Watch -Headless only).\n" +
           "  [--view-state-dir <path>] overrides local dashboard dismissal storage only.\n" +
           "Observe DevPilot reviewer and review-handler JSONL event streams.\n",
@@ -106,6 +113,8 @@ async function main(): Promise<void> {
     });
   const history = new PullRequestHistoryProjection();
   const health = new AgentHealthProjection();
+  reducer.registerHistoryRoots(args.historyStateDirectories);
+  const allStateDirectories = [...args.stateDirectories, ...args.historyStateDirectories];
   const historyHides = new FileHistoryHideStorage(
     args.viewStateDirectory ? join(args.viewStateDirectory, "hidden-pr-history.v1.json") : undefined);
   await historyHides.load()
@@ -118,7 +127,7 @@ async function main(): Promise<void> {
   let refresh = (): void => {};
   let stopHeadless: (code: number) => void = () => {};
   const tailer = new EventTailer({
-    stateDirectories: args.stateDirectories,
+    stateDirectories: allStateDirectories,
     eventLogPaths: args.eventLogPaths,
     onEvent(event, source) {
       const changed = reducer.apply(event, source);
@@ -158,7 +167,7 @@ async function main(): Promise<void> {
   const canvasBridge = canvasBridgeFile && broker
     ? new CanvasBridge({
         discoveryFile: canvasBridgeFile, consumerRepositoryRoot, launchMode: args.launchMode, broker, reducer, tailer,
-        history, historyHides, health, stateRoots: args.stateDirectories,
+        history, historyHides, health, stateRoots: allStateDirectories,
         onShutdown: args.headless ? () => stopHeadless(0) : undefined,
         toolkit: toolkitIdentity(dirname(fileURLToPath(import.meta.url)), packageInfo.version),
       })
