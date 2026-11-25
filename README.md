@@ -544,7 +544,9 @@ requires `-EnableReviewHandlerTeamsPrReferenceWrites` and the configured
 PR-reference mode described below. Unless `-StateDir` is
 supplied, the agents share a generated session root. Golden mode also reads a
 bounded set of trusted prior watch roots so one dashboard can group current
-activity and cross-launch PR history.
+activity and cross-launch PR history. Agents from those earlier launches that
+are no longer heartbeating (for example, after the app or terminal closed) move
+from Live to History as interrupted; an earlier watch that is still running stays live.
 
 Compatibility wrappers provide the shorter single-agent names:
 

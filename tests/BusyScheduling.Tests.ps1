@@ -65,7 +65,7 @@ function New-AgentProcessContainment {
         Copy-Item "$repo\src\DevPilot.Dashboard\src\dispatch.ts", "$repo\src\DevPilot.Dashboard\src\domain.ts" "$dashboard\dist\src"
         Copy-Item "$PSScriptRoot\fixtures\scheduling-dashboard.mjs" "$dashboard\dist\src\index.js"
         @'
-param([string[]]$StateDir, [string[]]$EventLogPath, [string]$BrokerDescriptorPath, [string]$LaunchMode, [switch]$ValidateOnly)
+param([string[]]$StateDir, [string[]]$EventLogPath, [string[]]$HistoryStateDir, [string]$BrokerDescriptorPath, [string]$LaunchMode, [switch]$ValidateOnly)
 if ($ValidateOnly) { return }
 $dashboard = Join-Path (Split-Path $PSScriptRoot -Parent) 'src\DevPilot.Dashboard'
 & (Join-Path $dashboard 'node_modules\bun\bin\bun.exe') --conditions=browser `

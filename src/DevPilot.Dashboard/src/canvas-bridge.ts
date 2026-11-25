@@ -47,7 +47,8 @@ export const SKIPPED_PRS_LIMIT = 200;
 const REPOSITORY_KEY = /^v1:[a-z]+:[A-Za-z0-9._:-]{1,200}$/;
 const SOURCE_COMMIT = /^[0-9a-f]{40}$/;
 
-type BridgeReducer = Pick<OperationsReducer, "list" | "getDispatch" | "registerLocalStream">;
+type BridgeReducer = Pick<OperationsReducer, "list" | "getDispatch" | "registerLocalStream"> &
+  Partial<Pick<OperationsReducer, "priorLaunchInterruptedCount">>;
 type BridgeHealth = Pick<AgentHealthProjection, "all" | "notification" | "failureLogSource" | "skipTarget">;
 type BridgeHistory = Pick<PullRequestHistoryProjection,
   "list" | "hide" | "restore" | "restoreAll" | "clearView" | "hiddenCount" | "hiddenKeyList" | "clearedThrough">;
@@ -283,6 +284,7 @@ export class CanvasBridge {
       automation: await this.automationStatus(now),
       health: this.healthView(),
       instances: instances.map((state) => instanceView(state, now)),
+      earlierWatchInterruptedCount: this.options.reducer.priorLaunchInterruptedCount?.(now) ?? 0,
       historyAvailable: Boolean(history),
       ...(view === "history" ? {
         pullRequests: pullRequests.slice(0, HISTORY_ROWS).map(historyView),

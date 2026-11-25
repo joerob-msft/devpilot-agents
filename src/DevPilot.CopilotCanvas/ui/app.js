@@ -951,6 +951,18 @@ function renderMain() {
       ? (data.hiddenPullRequestCount ? "All PR history is hidden. Use Restore hidden to show it." : "No pull request activity yet.")
       : history ? "No exited agent processes yet." : "No agents are running. Automation scans and manual runs appear here.";
   }
+  const interrupted = Number(data.earlierWatchInterruptedCount) || 0;
+  let interruptedNode = $("earlier-interrupted");
+  if (!history && interrupted > 0 && !interruptedNode) {
+    interruptedNode = el("p", { id: "earlier-interrupted", class: "muted" });
+    list.after(interruptedNode);
+  }
+  if (interruptedNode) {
+    interruptedNode.hidden = history || interrupted <= 0;
+    interruptedNode.textContent = interrupted === 1
+      ? "1 interrupted agent from an earlier watch is in History."
+      : `${interrupted} interrupted agents from earlier watches are in History.`;
+  }
   $("exited").hidden = !prHistory || !instances.length;
   if (prHistory) {
     $("exited-summary").textContent = `Exited processes (${instances.length})`;

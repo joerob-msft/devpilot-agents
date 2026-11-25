@@ -44,6 +44,7 @@ BeforeAll {
 param(
     [Parameter(Position = 0)][string[]]$StateDir = @(),
     [string[]]$EventLogPath = @(),
+    [string[]]$HistoryStateDir = @(),
     [string]$BrokerDescriptorPath,
     [string]$LaunchMode = 'observe',
     [switch]$ValidateOnly,
@@ -54,6 +55,7 @@ $record = [ordered]@{
     headless = [bool]$Headless
     launchMode = $LaunchMode
     stateDir = @($StateDir)
+    historyStateDir = @($HistoryStateDir)
     brokerDescriptorPath = [string]$BrokerDescriptorPath
     descriptor = $(if ($BrokerDescriptorPath -and (Test-Path -LiteralPath $BrokerDescriptorPath -PathType Leaf)) {
         Get-Content -LiteralPath $BrokerDescriptorPath -Raw
@@ -836,7 +838,10 @@ Describe 'cross-launch state history (issue #114)' {
         $result = Invoke-GoldenLaunch -Context $context -Arguments (@('-Golden') + (Get-BaseLaunchArgument -Context $context))
         $result.ExitCode | Should -Be 0 -Because $result.StdErr
         $record = (Get-DashboardRecord -Context $context)[-1]
-        $stateDirs = @($record.stateDir)
+        # Only the current launch is a --state-dir; prior launches are history-only roots.
+        @($record.stateDir).Count | Should -Be 1
+        @($record.historyStateDir).Count | Should -Be 20
+        $stateDirs = @($record.stateDir) + @($record.historyStateDir)
         $stateDirs.Count | Should -Be 21
         # Current launch first, then the 20 newest trusted prior launches of THIS repository, newest
         # to oldest, with previews capped at five so they cannot evict operational history.

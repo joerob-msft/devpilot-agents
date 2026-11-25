@@ -1066,9 +1066,11 @@ try {
         $brokerDescriptorPath = Assert-AgentTrustedFile -Path $brokerDescriptorPath -AllowedRoot $StateDir -Private
     }
     $global:LASTEXITCODE = 0
-    # Current run first, then the most recent trusted prior launches; the dashboard renders them in
-    # this order. Durable-state and lease roots are structurally excluded by Get-PriorWatchStateDir.
-    $dashboardParameters = @{ StateDir = @(@($StateDir) + @($priorStateDirs)); LaunchMode = $launch.LaunchMode }
+    # Current run first, then the most recent trusted prior launches as history-only roots: the
+    # dashboard moves their no-longer-heartbeating agents to History as interrupted. Durable-state
+    # and lease roots are structurally excluded by Get-PriorWatchStateDir.
+    $dashboardParameters = @{ StateDir = @($StateDir); LaunchMode = $launch.LaunchMode }
+    if (@($priorStateDirs).Count -gt 0) { $dashboardParameters.HistoryStateDir = @($priorStateDirs) }
     if ($brokerDescriptorPath) {
         $dashboardParameters.BrokerDescriptorPath = $brokerDescriptorPath
     }
