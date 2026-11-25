@@ -214,8 +214,10 @@ $child = New-AgentPersistentRedirectedProcess -FilePath (Resolve-AgentPwshPath) 
         It 'reports completion after an exited Unix leader leaves an empty group' -Skip:$IsWindows {
             $stdout = Join-Path $TestDrive 'empty.stdout.log'
             $stderr = Join-Path $TestDrive 'empty.stderr.log'
+            # Stay alive long enough for containment to read /proc/<pid>/stat: an instant `exit 0`
+            # can be reaped first on a fast runner, which made this test flaky on ubuntu-latest.
             $child = New-AgentRedirectedProcess -FilePath '/bin/sh' `
-                -ArgumentList @('-c', 'exit 0') `
+                -ArgumentList @('-c', 'sleep 1; exit 0') `
                 -StandardOutputPath $stdout -StandardErrorPath $stderr
             $containment = New-AgentProcessContainment -Process $child.Process
             try {
