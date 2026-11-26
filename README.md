@@ -49,6 +49,7 @@ marker. Anything else it prints is ignored.
 ```text
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
+  DevPilot.OwnerPipeline/    # experimental generic Owner review facade
   DevPilot.Dashboard/        # read-only reviewer/review-handler operations TUI
   DevPilot.CopilotCanvas/    # GitHub Copilot app canvas: start/stop and operate the Golden watch
   Agents/
@@ -59,6 +60,11 @@ tools/                       # launchers, dashboard entry point, and repo checks
 docs/                        # how to add an agent
 release/                     # mechanically checked release metadata
 ```
+
+The experimental Owner facade is documented in
+[docs/owner-pipeline-facade.md](docs/owner-pipeline-facade.md). It is an
+offline, zero-write-by-default contract only; it is not connected to the
+deployed reviewer or scheduler.
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or
 person-specific lives in this repo outside `samples/` — a CI check enforces that
